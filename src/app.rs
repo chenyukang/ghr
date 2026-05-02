@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::warn;
@@ -52,6 +52,12 @@ enum FocusTarget {
     Details,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupDialog {
+    MissingGh,
+    AuthRequired,
+}
+
 struct AppState {
     active_view: SectionKind,
     sections: Vec<SectionSnapshot>,
@@ -65,6 +71,7 @@ struct AppState {
     refreshing: bool,
     last_refresh_request: Instant,
     details: HashMap<String, DetailState>,
+    setup_dialog: Option<SetupDialog>,
 }
 
 pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
@@ -186,6 +193,15 @@ fn handle_key(
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) -> bool {
+    if app.setup_dialog.is_some() {
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Enter => app.dismiss_setup_dialog(),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.search_active {
         match key.code {
             KeyCode::Esc => app.clear_search(),
@@ -268,6 +284,10 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     draw_table(frame, app, body[0]);
     draw_details(frame, app, body[1]);
     draw_footer(frame, app, paths, chunks[3]);
+
+    if let Some(dialog) = app.setup_dialog {
+        draw_setup_dialog(frame, dialog, area);
+    }
 }
 
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -568,6 +588,80 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
     frame.render_widget(footer, area);
 }
 
+fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
+    let (title, lines) = setup_dialog_content(dialog);
+    let dialog_area = centered_rect(58, 12, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
+    match dialog {
+        SetupDialog::MissingGh => (
+            "GitHub CLI Required",
+            vec![
+                Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
+                Line::from(""),
+                Line::from("Install GitHub CLI, then authenticate:"),
+                command_line("brew install gh"),
+                command_line("gh auth login"),
+                Line::from(""),
+                Line::from("After setup, press Esc and then r to refresh."),
+                Line::from("Esc: close and use cached data    q: quit"),
+            ],
+        ),
+        SetupDialog::AuthRequired => (
+            "GitHub Login Required",
+            vec![
+                Line::from("GitHub CLI is installed, but it is not authenticated."),
+                Line::from(""),
+                Line::from("Run this in your terminal:"),
+                command_line("gh auth login"),
+                Line::from(""),
+                Line::from("You can also launch ghr with GH_TOKEN set."),
+                Line::from("After setup, press Esc and then r to refresh."),
+                Line::from("Esc: close and use cached data    q: quit"),
+            ],
+        ),
+    }
+}
+
+fn command_line(command: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            command,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
+    let mut width = area.width.saturating_mul(width_percent).saturating_div(100);
+    width = width.max(48.min(area.width)).min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
 fn push_heading(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::from(Span::styled(
         text.to_string(),
@@ -651,6 +745,18 @@ fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
     format!("refresh complete with {count} failed section(s)")
 }
 
+fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
+    if error.contains("GitHub CLI `gh` is required") {
+        return Some(SetupDialog::MissingGh);
+    }
+
+    if error.contains("Run `gh auth login`") {
+        return Some(SetupDialog::AuthRequired);
+    }
+
+    None
+}
+
 impl AppState {
     fn new(active_view: SectionKind, sections: Vec<SectionSnapshot>) -> Self {
         Self {
@@ -666,6 +772,7 @@ impl AppState {
             refreshing: false,
             last_refresh_request: Instant::now(),
             details: HashMap::new(),
+            setup_dialog: None,
         }
     }
 
@@ -688,11 +795,13 @@ impl AppState {
                     .iter()
                     .find_map(|section| section.error.as_deref())
                     .map(str::to_string);
+                let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 self.details_scroll = 0;
                 self.clamp_positions();
                 self.refreshing = false;
+                self.setup_dialog = setup_dialog;
                 self.status = match (errors, save_error) {
                     (0, None) => "refresh complete".to_string(),
                     (count, None) => refresh_error_status(count, first_error.as_deref()),
@@ -704,10 +813,18 @@ impl AppState {
                     self.details.insert(item_id, DetailState::Loaded(comments));
                 }
                 Err(error) => {
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog_from_error(&error);
+                    }
                     self.details.insert(item_id, DetailState::Error(error));
                 }
             },
         }
+    }
+
+    fn dismiss_setup_dialog(&mut self) {
+        self.setup_dialog = None;
+        self.status = "setup hint dismissed; cached data still available".to_string();
     }
 
     fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
@@ -1105,6 +1222,86 @@ mod tests {
             refresh_error_status(3, Some("rate limited")),
             "refresh complete with 3 failed section(s)"
         );
+    }
+
+    #[test]
+    fn setup_dialog_from_error_classifies_gh_setup_failures() {
+        assert_eq!(
+            setup_dialog_from_error("GitHub CLI `gh` is required but was not found."),
+            Some(SetupDialog::MissingGh)
+        );
+        assert_eq!(
+            setup_dialog_from_error(
+                "GitHub CLI is installed but not authenticated. Run `gh auth login`."
+            ),
+            Some(SetupDialog::AuthRequired)
+        );
+        assert_eq!(setup_dialog_from_error("HTTP 500"), None);
+    }
+
+    #[test]
+    fn refresh_failure_opens_setup_dialog() {
+        let mut failed_section = test_section();
+        failed_section.items.clear();
+        failed_section.error = Some("GitHub CLI `gh` is required but was not found.".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![failed_section],
+            save_error: None,
+        });
+
+        assert_eq!(app.setup_dialog, Some(SetupDialog::MissingGh));
+        assert_eq!(
+            app.status,
+            "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        );
+    }
+
+    #[test]
+    fn modal_keys_dismiss_dialog_before_regular_input() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.setup_dialog = Some(SetupDialog::AuthRequired);
+        app.search_active = true;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.setup_dialog, None);
+        assert!(app.search_active);
+        assert_eq!(
+            app.status,
+            "setup hint dismissed; cached data still available"
+        );
+    }
+
+    #[test]
+    fn setup_dialog_content_contains_actionable_commands() {
+        let (_title, missing_lines) = setup_dialog_content(SetupDialog::MissingGh);
+        let missing_text = missing_lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(missing_text.contains("brew install gh"));
+        assert!(missing_text.contains("gh auth login"));
+
+        let (_title, auth_lines) = setup_dialog_content(SetupDialog::AuthRequired);
+        let auth_text = auth_lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(auth_text.contains("gh auth login"));
+        assert!(auth_text.contains("GH_TOKEN"));
     }
 
     #[test]

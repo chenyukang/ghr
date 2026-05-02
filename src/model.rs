@@ -59,6 +59,23 @@ pub struct CommentPreview {
     pub is_mine: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionHints {
+    pub labels: Vec<String>,
+    pub checks: Option<CheckSummary>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckSummary {
+    pub passed: usize,
+    pub failed: usize,
+    pub pending: usize,
+    pub skipped: usize,
+    pub total: usize,
+    pub incomplete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionSnapshot {
     pub key: String,
@@ -66,6 +83,12 @@ pub struct SectionSnapshot {
     pub title: String,
     pub filters: String,
     pub items: Vec<WorkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<usize>,
+    #[serde(default = "default_section_page")]
+    pub page: usize,
+    #[serde(default)]
+    pub page_size: usize,
     pub refreshed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }
@@ -128,10 +151,17 @@ impl SectionSnapshot {
             title,
             filters,
             items: Vec::new(),
+            total_count: None,
+            page: 1,
+            page_size: 0,
             refreshed_at: None,
             error: None,
         }
     }
+}
+
+fn default_section_page() -> usize {
+    1
 }
 
 pub fn section_key(kind: SectionKind, title: &str) -> String {
@@ -146,12 +176,18 @@ pub fn repo_view_key(name: &str) -> String {
     format!("repo:{name}")
 }
 
+pub fn global_search_view_key() -> String {
+    "search".to_string()
+}
+
 pub fn section_view_key(section: &SectionSnapshot) -> String {
     if let Some((prefix, rest)) = section.key.split_once(':') {
         if prefix == "repo" {
             if let Some((name, _)) = rest.split_once(':') {
                 return repo_view_key(name);
             }
+        } else if prefix == "search" {
+            return global_search_view_key();
         }
     }
 
@@ -222,7 +258,7 @@ pub fn configured_sections(config: &Config) -> Vec<SectionSnapshot> {
 }
 
 pub fn repo_section_filters(repo: &str) -> String {
-    format!("repo:{repo} archived:false sort:updated-desc")
+    format!("repo:{repo} is:open archived:false sort:updated-desc")
 }
 
 pub fn merge_cached_sections(
@@ -266,7 +302,7 @@ pub fn merge_refreshed_sections(
 }
 
 pub fn section_counts(section: &SectionSnapshot) -> (usize, usize) {
-    let total = section.items.len();
+    let total = section.total_count.unwrap_or(section.items.len());
     let unread = section
         .items
         .iter()
@@ -328,7 +364,19 @@ mod tests {
         assert!(repo_sections[0].key.starts_with("repo:fiber:"));
         assert_eq!(
             repo_sections[0].filters,
-            "repo:nervosnetwork/fiber archived:false sort:updated-desc"
+            "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc"
         );
+    }
+
+    #[test]
+    fn search_sections_share_search_view() {
+        let section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "fiber",
+        );
+
+        assert_eq!(section_view_key(&section), "search");
     }
 }

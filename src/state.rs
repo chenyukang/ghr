@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -13,6 +14,12 @@ pub const MAX_LIST_WIDTH_PERCENT: u16 = 85;
 #[serde(default)]
 pub struct UiState {
     pub list_width_percent: u16,
+    pub active_view: String,
+    pub section_index: HashMap<String, usize>,
+    pub selected_index: HashMap<String, usize>,
+    pub focus: String,
+    pub details_scroll: u16,
+    pub selected_comment_index: usize,
 }
 
 impl UiState {
@@ -42,6 +49,9 @@ impl UiState {
 
     pub fn normalized(mut self) -> Self {
         self.list_width_percent = clamp_list_width_percent(self.list_width_percent);
+        if !matches!(self.focus.as_str(), "ghr" | "sections" | "list" | "details") {
+            self.focus = "list".to_string();
+        }
         self
     }
 }
@@ -50,6 +60,12 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             list_width_percent: DEFAULT_LIST_WIDTH_PERCENT,
+            active_view: String::new(),
+            section_index: HashMap::new(),
+            selected_index: HashMap::new(),
+            focus: "list".to_string(),
+            details_scroll: 0,
+            selected_comment_index: 0,
         }
     }
 }
@@ -73,6 +89,12 @@ mod tests {
 
         UiState {
             list_width_percent: 99,
+            active_view: "issues".to_string(),
+            section_index: HashMap::from([("issues".to_string(), 1)]),
+            selected_index: HashMap::from([("issues".to_string(), 3)]),
+            focus: "details".to_string(),
+            details_scroll: 8,
+            selected_comment_index: 2,
         }
         .save(&path)
         .expect("save state");
@@ -80,6 +102,12 @@ mod tests {
         let state = UiState::load_or_default(&path);
 
         assert_eq!(state.list_width_percent, MAX_LIST_WIDTH_PERCENT);
+        assert_eq!(state.active_view, "issues");
+        assert_eq!(state.section_index.get("issues"), Some(&1));
+        assert_eq!(state.selected_index.get("issues"), Some(&3));
+        assert_eq!(state.focus, "details");
+        assert_eq!(state.details_scroll, 8);
+        assert_eq!(state.selected_comment_index, 2);
 
         let _ = fs::remove_file(path);
     }
@@ -87,5 +115,16 @@ mod tests {
     #[test]
     fn default_split_ratio_is_even() {
         assert_eq!(UiState::default().list_width_percent, 50);
+    }
+
+    #[test]
+    fn invalid_focus_falls_back_to_list() {
+        let state = UiState {
+            focus: "somewhere".to_string(),
+            ..UiState::default()
+        }
+        .normalized();
+
+        assert_eq!(state.focus, "list");
     }
 }

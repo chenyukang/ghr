@@ -18,11 +18,11 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub view: SectionKind,
-    pub pr_limit: usize,
-    pub issue_limit: usize,
+    pub pr_per_page: usize,
+    pub issue_per_page: usize,
     pub notification_limit: usize,
     pub refetch_interval_seconds: u64,
     pub include_read_notifications: bool,
@@ -188,8 +188,8 @@ impl Default for Defaults {
     fn default() -> Self {
         Self {
             view: SectionKind::PullRequests,
-            pr_limit: 50,
-            issue_limit: 50,
+            pr_per_page: 50,
+            issue_per_page: 50,
             notification_limit: 50,
             refetch_interval_seconds: 120,
             include_read_notifications: true,
@@ -292,8 +292,8 @@ mod tests {
 
             [defaults]
             view = "pull_requests"
-            pr_limit = 50
-            issue_limit = 50
+            pr_per_page = 50
+            issue_per_page = 50
             notification_limit = 50
             refetch_interval_seconds = 120
             include_read_notifications = true
@@ -314,11 +314,29 @@ mod tests {
         .expect("existing config should parse");
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
+        assert_eq!(config.defaults.pr_per_page, 50);
+        assert_eq!(config.defaults.issue_per_page, 50);
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
         assert_eq!(config.repos[0].name, "fiber");
         assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
         assert_eq!(config.pr_sections[0].title, "Assigned to Me");
+    }
+
+    #[test]
+    fn defaults_reject_old_limit_names() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            pr_limit = 50
+            issue_limit = 50
+            "#,
+        )
+        .expect_err("old default limit names should not be accepted")
+        .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("pr_limit"));
     }
 }

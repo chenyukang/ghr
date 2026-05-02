@@ -33,33 +33,6 @@ cargo install ghr-cli
 ghr
 ```
 
-Run from the repository:
-
-```bash
-cargo run
-```
-
-Refresh the snapshot without opening the TUI:
-
-```bash
-cargo run -- --refresh --no-tui
-```
-
-Show local paths:
-
-```bash
-cargo run -- --print-paths
-```
-
-Install locally:
-
-```bash
-cargo install --path .
-ghr
-```
-
-The crates.io package is named `ghr-cli` because `ghr` is already taken, but the installed command is still `ghr`.
-
 ## Keybindings
 
 | Key | Action |

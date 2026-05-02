@@ -590,7 +590,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
 
 fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     let (title, lines) = setup_dialog_content(dialog);
-    let dialog_area = centered_rect(58, 12, area);
+    let dialog_area = centered_rect(66, 15, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -615,10 +615,15 @@ fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>
         SetupDialog::MissingGh => (
             "GitHub CLI Required",
             vec![
-                Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
+                Line::from("ghr uses GitHub CLI for GitHub access."),
                 Line::from(""),
-                Line::from("Install GitHub CLI, then authenticate:"),
-                command_line("brew install gh"),
+                Line::from("Install GitHub CLI for your system: cli.github.com"),
+                command_line("macOS: brew install gh"),
+                command_line("Debian/Ubuntu: apt setup at cli.github.com"),
+                command_line("Fedora/RHEL: sudo dnf install gh"),
+                command_line("Arch: sudo pacman -S github-cli"),
+                Line::from(""),
+                Line::from("Then authenticate:"),
                 command_line("gh auth login"),
                 Line::from(""),
                 Line::from("After setup, press Esc and then r to refresh."),
@@ -1292,7 +1297,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(missing_text.contains("brew install gh"));
+        assert!(missing_text.contains("apt setup at cli.github.com"));
+        assert!(missing_text.contains("sudo dnf install gh"));
+        assert!(missing_text.contains("sudo pacman -S github-cli"));
         assert!(missing_text.contains("gh auth login"));
+        assert!(
+            missing_lines
+                .iter()
+                .map(|line| line.to_string())
+                .all(|line| line.chars().count() <= 50)
+        );
 
         let (_title, auth_lines) = setup_dialog_content(SetupDialog::AuthRequired);
         let auth_text = auth_lines

@@ -468,7 +468,7 @@ async fn run_gh_json(args: &[String]) -> Result<String> {
 
 fn gh_missing_message(args: &[String]) -> String {
     format!(
-        "GitHub CLI `gh` is required but was not found. Install it from https://cli.github.com/ or run `brew install gh`, then run `gh auth login`. Tried: gh {}",
+        "GitHub CLI `gh` is required but was not found. Install it for your OS from https://cli.github.com/: macOS `brew install gh`, Fedora `sudo dnf install gh`, Arch `sudo pacman -S github-cli`, Debian/Ubuntu official apt setup at https://github.com/cli/cli/blob/trunk/docs/install_linux.md. Then run `gh auth login`. Tried: gh {}",
         args.join(" ")
     )
 }
@@ -742,6 +742,9 @@ mod tests {
 
         assert!(message.contains("GitHub CLI `gh` is required"));
         assert!(message.contains("brew install gh"));
+        assert!(message.contains("sudo dnf install gh"));
+        assert!(message.contains("sudo pacman -S github-cli"));
+        assert!(message.contains("official apt setup"));
         assert!(message.contains("gh auth login"));
     }
 

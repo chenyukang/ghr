@@ -22,6 +22,7 @@ crossterm = "0.28"
 dirs = "6"
 futures = "0.3"
 open = "5"
+pulldown-cmark = "0.12"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

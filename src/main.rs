@@ -4,6 +4,7 @@ mod dirs;
 mod github;
 mod model;
 mod snapshot;
+mod state;
 
 use std::path::PathBuf;
 
@@ -52,6 +53,7 @@ async fn main() -> Result<()> {
         println!("config: {}", paths.config_path.display());
         println!("db:     {}", paths.db_path.display());
         println!("log:    {}", paths.log_path.display());
+        println!("state:  {}", paths.state_path.display());
         return Ok(());
     }
 

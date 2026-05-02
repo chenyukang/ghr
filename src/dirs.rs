@@ -9,6 +9,7 @@ pub struct Paths {
     pub config_path: PathBuf,
     pub db_path: PathBuf,
     pub log_path: PathBuf,
+    pub state_path: PathBuf,
 }
 
 impl Paths {
@@ -18,12 +19,14 @@ impl Paths {
         let config_path = config_path.unwrap_or_else(|| root.join("config.toml"));
         let db_path = root.join("ghr.db");
         let log_path = root.join("ghr.log");
+        let state_path = root.join("state.toml");
 
         Ok(Self {
             root,
             config_path,
             db_path,
             log_path,
+            state_path,
         })
     }
 

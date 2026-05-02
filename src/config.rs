@@ -11,17 +11,18 @@ use crate::model::SectionKind;
 pub struct Config {
     pub defaults: Defaults,
     pub exclude_repos: Vec<String>,
+    pub repos: Vec<RepoConfig>,
     pub pr_sections: Vec<SearchSection>,
     pub issue_sections: Vec<SearchSection>,
     pub notification_sections: Vec<SearchSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Defaults {
     pub view: SectionKind,
-    pub pr_limit: usize,
-    pub issue_limit: usize,
+    pub pr_per_page: usize,
+    pub issue_per_page: usize,
     pub notification_limit: usize,
     pub refetch_interval_seconds: u64,
     pub include_read_notifications: bool,
@@ -37,6 +38,15 @@ pub struct SearchSection {
     pub queries: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoConfig {
+    pub name: String,
+    pub repo: String,
+    pub show_prs: bool,
+    pub show_issues: bool,
 }
 
 impl SearchSection {
@@ -82,6 +92,7 @@ impl Default for Config {
         Self {
             defaults: Defaults::default(),
             exclude_repos: vec![],
+            repos: vec![],
             pr_sections: vec![
                 SearchSection {
                     title: "My Pull Requests".to_string(),
@@ -162,12 +173,23 @@ impl Default for Config {
     }
 }
 
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            repo: String::new(),
+            show_prs: true,
+            show_issues: true,
+        }
+    }
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Self {
             view: SectionKind::PullRequests,
-            pr_limit: 50,
-            issue_limit: 50,
+            pr_per_page: 50,
+            issue_per_page: 50,
             notification_limit: 50,
             refetch_interval_seconds: 120,
             include_read_notifications: true,
@@ -203,6 +225,7 @@ mod tests {
 
         let decoded = toml::from_str::<Config>(&encoded).expect("decode generated default config");
         assert_eq!(decoded.defaults.view, SectionKind::PullRequests);
+        assert!(decoded.repos.is_empty());
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
         assert!(!decoded.notification_sections.is_empty());
@@ -261,10 +284,16 @@ mod tests {
             r#"
             exclude_repos = ["nervosnetwork/archive-*"]
 
+            [[repos]]
+            name = "fiber"
+            repo = "nervosnetwork/fiber"
+            show_prs = true
+            show_issues = true
+
             [defaults]
             view = "pull_requests"
-            pr_limit = 50
-            issue_limit = 50
+            pr_per_page = 50
+            issue_per_page = 50
             notification_limit = 50
             refetch_interval_seconds = 120
             include_read_notifications = true
@@ -285,7 +314,29 @@ mod tests {
         .expect("existing config should parse");
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
+        assert_eq!(config.defaults.pr_per_page, 50);
+        assert_eq!(config.defaults.issue_per_page, 50);
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
+        assert_eq!(config.repos[0].name, "fiber");
+        assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
+        assert!(config.repos[0].show_prs);
+        assert!(config.repos[0].show_issues);
         assert_eq!(config.pr_sections[0].title, "Assigned to Me");
+    }
+
+    #[test]
+    fn defaults_reject_old_limit_names() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            pr_limit = 50
+            issue_limit = 50
+            "#,
+        )
+        .expect_err("old default limit names should not be accepted")
+        .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("pr_limit"));
     }
 }

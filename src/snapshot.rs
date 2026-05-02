@@ -29,11 +29,17 @@ impl SnapshotStore {
                 title TEXT NOT NULL,
                 filters TEXT NOT NULL,
                 items_json TEXT NOT NULL,
+                total_count INTEGER,
+                page INTEGER NOT NULL DEFAULT 1,
+                page_size INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT NOT NULL
             );
             "#,
         )
         .context("failed to initialize snapshot database")?;
+        ensure_snapshot_column(&conn, "total_count", "INTEGER")?;
+        ensure_snapshot_column(&conn, "page", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_snapshot_column(&conn, "page_size", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -42,7 +48,7 @@ impl SnapshotStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT key, kind, title, filters, items_json, refreshed_at
+                SELECT key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at
                 FROM snapshots
                 "#,
             )
@@ -56,7 +62,16 @@ impl SnapshotStore {
             let title: String = row.get(2)?;
             let filters: String = row.get(3)?;
             let items_json: String = row.get(4)?;
-            let refreshed_at_raw: String = row.get(5)?;
+            let total_count_raw: Option<i64> = row.get(5)?;
+            let total_count = total_count_raw.and_then(|value| usize::try_from(value).ok());
+            let page_raw: i64 = row.get(6)?;
+            let page = usize::try_from(page_raw)
+                .ok()
+                .filter(|page| *page > 0)
+                .unwrap_or(1);
+            let page_size_raw: i64 = row.get(7)?;
+            let page_size = usize::try_from(page_size_raw).unwrap_or(0);
+            let refreshed_at_raw: String = row.get(8)?;
 
             let kind = SectionKind::from_str(&kind_raw).map_err(anyhow::Error::msg)?;
             let items = serde_json::from_str(&items_json)
@@ -73,6 +88,9 @@ impl SnapshotStore {
                     title,
                     filters,
                     items,
+                    total_count,
+                    page,
+                    page_size,
                     refreshed_at: Some(refreshed_at),
                     error: None,
                 },
@@ -93,13 +111,16 @@ impl SnapshotStore {
 
         conn.execute(
             r#"
-            INSERT INTO snapshots (key, kind, title, filters, items_json, refreshed_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO snapshots (key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(key) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
                 filters = excluded.filters,
                 items_json = excluded.items_json,
+                total_count = excluded.total_count,
+                page = excluded.page,
+                page_size = excluded.page_size,
                 refreshed_at = excluded.refreshed_at
             "#,
             params![
@@ -108,6 +129,9 @@ impl SnapshotStore {
                 &section.title,
                 &section.filters,
                 items_json,
+                section.total_count.map(|value| value as i64),
+                section.page as i64,
+                section.page_size as i64,
                 refreshed_at.to_rfc3339(),
             ],
         )
@@ -120,4 +144,23 @@ impl SnapshotStore {
         Connection::open(&self.path)
             .with_context(|| format!("failed to open {}", self.path.display()))
     }
+}
+
+fn ensure_snapshot_column(conn: &Connection, name: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(snapshots)")
+        .context("failed to inspect snapshot schema")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to read snapshot schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse snapshot schema")?;
+    if !columns.iter().any(|column| column == name) {
+        conn.execute(
+            &format!("ALTER TABLE snapshots ADD COLUMN {name} {definition}"),
+            [],
+        )
+        .with_context(|| format!("failed to migrate snapshot {name} column"))?;
+    }
+    Ok(())
 }

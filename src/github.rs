@@ -13,7 +13,10 @@ use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
-use crate::model::{CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem};
+use crate::model::{
+    CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
+    repo_section_filters, repo_view_key,
+};
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
 
@@ -133,6 +136,7 @@ async fn refresh_search_sections(
                 (
                     index,
                     refresh_search_section(
+                        builtin_view_key(SectionKind::PullRequests),
                         SectionKind::PullRequests,
                         section,
                         limit,
@@ -157,6 +161,7 @@ async fn refresh_search_sections(
                 (
                     index,
                     refresh_search_section(
+                        builtin_view_key(SectionKind::Issues),
                         SectionKind::Issues,
                         section,
                         limit,
@@ -167,6 +172,74 @@ async fn refresh_search_sections(
             }
             .boxed(),
         );
+    }
+
+    for repo in config.repos.clone() {
+        if repo.name.trim().is_empty() || repo.repo.trim().is_empty() {
+            continue;
+        }
+
+        let view = repo_view_key(&repo.name);
+        let filters = repo_section_filters(&repo.repo);
+        if repo.show_prs {
+            let excludes = excludes.clone();
+            let limit = config.defaults.pr_limit;
+            let section = SearchSection {
+                title: "Pull Requests".to_string(),
+                filters: filters.clone(),
+                queries: Vec::new(),
+                limit: None,
+            };
+            let view = view.clone();
+            let index = order;
+            order += 1;
+            tasks.push(
+                async move {
+                    (
+                        index,
+                        refresh_search_section(
+                            view,
+                            SectionKind::PullRequests,
+                            section,
+                            limit,
+                            excludes.as_slice(),
+                        )
+                        .await,
+                    )
+                }
+                .boxed(),
+            );
+        }
+
+        if repo.show_issues {
+            let excludes = excludes.clone();
+            let limit = config.defaults.issue_limit;
+            let section = SearchSection {
+                title: "Issues".to_string(),
+                filters: filters.clone(),
+                queries: Vec::new(),
+                limit: None,
+            };
+            let view = view.clone();
+            let index = order;
+            order += 1;
+            tasks.push(
+                async move {
+                    (
+                        index,
+                        refresh_search_section(
+                            view,
+                            SectionKind::Issues,
+                            section,
+                            limit,
+                            excludes.as_slice(),
+                        )
+                        .await,
+                    )
+                }
+                .boxed(),
+            );
+        }
     }
 
     let mut sections = Vec::new();
@@ -181,6 +254,7 @@ async fn refresh_search_sections(
 }
 
 async fn refresh_search_section(
+    view: String,
     kind: SectionKind,
     section: SearchSection,
     limit: usize,
@@ -188,7 +262,7 @@ async fn refresh_search_section(
 ) -> SectionSnapshot {
     let queries = section.search_filters();
     let display_filters = section.display_filters();
-    let mut snapshot = SectionSnapshot::empty(kind, section.title, display_filters);
+    let mut snapshot = SectionSnapshot::empty_for_view(view, kind, section.title, display_filters);
     let started = Instant::now();
 
     match fetch_search_items(kind, queries, limit, exclude_repos).await {
@@ -364,6 +438,31 @@ pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -
         path,
         "-f".to_string(),
         format!("body={body}"),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub async fn merge_pull_request(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&[
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        "--merge".to_string(),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&[
+        "pr".to_string(),
+        "close".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
     ])
     .await?;
     Ok(())

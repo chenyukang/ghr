@@ -83,6 +83,12 @@ Example:
 ```toml
 exclude_repos = ["some-org/archive-*"]
 
+[[repos]]
+name = "Rust"
+repo = "rust-lang/rust"
+show_prs = true
+show_issues = true
+
 [defaults]
 view = "pull_requests"
 pr_limit = 50
@@ -105,6 +111,8 @@ queries = [
 ```
 
 Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list.
+
+Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`.
 
 ## Local Data
 

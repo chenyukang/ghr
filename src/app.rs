@@ -26,11 +26,13 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    edit_issue_comment, fetch_issue_comments, post_issue_comment, refresh_dashboard,
+    close_pull_request, edit_issue_comment, fetch_issue_comments, merge_pull_request,
+    post_issue_comment, refresh_dashboard,
 };
 use crate::model::{
-    CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem, configured_sections,
-    merge_cached_sections, merge_refreshed_sections, section_counts,
+    CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
+    configured_sections, merge_cached_sections, merge_refreshed_sections, section_counts,
+    section_view_key,
 };
 use crate::snapshot::SnapshotStore;
 use crate::state::{DEFAULT_LIST_WIDTH_PERCENT, UiState, clamp_list_width_percent};
@@ -53,6 +55,11 @@ enum AppMsg {
         item_id: String,
         comment_index: usize,
         result: std::result::Result<Vec<CommentPreview>, String>,
+    },
+    PrActionFinished {
+        item_id: String,
+        action: PrAction,
+        result: std::result::Result<(), String>,
     },
 }
 
@@ -102,6 +109,18 @@ struct PendingCommentSubmit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrAction {
+    Merge,
+    Close,
+}
+
+#[derive(Debug, Clone)]
+struct PrActionDialog {
+    item: WorkItem,
+    action: PrAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingCommentMode {
     Post,
     Edit {
@@ -123,10 +142,10 @@ const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
 
 struct AppState {
-    active_view: SectionKind,
+    active_view: String,
     sections: Vec<SectionSnapshot>,
-    section_index: [usize; 3],
-    selected_index: [usize; 3],
+    section_index: HashMap<String, usize>,
+    selected_index: HashMap<String, usize>,
     focus: FocusTarget,
     details_scroll: u16,
     list_width_percent: u16,
@@ -142,8 +161,16 @@ struct AppState {
     selected_comment_index: usize,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
+    pr_action_dialog: Option<PrActionDialog>,
+    pr_action_running: bool,
     setup_dialog: Option<SetupDialog>,
     help_dialog: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewTab {
+    key: String,
+    label: String,
 }
 
 pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
@@ -325,6 +352,56 @@ fn start_comment_edit(
     });
 }
 
+fn start_pr_action(
+    item: WorkItem,
+    action: PrAction,
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => match action {
+                PrAction::Merge => merge_pull_request(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
+                PrAction::Close => close_pull_request(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
+            },
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let should_refresh = result.is_ok();
+        let _ = tx.send(AppMsg::PrActionFinished {
+            item_id,
+            action,
+            result,
+        });
+
+        if should_refresh {
+            let _ = tx.send(AppMsg::RefreshStarted);
+            let sections = refresh_dashboard(&config).await;
+            let mut save_error = None;
+            for section in &sections {
+                if section.error.is_some() {
+                    continue;
+                }
+                if let Err(error) = store.save_section(section) {
+                    let message = error.to_string();
+                    warn!(error = %message, "failed to save refreshed snapshot after PR action");
+                    save_error = Some(message);
+                    break;
+                }
+            }
+            let _ = tx.send(AppMsg::RefreshFinished {
+                sections,
+                save_error,
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 fn handle_key(
     app: &mut AppState,
@@ -358,6 +435,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.pr_action_dialog.is_some() {
+        app.handle_pr_action_dialog_key(key, config, store, tx);
+        return false;
+    }
+
     if app.help_dialog {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -386,6 +468,8 @@ fn handle_key_in_area(
             KeyCode::Char('?') => app.show_help_dialog(),
             KeyCode::Char('4') => app.focus_primary_list(),
             KeyCode::Char('o') => app.open_selected(),
+            KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
+            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Char('R') => app.start_reply_to_selected_comment(),
             KeyCode::Char('e') => app.start_edit_selected_comment_dialog(),
@@ -409,11 +493,11 @@ fn handle_key_in_area(
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('5') => app.focus_details(),
-        KeyCode::Tab => app.switch_view(app.active_view.next()),
-        KeyCode::BackTab => app.switch_view(app.active_view.previous()),
-        KeyCode::Char('1') => app.switch_view(SectionKind::PullRequests),
-        KeyCode::Char('2') => app.switch_view(SectionKind::Issues),
-        KeyCode::Char('3') => app.switch_view(SectionKind::Notifications),
+        KeyCode::Tab => app.move_view(1),
+        KeyCode::BackTab => app.move_view(-1),
+        KeyCode::Char('1') => app.switch_builtin_view(SectionKind::PullRequests),
+        KeyCode::Char('2') => app.switch_builtin_view(SectionKind::Issues),
+        KeyCode::Char('3') => app.switch_builtin_view(SectionKind::Notifications),
         KeyCode::Char('4') => app.focus_primary_list(),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => app.move_section(1),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => app.move_section(-1),
@@ -428,6 +512,8 @@ fn handle_key_in_area(
         KeyCode::Char('g') => app.set_selection(0),
         KeyCode::Char('G') => app.select_last(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
+        KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
+        KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
         KeyCode::Char('a') => app.start_new_comment_dialog(),
         KeyCode::Char('o') => app.open_selected(),
         KeyCode::Enter => app.focus_details(),
@@ -463,6 +549,9 @@ fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
         return false;
     }
     if app.help_dialog {
+        return false;
+    }
+    if app.pr_action_dialog.is_some() {
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
@@ -527,7 +616,7 @@ fn handle_left_click(
     table_area: Rect,
     details_area: Rect,
 ) {
-    if let Some(view) = view_tab_at(view_tabs_area, mouse.column, mouse.row) {
+    if let Some(view) = view_tab_at(app, view_tabs_area, mouse.column, mouse.row) {
         app.switch_view(view);
         app.search_active = false;
         app.status = "list focused".to_string();
@@ -668,19 +757,14 @@ fn table_viewport_offset(selected: usize, visible_rows: usize) -> usize {
     selected.saturating_sub(visible_rows - 1)
 }
 
-fn view_tab_at(area: Rect, column: u16, row: u16) -> Option<SectionKind> {
-    let views = [
-        SectionKind::PullRequests,
-        SectionKind::Issues,
-        SectionKind::Notifications,
-    ];
-    tab_index_at(
-        &views.map(|view| view.label().to_string()),
-        area,
-        column,
-        row,
-    )
-    .and_then(|index| views.get(index).copied())
+fn view_tab_at(app: &AppState, area: Rect, column: u16, row: u16) -> Option<String> {
+    let views = app.view_tabs();
+    let labels = views
+        .iter()
+        .map(|view| view.label.clone())
+        .collect::<Vec<_>>();
+    tab_index_at(&labels, area, column, row)
+        .and_then(|index| views.get(index).map(|view| view.key.clone()))
 }
 
 fn section_tab_at(app: &AppState, area: Rect, column: u16, row: u16) -> Option<usize> {
@@ -728,6 +812,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_setup_dialog(frame, dialog, area);
     } else if app.help_dialog {
         draw_help_dialog(frame, area);
+    } else if let Some(dialog) = &app.pr_action_dialog {
+        draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     }
@@ -802,18 +888,14 @@ fn split_percent_from_column(body: Rect, column: u16) -> u16 {
 }
 
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let views = [
-        SectionKind::PullRequests,
-        SectionKind::Issues,
-        SectionKind::Notifications,
-    ];
+    let views = app.view_tabs();
     let titles = views
         .iter()
-        .map(|kind| Line::from(kind.label()))
+        .map(|view| Line::from(view.label.clone()))
         .collect::<Vec<_>>();
     let active = views
         .iter()
-        .position(|kind| *kind == app.active_view)
+        .position(|view| view.key == app.active_view)
         .unwrap_or(0);
 
     let tabs = Tabs::new(titles)
@@ -1026,7 +1108,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
         format!("filter: /{}", app.search_query)
     };
     let text = format!(
-        "tab/1-3 view  ? help  4 list  h/l section  j/k move  pg/d/u page  enter/5 details  a comment  R reply  e edit  r refresh  o open  q quit | drag split | focus {focus} | {search} | {refresh} | {} | db {}",
+        "tab/1-3 view  ? help  4 list  h/l section  j/k move  pg/d/u page  enter/5 details  M merge  C close  a comment  R reply  e edit  r refresh  o open  q quit | drag split | focus {focus} | {search} | {refresh} | {} | db {}",
         app.status,
         paths.db_path.display()
     );
@@ -1077,6 +1159,74 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+}
+
+fn draw_pr_action_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &PrActionDialog,
+    running: bool,
+    area: Rect,
+) {
+    let dialog_area = centered_rect(66, 12, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let action_label = match dialog.action {
+        PrAction::Merge => "merge",
+        PrAction::Close => "close",
+    };
+    let prompt = match dialog.action {
+        PrAction::Merge => "Merge this pull request on GitHub?",
+        PrAction::Close => "Close this pull request on GitHub?",
+    };
+    let status = if running {
+        "working...".to_string()
+    } else {
+        format!("y/Enter: yes, {action_label} PR    Esc: cancel")
+    };
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(""),
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("pull request", number),
+        key_value_line("title", dialog.item.title.clone()),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            status,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(Color::Black))
+        .title(Span::styled(
+            match dialog.action {
+                PrAction::Merge => "Merge Pull Request",
+                PrAction::Close => "Close Pull Request",
+            },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn key_value_line(key: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
+        Span::raw(value),
+    ])
 }
 
 fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
@@ -1400,6 +1550,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Enter or 5", "focus Details"),
         help_key_line("4", "focus primary list"),
         help_key_line("o", "open selected item in browser"),
+        help_key_line("M", "open PR merge confirmation"),
+        help_key_line("C", "open PR close confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
         help_heading("Details"),
@@ -1410,7 +1562,13 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
+        help_key_line("M", "open PR merge confirmation"),
+        help_key_line("C", "open PR close confirmation"),
         help_key_line("o", "open selected item in browser"),
+        Line::from(""),
+        help_heading("Pull Request Confirmation"),
+        help_key_line("y / Enter", "run the confirmed PR action"),
+        help_key_line("Esc", "cancel PR action"),
         Line::from(""),
         help_heading("Comment Editor"),
         help_key_line("Enter", "insert newline"),
@@ -2350,11 +2508,11 @@ impl AppState {
         ui_state: UiState,
     ) -> Self {
         let ui_state = ui_state.normalized();
-        Self {
-            active_view,
+        let mut state = Self {
+            active_view: builtin_view_key(active_view),
             sections,
-            section_index: [0; 3],
-            selected_index: [0; 3],
+            section_index: HashMap::new(),
+            selected_index: HashMap::new(),
             focus: FocusTarget::List,
             details_scroll: 0,
             list_width_percent: ui_state.list_width_percent,
@@ -2370,9 +2528,13 @@ impl AppState {
             selected_comment_index: 0,
             comment_dialog: None,
             posting_comment: false,
+            pr_action_dialog: None,
+            pr_action_running: false,
             setup_dialog: None,
             help_dialog: false,
-        }
+        };
+        state.clamp_positions();
+        state
     }
 
     fn ui_state(&self) -> UiState {
@@ -2522,6 +2684,33 @@ impl AppState {
                     self.status = format!("comment update failed: {error}");
                 }
             },
+            AppMsg::PrActionFinished {
+                item_id,
+                action,
+                result,
+            } => {
+                self.pr_action_running = false;
+                self.pr_action_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.mark_item_after_pr_action(&item_id, action);
+                        self.status = match action {
+                            PrAction::Merge => "pull request merged; refreshing".to_string(),
+                            PrAction::Close => "pull request closed; refreshing".to_string(),
+                        };
+                    }
+                    Err(error) => {
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog_from_error(&error);
+                        }
+                        self.status = match action {
+                            PrAction::Merge => format!("pull request merge failed: {error}"),
+                            PrAction::Close => format!("pull request close failed: {error}"),
+                        };
+                    }
+                }
+            }
         }
     }
 
@@ -2539,6 +2728,20 @@ impl AppState {
     fn dismiss_help_dialog(&mut self) {
         self.help_dialog = false;
         self.status = "help dismissed".to_string();
+    }
+
+    fn mark_item_after_pr_action(&mut self, item_id: &str, action: PrAction) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                item.state = Some(match action {
+                    PrAction::Merge => "merged".to_string(),
+                    PrAction::Close => "closed".to_string(),
+                });
+            }
+        }
     }
 
     fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
@@ -2563,13 +2766,34 @@ impl AppState {
         !self.details.contains_key(item_id) || should_refresh
     }
 
-    fn switch_view(&mut self, view: SectionKind) {
+    fn switch_builtin_view(&mut self, view: SectionKind) {
+        self.switch_view(builtin_view_key(view));
+    }
+
+    fn switch_view(&mut self, view: impl Into<String>) {
+        let view = view.into();
         self.active_view = view;
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
         self.clamp_positions();
+    }
+
+    fn move_view(&mut self, delta: isize) {
+        let views = self.view_tabs();
+        if views.is_empty() {
+            return;
+        }
+        let current = views
+            .iter()
+            .position(|view| view.key == self.active_view)
+            .unwrap_or(0);
+        let next = move_bounded(current, views.len(), delta);
+        if let Some(view) = views.get(next) {
+            self.switch_view(view.key.clone());
+        }
     }
 
     fn focus_primary_list(&mut self) {
@@ -2577,6 +2801,7 @@ impl AppState {
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
         self.search_active = false;
         self.status = "list focused".to_string();
         self.clamp_positions();
@@ -2587,14 +2812,15 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let slot = kind_slot(self.active_view);
-        let current = self.section_index[slot].min(len - 1);
-        self.section_index[slot] = move_bounded(current, len, delta);
-        self.selected_index[slot] = 0;
+        let current = self.current_section_position().min(len - 1);
+        let next = move_bounded(current, len, delta);
+        self.set_current_section_position(next);
+        self.set_current_selected_position(0);
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
     }
 
     fn select_section(&mut self, index: usize) {
@@ -2602,13 +2828,13 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let slot = kind_slot(self.active_view);
-        self.section_index[slot] = index.min(len - 1);
-        self.selected_index[slot] = 0;
+        self.set_current_section_position(index.min(len - 1));
+        self.set_current_selected_position(0);
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
         self.search_active = false;
         self.status = "list focused".to_string();
     }
@@ -2621,20 +2847,20 @@ impl AppState {
         if len == 0 {
             return;
         }
-        let slot = kind_slot(self.active_view);
-        let current = self.selected_index[slot].min(len - 1);
-        self.selected_index[slot] = move_bounded(current, len, delta);
+        let current = self.current_selected_position().min(len - 1);
+        self.set_current_selected_position(move_bounded(current, len, delta));
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
     }
 
     fn set_selection(&mut self, index: usize) {
-        let slot = kind_slot(self.active_view);
-        self.selected_index[slot] = index;
+        self.set_current_selected_position(index);
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
         self.clamp_positions();
     }
 
@@ -2644,11 +2870,11 @@ impl AppState {
         };
         let len = self.filtered_indices(section).len();
         if len > 0 {
-            let slot = kind_slot(self.active_view);
-            self.selected_index[slot] = len - 1;
+            self.set_current_selected_position(len - 1);
             self.details_scroll = 0;
             self.selected_comment_index = 0;
             self.comment_dialog = None;
+            self.pr_action_dialog = None;
         }
     }
 
@@ -2709,6 +2935,81 @@ impl AppState {
         }
     }
 
+    fn start_pr_action_dialog(&mut self, action: PrAction) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.pr_action_running = false;
+        self.status = match action {
+            PrAction::Merge => "confirm pull request merge".to_string(),
+            PrAction::Close => "confirm pull request close".to_string(),
+        };
+    }
+
+    fn handle_pr_action_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        self.handle_pr_action_dialog_key_with_submit(key, |item, action| {
+            start_pr_action(
+                item,
+                action,
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+            );
+        });
+    }
+
+    fn handle_pr_action_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, PrAction),
+    {
+        if self.pr_action_running {
+            self.status = "pull request action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pr_action_dialog = None;
+                self.status = "pull request action cancelled".to_string();
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(action) = self.pr_action_dialog.as_ref().map(|dialog| dialog.action) {
+                    self.submit_pr_action(action, &mut submit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_pr_action<F>(&mut self, action: PrAction, submit: &mut F)
+    where
+        F: FnMut(WorkItem, PrAction),
+    {
+        let Some(dialog) = &self.pr_action_dialog else {
+            return;
+        };
+        let item = dialog.item.clone();
+        self.pr_action_running = true;
+        self.status = match action {
+            PrAction::Merge => "merging pull request".to_string(),
+            PrAction::Close => "closing pull request".to_string(),
+        };
+        submit(item, action);
+    }
+
     fn start_new_comment_dialog(&mut self) {
         if !self.current_item_supports_comments() {
             self.status = "selected item cannot be commented on".to_string();
@@ -2716,6 +3017,7 @@ impl AppState {
         }
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -2737,6 +3039,7 @@ impl AppState {
         let author = comment.author.clone();
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -2769,6 +3072,7 @@ impl AppState {
 
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -2916,6 +3220,7 @@ impl AppState {
         self.focus = FocusTarget::List;
         self.search_active = true;
         self.comment_dialog = None;
+        self.pr_action_dialog = None;
         self.status = "search mode".to_string();
         self.clamp_positions();
     }
@@ -2931,14 +3236,14 @@ impl AppState {
 
     fn push_search_char(&mut self, value: char) {
         self.search_query.push(value);
-        self.selected_index[kind_slot(self.active_view)] = 0;
+        self.set_current_selected_position(0);
         self.details_scroll = 0;
         self.clamp_positions();
     }
 
     fn pop_search_char(&mut self) {
         self.search_query.pop();
-        self.selected_index[kind_slot(self.active_view)] = 0;
+        self.set_current_selected_position(0);
         self.details_scroll = 0;
         self.clamp_positions();
     }
@@ -2967,7 +3272,7 @@ impl AppState {
     fn visible_sections(&self) -> Vec<&SectionSnapshot> {
         self.sections
             .iter()
-            .filter(|section| section.kind == self.active_view)
+            .filter(|section| section_view_key(section) == self.active_view)
             .collect()
     }
 
@@ -3010,11 +3315,29 @@ impl AppState {
     }
 
     fn current_section_position(&self) -> usize {
-        self.section_index[kind_slot(self.active_view)]
+        self.section_position(&self.active_view)
     }
 
     fn current_selected_position(&self) -> usize {
-        self.selected_index[kind_slot(self.active_view)]
+        self.selected_position(&self.active_view)
+    }
+
+    fn section_position(&self, view: &str) -> usize {
+        self.section_index.get(view).copied().unwrap_or(0)
+    }
+
+    fn selected_position(&self, view: &str) -> usize {
+        self.selected_index.get(view).copied().unwrap_or(0)
+    }
+
+    fn set_current_section_position(&mut self, position: usize) {
+        self.section_index
+            .insert(self.active_view.clone(), position);
+    }
+
+    fn set_current_selected_position(&mut self, position: usize) {
+        self.selected_index
+            .insert(self.active_view.clone(), position);
     }
 
     fn select_current_item_by_id(&mut self, item_id: &str) -> bool {
@@ -3036,41 +3359,45 @@ impl AppState {
             return false;
         };
 
-        self.selected_index[kind_slot(self.active_view)] = position;
+        self.set_current_selected_position(position);
         true
     }
 
     fn clamp_positions(&mut self) {
-        for kind in [
-            SectionKind::PullRequests,
-            SectionKind::Issues,
-            SectionKind::Notifications,
-        ] {
-            let slot = kind_slot(kind);
+        let views = self.view_tabs();
+        if !views.iter().any(|view| view.key == self.active_view) {
+            if let Some(view) = views.first() {
+                self.active_view = view.key.clone();
+            }
+        }
+
+        for view in views {
             let section_count = self
                 .sections
                 .iter()
-                .filter(|section| section.kind == kind)
+                .filter(|section| section_view_key(section) == view.key)
                 .count();
             if section_count == 0 {
-                self.section_index[slot] = 0;
-                self.selected_index[slot] = 0;
+                self.section_index.insert(view.key.clone(), 0);
+                self.selected_index.insert(view.key, 0);
                 continue;
             }
 
-            self.section_index[slot] = self.section_index[slot].min(section_count - 1);
+            let section_index = self.section_position(&view.key).min(section_count - 1);
+            self.section_index.insert(view.key.clone(), section_index);
             let item_count = self
                 .sections
                 .iter()
-                .filter(|section| section.kind == kind)
-                .nth(self.section_index[slot])
+                .filter(|section| section_view_key(section) == view.key)
+                .nth(section_index)
                 .map(|section| self.filtered_indices(section).len())
                 .unwrap_or(0);
-            if item_count == 0 {
-                self.selected_index[slot] = 0;
+            let selected_index = if item_count == 0 {
+                0
             } else {
-                self.selected_index[slot] = self.selected_index[slot].min(item_count - 1);
-            }
+                self.selected_position(&view.key).min(item_count - 1)
+            };
+            self.selected_index.insert(view.key, selected_index);
         }
         self.clamp_selected_comment();
     }
@@ -3087,13 +3414,40 @@ impl AppState {
     fn filtered_indices(&self, section: &SectionSnapshot) -> Vec<usize> {
         filtered_indices(section, &self.search_query)
     }
-}
 
-fn kind_slot(kind: SectionKind) -> usize {
-    match kind {
-        SectionKind::PullRequests => 0,
-        SectionKind::Issues => 1,
-        SectionKind::Notifications => 2,
+    fn view_tabs(&self) -> Vec<ViewTab> {
+        let mut tabs = Vec::new();
+        for kind in [
+            SectionKind::PullRequests,
+            SectionKind::Issues,
+            SectionKind::Notifications,
+        ] {
+            let key = builtin_view_key(kind);
+            if self
+                .sections
+                .iter()
+                .any(|section| section_view_key(section) == key)
+            {
+                tabs.push(ViewTab {
+                    key,
+                    label: kind.label().to_string(),
+                });
+            }
+        }
+
+        for section in &self.sections {
+            let key = section_view_key(section);
+            if !key.starts_with("repo:") || tabs.iter().any(|view| view.key == key) {
+                continue;
+            }
+            let label = key
+                .strip_prefix("repo:")
+                .unwrap_or(key.as_str())
+                .to_string();
+            tabs.push(ViewTab { key, label });
+        }
+
+        tabs
     }
 }
 
@@ -4245,10 +4599,47 @@ mod tests {
 
         handle_mouse(&mut app, mouse, area);
 
-        assert_eq!(app.active_view, SectionKind::Issues);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
         assert_eq!(app.focus, FocusTarget::List);
         assert!(!app.search_active);
         assert_eq!(app.status, "list focused");
+    }
+
+    #[test]
+    fn repo_sections_create_top_level_repo_tab_with_generic_section_titles() {
+        let sections = vec![
+            test_section(),
+            SectionSnapshot::empty_for_view(
+                "repo:fiber",
+                SectionKind::PullRequests,
+                "Pull Requests",
+                "repo:nervosnetwork/fiber archived:false sort:updated-desc",
+            ),
+            SectionSnapshot::empty_for_view(
+                "repo:fiber",
+                SectionKind::Issues,
+                "Issues",
+                "repo:nervosnetwork/fiber archived:false sort:updated-desc",
+            ),
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+
+        app.switch_view("repo:fiber");
+
+        assert_eq!(
+            app.view_tabs()
+                .iter()
+                .map(|view| view.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pull Requests", "fiber"]
+        );
+        assert_eq!(
+            app.visible_sections()
+                .iter()
+                .map(|section| section.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pull Requests", "Issues"]
+        );
     }
 
     #[test]
@@ -4638,7 +5029,7 @@ mod tests {
             &tx
         ));
 
-        assert_eq!(app.active_view, SectionKind::Issues);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
         assert_eq!(app.current_section_position(), 0);
         assert_eq!(app.current_selected_position(), 0);
         assert_eq!(app.focus, FocusTarget::List);

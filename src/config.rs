@@ -11,6 +11,7 @@ use crate::model::SectionKind;
 pub struct Config {
     pub defaults: Defaults,
     pub exclude_repos: Vec<String>,
+    pub repos: Vec<RepoConfig>,
     pub pr_sections: Vec<SearchSection>,
     pub issue_sections: Vec<SearchSection>,
     pub notification_sections: Vec<SearchSection>,
@@ -37,6 +38,15 @@ pub struct SearchSection {
     pub queries: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoConfig {
+    pub name: String,
+    pub repo: String,
+    pub show_prs: bool,
+    pub show_issues: bool,
 }
 
 impl SearchSection {
@@ -82,6 +92,7 @@ impl Default for Config {
         Self {
             defaults: Defaults::default(),
             exclude_repos: vec![],
+            repos: vec![],
             pr_sections: vec![
                 SearchSection {
                     title: "My Pull Requests".to_string(),
@@ -162,6 +173,17 @@ impl Default for Config {
     }
 }
 
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            repo: String::new(),
+            show_prs: true,
+            show_issues: true,
+        }
+    }
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Self {
@@ -203,6 +225,7 @@ mod tests {
 
         let decoded = toml::from_str::<Config>(&encoded).expect("decode generated default config");
         assert_eq!(decoded.defaults.view, SectionKind::PullRequests);
+        assert!(decoded.repos.is_empty());
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
         assert!(!decoded.notification_sections.is_empty());
@@ -261,6 +284,12 @@ mod tests {
             r#"
             exclude_repos = ["nervosnetwork/archive-*"]
 
+            [[repos]]
+            name = "fiber"
+            repo = "nervosnetwork/fiber"
+            show_prs = true
+            show_issues = true
+
             [defaults]
             view = "pull_requests"
             pr_limit = 50
@@ -286,6 +315,10 @@ mod tests {
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
+        assert_eq!(config.repos[0].name, "fiber");
+        assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
+        assert!(config.repos[0].show_prs);
+        assert!(config.repos[0].show_issues);
         assert_eq!(config.pr_sections[0].title, "Assigned to Me");
     }
 }

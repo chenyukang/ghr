@@ -390,7 +390,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let border_style = if app.focus == FocusTarget::List {
         Style::default().fg(Color::Cyan)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     };
 
     let table = Table::new(
@@ -430,10 +430,20 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .current_section()
         .map(|section| format!("details: {}", section.kind.label()))
         .unwrap_or_else(|| "details".to_string());
-    let border_style = if app.focus == FocusTarget::Details {
-        Style::default().fg(Color::Yellow)
+    let (border_style, title_style) = if app.focus == FocusTarget::Details {
+        (
+            Style::default().fg(Color::Yellow),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Style::default().fg(Color::DarkGray)
+        (
+            Style::default().fg(Color::Gray),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
     };
 
     let lines = match app.current_item() {
@@ -529,7 +539,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(title),
+                .title(Span::styled(title, title_style)),
         )
         .scroll((app.details_scroll, 0))
         .wrap(Wrap { trim: false });

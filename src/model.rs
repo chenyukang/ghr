@@ -48,11 +48,15 @@ pub struct WorkItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentPreview {
+    #[serde(default)]
+    pub id: Option<u64>,
     pub author: String,
     pub body: String,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub is_mine: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

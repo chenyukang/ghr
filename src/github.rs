@@ -9,10 +9,13 @@ use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem};
+
+static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +80,7 @@ struct ViewerRaw {
 
 #[derive(Debug, Deserialize)]
 struct IssueCommentRaw {
+    id: Option<u64>,
     body: Option<String>,
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -88,7 +92,7 @@ pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
     let started = Instant::now();
     let notifications = refresh_notification_sections(config);
     let searches = async {
-        let viewer_login = match fetch_viewer_login().await {
+        let viewer_login = match cached_viewer_login().await {
             Ok(login) => Some(login),
             Err(error) => {
                 warn!(error = %error, "failed to resolve @me for search filters");
@@ -327,7 +331,14 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<C
         path,
     ])
     .await?;
-    parse_issue_comments_output(&output, repository, number)
+    let viewer_login = match cached_viewer_login().await {
+        Ok(login) => Some(login),
+        Err(error) => {
+            warn!(error = %error, "failed to resolve current GitHub user for comment ownership");
+            None
+        }
+    };
+    parse_issue_comments_output(&output, repository, number, viewer_login.as_deref())
 }
 
 pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Result<()> {
@@ -344,25 +355,48 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -> Result<()> {
+    let path = format!("repos/{repository}/issues/comments/{comment_id}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        path,
+        "-f".to_string(),
+        format!("body={body}"),
+    ])
+    .await?;
+    Ok(())
+}
+
 fn parse_issue_comments_output(
     output: &str,
     repository: &str,
     number: u64,
+    viewer_login: Option<&str>,
 ) -> Result<Vec<CommentPreview>> {
     let pages = serde_json::from_str::<Vec<Vec<IssueCommentRaw>>>(output)
         .with_context(|| format!("failed to parse comments for {repository}#{number}"))?;
     let mut comments = pages
         .into_iter()
         .flatten()
-        .map(|comment| CommentPreview {
-            author: comment
+        .map(|comment| {
+            let author = comment
                 .user
-                .map(|user| user.login)
-                .unwrap_or_else(|| "unknown".to_string()),
-            body: comment.body.unwrap_or_default(),
-            created_at: comment.created_at,
-            updated_at: comment.updated_at,
-            url: comment.html_url,
+                .as_ref()
+                .map(|user| user.login.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
+            CommentPreview {
+                id: comment.id,
+                author,
+                body: comment.body.unwrap_or_default(),
+                created_at: comment.created_at,
+                updated_at: comment.updated_at,
+                url: comment.html_url,
+                is_mine,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -434,6 +468,16 @@ async fn fetch_viewer_login() -> Result<String> {
     let viewer =
         serde_json::from_str::<ViewerRaw>(&output).context("failed to parse gh user output")?;
     Ok(viewer.login)
+}
+
+async fn cached_viewer_login() -> Result<String> {
+    if let Some(login) = VIEWER_LOGIN.get() {
+        return Ok(login.clone());
+    }
+
+    let login = fetch_viewer_login().await?;
+    let _ = VIEWER_LOGIN.set(login.clone());
+    Ok(login)
 }
 
 fn resolve_me_section(mut section: SearchSection, viewer_login: Option<&str>) -> SearchSection {
@@ -767,6 +811,7 @@ mod tests {
         [
           [
             {
+              "id": 1,
               "body": "old",
               "html_url": "https://github.com/owner/repo/issues/1#issuecomment-1",
               "created_at": "2026-01-01T00:00:00Z",
@@ -774,6 +819,7 @@ mod tests {
               "user": { "login": "alice" }
             },
             {
+              "id": 2,
               "body": "new",
               "html_url": "https://github.com/owner/repo/issues/1#issuecomment-2",
               "created_at": "2026-01-03T00:00:00Z",
@@ -783,6 +829,7 @@ mod tests {
           ],
           [
             {
+              "id": 3,
               "body": "middle",
               "html_url": "https://github.com/owner/repo/issues/1#issuecomment-3",
               "created_at": "2026-01-02T00:00:00Z",
@@ -793,7 +840,7 @@ mod tests {
         ]
         "##;
 
-        let comments = parse_issue_comments_output(output, "owner/repo", 1).unwrap();
+        let comments = parse_issue_comments_output(output, "owner/repo", 1, Some("bob")).unwrap();
 
         assert_eq!(comments.len(), 3);
         assert_eq!(
@@ -802,6 +849,20 @@ mod tests {
                 .map(|comment| comment.body.as_str())
                 .collect::<Vec<_>>(),
             vec!["old", "middle", "new"]
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(3), Some(2)]
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.is_mine)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
         );
     }
 

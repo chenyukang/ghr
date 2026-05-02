@@ -16,7 +16,6 @@
 
 ## Requirements
 
-- Rust
 - GitHub CLI (`gh`)
 - An authenticated GitHub CLI session:
 

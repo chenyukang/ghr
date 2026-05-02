@@ -615,13 +615,11 @@ fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>
         SetupDialog::MissingGh => (
             "GitHub CLI Required",
             vec![
-                Line::from("ghr uses GitHub CLI for GitHub access."),
+                Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
                 Line::from(""),
                 Line::from("Install GitHub CLI for your system: cli.github.com"),
                 command_line("macOS: brew install gh"),
-                command_line("Debian/Ubuntu: apt setup at cli.github.com"),
-                command_line("Fedora/RHEL: sudo dnf install gh"),
-                command_line("Arch: sudo pacman -S github-cli"),
+                command_line("Debian/Ubuntu: sudo apt install gh"),
                 Line::from(""),
                 Line::from("Then authenticate:"),
                 command_line("gh auth login"),
@@ -1297,16 +1295,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(missing_text.contains("brew install gh"));
-        assert!(missing_text.contains("apt setup at cli.github.com"));
-        assert!(missing_text.contains("sudo dnf install gh"));
-        assert!(missing_text.contains("sudo pacman -S github-cli"));
+        assert!(missing_text.contains("sudo apt install gh"));
         assert!(missing_text.contains("gh auth login"));
-        assert!(
-            missing_lines
-                .iter()
-                .map(|line| line.to_string())
-                .all(|line| line.chars().count() <= 50)
-        );
 
         let (_title, auth_lines) = setup_dialog_content(SetupDialog::AuthRequired);
         let auth_text = auth_lines

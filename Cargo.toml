@@ -1,7 +1,18 @@
 [package]
-name = "ghr"
+name = "ghr-cli"
 version = "0.1.0"
 edition = "2024"
+description = "A fast terminal dashboard for GitHub pull requests, issues, and notifications."
+license = "MIT"
+repository = "https://github.com/chenyukang/ghr"
+homepage = "https://github.com/chenyukang/ghr"
+readme = "README.md"
+keywords = ["github", "tui", "cli", "dashboard"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ghr"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

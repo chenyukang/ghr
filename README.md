@@ -26,6 +26,13 @@ gh auth login
 
 ## Usage
 
+Install from crates.io:
+
+```bash
+cargo install ghr-cli
+ghr
+```
+
 Run from the repository:
 
 ```bash
@@ -50,6 +57,8 @@ Install locally:
 cargo install --path .
 ghr
 ```
+
+The crates.io package is named `ghr-cli` because `ghr` is already taken, but the installed command is still `ghr`.
 
 ## Keybindings
 

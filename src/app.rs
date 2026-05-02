@@ -4,11 +4,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use pulldown_cmark::{Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,12 +24,13 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::dirs::Paths;
-use crate::github::{fetch_issue_comments, refresh_dashboard};
+use crate::github::{fetch_issue_comments, post_issue_comment, refresh_dashboard};
 use crate::model::{
     CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem, configured_sections,
     merge_cached_sections, merge_refreshed_sections, section_counts,
 };
 use crate::snapshot::SnapshotStore;
+use crate::state::{DEFAULT_LIST_WIDTH_PERCENT, UiState, clamp_list_width_percent};
 
 enum AppMsg {
     RefreshStarted,
@@ -34,6 +39,10 @@ enum AppMsg {
         save_error: Option<String>,
     },
     DetailsLoaded {
+        item_id: String,
+        result: std::result::Result<Vec<CommentPreview>, String>,
+    },
+    CommentPosted {
         item_id: String,
         result: std::result::Result<Vec<CommentPreview>, String>,
     },
@@ -58,6 +67,25 @@ enum SetupDialog {
     AuthRequired,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommentDialogMode {
+    New,
+    Reply {
+        comment_index: usize,
+        author: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommentDialog {
+    mode: CommentDialogMode,
+    body: String,
+}
+
+const TABLE_HEADER_HEIGHT: u16 = 2;
+const TAB_DIVIDER_WIDTH: u16 = 3;
+const MOUSE_SCROLL_LINES: u16 = 3;
+
 struct AppState {
     active_view: SectionKind,
     sections: Vec<SectionSnapshot>,
@@ -65,26 +93,33 @@ struct AppState {
     selected_index: [usize; 3],
     focus: FocusTarget,
     details_scroll: u16,
+    list_width_percent: u16,
+    dragging_split: bool,
+    split_drag_changed: bool,
     search_active: bool,
     search_query: String,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
     details: HashMap<String, DetailState>,
+    selected_comment_index: usize,
+    comment_dialog: Option<CommentDialog>,
+    posting_comment: bool,
     setup_dialog: Option<SetupDialog>,
 }
 
 pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
     let cached = store.load_all()?;
     let sections = merge_cached_sections(configured_sections(&config), cached);
-    let mut app = AppState::new(config.defaults.view, sections);
+    let ui_state = UiState::load_or_default(&paths.state_path);
+    let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     start_refresh(config.clone(), store.clone(), tx.clone());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -100,7 +135,11 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     .await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -132,15 +171,25 @@ async fn run_loop(
         terminal.draw(|frame| draw(frame, app, paths))?;
 
         if event::poll(Duration::from_millis(120))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
 
-            if handle_key(app, key, config, store, tx) {
-                break;
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if handle_key_in_area(app, key, config, store, tx, Some(area)) {
+                        break;
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    if handle_mouse(app, mouse, Rect::new(0, 0, size.width, size.height)) {
+                        save_ui_state(app, paths);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -174,7 +223,7 @@ fn start_refresh(config: Config, store: SnapshotStore, tx: UnboundedSender<AppMs
 fn start_details_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let result = match item.number {
-            Some(number) => fetch_issue_comments(&item.repo, number, 5)
+            Some(number) => fetch_issue_comments(&item.repo, number)
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(Vec::new()),
@@ -186,6 +235,25 @@ fn start_details_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     });
 }
 
+fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = match item.number {
+            Some(number) => match post_issue_comment(&item.repo, number, &body).await {
+                Ok(()) => fetch_issue_comments(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::CommentPosted {
+            item_id: item.id,
+            result,
+        });
+    });
+}
+
+#[cfg(test)]
 fn handle_key(
     app: &mut AppState,
     key: KeyEvent,
@@ -193,12 +261,28 @@ fn handle_key(
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) -> bool {
+    handle_key_in_area(app, key, config, store, tx, None)
+}
+
+fn handle_key_in_area(
+    app: &mut AppState,
+    key: KeyEvent,
+    config: &Config,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+    area: Option<Rect>,
+) -> bool {
     if app.setup_dialog.is_some() {
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc | KeyCode::Enter => app.dismiss_setup_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.comment_dialog.is_some() {
+        app.handle_comment_dialog_key(key, tx);
         return false;
     }
 
@@ -219,6 +303,10 @@ fn handle_key(
             KeyCode::Esc => app.focus_list(),
             KeyCode::Char('4') => app.focus_primary_list(),
             KeyCode::Char('o') => app.open_selected(),
+            KeyCode::Char('a') => app.start_new_comment_dialog(),
+            KeyCode::Char('r') => app.start_reply_to_selected_comment(),
+            KeyCode::Char('n') => app.move_comment(1),
+            KeyCode::Char('p') => app.move_comment(-1),
             KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
             KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
             KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
@@ -245,6 +333,12 @@ fn handle_key(
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => app.move_section(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+        KeyCode::PageDown | KeyCode::Char('d') => {
+            app.move_selection(list_page_delta(app, area, 1));
+        }
+        KeyCode::PageUp | KeyCode::Char('u') => {
+            app.move_selection(list_page_delta(app, area, -1));
+        }
         KeyCode::Char('g') => app.set_selection(0),
         KeyCode::Char('G') => app.select_last(),
         KeyCode::Char('r') => {
@@ -254,6 +348,7 @@ fn handle_key(
                 start_refresh(config.clone(), store.clone(), tx.clone());
             }
         }
+        KeyCode::Char('a') => app.start_new_comment_dialog(),
         KeyCode::Char('o') => app.open_selected(),
         KeyCode::Enter => app.focus_details(),
         _ => {}
@@ -262,9 +357,276 @@ fn handle_key(
     false
 }
 
+fn save_ui_state(app: &mut AppState, paths: &Paths) {
+    if let Err(error) = app.ui_state().save(&paths.state_path) {
+        let message = error.to_string();
+        warn!(error = %message, "failed to save ui state");
+        app.status = format!("layout save failed: {message}");
+    }
+}
+
+fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
+    if app.setup_dialog.is_some() || app.comment_dialog.is_some() {
+        return false;
+    }
+
+    let page = page_areas(area);
+    let body_area = page[2];
+    let body = body_areas_with_ratio(body_area, app.list_width_percent);
+    let details_area = body[1];
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if splitter_contains(body_area, body[0], details_area, mouse.column, mouse.row) {
+                app.start_split_drag();
+                return false;
+            }
+            handle_left_click(app, mouse, page[0], page[1], body[0], details_area);
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.dragging_split => {
+            app.update_split_drag(body_area, mouse.column);
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.dragging_split => {
+            app.update_split_drag(body_area, mouse.column);
+            return app.finish_split_drag();
+        }
+        MouseEventKind::ScrollDown if rect_contains(body[0], mouse.column, mouse.row) => {
+            handle_list_scroll(app, MOUSE_SCROLL_LINES as isize);
+        }
+        MouseEventKind::ScrollUp if rect_contains(body[0], mouse.column, mouse.row) => {
+            handle_list_scroll(app, -(MOUSE_SCROLL_LINES as isize));
+        }
+        MouseEventKind::ScrollDown if rect_contains(details_area, mouse.column, mouse.row) => {
+            handle_details_scroll(app, details_area, MOUSE_SCROLL_LINES as i16);
+        }
+        MouseEventKind::ScrollUp if rect_contains(details_area, mouse.column, mouse.row) => {
+            handle_details_scroll(app, details_area, -(MOUSE_SCROLL_LINES as i16));
+        }
+        _ => {}
+    }
+
+    false
+}
+
+fn handle_left_click(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    view_tabs_area: Rect,
+    section_tabs_area: Rect,
+    table_area: Rect,
+    details_area: Rect,
+) {
+    if let Some(view) = view_tab_at(view_tabs_area, mouse.column, mouse.row) {
+        app.switch_view(view);
+        app.search_active = false;
+        app.status = "list focused".to_string();
+        return;
+    }
+
+    if let Some(section_index) = section_tab_at(app, section_tabs_area, mouse.column, mouse.row) {
+        app.select_section(section_index);
+        return;
+    }
+
+    if rect_contains(table_area, mouse.column, mouse.row) {
+        handle_table_click(app, mouse, table_area);
+        return;
+    }
+
+    if !rect_contains(details_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    app.focus = FocusTarget::Details;
+    app.search_active = false;
+
+    let inner = block_inner(details_area);
+    if !rect_contains(inner, mouse.column, mouse.row) {
+        return;
+    }
+
+    let document = build_details_document(app, inner.width);
+    let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
+    let column = mouse.column - inner.x;
+    if let Some(comment_index) = document.comment_at(line_index) {
+        app.select_comment(comment_index);
+    }
+    if let Some(action) = document.action_at(line_index, column) {
+        app.handle_detail_action(action);
+        return;
+    }
+    if let Some(url) = document.link_at(line_index, column) {
+        app.open_url(&url);
+    }
+}
+
+fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
+    app.focus = FocusTarget::Details;
+    app.search_active = false;
+
+    let max_scroll = max_details_scroll(app, area);
+    if max_scroll == 0 {
+        app.details_scroll = 0;
+        return;
+    }
+
+    if delta < 0 {
+        app.details_scroll = app.details_scroll.saturating_sub(delta.unsigned_abs());
+    } else {
+        app.details_scroll = app.details_scroll.saturating_add(delta as u16);
+    }
+    app.details_scroll = app.details_scroll.min(max_scroll);
+}
+
+fn handle_list_scroll(app: &mut AppState, delta: isize) {
+    app.focus = FocusTarget::List;
+    app.search_active = false;
+    app.move_selection(delta);
+}
+
+fn list_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
+    let rows = area
+        .map(|area| {
+            let body = body_areas_with_ratio(page_areas(area)[2], app.list_width_percent);
+            usize::from(table_visible_rows(body[0]).max(1))
+        })
+        .unwrap_or(10);
+    direction.saturating_mul(rows as isize)
+}
+
+fn max_details_scroll(app: &AppState, area: Rect) -> u16 {
+    let inner = block_inner(area);
+    let document = build_details_document(app, inner.width);
+    let max = document
+        .lines
+        .len()
+        .saturating_sub(usize::from(inner.height));
+    max.min(usize::from(u16::MAX)) as u16
+}
+
+fn handle_table_click(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(position) = table_row_at(app, area, mouse.row) else {
+        return;
+    };
+
+    app.set_selection(position);
+    app.focus_details();
+}
+
+fn table_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize> {
+    let section = app.current_section()?;
+    let filtered_len = app.filtered_indices(section).len();
+    if filtered_len == 0 {
+        return None;
+    }
+
+    let inner = block_inner(area);
+    let data_start = inner.y.saturating_add(TABLE_HEADER_HEIGHT);
+    if row < data_start {
+        return None;
+    }
+
+    let visible_rows = table_visible_rows(area);
+    if visible_rows == 0 || row >= data_start.saturating_add(visible_rows) {
+        return None;
+    }
+
+    let offset = table_viewport_offset(app.current_selected_position(), usize::from(visible_rows));
+    let position = offset + usize::from(row - data_start);
+    (position < filtered_len).then_some(position)
+}
+
+fn table_visible_rows(area: Rect) -> u16 {
+    block_inner(area).height.saturating_sub(TABLE_HEADER_HEIGHT)
+}
+
+fn table_visible_range(selected: usize, visible_rows: usize, len: usize) -> Option<(usize, usize)> {
+    if visible_rows == 0 || len == 0 {
+        return None;
+    }
+
+    let offset = table_viewport_offset(selected.min(len - 1), visible_rows);
+    let end = offset.saturating_add(visible_rows).min(len);
+    Some((offset + 1, end))
+}
+
+fn table_viewport_offset(selected: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return 0;
+    }
+    selected.saturating_sub(visible_rows - 1)
+}
+
+fn view_tab_at(area: Rect, column: u16, row: u16) -> Option<SectionKind> {
+    let views = [
+        SectionKind::PullRequests,
+        SectionKind::Issues,
+        SectionKind::Notifications,
+    ];
+    tab_index_at(
+        &views.map(|view| view.label().to_string()),
+        area,
+        column,
+        row,
+    )
+    .and_then(|index| views.get(index).copied())
+}
+
+fn section_tab_at(app: &AppState, area: Rect, column: u16, row: u16) -> Option<usize> {
+    let labels = app
+        .visible_sections()
+        .iter()
+        .map(|section| section_tab_label(app, section))
+        .collect::<Vec<_>>();
+    tab_index_at(&labels, area, column, row)
+}
+
+fn tab_index_at(labels: &[String], area: Rect, column: u16, row: u16) -> Option<usize> {
+    let inner = block_inner(area);
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+
+    let clicked = column.saturating_sub(inner.x);
+    let mut offset = 0_u16;
+    for (index, label) in labels.iter().enumerate() {
+        let width = display_width(label) as u16;
+        let end = offset.saturating_add(width);
+        if clicked >= offset && clicked < end {
+            return Some(index);
+        }
+        offset = end.saturating_add(TAB_DIVIDER_WIDTH);
+    }
+
+    None
+}
+
 fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     let area = frame.area();
-    let chunks = Layout::default()
+    let chunks = page_areas(area);
+
+    draw_view_tabs(frame, app, chunks[0]);
+    draw_section_tabs(frame, app, chunks[1]);
+
+    let body = body_areas_with_ratio(chunks[2], app.list_width_percent);
+    draw_table(frame, app, body[0]);
+    draw_details(frame, app, body[1]);
+    draw_footer(frame, app, paths, chunks[3]);
+
+    if let Some(dialog) = app.setup_dialog {
+        draw_setup_dialog(frame, dialog, area);
+    } else if let Some(dialog) = &app.comment_dialog {
+        draw_comment_dialog(frame, dialog, area);
+    }
+}
+
+#[cfg(test)]
+fn body_area(area: Rect) -> Rect {
+    page_areas(area)[2]
+}
+
+fn page_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
@@ -272,22 +634,58 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
             Constraint::Min(4),
             Constraint::Length(2),
         ])
-        .split(area);
+        .split(area)
+}
 
-    draw_view_tabs(frame, app, chunks[0]);
-    draw_section_tabs(frame, app, chunks[1]);
+#[cfg(test)]
+fn body_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+    body_areas_with_ratio(area, DEFAULT_LIST_WIDTH_PERCENT)
+}
 
-    let body = Layout::default()
+fn body_areas_with_ratio(area: Rect, list_width_percent: u16) -> std::rc::Rc<[Rect]> {
+    let list_width_percent = clamp_list_width_percent(list_width_percent);
+    Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
-        .split(chunks[2]);
-    draw_table(frame, app, body[0]);
-    draw_details(frame, app, body[1]);
-    draw_footer(frame, app, paths, chunks[3]);
+        .constraints([
+            Constraint::Percentage(list_width_percent),
+            Constraint::Percentage(100 - list_width_percent),
+        ])
+        .split(area)
+}
 
-    if let Some(dialog) = app.setup_dialog {
-        draw_setup_dialog(frame, dialog, area);
+fn block_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     }
+}
+
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+fn splitter_contains(body: Rect, list: Rect, details: Rect, x: u16, y: u16) -> bool {
+    if !rect_contains(body, x, y) {
+        return false;
+    }
+
+    let list_border = list.x.saturating_add(list.width).saturating_sub(1);
+    x == list_border || x == details.x
+}
+
+fn split_percent_from_column(body: Rect, column: u16) -> u16 {
+    if body.width == 0 {
+        return DEFAULT_LIST_WIDTH_PERCENT;
+    }
+
+    let left_width = column.saturating_sub(body.x).min(body.width);
+    let percent = (u32::from(left_width) * 100 + u32::from(body.width) / 2) / u32::from(body.width);
+    clamp_list_width_percent(percent as u16)
 }
 
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -329,21 +727,7 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     let titles = sections
         .iter()
-        .map(|section| {
-            let (total, unread) = section_counts(section);
-            let label = if !app.search_query.is_empty() {
-                format!(
-                    "{} ({}/{total})",
-                    section.title,
-                    app.filtered_indices(section).len()
-                )
-            } else if unread > 0 {
-                format!("{} ({total}/{unread})", section.title)
-            } else {
-                format!("{} ({total})", section.title)
-            };
-            Line::from(label)
-        })
+        .map(|section| Line::from(section_tab_label(app, section)))
         .collect::<Vec<_>>();
 
     let tabs = Tabs::new(titles)
@@ -356,6 +740,21 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_widget(tabs, area);
+}
+
+fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
+    let (total, unread) = section_counts(section);
+    if !app.search_query.is_empty() {
+        format!(
+            "{} ({}/{total})",
+            section.title,
+            app.filtered_indices(section).len()
+        )
+    } else if unread > 0 {
+        format!("{} ({total}/{unread})", section.title)
+    } else {
+        format!("{} ({total})", section.title)
+    }
 }
 
 fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -406,8 +805,20 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     if let Some(error) = &section.error {
         title.push_str(&format!(" - error: {error}"));
     };
+    if let Some((start, end)) = table_visible_range(
+        app.current_selected_position(),
+        usize::from(table_visible_rows(area)),
+        filtered_indices.len(),
+    ) {
+        title.push_str(&format!(
+            " | showing {start}-{end}/{}",
+            filtered_indices.len()
+        ));
+    }
 
-    let border_style = if app.focus == FocusTarget::List {
+    let border_style = if app.dragging_split {
+        Style::default().fg(Color::LightMagenta)
+    } else if app.focus == FocusTarget::List {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::Gray)
@@ -446,11 +857,15 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let title = app
-        .current_section()
-        .map(|section| format!("details: {}", section.kind.label()))
-        .unwrap_or_else(|| "details".to_string());
-    let (border_style, title_style) = if app.focus == FocusTarget::Details {
+    let title = details_title();
+    let (border_style, title_style) = if app.dragging_split {
+        (
+            Style::default().fg(Color::LightMagenta),
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.focus == FocusTarget::Details {
         (
             Style::default().fg(Color::Yellow),
             Style::default()
@@ -466,104 +881,22 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let lines = match app.current_item() {
-        Some(item) => {
-            let mut lines = vec![
-                Line::from(vec![Span::styled(
-                    item.title.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(""),
-                Line::from(format!("repo: {}", item.repo)),
-                Line::from(format!(
-                    "number: {}",
-                    item.number
-                        .map(|number| format!("#{number}"))
-                        .unwrap_or_else(|| "-".to_string())
-                )),
-                Line::from(format!("updated: {}", relative_time(item.updated_at))),
-                Line::from(format!(
-                    "author: {}",
-                    item.author.clone().unwrap_or_else(|| "-".to_string())
-                )),
-                Line::from(format!(
-                    "state: {}",
-                    item.state.clone().unwrap_or_else(|| "-".to_string())
-                )),
-                Line::from(format!(
-                    "reason: {}",
-                    item.reason.clone().unwrap_or_else(|| "-".to_string())
-                )),
-                Line::from(format!(
-                    "comments: {}",
-                    item.comments
-                        .map(|comments| comments.to_string())
-                        .unwrap_or_else(|| "-".to_string())
-                )),
-                Line::from(format!("url: {}", item.url)),
-            ];
+    let document = build_details_document(app, area.width.saturating_sub(2));
 
-            if !item.labels.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!("labels: {}", item.labels.join(", "))));
-            }
-
-            if let Some(extra) = &item.extra {
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!("extra: {extra}")));
-            }
-
-            lines.push(Line::from(""));
-            push_heading(&mut lines, "Description");
-            push_text_block(
-                &mut lines,
-                item.body.as_deref().unwrap_or(""),
-                "No description.",
-                22,
-                2_400,
-            );
-
-            if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
-                lines.push(Line::from(""));
-                push_heading(&mut lines, "Recent Comments");
-                match app.details.get(&item.id) {
-                    Some(DetailState::Loading) => {
-                        lines.push(Line::from("loading comments..."));
-                    }
-                    Some(DetailState::Loaded(comments)) if comments.is_empty() => {
-                        lines.push(Line::from("No comments."));
-                    }
-                    Some(DetailState::Loaded(comments)) => {
-                        for comment in comments {
-                            push_comment(&mut lines, comment);
-                        }
-                    }
-                    Some(DetailState::Error(error)) => {
-                        lines.push(Line::from(format!("Failed to load comments: {error}")));
-                    }
-                    None => {
-                        lines.push(Line::from("loading comments..."));
-                    }
-                }
-            }
-
-            lines
-        }
-        None => vec![Line::from("No item selected")],
-    };
-
-    let details = Paragraph::new(Text::from(lines))
+    let details = Paragraph::new(Text::from(document.lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(Span::styled(title, title_style)),
+                .title(Span::styled(title.to_string(), title_style)),
         )
         .scroll((app.details_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(details, area);
+}
+
+fn details_title() -> &'static str {
+    "Details:"
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect) {
@@ -580,7 +913,7 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
         format!("filter: /{}", app.search_query)
     };
     let text = format!(
-        "tab/1-3 view  4 list  h/l section  j/k move  enter/5 details  esc list  / search  o open  q quit | focus {focus} | {search} | {refresh} | {} | db {}",
+        "tab/1-3 view  4 list  h/l section  j/k move  pg/d/u page  enter/5 details  a comment  r reply  o open  q quit | drag split | focus {focus} | {search} | {refresh} | {} | db {}",
         app.status,
         paths.db_path.display()
     );
@@ -599,6 +932,59 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
             title,
             Style::default()
                 .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
+    let title = match &dialog.mode {
+        CommentDialogMode::New => "New Comment",
+        CommentDialogMode::Reply { author, .. } => {
+            return draw_reply_dialog(frame, dialog, author, area);
+        }
+    };
+    draw_comment_editor(frame, title, dialog, area);
+}
+
+fn draw_reply_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, author: &str, area: Rect) {
+    draw_comment_editor(frame, &format!("Reply to @{author}"), dialog, area);
+}
+
+fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialog, area: Rect) {
+    let dialog_area = centered_rect(72, 14, area);
+    let mut lines = dialog
+        .body
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect::<Vec<_>>();
+    if dialog.body.ends_with('\n') || lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::raw(" send  "),
+        Span::styled("Ctrl+J", Style::default().fg(Color::Yellow)),
+        Span::raw(" newline  "),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(" cancel"),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(Style::default().bg(Color::Black))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -665,54 +1051,813 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
-fn push_heading(lines: &mut Vec<Line<'static>>, text: &str) {
-    lines.push(Line::from(Span::styled(
-        text.to_string(),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
+#[derive(Debug, Clone)]
+struct DetailsDocument {
+    lines: Vec<Line<'static>>,
+    links: Vec<LinkRegion>,
+    actions: Vec<ActionRegion>,
+    comments: Vec<CommentRegion>,
 }
 
-fn push_text_block(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    empty_message: &str,
-    max_lines: usize,
-    max_chars: usize,
-) {
-    let text = truncate_text(&normalize_text(text), max_chars);
-    if text.trim().is_empty() {
-        lines.push(Line::from(empty_message.to_string()));
-        return;
+impl DetailsDocument {
+    fn link_at(&self, line: usize, column: u16) -> Option<String> {
+        self.links
+            .iter()
+            .find(|link| link.line == line && column >= link.start && column < link.end)
+            .map(|link| link.url.clone())
     }
 
-    for (emitted, line) in text.lines().enumerate() {
-        if emitted >= max_lines {
-            lines.push(Line::from("..."));
+    fn action_at(&self, line: usize, column: u16) -> Option<DetailAction> {
+        self.actions
+            .iter()
+            .find(|action| action.line == line && column >= action.start && column < action.end)
+            .map(|action| action.action.clone())
+    }
+
+    fn comment_at(&self, line: usize) -> Option<usize> {
+        self.comments
+            .iter()
+            .find(|comment| line >= comment.start_line && line < comment.end_line)
+            .map(|comment| comment.index)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LinkRegion {
+    line: usize,
+    start: u16,
+    end: u16,
+    url: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActionRegion {
+    line: usize,
+    start: u16,
+    end: u16,
+    action: DetailAction,
+}
+
+#[derive(Debug, Clone)]
+struct CommentRegion {
+    index: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DetailAction {
+    ReplyComment(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailSegment {
+    text: String,
+    style: Style,
+    link: Option<String>,
+    action: Option<DetailAction>,
+}
+
+impl DetailSegment {
+    fn raw(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::default(),
+            link: None,
+            action: None,
+        }
+    }
+
+    fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link: None,
+            action: None,
+        }
+    }
+
+    fn link(text: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: link_style(),
+            link: Some(url.into()),
+            action: None,
+        }
+    }
+
+    fn action(text: impl Into<String>, action: DetailAction) -> Self {
+        Self {
+            text: text.into(),
+            style: action_style(),
+            link: None,
+            action: Some(action),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownBlock {
+    quote_depth: u8,
+    segments: Vec<DetailSegment>,
+}
+
+struct DetailsBuilder {
+    document: DetailsDocument,
+    width: usize,
+}
+
+impl DetailsBuilder {
+    fn new(width: u16) -> Self {
+        Self {
+            document: DetailsDocument {
+                lines: Vec::new(),
+                links: Vec::new(),
+                actions: Vec::new(),
+                comments: Vec::new(),
+            },
+            width: usize::from(width.max(1)),
+        }
+    }
+
+    fn finish(self) -> DetailsDocument {
+        self.document
+    }
+
+    fn push_blank(&mut self) {
+        self.document.lines.push(Line::from(""));
+    }
+
+    fn push_line(&mut self, segments: Vec<DetailSegment>) {
+        let line_index = self.document.lines.len();
+        let mut column = 0_u16;
+        let mut spans = Vec::new();
+        for segment in segments {
+            let width = display_width(&segment.text) as u16;
+            if let Some(url) = &segment.link {
+                self.document.links.push(LinkRegion {
+                    line: line_index,
+                    start: column,
+                    end: column.saturating_add(width),
+                    url: url.clone(),
+                });
+            }
+            if let Some(action) = &segment.action {
+                self.document.actions.push(ActionRegion {
+                    line: line_index,
+                    start: column,
+                    end: column.saturating_add(width),
+                    action: action.clone(),
+                });
+            }
+            column = column.saturating_add(width);
+            spans.push(Span::styled(segment.text, segment.style));
+        }
+        self.document.lines.push(Line::from(spans));
+    }
+
+    fn push_plain(&mut self, text: impl Into<String>) {
+        self.push_line(vec![DetailSegment::raw(text)]);
+    }
+
+    fn push_heading(&mut self, text: &str) {
+        self.push_line(vec![DetailSegment::styled(
+            text.to_string(),
+            heading_style(),
+        )]);
+    }
+
+    fn push_key_value(&mut self, key: &str, value: impl Into<String>) {
+        self.push_wrapped_limited(
+            vec![
+                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
+                DetailSegment::raw(value.into()),
+            ],
+            1,
+        );
+    }
+
+    fn push_link_value(&mut self, key: &str, url: &str) {
+        self.push_wrapped_limited(
+            vec![
+                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
+                DetailSegment::link(url.to_string(), url.to_string()),
+            ],
+            3,
+        );
+    }
+
+    fn push_markdown_block(
+        &mut self,
+        text: &str,
+        empty_message: &str,
+        max_lines: usize,
+        max_chars: usize,
+    ) {
+        let text = truncate_text(&normalize_text(text), max_chars);
+        if text.trim().is_empty() {
+            self.push_plain(empty_message.to_string());
             return;
         }
-        lines.push(Line::from(line.to_string()));
+
+        let blocks = markdown_blocks(&text);
+        let mut emitted = 0;
+        for block in blocks {
+            let prefix = quote_prefix(block.quote_depth);
+            if !self.push_wrapped_prefixed(
+                &block.segments,
+                prefix.as_slice(),
+                &mut emitted,
+                max_lines,
+            ) {
+                return;
+            }
+        }
+    }
+
+    fn push_wrapped_limited(&mut self, segments: Vec<DetailSegment>, max_lines: usize) {
+        let mut emitted = 0;
+        let _ = self.push_wrapped(&segments, &mut emitted, max_lines);
+    }
+
+    fn push_wrapped_prefixed(
+        &mut self,
+        segments: &[DetailSegment],
+        prefix: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        if prefix.is_empty() {
+            return self.push_wrapped(segments, emitted, max_lines);
+        }
+
+        let prefix_width: usize = prefix
+            .iter()
+            .map(|segment| display_width(&segment.text))
+            .sum();
+        if prefix_width >= self.width {
+            return self.push_wrapped(segments, emitted, max_lines);
+        }
+
+        let mut current = prefix.to_vec();
+        let mut column = prefix_width;
+        let mut wrote_any = false;
+
+        for segment in segments {
+            for ch in segment.text.chars() {
+                if ch == '\n' {
+                    if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
+                        return false;
+                    }
+                    current = prefix.to_vec();
+                    column = prefix_width;
+                    wrote_any = false;
+                    continue;
+                }
+
+                if column >= self.width {
+                    if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
+                        return false;
+                    }
+                    current = prefix.to_vec();
+                    column = prefix_width;
+                }
+
+                push_char_segment(&mut current, segment, ch);
+                column += 1;
+                wrote_any = true;
+            }
+        }
+
+        if wrote_any || current.len() > prefix.len() {
+            self.flush_wrapped_line(&mut current, emitted, max_lines)
+        } else {
+            true
+        }
+    }
+
+    fn push_wrapped(
+        &mut self,
+        segments: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        let mut current = Vec::new();
+        let mut column = 0;
+        let mut wrote_any = false;
+
+        for segment in segments {
+            for ch in segment.text.chars() {
+                if ch == '\n' {
+                    if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
+                        return false;
+                    }
+                    column = 0;
+                    wrote_any = false;
+                    continue;
+                }
+
+                if column >= self.width {
+                    if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
+                        return false;
+                    }
+                    column = 0;
+                }
+
+                push_char_segment(&mut current, segment, ch);
+                column += 1;
+                wrote_any = true;
+            }
+        }
+
+        if wrote_any || !current.is_empty() {
+            self.flush_wrapped_line(&mut current, emitted, max_lines)
+        } else {
+            true
+        }
+    }
+
+    fn flush_wrapped_line(
+        &mut self,
+        current: &mut Vec<DetailSegment>,
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        if *emitted >= max_lines {
+            self.push_plain("...");
+            return false;
+        }
+        let line = std::mem::take(current);
+        self.push_line(line);
+        *emitted += 1;
+        true
     }
 }
 
-fn push_comment(lines: &mut Vec<Line<'static>>, comment: &CommentPreview) {
+fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
+    let mut builder = DetailsBuilder::new(width);
+    let Some(item) = app.current_item() else {
+        builder.push_plain("No item selected");
+        return builder.finish();
+    };
+
+    builder.push_line(vec![DetailSegment::styled(
+        item.title.clone(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    builder.push_blank();
+    builder.push_key_value("repo", item.repo.clone());
+    builder.push_key_value(
+        "number",
+        item.number
+            .map(|number| format!("#{number}"))
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    builder.push_key_value("updated", relative_time(item.updated_at));
+    builder.push_key_value(
+        "author",
+        item.author.clone().unwrap_or_else(|| "-".to_string()),
+    );
+    builder.push_key_value(
+        "state",
+        item.state.clone().unwrap_or_else(|| "-".to_string()),
+    );
+    builder.push_key_value(
+        "reason",
+        item.reason.clone().unwrap_or_else(|| "-".to_string()),
+    );
+    builder.push_key_value(
+        "comments",
+        item.comments
+            .map(|comments| comments.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    builder.push_link_value("url", &item.url);
+
+    if !item.labels.is_empty() {
+        builder.push_blank();
+        builder.push_key_value("labels", item.labels.join(", "));
+    }
+
+    if let Some(extra) = &item.extra {
+        builder.push_blank();
+        builder.push_key_value("extra", extra.clone());
+    }
+
+    builder.push_blank();
+    builder.push_heading("Description");
+    builder.push_markdown_block(
+        item.body.as_deref().unwrap_or(""),
+        "No description.",
+        22,
+        2_400,
+    );
+
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        builder.push_blank();
+        builder.push_heading("Recent Comments");
+        match app.details.get(&item.id) {
+            Some(DetailState::Loading) => {
+                builder.push_plain("loading comments...");
+            }
+            Some(DetailState::Loaded(comments)) if comments.is_empty() => {
+                builder.push_plain("No comments.");
+            }
+            Some(DetailState::Loaded(comments)) => {
+                for (index, comment) in comments.iter().enumerate() {
+                    push_comment(
+                        &mut builder,
+                        index,
+                        comment,
+                        app.focus == FocusTarget::Details && index == app.selected_comment_index,
+                    );
+                }
+            }
+            Some(DetailState::Error(error)) => {
+                builder.push_plain(format!("Failed to load comments: {error}"));
+            }
+            None => {
+                builder.push_plain("loading comments...");
+            }
+        }
+    }
+
+    builder.finish()
+}
+
+fn push_comment(
+    builder: &mut DetailsBuilder,
+    index: usize,
+    comment: &CommentPreview,
+    selected: bool,
+) {
     let timestamp = comment
         .updated_at
         .as_ref()
         .or(comment.created_at.as_ref())
         .cloned();
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            comment.author.clone(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+    let start_line = builder.document.lines.len();
+    push_comment_separator(builder, selected);
+
+    let mut header = vec![
+        DetailSegment::styled(
+            if selected { "▸ " } else { "  " },
+            comment_marker_style(selected),
         ),
-        Span::raw(format!(" - {}", relative_time(timestamp))),
-    ]));
-    push_text_block(lines, &comment.body, "No comment body.", 6, 900);
+        DetailSegment::styled(comment.author.clone(), comment_author_style(selected)),
+        DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
+    ];
+    if let Some(url) = &comment.url {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::link("open", url.clone()));
+    }
+    header.push(DetailSegment::raw("  "));
+    header.push(DetailSegment::action(
+        "reply",
+        DetailAction::ReplyComment(index),
+    ));
+    builder.push_wrapped_limited(header, 2);
+    builder.push_markdown_block(&comment.body, "No comment body.", usize::MAX, usize::MAX);
+    builder.document.comments.push(CommentRegion {
+        index,
+        start_line,
+        end_line: builder.document.lines.len(),
+    });
+}
+
+fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool) {
+    let width = builder.width.max(12);
+    builder.push_line(vec![DetailSegment::styled(
+        "─".repeat(width.min(72)),
+        comment_separator_style(selected),
+    )]);
+}
+
+fn quote_comment_for_reply(comment: &CommentPreview) -> String {
+    let quote = truncate_text(&normalize_text(&comment.body), 1_200);
+    let mut body = format!("> @{} wrote:\n", comment.author);
+    if quote.trim().is_empty() {
+        body.push_str(">\n");
+    } else {
+        for line in quote.lines().take(18) {
+            if line.trim().is_empty() {
+                body.push_str(">\n");
+            } else {
+                body.push_str("> ");
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        if quote.lines().count() > 18 {
+            body.push_str("> ...\n");
+        }
+    }
+    body.push('\n');
+    body
+}
+
+fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut link: Option<String> = None;
+    let mut code_block = String::new();
+    let mut in_code_block = false;
+    let mut strong_depth = 0_u8;
+    let mut emphasis_depth = 0_u8;
+    let mut quote_depth = 0_u8;
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+
+    for event in Parser::new_ext(text, options) {
+        match event {
+            MarkdownEvent::Start(Tag::Paragraph) => {}
+            MarkdownEvent::End(TagEnd::Paragraph) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth)
+            }
+            MarkdownEvent::Start(Tag::Heading { .. }) => {}
+            MarkdownEvent::End(TagEnd::Heading(_)) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth)
+            }
+            MarkdownEvent::Start(Tag::BlockQuote(_)) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+                quote_depth = quote_depth.saturating_add(1);
+            }
+            MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+                quote_depth = quote_depth.saturating_sub(1);
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                current.push(DetailSegment::styled(
+                    "- ",
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            MarkdownEvent::End(TagEnd::Item) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth)
+            }
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                link = Some(dest_url.to_string());
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                link = None;
+            }
+            MarkdownEvent::Start(Tag::Strong) => {
+                strong_depth = strong_depth.saturating_add(1);
+            }
+            MarkdownEvent::End(TagEnd::Strong) => {
+                strong_depth = strong_depth.saturating_sub(1);
+            }
+            MarkdownEvent::Start(Tag::Emphasis) => {
+                emphasis_depth = emphasis_depth.saturating_add(1);
+            }
+            MarkdownEvent::End(TagEnd::Emphasis) => {
+                emphasis_depth = emphasis_depth.saturating_sub(1);
+            }
+            MarkdownEvent::Start(Tag::CodeBlock(_)) => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+                in_code_block = true;
+                code_block.clear();
+            }
+            MarkdownEvent::End(TagEnd::CodeBlock) => {
+                for line in code_block.lines() {
+                    blocks.push(MarkdownBlock {
+                        quote_depth,
+                        segments: vec![DetailSegment::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::LightGreen),
+                        )],
+                    });
+                }
+                in_code_block = false;
+                code_block.clear();
+            }
+            MarkdownEvent::Text(text) => {
+                if in_code_block {
+                    code_block.push_str(&text);
+                } else {
+                    append_text_segments(
+                        &mut current,
+                        &text,
+                        inline_style(strong_depth, emphasis_depth, link.is_some()),
+                        link.clone(),
+                    );
+                }
+            }
+            MarkdownEvent::Code(text) => current.push(DetailSegment::styled(
+                text.to_string(),
+                Style::default().fg(Color::LightGreen),
+            )),
+            MarkdownEvent::SoftBreak => current.push(DetailSegment::raw(" ")),
+            MarkdownEvent::HardBreak => {
+                flush_markdown_block(&mut blocks, &mut current, quote_depth)
+            }
+            MarkdownEvent::Rule => blocks.push(MarkdownBlock {
+                quote_depth,
+                segments: vec![DetailSegment::styled(
+                    "─".repeat(24),
+                    Style::default().fg(Color::DarkGray),
+                )],
+            }),
+            MarkdownEvent::TaskListMarker(checked) => {
+                current.push(DetailSegment::raw(if checked { "[x] " } else { "[ ] " }));
+            }
+            _ => {}
+        }
+    }
+    flush_markdown_block(&mut blocks, &mut current, quote_depth);
+    blocks
+}
+
+fn flush_markdown_block(
+    blocks: &mut Vec<MarkdownBlock>,
+    current: &mut Vec<DetailSegment>,
+    quote_depth: u8,
+) {
+    if current.iter().any(|segment| !segment.text.is_empty()) {
+        blocks.push(MarkdownBlock {
+            quote_depth,
+            segments: std::mem::take(current),
+        });
+    }
+}
+
+fn quote_prefix(depth: u8) -> Vec<DetailSegment> {
+    if depth == 0 {
+        return Vec::new();
+    }
+
+    vec![DetailSegment::styled(
+        "│ ".repeat(depth.min(3) as usize),
+        quote_style(),
+    )]
+}
+
+fn append_text_segments(
+    current: &mut Vec<DetailSegment>,
+    text: &str,
+    style: Style,
+    link: Option<String>,
+) {
+    if let Some(url) = link {
+        current.push(DetailSegment {
+            text: text.to_string(),
+            style,
+            link: Some(url),
+            action: None,
+        });
+        return;
+    }
+
+    for (part, url) in split_raw_urls(text) {
+        match url {
+            Some(url) => current.push(DetailSegment::link(part, url)),
+            None => current.push(DetailSegment::styled(part, style)),
+        }
+    }
+}
+
+fn split_raw_urls(text: &str) -> Vec<(String, Option<String>)> {
+    let mut result = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = find_url_start(rest) {
+        if start > 0 {
+            result.push((rest[..start].to_string(), None));
+        }
+
+        let after_start = &rest[start..];
+        let end = after_start
+            .find(char::is_whitespace)
+            .unwrap_or(after_start.len());
+        let mut url = after_start[..end].to_string();
+        let trailing = trim_url_trailing_punctuation(&mut url);
+        if url.is_empty() {
+            result.push((after_start[..end].to_string(), None));
+        } else {
+            result.push((url.clone(), Some(url)));
+            if !trailing.is_empty() {
+                result.push((trailing, None));
+            }
+        }
+        rest = &after_start[end..];
+    }
+
+    if !rest.is_empty() {
+        result.push((rest.to_string(), None));
+    }
+
+    result
+}
+
+fn find_url_start(text: &str) -> Option<usize> {
+    match (text.find("https://"), text.find("http://")) {
+        (Some(https), Some(http)) => Some(https.min(http)),
+        (Some(https), None) => Some(https),
+        (None, Some(http)) => Some(http),
+        (None, None) => None,
+    }
+}
+
+fn trim_url_trailing_punctuation(url: &mut String) -> String {
+    let mut trailing = String::new();
+    while matches!(
+        url.chars().last(),
+        Some('.') | Some(',') | Some(';') | Some(':') | Some(')')
+    ) {
+        let Some(ch) = url.pop() else {
+            break;
+        };
+        trailing.insert(0, ch);
+    }
+    trailing
+}
+
+fn push_char_segment(current: &mut Vec<DetailSegment>, template: &DetailSegment, ch: char) {
+    if let Some(last) = current.last_mut()
+        && last.style == template.style
+        && last.link == template.link
+        && last.action == template.action
+    {
+        last.text.push(ch);
+        return;
+    }
+
+    current.push(DetailSegment {
+        text: ch.to_string(),
+        style: template.style,
+        link: template.link.clone(),
+        action: template.action.clone(),
+    });
+}
+
+fn inline_style(strong_depth: u8, emphasis_depth: u8, is_link: bool) -> Style {
+    let mut style = if is_link {
+        link_style()
+    } else {
+        Style::default()
+    };
+    if strong_depth > 0 {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if emphasis_depth > 0 {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    style
+}
+
+fn heading_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn link_style() -> Style {
+    Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn action_style() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+fn quote_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn comment_author_style(selected: bool) -> Style {
+    let style = if selected {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    style.add_modifier(Modifier::BOLD)
+}
+
+fn comment_marker_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn comment_separator_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(Color::LightMagenta)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn normalize_text(text: &str) -> String {
@@ -761,7 +1906,17 @@ fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
 }
 
 impl AppState {
+    #[cfg(test)]
     fn new(active_view: SectionKind, sections: Vec<SectionSnapshot>) -> Self {
+        Self::with_ui_state(active_view, sections, UiState::default())
+    }
+
+    fn with_ui_state(
+        active_view: SectionKind,
+        sections: Vec<SectionSnapshot>,
+        ui_state: UiState,
+    ) -> Self {
+        let ui_state = ui_state.normalized();
         Self {
             active_view,
             sections,
@@ -769,14 +1924,66 @@ impl AppState {
             selected_index: [0; 3],
             focus: FocusTarget::List,
             details_scroll: 0,
+            list_width_percent: ui_state.list_width_percent,
+            dragging_split: false,
+            split_drag_changed: false,
             search_active: false,
             search_query: String::new(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
             details: HashMap::new(),
+            selected_comment_index: 0,
+            comment_dialog: None,
+            posting_comment: false,
             setup_dialog: None,
         }
+    }
+
+    fn ui_state(&self) -> UiState {
+        UiState {
+            list_width_percent: self.list_width_percent,
+        }
+    }
+
+    fn start_split_drag(&mut self) {
+        self.dragging_split = true;
+        self.split_drag_changed = false;
+        self.search_active = false;
+        self.status = "split selected; drag left or right".to_string();
+    }
+
+    fn update_split_drag(&mut self, body: Rect, column: u16) {
+        let next = split_percent_from_column(body, column);
+        if next != self.list_width_percent {
+            self.list_width_percent = next;
+            self.split_drag_changed = true;
+        }
+        self.status = format!(
+            "layout {} / {}",
+            self.list_width_percent,
+            100 - self.list_width_percent
+        );
+        let details_area = body_areas_with_ratio(body, self.list_width_percent)[1];
+        self.details_scroll = self
+            .details_scroll
+            .min(max_details_scroll(self, details_area));
+    }
+
+    fn finish_split_drag(&mut self) -> bool {
+        self.dragging_split = false;
+        let changed = self.split_drag_changed;
+        self.split_drag_changed = false;
+        if !changed {
+            self.status = "layout unchanged".to_string();
+            return false;
+        }
+        self.status = format!(
+            "layout saved {} / {}",
+            self.list_width_percent,
+            100 - self.list_width_percent
+        );
+        true
     }
 
     fn handle_msg(&mut self, message: AppMsg) {
@@ -790,6 +1997,9 @@ impl AppState {
                 sections,
                 save_error,
             } => {
+                let previous_item_id = self.current_item().map(|item| item.id.clone());
+                let previous_details_scroll = self.details_scroll;
+                let previous_comment_index = self.selected_comment_index;
                 let errors = sections
                     .iter()
                     .filter(|section| section.error.is_some())
@@ -801,8 +2011,18 @@ impl AppState {
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
-                self.details_scroll = 0;
                 self.clamp_positions();
+                let restored_item = previous_item_id
+                    .as_deref()
+                    .is_some_and(|item_id| self.select_current_item_by_id(item_id));
+                if restored_item {
+                    self.details_scroll = previous_details_scroll;
+                    self.selected_comment_index = previous_comment_index;
+                    self.clamp_selected_comment();
+                } else {
+                    self.details_scroll = 0;
+                    self.selected_comment_index = 0;
+                }
                 self.refreshing = false;
                 self.setup_dialog = setup_dialog;
                 self.status = match (errors, save_error) {
@@ -814,12 +2034,29 @@ impl AppState {
             AppMsg::DetailsLoaded { item_id, result } => match result {
                 Ok(comments) => {
                     self.details.insert(item_id, DetailState::Loaded(comments));
+                    self.clamp_selected_comment();
                 }
                 Err(error) => {
                     if self.setup_dialog.is_none() {
                         self.setup_dialog = setup_dialog_from_error(&error);
                     }
                     self.details.insert(item_id, DetailState::Error(error));
+                }
+            },
+            AppMsg::CommentPosted { item_id, result } => match result {
+                Ok(comments) => {
+                    self.selected_comment_index = comments.len().saturating_sub(1);
+                    self.details.insert(item_id, DetailState::Loaded(comments));
+                    self.clamp_selected_comment();
+                    self.posting_comment = false;
+                    self.status = "comment posted".to_string();
+                }
+                Err(error) => {
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog_from_error(&error);
+                    }
+                    self.posting_comment = false;
+                    self.status = format!("comment post failed: {error}");
                 }
             },
         }
@@ -849,12 +2086,16 @@ impl AppState {
         self.active_view = view;
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
         self.clamp_positions();
     }
 
     fn focus_primary_list(&mut self) {
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
         self.search_active = false;
         self.status = "list focused".to_string();
         self.clamp_positions();
@@ -871,6 +2112,24 @@ impl AppState {
         self.selected_index[slot] = 0;
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
+    }
+
+    fn select_section(&mut self, index: usize) {
+        let len = self.visible_sections().len();
+        if len == 0 {
+            return;
+        }
+        let slot = kind_slot(self.active_view);
+        self.section_index[slot] = index.min(len - 1);
+        self.selected_index[slot] = 0;
+        self.focus = FocusTarget::List;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
+        self.search_active = false;
+        self.status = "list focused".to_string();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -885,12 +2144,16 @@ impl AppState {
         let current = self.selected_index[slot].min(len - 1);
         self.selected_index[slot] = move_bounded(current, len, delta);
         self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
     }
 
     fn set_selection(&mut self, index: usize) {
         let slot = kind_slot(self.active_view);
         self.selected_index[slot] = index;
         self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
         self.clamp_positions();
     }
 
@@ -903,6 +2166,8 @@ impl AppState {
             let slot = kind_slot(self.active_view);
             self.selected_index[slot] = len - 1;
             self.details_scroll = 0;
+            self.selected_comment_index = 0;
+            self.comment_dialog = None;
         }
     }
 
@@ -910,6 +2175,7 @@ impl AppState {
         if self.current_item().is_some() {
             self.focus = FocusTarget::Details;
             self.search_active = false;
+            self.clamp_selected_comment();
             self.status = "details focused".to_string();
         } else {
             self.status = "nothing to focus".to_string();
@@ -929,9 +2195,125 @@ impl AppState {
         }
     }
 
+    fn select_comment(&mut self, index: usize) {
+        self.selected_comment_index = index;
+        self.clamp_selected_comment();
+        self.status = format!("comment {} focused", self.selected_comment_index + 1);
+    }
+
+    fn move_comment(&mut self, delta: isize) {
+        let Some(len) = self.current_comments().map(Vec::len) else {
+            self.status = "no comments".to_string();
+            return;
+        };
+        if len == 0 {
+            self.status = "no comments".to_string();
+            return;
+        }
+        self.selected_comment_index =
+            move_bounded(self.selected_comment_index.min(len - 1), len, delta);
+        self.status = format!("comment {} focused", self.selected_comment_index + 1);
+    }
+
+    fn handle_detail_action(&mut self, action: DetailAction) {
+        match action {
+            DetailAction::ReplyComment(index) => {
+                self.select_comment(index);
+                self.start_reply_to_selected_comment();
+            }
+        }
+    }
+
+    fn start_new_comment_dialog(&mut self) {
+        if !self.current_item_supports_comments() {
+            self.status = "selected item cannot be commented on".to_string();
+            return;
+        }
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.comment_dialog = Some(CommentDialog {
+            mode: CommentDialogMode::New,
+            body: String::new(),
+        });
+        self.status = "new comment".to_string();
+    }
+
+    fn start_reply_to_selected_comment(&mut self) {
+        if !self.current_item_supports_comments() {
+            self.status = "selected item cannot be commented on".to_string();
+            return;
+        }
+        let Some(comment) = self.current_selected_comment().cloned() else {
+            self.status = "no comment selected".to_string();
+            return;
+        };
+        let author = comment.author.clone();
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.comment_dialog = Some(CommentDialog {
+            mode: CommentDialogMode::Reply {
+                comment_index: self.selected_comment_index,
+                author: author.clone(),
+            },
+            body: quote_comment_for_reply(&comment),
+        });
+        self.status = format!("replying to @{author}");
+    }
+
+    fn handle_comment_dialog_key(&mut self, key: KeyEvent, tx: &UnboundedSender<AppMsg>) {
+        if self.posting_comment {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.comment_dialog = None;
+                self.status = "comment cancelled".to_string();
+            }
+            KeyCode::Enter => self.submit_comment_dialog(tx),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.comment_dialog {
+                    dialog.body.pop();
+                }
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(dialog) = &mut self.comment_dialog {
+                    dialog.body.push('\n');
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.comment_dialog {
+                    dialog.body.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_comment_dialog(&mut self, tx: &UnboundedSender<AppMsg>) {
+        let Some(dialog) = self.comment_dialog.take() else {
+            return;
+        };
+        let body = dialog.body.trim().to_string();
+        if body.is_empty() {
+            self.comment_dialog = Some(dialog);
+            self.status = "comment is empty".to_string();
+            return;
+        }
+        let Some(item) = self.current_item().cloned() else {
+            self.comment_dialog = Some(dialog);
+            self.status = "nothing to comment on".to_string();
+            return;
+        };
+        self.posting_comment = true;
+        self.status = "posting comment".to_string();
+        start_comment_submit(item, body, tx.clone());
+    }
+
     fn start_search(&mut self) {
         self.focus = FocusTarget::List;
         self.search_active = true;
+        self.comment_dialog = None;
         self.status = "search mode".to_string();
         self.clamp_positions();
     }
@@ -965,9 +2347,14 @@ impl AppState {
             return;
         };
 
-        match open::that(&item.url) {
+        let url = item.url.clone();
+        self.open_url(&url);
+    }
+
+    fn open_url(&mut self, url: &str) {
+        match open::that(url) {
             Ok(_) => {
-                self.status = format!("opened {}", item.url);
+                self.status = format!("opened {url}");
             }
             Err(error) => {
                 self.status = format!("open failed: {error}");
@@ -999,12 +2386,56 @@ impl AppState {
         section.items.get(*item_index)
     }
 
+    fn current_item_supports_comments(&self) -> bool {
+        self.current_item()
+            .map(|item| {
+                matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
+                    && item.number.is_some()
+            })
+            .unwrap_or(false)
+    }
+
+    fn current_comments(&self) -> Option<&Vec<CommentPreview>> {
+        let item = self.current_item()?;
+        match self.details.get(&item.id) {
+            Some(DetailState::Loaded(comments)) => Some(comments),
+            _ => None,
+        }
+    }
+
+    fn current_selected_comment(&self) -> Option<&CommentPreview> {
+        self.current_comments()?.get(self.selected_comment_index)
+    }
+
     fn current_section_position(&self) -> usize {
         self.section_index[kind_slot(self.active_view)]
     }
 
     fn current_selected_position(&self) -> usize {
         self.selected_index[kind_slot(self.active_view)]
+    }
+
+    fn select_current_item_by_id(&mut self, item_id: &str) -> bool {
+        let Some(section) = self.current_section() else {
+            return false;
+        };
+        let Some(position) = self
+            .filtered_indices(section)
+            .into_iter()
+            .enumerate()
+            .find_map(|(position, item_index)| {
+                section
+                    .items
+                    .get(item_index)
+                    .is_some_and(|item| item.id == item_id)
+                    .then_some(position)
+            })
+        else {
+            return false;
+        };
+
+        self.selected_index[kind_slot(self.active_view)] = position;
+        true
     }
 
     fn clamp_positions(&mut self) {
@@ -1038,6 +2469,16 @@ impl AppState {
             } else {
                 self.selected_index[slot] = self.selected_index[slot].min(item_count - 1);
             }
+        }
+        self.clamp_selected_comment();
+    }
+
+    fn clamp_selected_comment(&mut self) {
+        let len = self.current_comments().map(Vec::len).unwrap_or(0);
+        if len == 0 {
+            self.selected_comment_index = 0;
+        } else {
+            self.selected_comment_index = self.selected_comment_index.min(len - 1);
         }
     }
 
@@ -1262,6 +2703,71 @@ mod tests {
     }
 
     #[test]
+    fn refresh_preserves_details_scroll_when_current_item_survives() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_selection(1);
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+        app.details.insert(
+            "2".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        let refreshed = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![
+                work_item("2", "nervosnetwork/fiber", 2, "Funding state updated", None),
+                work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None),
+            ],
+            refreshed_at: None,
+            error: None,
+        };
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![refreshed],
+            save_error: None,
+        });
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(app.current_selected_position(), 0);
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn refresh_resets_details_scroll_when_current_item_disappears() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_selection(1);
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+        let refreshed = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![work_item("3", "rust-lang/rust", 3, "New item", None)],
+            refreshed_at: None,
+            error: None,
+        };
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![refreshed],
+            save_error: None,
+        });
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("3"));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.selected_comment_index, 0);
+    }
+
+    #[test]
     fn modal_keys_dismiss_dialog_before_regular_input() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1355,6 +2861,599 @@ mod tests {
         app.clamp_positions();
 
         assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+    }
+
+    #[test]
+    fn details_url_line_tracks_clickable_region() {
+        let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let document = build_details_document(&app, 100);
+        let url = "https://github.com/rust-lang/rust/pull/1";
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains(url))
+            .expect("url line");
+        let column = document.lines[line_index]
+            .to_string()
+            .find(url)
+            .expect("url column") as u16;
+
+        assert_eq!(document.link_at(line_index, column), Some(url.to_string()));
+        assert_eq!(document.link_at(line_index, column.saturating_sub(1)), None);
+    }
+
+    #[test]
+    fn details_markdown_renders_without_raw_syntax_and_keeps_links() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.body = Some(
+            "**Fixes** [tracking issue](https://example.com/issues/1).\n\n- first item\n\n```rust\nlet x = 1;\n```"
+                .to_string(),
+        );
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let document = build_details_document(&app, 100);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Fixes tracking issue."));
+        assert!(rendered.contains("- first item"));
+        assert!(rendered.contains("let x = 1;"));
+        assert!(!rendered.contains("**Fixes**"));
+        assert!(!rendered.contains("[tracking issue]"));
+        assert!(!rendered.contains("```"));
+
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("tracking issue"))
+            .expect("markdown link line");
+        let column = document.lines[line_index]
+            .to_string()
+            .find("tracking issue")
+            .expect("markdown link column") as u16;
+        assert_eq!(
+            document.link_at(line_index, column),
+            Some("https://example.com/issues/1".to_string())
+        );
+    }
+
+    #[test]
+    fn markdown_blockquotes_render_with_quote_marker_on_wrapped_lines() {
+        let mut builder = DetailsBuilder::new(12);
+        builder.push_markdown_block(
+            "> quoted reply with enough text to wrap\n\nnormal reply",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let quote_lines = rendered
+            .iter()
+            .take_while(|line| !line.contains("normal reply"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            quote_lines.len() > 1,
+            "quote should wrap in the narrow details pane"
+        );
+        assert!(
+            quote_lines.iter().all(|line| line.starts_with("│ ")),
+            "each wrapped quote line should keep the quote marker: {quote_lines:?}"
+        );
+        assert!(rendered.iter().any(|line| line == "normal reply"));
+    }
+
+    #[test]
+    fn details_comments_have_separators_and_raw_urls_are_clickable() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                CommentPreview {
+                    author: "alice".to_string(),
+                    body: "See https://example.com/one.".to_string(),
+                    created_at: None,
+                    updated_at: None,
+                    url: None,
+                },
+                CommentPreview {
+                    author: "bob".to_string(),
+                    body: "Second comment".to_string(),
+                    created_at: None,
+                    updated_at: None,
+                    url: Some(
+                        "https://github.com/rust-lang/rust/pull/1#issuecomment-2".to_string(),
+                    ),
+                },
+            ]),
+        );
+
+        let document = build_details_document(&app, 100);
+        let separator_count = document
+            .lines
+            .iter()
+            .filter(|line| line.to_string().starts_with('─'))
+            .count();
+        assert_eq!(separator_count, 2);
+
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("https://example.com/one"))
+            .expect("raw url line");
+        let column = document.lines[line_index]
+            .to_string()
+            .find("https://example.com/one")
+            .expect("raw url column") as u16;
+        assert_eq!(
+            document.link_at(line_index, column),
+            Some("https://example.com/one".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_comment_is_highlighted_and_has_reply_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.selected_comment_index = 1;
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "First comment", None),
+                comment(
+                    "bob",
+                    "Second comment",
+                    Some("https://example.com/comment-2"),
+                ),
+            ]),
+        );
+
+        let document = build_details_document(&app, 100);
+        let bob_line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("▸ bob"))
+            .expect("selected comment header");
+        let reply_column = document.lines[bob_line_index]
+            .to_string()
+            .find("reply")
+            .expect("reply button") as u16;
+
+        assert_eq!(
+            document.action_at(bob_line_index, reply_column),
+            Some(DetailAction::ReplyComment(1))
+        );
+        assert_eq!(document.comment_at(bob_line_index), Some(1));
+    }
+
+    #[test]
+    fn reply_action_opens_dialog_prefilled_with_quote() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "Quoted body", None)]),
+        );
+
+        app.handle_detail_action(DetailAction::ReplyComment(0));
+
+        let dialog = app.comment_dialog.expect("reply dialog");
+        assert_eq!(
+            dialog.mode,
+            CommentDialogMode::Reply {
+                comment_index: 0,
+                author: "alice".to_string()
+            }
+        );
+        assert!(dialog.body.contains("> @alice wrote:"));
+        assert!(dialog.body.contains("> Quoted body"));
+    }
+
+    #[test]
+    fn a_key_opens_new_comment_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('a')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(
+            app.comment_dialog.map(|dialog| dialog.mode),
+            Some(CommentDialogMode::New)
+        );
+    }
+
+    #[test]
+    fn details_comment_bodies_are_not_truncated() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let body = (1..=12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![CommentPreview {
+                author: "alice".to_string(),
+                body,
+                created_at: None,
+                updated_at: None,
+                url: None,
+            }]),
+        );
+
+        let document = build_details_document(&app, 100);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("line 1 line 2 line 3"));
+        assert!(rendered.contains("line 10 line 11 line 12"));
+        assert!(!rendered.contains("\n...\n"));
+    }
+
+    #[test]
+    fn mouse_clicking_table_row_selects_item_and_focuses_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 100, 40);
+        let table = body_areas(body_area(area))[0];
+        let inner = block_inner(table);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 4,
+            row: inner.y + TABLE_HEADER_HEIGHT + 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, mouse, area);
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.current_selected_position(), 1);
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(app.status, "details focused");
+    }
+
+    #[test]
+    fn mouse_clicking_table_header_does_not_change_selection() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 100, 40);
+        let table = body_areas(body_area(area))[0];
+        let inner = block_inner(table);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 4,
+            row: inner.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, mouse, area);
+
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.current_selected_position(), 0);
+    }
+
+    #[test]
+    fn mouse_clicking_view_tab_switches_view_and_focuses_list() {
+        let sections = vec![
+            test_section(),
+            SectionSnapshot {
+                key: "issues:test".to_string(),
+                kind: SectionKind::Issues,
+                title: "Issues".to_string(),
+                filters: String::new(),
+                items: vec![work_item("3", "nervosnetwork/fiber", 3, "Issue", None)],
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+        app.focus_details();
+        app.search_active = true;
+        let area = Rect::new(0, 0, 120, 40);
+        let inner = block_inner(page_areas(area)[0]);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x
+                + display_width(SectionKind::PullRequests.label()) as u16
+                + TAB_DIVIDER_WIDTH
+                + 1,
+            row: inner.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, mouse, area);
+
+        assert_eq!(app.active_view, SectionKind::Issues);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert!(!app.search_active);
+        assert_eq!(app.status, "list focused");
+    }
+
+    #[test]
+    fn mouse_clicking_section_tab_switches_section_and_focuses_list() {
+        let sections = vec![
+            SectionSnapshot {
+                key: "pull_requests:Mine".to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Mine".to_string(),
+                filters: String::new(),
+                items: vec![work_item("1", "rust-lang/rust", 1, "Compiler", None)],
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "pull_requests:Assigned".to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Assigned".to_string(),
+                filters: String::new(),
+                items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+        app.focus_details();
+        app.search_active = true;
+        let area = Rect::new(0, 0, 120, 40);
+        let inner = block_inner(page_areas(area)[1]);
+        let first_label = section_tab_label(&app, app.visible_sections()[0]);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + display_width(&first_label) as u16 + TAB_DIVIDER_WIDTH + 1,
+            row: inner.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        handle_mouse(&mut app, mouse, area);
+
+        assert_eq!(app.current_section_position(), 1);
+        assert_eq!(
+            app.current_section().map(|section| section.title.as_str()),
+            Some("Assigned")
+        );
+        assert_eq!(app.current_selected_position(), 0);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert!(!app.search_active);
+        assert_eq!(app.status, "list focused");
+    }
+
+    #[test]
+    fn mouse_dragging_splitter_changes_list_details_ratio_and_requests_save() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 120, 40);
+        let body = body_area(area);
+        let split = body_areas_with_ratio(body, app.list_width_percent)[1].x;
+        let row = body.y + 3;
+
+        let should_save = handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: split,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert!(!should_save);
+        assert!(app.dragging_split);
+
+        let target = body.x + body.width.saturating_mul(60) / 100;
+        let should_save = handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: target,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert!(!should_save);
+        assert_eq!(app.list_width_percent, 60);
+        assert_eq!(app.status, "layout 60 / 40");
+
+        let should_save = handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: target,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert!(should_save);
+        assert!(!app.dragging_split);
+        assert_eq!(app.status, "layout saved 60 / 40");
+    }
+
+    #[test]
+    fn split_drag_clamps_to_reasonable_widths() {
+        let body = Rect::new(10, 3, 100, 20);
+
+        assert_eq!(
+            split_percent_from_column(body, 0),
+            crate::state::MIN_LIST_WIDTH_PERCENT
+        );
+        assert_eq!(
+            split_percent_from_column(body, 500),
+            crate::state::MAX_LIST_WIDTH_PERCENT
+        );
+    }
+
+    #[test]
+    fn list_page_keys_move_by_visible_page_size() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![many_items_section(30)]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 120, 20);
+        let table = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let visible_rows = usize::from(table_visible_rows(table));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::PageDown),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), visible_rows);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::PageUp),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_list_when_pointer_is_over_list() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![many_items_section(30)]);
+        app.focus_details();
+        app.search_active = true;
+        let area = Rect::new(0, 0, 120, 40);
+        let table = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let inner = block_inner(table);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: inner.x + 2,
+                row: inner.y + TABLE_HEADER_HEIGHT + 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::List);
+        assert!(!app.search_active);
+        assert_eq!(
+            app.current_selected_position(),
+            usize::from(MOUSE_SCROLL_LINES)
+        );
+    }
+
+    #[test]
+    fn table_visible_range_tracks_current_page() {
+        assert_eq!(table_visible_range(0, 10, 25), Some((1, 10)));
+        assert_eq!(table_visible_range(10, 10, 25), Some((2, 11)));
+        assert_eq!(table_visible_range(24, 10, 25), Some((16, 25)));
+        assert_eq!(table_visible_range(0, 10, 0), None);
+    }
+
+    #[test]
+    fn details_panel_title_is_static() {
+        assert_eq!(details_title(), "Details:");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_details_when_content_overflows() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.body = Some(
+            (1..=30)
+                .map(|index| format!("paragraph {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let area = Rect::new(0, 0, 100, 20);
+        let details = body_areas(body_area(area))[1];
+        let inner = block_inner(details);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: inner.x + 2,
+                row: inner.y + 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.details_scroll, MOUSE_SCROLL_LINES);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: inner.x + 2,
+                row: inner.y + 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_scroll_details_without_overflow() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 100, 80);
+        let details = body_areas(body_area(area))[1];
+        let inner = block_inner(details);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: inner.x + 2,
+                row: inner.y + 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.details_scroll, 0);
     }
 
     #[test]
@@ -1510,6 +3609,38 @@ mod tests {
             ],
             refreshed_at: None,
             error: None,
+        }
+    }
+
+    fn many_items_section(count: u64) -> SectionSnapshot {
+        SectionSnapshot {
+            key: "pull_requests:many".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Many".to_string(),
+            filters: String::new(),
+            items: (1..=count)
+                .map(|number| {
+                    work_item(
+                        &number.to_string(),
+                        "rust-lang/rust",
+                        number,
+                        &format!("Item {number}"),
+                        None,
+                    )
+                })
+                .collect(),
+            refreshed_at: None,
+            error: None,
+        }
+    }
+
+    fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
+        CommentPreview {
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at: None,
+            updated_at: None,
+            url: url.map(str::to_string),
         }
     }
 

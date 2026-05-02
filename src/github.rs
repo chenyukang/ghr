@@ -318,16 +318,42 @@ fn search_fields(kind: SectionKind) -> &'static str {
     }
 }
 
-pub async fn fetch_issue_comments(
+pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<CommentPreview>> {
+    let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+    ])
+    .await?;
+    parse_issue_comments_output(&output, repository, number)
+}
+
+pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Result<()> {
+    let path = format!("repos/{repository}/issues/{number}/comments");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("body={body}"),
+    ])
+    .await?;
+    Ok(())
+}
+
+fn parse_issue_comments_output(
+    output: &str,
     repository: &str,
     number: u64,
-    limit: usize,
 ) -> Result<Vec<CommentPreview>> {
-    let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
-    let output = run_gh_json(&["api".to_string(), path]).await?;
-    let mut comments = serde_json::from_str::<Vec<IssueCommentRaw>>(&output)
-        .with_context(|| format!("failed to parse comments for {repository}#{number}"))?
+    let pages = serde_json::from_str::<Vec<Vec<IssueCommentRaw>>>(output)
+        .with_context(|| format!("failed to parse comments for {repository}#{number}"))?;
+    let mut comments = pages
         .into_iter()
+        .flatten()
         .map(|comment| CommentPreview {
             author: comment
                 .user
@@ -340,8 +366,7 @@ pub async fn fetch_issue_comments(
         })
         .collect::<Vec<_>>();
 
-    comments.sort_by_key(|comment| std::cmp::Reverse(comment.updated_at));
-    comments.truncate(limit);
+    comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
 }
 
@@ -734,6 +759,50 @@ mod tests {
     fn search_fields_include_body_for_preview() {
         assert!(search_fields(SectionKind::PullRequests).contains("body"));
         assert!(search_fields(SectionKind::Issues).contains("body"));
+    }
+
+    #[test]
+    fn paginated_comments_are_flattened_sorted_oldest_first_and_not_truncated() {
+        let output = r##"
+        [
+          [
+            {
+              "body": "old",
+              "html_url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+              "created_at": "2026-01-01T00:00:00Z",
+              "updated_at": "2026-01-04T00:00:00Z",
+              "user": { "login": "alice" }
+            },
+            {
+              "body": "new",
+              "html_url": "https://github.com/owner/repo/issues/1#issuecomment-2",
+              "created_at": "2026-01-03T00:00:00Z",
+              "updated_at": "2026-01-03T00:00:00Z",
+              "user": { "login": "bob" }
+            }
+          ],
+          [
+            {
+              "body": "middle",
+              "html_url": "https://github.com/owner/repo/issues/1#issuecomment-3",
+              "created_at": "2026-01-02T00:00:00Z",
+              "updated_at": "2026-01-02T00:00:00Z",
+              "user": { "login": "carol" }
+            }
+          ]
+        ]
+        "##;
+
+        let comments = parse_issue_comments_output(output, "owner/repo", 1).unwrap();
+
+        assert_eq!(comments.len(), 3);
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old", "middle", "new"]
+        );
     }
 
     #[test]

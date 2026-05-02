@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -447,16 +448,57 @@ async fn run_gh_json(args: &[String]) -> Result<String> {
         .args(args)
         .output()
         .await
-        .with_context(|| format!("failed to run gh {}", args.join(" ")))?;
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                anyhow!("{}", gh_missing_message(args))
+            } else {
+                anyhow!("failed to run gh {}: {error}", args.join(" "))
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!("gh {} failed: {message}", args.join(" "));
+        bail!("{}", gh_failure_message(args, &message));
     }
 
     String::from_utf8(output.stdout).context("gh output was not UTF-8")
+}
+
+fn gh_missing_message(args: &[String]) -> String {
+    format!(
+        "GitHub CLI `gh` is required but was not found. Install it from https://cli.github.com/ or run `brew install gh`, then run `gh auth login`. Tried: gh {}",
+        args.join(" ")
+    )
+}
+
+fn gh_failure_message(args: &[String], message: &str) -> String {
+    if is_gh_auth_error(message) {
+        return format!(
+            "GitHub CLI is installed but not authenticated. Run `gh auth login`, then restart ghr. Original error from `gh {}`: {}",
+            args.join(" "),
+            message
+        );
+    }
+
+    format!("gh {} failed: {message}", args.join(" "))
+}
+
+fn is_gh_auth_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "gh auth login",
+        "not authenticated",
+        "not logged in",
+        "authentication required",
+        "requires authentication",
+        "must authenticate",
+        "bad credentials",
+        "no oauth token",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem {
@@ -692,5 +734,32 @@ mod tests {
     fn search_fields_include_body_for_preview() {
         assert!(search_fields(SectionKind::PullRequests).contains("body"));
         assert!(search_fields(SectionKind::Issues).contains("body"));
+    }
+
+    #[test]
+    fn missing_gh_message_explains_install_and_login() {
+        let message = gh_missing_message(&["api".to_string(), "user".to_string()]);
+
+        assert!(message.contains("GitHub CLI `gh` is required"));
+        assert!(message.contains("brew install gh"));
+        assert!(message.contains("gh auth login"));
+    }
+
+    #[test]
+    fn auth_errors_are_rewritten_with_login_hint() {
+        let message = gh_failure_message(
+            &["search".to_string(), "prs".to_string()],
+            "To get started with GitHub CLI, please run: gh auth login",
+        );
+
+        assert!(message.contains("not authenticated"));
+        assert!(message.contains("Run `gh auth login`"));
+    }
+
+    #[test]
+    fn non_auth_gh_errors_keep_original_command_context() {
+        let message = gh_failure_message(&["search".to_string(), "issues".to_string()], "HTTP 500");
+
+        assert_eq!(message, "gh search issues failed: HTTP 500");
     }
 }

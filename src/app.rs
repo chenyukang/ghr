@@ -635,6 +635,22 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
+    let Some(first_error) = first_error else {
+        return format!("refresh complete with {count} failed section(s)");
+    };
+
+    if first_error.contains("GitHub CLI `gh` is required") {
+        return "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string();
+    }
+
+    if first_error.contains("Run `gh auth login`") {
+        return "GitHub CLI auth required: run `gh auth login`".to_string();
+    }
+
+    format!("refresh complete with {count} failed section(s)")
+}
+
 impl AppState {
     fn new(active_view: SectionKind, sections: Vec<SectionSnapshot>) -> Self {
         Self {
@@ -668,6 +684,10 @@ impl AppState {
                     .iter()
                     .filter(|section| section.error.is_some())
                     .count();
+                let first_error = sections
+                    .iter()
+                    .find_map(|section| section.error.as_deref())
+                    .map(str::to_string);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 self.details_scroll = 0;
@@ -675,7 +695,7 @@ impl AppState {
                 self.refreshing = false;
                 self.status = match (errors, save_error) {
                     (0, None) => "refresh complete".to_string(),
-                    (count, None) => format!("refresh complete with {count} failed section(s)"),
+                    (count, None) => refresh_error_status(count, first_error.as_deref()),
                     (_, Some(error)) => format!("snapshot save failed: {error}"),
                 };
             }
@@ -1066,6 +1086,25 @@ mod tests {
     fn fuzzy_score_matches_ordered_subsequence() {
         assert!(fuzzy_score("frc", "fix rust closure").is_some());
         assert!(fuzzy_score("zz", "fix rust closure").is_none());
+    }
+
+    #[test]
+    fn refresh_error_status_guides_missing_gh_and_auth() {
+        assert_eq!(
+            refresh_error_status(3, Some("GitHub CLI `gh` is required but was not found.")),
+            "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        );
+        assert_eq!(
+            refresh_error_status(
+                3,
+                Some("GitHub CLI is installed but not authenticated. Run `gh auth login`.")
+            ),
+            "GitHub CLI auth required: run `gh auth login`"
+        );
+        assert_eq!(
+            refresh_error_status(3, Some("rate limited")),
+            "refresh complete with 3 failed section(s)"
+        );
     }
 
     #[test]

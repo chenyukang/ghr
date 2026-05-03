@@ -104,12 +104,15 @@ impl Config {
         }
 
         let name = runtime_repo_name(&self.repos, &repo);
-        self.repos.push(RepoConfig {
-            name,
-            repo,
-            show_prs: true,
-            show_issues: true,
-        });
+        self.repos.insert(
+            0,
+            RepoConfig {
+                name,
+                repo,
+                show_prs: true,
+                show_issues: true,
+            },
+        );
         true
     }
 }
@@ -386,8 +389,24 @@ mod tests {
         });
 
         assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
-        assert_eq!(config.repos[1].name, "chenyukang/ghr");
-        assert_eq!(config.repos[1].repo, "chenyukang/ghr");
+        assert_eq!(config.repos[0].name, "chenyukang/ghr");
+        assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+    }
+
+    #[test]
+    fn runtime_repo_uses_remote_name_and_leads_configured_repos() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            show_prs: true,
+            show_issues: true,
+        });
+
+        assert!(config.add_runtime_repo("chenyukang/runnel".to_string()));
+        assert_eq!(config.repos[0].name, "runnel");
+        assert_eq!(config.repos[0].repo, "chenyukang/runnel");
+        assert_eq!(config.repos[1].name, "Fiber");
     }
 
     #[test]

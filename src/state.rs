@@ -22,6 +22,10 @@ pub struct UiState {
     pub details_scroll: u16,
     pub selected_comment_index: usize,
     pub expanded_comments: Vec<String>,
+    pub details_scroll_by_item: HashMap<String, u16>,
+    pub selected_comment_index_by_item: HashMap<String, usize>,
+    pub viewed_details_snapshot: HashMap<String, String>,
+    pub viewed_comments_snapshot: HashMap<String, String>,
     pub selected_diff_file: HashMap<String, usize>,
     pub selected_diff_line: HashMap<String, usize>,
 }
@@ -63,6 +67,14 @@ impl UiState {
         self.expanded_comments
             .retain(|key| !key.trim().is_empty() && seen.insert(key.clone()));
         self.expanded_comments.sort();
+        self.details_scroll_by_item
+            .retain(|key, _| !key.trim().is_empty());
+        self.selected_comment_index_by_item
+            .retain(|key, _| !key.trim().is_empty());
+        self.viewed_details_snapshot
+            .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
+        self.viewed_comments_snapshot
+            .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
         self
     }
 }
@@ -79,6 +91,10 @@ impl Default for UiState {
             details_scroll: 0,
             selected_comment_index: 0,
             expanded_comments: Vec::new(),
+            details_scroll_by_item: HashMap::new(),
+            selected_comment_index_by_item: HashMap::new(),
+            viewed_details_snapshot: HashMap::new(),
+            viewed_comments_snapshot: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
         }
@@ -112,6 +128,16 @@ mod tests {
             details_scroll: 8,
             selected_comment_index: 2,
             expanded_comments: vec!["1:comment:42".to_string()],
+            details_scroll_by_item: HashMap::from([("issue-3".to_string(), 12)]),
+            selected_comment_index_by_item: HashMap::from([("issue-3".to_string(), 4)]),
+            viewed_details_snapshot: HashMap::from([(
+                "issue-3".to_string(),
+                "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            )]),
+            viewed_comments_snapshot: HashMap::from([(
+                "issue-3".to_string(),
+                "0cc175b9c0f1b6a831c399e269772661".to_string(),
+            )]),
             selected_diff_file: HashMap::from([("issue-3".to_string(), 4)]),
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
         }
@@ -129,6 +155,19 @@ mod tests {
         assert_eq!(state.details_scroll, 8);
         assert_eq!(state.selected_comment_index, 2);
         assert_eq!(state.expanded_comments, vec!["1:comment:42"]);
+        assert_eq!(state.details_scroll_by_item.get("issue-3"), Some(&12));
+        assert_eq!(
+            state.selected_comment_index_by_item.get("issue-3"),
+            Some(&4)
+        );
+        assert_eq!(
+            state.viewed_details_snapshot.get("issue-3"),
+            Some(&"d41d8cd98f00b204e9800998ecf8427e".to_string())
+        );
+        assert_eq!(
+            state.viewed_comments_snapshot.get("issue-3"),
+            Some(&"0cc175b9c0f1b6a831c399e269772661".to_string())
+        );
         assert_eq!(state.selected_diff_file.get("issue-3"), Some(&4));
         assert_eq!(state.selected_diff_line.get("issue-3"), Some(&9));
 

@@ -314,8 +314,12 @@ struct AppState {
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
+    conversation_details_state: HashMap<String, ConversationDetailsState>,
+    viewed_details_snapshot: HashMap<String, String>,
+    viewed_comments_snapshot: HashMap<String, String>,
     action_hints: HashMap<String, ActionHintState>,
     details_stale: HashSet<String>,
+    details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
     notification_read_pending: HashSet<String>,
     selected_comment_index: usize,
@@ -358,6 +362,12 @@ struct DiffModeState {
     details_scroll: u16,
     selected_file: usize,
     selected_line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConversationDetailsState {
+    details_scroll: u16,
+    selected_comment_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,12 +1645,13 @@ fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
 }
 
 fn mouse_list_scroll_delta(app: &AppState, direction: isize) -> isize {
-    let lines = if app.details_mode == DetailsMode::Diff {
-        MOUSE_DIFF_FILE_SCROLL_LINES
-    } else {
-        MOUSE_LIST_SCROLL_LINES
-    };
-    direction.saturating_mul(lines as isize)
+    if app.details_mode == DetailsMode::Diff {
+        return direction
+            .signum()
+            .saturating_mul(MOUSE_DIFF_FILE_SCROLL_LINES as isize);
+    }
+
+    direction.saturating_mul(MOUSE_LIST_SCROLL_LINES as isize)
 }
 
 fn list_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
@@ -2193,6 +2204,11 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .iter()
         .filter_map(|index| section.items.get(*index))
         .map(|item| {
+            let row_style = if app.item_has_unseen_details(item) {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 item.repo.clone(),
                 item.number
@@ -2202,6 +2218,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 relative_time(item.updated_at),
                 item_meta(item),
             ])
+            .style(row_style)
         })
         .collect::<Vec<_>>();
 
@@ -2469,7 +2486,10 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
 
     if app.search_active {
         return Some((
-            format!("Filter: /{}_  Enter apply  Esc clear", app.search_query),
+            format!(
+                "Local Search: /{}_  Enter search  Esc clear",
+                app.search_query
+            ),
             Color::Yellow,
         ));
     }
@@ -2605,11 +2625,11 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     } else if app.global_search_running {
         Some("repo search running".to_string())
     } else if app.search_active {
-        Some(format!("filter: /{}_", app.search_query))
+        Some(format!("local-search: /{}_", app.search_query))
     } else if app.search_query.is_empty() {
         None
     } else {
-        Some(format!("filter: /{}", app.search_query))
+        Some(format!("local-search: /{}", app.search_query))
     };
     let (mouse, text_selection_state) = footer_mouse_shortcut(app);
 
@@ -2695,7 +2715,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "[ ]", "results", Color::Cyan);
                 push_footer_pair(spans, "g/G", "ends", Color::Cyan);
                 push_footer_pair(spans, "enter", "Details", Color::Cyan);
-                push_footer_pair(spans, "/", "filter", Color::Yellow);
+                push_footer_pair(spans, "/", "search", Color::Yellow);
                 if app.is_global_search_results_view() {
                     push_footer_pair(spans, "esc", "back", Color::Cyan);
                 }
@@ -3480,7 +3500,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("r", "refresh from GitHub"),
         help_key_line("Tab / Shift+Tab", "switch the focused tab group"),
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
-        help_key_line("/", "start list filtering or Details comment search"),
+        help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line(
             "Esc in Search results",
@@ -6752,6 +6772,11 @@ fn push_markdown_block(
     segments: Vec<DetailSegment>,
 ) {
     let gap_before = markdown_gap_before(blocks.last(), quote_depth, kind);
+    let segments = if quote_depth > 0 {
+        muted_quote_segments(segments)
+    } else {
+        segments
+    };
     blocks.push(MarkdownBlock {
         quote_depth,
         kind,
@@ -6769,7 +6794,7 @@ fn markdown_gap_before(
         return false;
     };
     if previous.quote_depth != quote_depth {
-        return false;
+        return previous.quote_depth > quote_depth;
     }
     !matches!(
         (previous.kind, kind),
@@ -6780,6 +6805,13 @@ fn markdown_gap_before(
                 MarkdownBlockKind::Code { .. }
             )
     )
+}
+
+fn muted_quote_segments(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
+    for segment in &mut segments {
+        segment.style = segment.style.fg(Color::Gray);
+    }
+    segments
 }
 
 fn quote_prefix(depth: u8) -> Vec<DetailSegment> {
@@ -7486,6 +7518,33 @@ fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
     values
 }
 
+fn item_supports_details_memory(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
+}
+
+fn details_snapshot_hash(item: &WorkItem) -> String {
+    let value = serde_json::json!({
+        "kind": item.kind,
+        "repo": &item.repo,
+        "number": item.number,
+        "title": &item.title,
+        "body": &item.body,
+        "author": &item.author,
+        "state": &item.state,
+        "url": &item.url,
+        "updated_at": &item.updated_at,
+        "labels": &item.labels,
+        "comments_count": item.comments,
+    });
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    format!("{:x}", md5::compute(bytes))
+}
+
+fn comments_snapshot_hash(comments: &[CommentPreview]) -> String {
+    let bytes = serde_json::to_vec(comments).unwrap_or_default();
+    format!("{:x}", md5::compute(bytes))
+}
+
 fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog {
     match mode {
         PendingCommentMode::Post => message_dialog(
@@ -7528,6 +7587,23 @@ impl AppState {
         let focus = FocusTarget::from_state_str(&ui_state.focus);
         let details_scroll = ui_state.details_scroll;
         let selected_comment_index = ui_state.selected_comment_index;
+        let conversation_details_state = ui_state
+            .details_scroll_by_item
+            .iter()
+            .map(|(item_id, details_scroll)| {
+                (
+                    item_id.clone(),
+                    ConversationDetailsState {
+                        details_scroll: *details_scroll,
+                        selected_comment_index: ui_state
+                            .selected_comment_index_by_item
+                            .get(item_id)
+                            .copied()
+                            .unwrap_or(0),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let mut state = Self {
             active_view,
             sections,
@@ -7560,8 +7636,12 @@ impl AppState {
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
+            conversation_details_state,
+            viewed_details_snapshot: ui_state.viewed_details_snapshot.clone(),
+            viewed_comments_snapshot: ui_state.viewed_comments_snapshot.clone(),
             action_hints: HashMap::new(),
             details_stale: HashSet::new(),
+            details_refreshing: HashSet::new(),
             pending_details_load: None,
             notification_read_pending: HashSet::new(),
             selected_comment_index: 0,
@@ -7592,6 +7672,21 @@ impl AppState {
     }
 
     fn ui_state(&self) -> UiState {
+        let mut conversation_details_state = self.conversation_details_state.clone();
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(item) = self.current_item()
+            && item_supports_details_memory(item)
+        {
+            conversation_details_state.insert(
+                item.id.clone(),
+                ConversationDetailsState {
+                    details_scroll: self.details_scroll,
+                    selected_comment_index: self.selected_comment_index,
+                },
+            );
+        }
+
         UiState {
             list_width_percent: self.list_width_percent,
             active_view: self.active_view.clone(),
@@ -7602,6 +7697,16 @@ impl AppState {
             details_scroll: self.details_scroll,
             selected_comment_index: self.selected_comment_index,
             expanded_comments: sorted_strings(&self.expanded_comments),
+            details_scroll_by_item: conversation_details_state
+                .iter()
+                .map(|(item_id, state)| (item_id.clone(), state.details_scroll))
+                .collect(),
+            selected_comment_index_by_item: conversation_details_state
+                .iter()
+                .map(|(item_id, state)| (item_id.clone(), state.selected_comment_index))
+                .collect(),
+            viewed_details_snapshot: self.viewed_details_snapshot.clone(),
+            viewed_comments_snapshot: self.viewed_comments_snapshot.clone(),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
         }
@@ -7789,15 +7894,18 @@ impl AppState {
             AppMsg::CommentsLoaded { item_id, comments } => match comments {
                 Ok(comments) => {
                     self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(comments));
                     self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
                 }
                 Err(error) => {
                     if self.setup_dialog.is_none() {
                         self.setup_dialog = setup_dialog_from_error(&error);
                     }
                     self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
                     self.details
                         .insert(item_id.clone(), DetailState::Error(error));
                 }
@@ -7845,8 +7953,11 @@ impl AppState {
                 Ok(comments) => {
                     self.selected_comment_index = comments.len().saturating_sub(1);
                     self.details_stale.remove(&item_id);
-                    self.details.insert(item_id, DetailState::Loaded(comments));
+                    self.details_refreshing.remove(&item_id);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Loaded(comments));
                     self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
                     self.status = "comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
@@ -7880,8 +7991,11 @@ impl AppState {
                     self.selected_comment_index =
                         comment_index.min(comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
-                    self.details.insert(item_id, DetailState::Loaded(comments));
+                    self.details_refreshing.remove(&item_id);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Loaded(comments));
                     self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
                     self.status = "comment updated".to_string();
                     self.message_dialog = Some(success_message_dialog(
@@ -8131,7 +8245,7 @@ impl AppState {
         let Some(item) = self.current_item() else {
             return;
         };
-        if !matches!(item.kind, ItemKind::Notification) || !item.unread.unwrap_or(false) {
+        if !item.unread.unwrap_or(false) {
             return;
         }
 
@@ -8158,8 +8272,7 @@ impl AppState {
         let filtered_indices = self.filtered_indices(section);
         let item_index = filtered_indices.get(position)?;
         let item = section.items.get(*item_index)?;
-        (matches!(item.kind, ItemKind::Notification) && item.unread.unwrap_or(false))
-            .then(|| item.id.clone())
+        item.unread.unwrap_or(false).then(|| item.id.clone())
     }
 
     fn apply_notification_read_local(&mut self, thread_id: &str) -> bool {
@@ -8483,6 +8596,9 @@ impl AppState {
         if self.details.contains_key(&item.id) && !should_refresh {
             return false;
         }
+        if should_refresh {
+            self.details_refreshing.insert(item.id.clone());
+        }
         if !self.details.contains_key(&item.id) {
             self.details.insert(item.id.clone(), DetailState::Loading);
         }
@@ -8499,6 +8615,7 @@ impl AppState {
     }
 
     fn switch_view(&mut self, view: impl Into<String>) {
+        self.save_current_conversation_details_state();
         let view = view.into();
         let focus = self.focus;
         self.active_view = view;
@@ -8541,6 +8658,7 @@ impl AppState {
     }
 
     fn focus_primary_list(&mut self) {
+        self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         if self.details_mode != DetailsMode::Diff {
             self.details_scroll = 0;
@@ -8560,6 +8678,7 @@ impl AppState {
     }
 
     fn focus_ghr(&mut self) {
+        self.save_current_conversation_details_state();
         self.focus = FocusTarget::Ghr;
         self.search_active = false;
         self.comment_search_active = false;
@@ -8570,6 +8689,7 @@ impl AppState {
     }
 
     fn focus_sections(&mut self) {
+        self.save_current_conversation_details_state();
         self.focus = FocusTarget::Sections;
         self.search_active = false;
         self.comment_search_active = false;
@@ -8585,6 +8705,7 @@ impl AppState {
         if len == 0 {
             return;
         }
+        self.save_current_conversation_details_state();
         let current = self.current_section_position().min(len - 1);
         let next = move_wrapping(current, len, delta);
         self.set_current_section_position(next);
@@ -8605,6 +8726,7 @@ impl AppState {
         if len == 0 {
             return;
         }
+        self.save_current_conversation_details_state();
         self.set_current_section_position(index.min(len - 1));
         self.set_current_selected_position(0);
         self.clear_current_list_scroll_offset();
@@ -8628,6 +8750,7 @@ impl AppState {
         if len == 0 {
             return;
         }
+        self.save_current_conversation_details_state();
         let current = self.current_selected_position().min(len - 1);
         self.set_current_selected_position(move_bounded(current, len, delta));
         self.clear_current_list_scroll_offset();
@@ -8641,6 +8764,7 @@ impl AppState {
     }
 
     fn set_selection(&mut self, index: usize) {
+        self.save_current_conversation_details_state();
         self.set_current_selected_position(index);
         self.clear_current_list_scroll_offset();
         self.details_scroll = 0;
@@ -9039,6 +9163,7 @@ impl AppState {
         };
         let len = self.filtered_indices(section).len();
         if len > 0 {
+            self.save_current_conversation_details_state();
             self.set_current_selected_position(len - 1);
             self.details_scroll = 0;
             self.selected_comment_index = 0;
@@ -9052,11 +9177,19 @@ impl AppState {
 
     fn focus_details(&mut self) {
         if self.current_item().is_some() {
+            if self.details_mode == DetailsMode::Conversation {
+                self.restore_current_conversation_details_state();
+            }
             self.focus = FocusTarget::Details;
             self.search_active = false;
             self.comment_search_active = false;
             self.global_search_active = false;
-            self.clamp_selected_comment();
+            if self.current_comments().is_some() {
+                self.clamp_selected_comment();
+            }
+            if self.details_mode == DetailsMode::Conversation {
+                self.mark_current_details_viewed();
+            }
             self.status = "details focused".to_string();
         } else {
             self.status = "nothing to focus".to_string();
@@ -9095,6 +9228,7 @@ impl AppState {
         }
 
         let item_id = item.id.clone();
+        self.save_current_conversation_details_state();
         let loading = !self.diffs.contains_key(&item_id);
         let saved_diff_state = self.diff_mode_state.get(&item_id).cloned();
         if let Some(saved) = saved_diff_state.as_ref() {
@@ -9203,6 +9337,7 @@ impl AppState {
     }
 
     fn focus_list(&mut self) {
+        self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         self.status = if self.details_mode == DetailsMode::Diff {
             "files focused".to_string()
@@ -9748,6 +9883,7 @@ impl AppState {
     }
 
     fn start_global_search_input(&mut self) {
+        self.save_current_conversation_details_state();
         if !self.is_global_search_results_view() {
             self.global_search_return_view = Some(self.active_view.clone());
         }
@@ -9821,6 +9957,7 @@ impl AppState {
     }
 
     fn start_search(&mut self) {
+        self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         self.search_active = true;
         self.global_search_active = false;
@@ -9832,6 +9969,7 @@ impl AppState {
     }
 
     fn clear_search(&mut self) {
+        self.save_current_conversation_details_state();
         self.search_active = false;
         self.global_search_active = false;
         self.search_query.clear();
@@ -9842,6 +9980,7 @@ impl AppState {
     }
 
     fn push_search_char(&mut self, value: char) {
+        self.save_current_conversation_details_state();
         self.search_query.push(value);
         self.set_current_selected_position(0);
         self.details_scroll = 0;
@@ -9849,6 +9988,7 @@ impl AppState {
     }
 
     fn pop_search_char(&mut self) {
+        self.save_current_conversation_details_state();
         self.search_query.pop();
         self.set_current_selected_position(0);
         self.details_scroll = 0;
@@ -9990,6 +10130,104 @@ impl AppState {
         match self.details.get(&item.id) {
             Some(DetailState::Loaded(comments)) => Some(comments),
             _ => None,
+        }
+    }
+
+    fn loaded_comments_for_item(&self, item_id: &str) -> Option<&[CommentPreview]> {
+        match self.details.get(item_id) {
+            Some(DetailState::Loaded(comments)) => Some(comments.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn details_snapshot_hash_for_item(&self, item: &WorkItem) -> String {
+        details_snapshot_hash(item)
+    }
+
+    fn item_has_unseen_details(&self, item: &WorkItem) -> bool {
+        if !item_supports_details_memory(item) {
+            return false;
+        }
+        if self
+            .viewed_details_snapshot
+            .get(&item.id)
+            .is_some_and(|viewed| viewed != &self.details_snapshot_hash_for_item(item))
+        {
+            return true;
+        }
+        self.loaded_comments_for_item(&item.id)
+            .is_some_and(|comments| {
+                self.viewed_comments_snapshot
+                    .get(&item.id)
+                    .is_some_and(|viewed| viewed != &comments_snapshot_hash(comments))
+            })
+    }
+
+    fn mark_current_details_viewed(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if !item_supports_details_memory(&item)
+            || self.details_stale.contains(&item.id)
+            || self.details_refreshing.contains(&item.id)
+        {
+            return;
+        }
+        self.viewed_details_snapshot
+            .insert(item.id.clone(), self.details_snapshot_hash_for_item(&item));
+        let comments_hash = self
+            .loaded_comments_for_item(&item.id)
+            .map(comments_snapshot_hash);
+        if let Some(hash) = comments_hash {
+            self.viewed_comments_snapshot.insert(item.id.clone(), hash);
+        }
+    }
+
+    fn mark_current_details_viewed_if_current(&mut self, item_id: &str) {
+        if self.focus != FocusTarget::Details || self.details_mode != DetailsMode::Conversation {
+            return;
+        }
+        if self
+            .current_item()
+            .is_some_and(|item| item.id.as_str() == item_id)
+        {
+            self.mark_current_details_viewed();
+        }
+    }
+
+    fn save_current_conversation_details_state(&mut self) {
+        if self.details_mode != DetailsMode::Conversation {
+            return;
+        }
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        if !item_supports_details_memory(item) {
+            return;
+        }
+        let item_id = item.id.clone();
+        self.conversation_details_state.insert(
+            item_id,
+            ConversationDetailsState {
+                details_scroll: self.details_scroll,
+                selected_comment_index: self.selected_comment_index,
+            },
+        );
+    }
+
+    fn restore_current_conversation_details_state(&mut self) {
+        if self.details_mode != DetailsMode::Conversation {
+            return;
+        }
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        if let Some(state) = self.conversation_details_state.get(&item.id).copied() {
+            self.details_scroll = state.details_scroll;
+            self.selected_comment_index = state.selected_comment_index;
+            if self.current_comments().is_some() {
+                self.clamp_selected_comment();
+            }
         }
     }
 
@@ -11873,6 +12111,10 @@ diff --git a/src/github.rs b/src/github.rs
             details_scroll: 7,
             selected_comment_index: 2,
             expanded_comments: Vec::new(),
+            details_scroll_by_item: HashMap::new(),
+            selected_comment_index_by_item: HashMap::new(),
+            viewed_details_snapshot: HashMap::new(),
+            viewed_comments_snapshot: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
         };
@@ -11895,6 +12137,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(saved.focus, "details");
         assert_eq!(saved.details_mode, "conversation");
         assert_eq!(saved.details_scroll, 7);
+        assert_eq!(saved.details_scroll_by_item.get("issue-2"), Some(&7));
+        assert_eq!(
+            saved.selected_comment_index_by_item.get("issue-2"),
+            Some(&2)
+        );
     }
 
     #[test]
@@ -11921,6 +12168,68 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(saved.details_mode, "diff");
         assert_eq!(saved.selected_diff_file.get("1"), Some(&2));
         assert_eq!(saved.selected_diff_line.get("1"), Some(&7));
+    }
+
+    #[test]
+    fn conversation_details_position_is_restored_per_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+
+        app.move_selection(1);
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.selected_comment_index, 0);
+
+        app.move_selection(-1);
+        app.focus_details();
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn viewed_details_snapshot_marks_unseen_comment_updates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "old", None)]),
+        );
+        app.focus_details();
+        assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+
+        app.focus_list();
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Ok(vec![
+                comment("alice", "old", None),
+                comment("bob", "new", None),
+            ]),
+        });
+        assert!(app.item_has_unseen_details(app.current_item().expect("item")));
+
+        app.focus_details();
+        assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+    }
+
+    #[test]
+    fn viewed_details_snapshot_marks_unseen_list_metadata_updates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+
+        app.sections[0].items[0].comments = Some(3);
+
+        assert!(app.item_has_unseen_details(app.current_item().expect("item")));
     }
 
     #[test]
@@ -12487,7 +12796,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(
             text.contains("List items  j/k move  pg page  [ ] results  g/G ends  enter Details")
         );
-        assert!(text.contains("/ filter"));
+        assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
         assert!(text.contains("M/C/A pr action"));
         assert!(
@@ -12817,7 +13126,7 @@ diff --git a/src/github.rs b/src/github.rs
             .expect("draw");
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert!(rendered.contains("Filter: /borrow_  Enter apply  Esc clear"));
+        assert!(rendered.contains("Local Search: /borrow_  Enter search  Esc clear"));
     }
 
     #[test]
@@ -13474,6 +13783,7 @@ diff --git a/src/github.rs b/src/github.rs
         let quote_lines = rendered
             .iter()
             .take_while(|line| !line.contains("normal reply"))
+            .filter(|line| !line.is_empty())
             .collect::<Vec<_>>();
 
         assert!(
@@ -13484,7 +13794,30 @@ diff --git a/src/github.rs b/src/github.rs
             quote_lines.iter().all(|line| line.starts_with("│ ")),
             "each wrapped quote line should keep the quote marker: {quote_lines:?}"
         );
-        assert!(rendered.iter().any(|line| line == "normal reply"));
+        let quoted_text = document.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("quoted"))
+            .expect("quoted text span");
+        assert_eq!(quoted_text.style.fg, Some(Color::Gray));
+        let normal_index = rendered
+            .iter()
+            .position(|line| line == "normal reply")
+            .expect("normal reply line");
+        assert_eq!(
+            rendered
+                .get(normal_index.saturating_sub(1))
+                .map(String::as_str),
+            Some(""),
+            "normal paragraph should be separated from the quoted block: {rendered:?}"
+        );
+        assert!(
+            document.lines[normal_index]
+                .spans
+                .iter()
+                .all(|span| span.style.fg != Some(Color::Gray)),
+            "normal paragraph should keep the regular text color"
+        );
     }
 
     #[test]
@@ -15292,6 +15625,33 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn current_repo_tab_can_lead_configured_repo_tabs() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "runnel".to_string(),
+            repo: "chenyukang/runnel".to_string(),
+            show_prs: true,
+            show_issues: true,
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            show_prs: true,
+            show_issues: true,
+        });
+        let app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        let repo_tabs = app
+            .view_tabs()
+            .into_iter()
+            .filter(|view| view.key.starts_with("repo:"))
+            .map(|view| view.label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(repo_tabs, vec!["runnel", "Fiber"]);
+    }
+
+    #[test]
     fn mouse_clicking_section_tab_switches_section_and_focuses_sections() {
         let sections = vec![
             SectionSnapshot {
@@ -15603,6 +15963,70 @@ diff --git a/c.rs b/c.rs
             app.selected_diff_file.get("1"),
             Some(&(MOUSE_DIFF_FILE_SCROLL_LINES as usize))
         );
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn event_batch_coalesces_diff_file_list_wheel_to_one_file() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/c.rs b/c.rs
+--- a/c.rs
++++ b/c.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/d.rs b/d.rs
+--- a/d.rs
++++ b/d.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let config = Config::default();
+        let paths = test_paths();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let area = Rect::new(0, 0, 120, 40);
+        let files_area = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let inner = block_inner(files_area);
+        let events = (0..100)
+            .map(|_| {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: inner.x + 2,
+                    row: inner.y + 1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                })
+            })
+            .collect();
+
+        assert!(!handle_event_batch(
+            &mut app, events, area, &config, &paths, &store, &tx
+        ));
+
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
         assert_eq!(app.details_scroll, 0);
     }
 
@@ -16266,6 +16690,88 @@ diff --git a/c.rs b/c.rs
     }
 
     #[test]
+    fn pull_request_notification_enter_and_v_open_diff_context() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:reviews".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Review requested".to_string(),
+            filters: "reason:review-requested".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert_eq!(
+            app.current_item().map(|item| item.kind),
+            Some(ItemKind::PullRequest)
+        );
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::Details);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.status, "loading diff");
+    }
+
+    #[test]
+    fn pull_request_notification_click_focuses_pr_details() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:reviews".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Review requested".to_string(),
+            filters: "reason:review-requested".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        let area = Rect::new(0, 0, 100, 40);
+        let table = body_areas(body_area(area))[0];
+        let inner = block_inner(table);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 4,
+                row: inner.y + TABLE_HEADER_HEIGHT,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(
+            app.current_item().map(|item| item.kind),
+            Some(ItemKind::PullRequest)
+        );
+    }
+
+    #[test]
     fn three_focuses_primary_list_without_changing_page() {
         let sections = vec![
             SectionSnapshot {
@@ -16491,7 +16997,7 @@ diff --git a/c.rs b/c.rs
     fn notification_item(id: &str, unread: bool) -> WorkItem {
         WorkItem {
             id: id.to_string(),
-            kind: ItemKind::Notification,
+            kind: ItemKind::PullRequest,
             repo: "rust-lang/rust".to_string(),
             number: Some(1),
             title: format!("Notification {id}"),

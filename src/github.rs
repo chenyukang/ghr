@@ -744,6 +744,9 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    if should_default_global_search_to_title(&tokens) {
+        tokens.push("in:title".to_string());
+    }
     if !tokens.iter().any(|token| token.starts_with("repo:"))
         && let Some(repo) = repo_scope.map(str::trim).filter(|repo| !repo.is_empty())
     {
@@ -756,6 +759,22 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         tokens.push("sort:updated-desc".to_string());
     }
     tokens.join(" ")
+}
+
+fn should_default_global_search_to_title(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| is_plain_search_term(token))
+        && !tokens
+            .iter()
+            .any(|token| token.starts_with("in:") || token.starts_with("-in:"))
+}
+
+fn is_plain_search_term(token: &str) -> bool {
+    let token = token.trim_matches('"');
+    if token.is_empty() {
+        return false;
+    }
+    let token = token.strip_prefix('-').unwrap_or(token);
+    !token.contains(':')
 }
 
 fn search_fields(kind: SectionKind) -> &'static str {
@@ -1722,10 +1741,11 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         .as_deref()
         .and_then(extract_trailing_number);
     let url = notification_url(notification, number);
+    let kind = notification_item_kind(&notification.subject.subject_type);
 
     WorkItem {
         id: notification.id.clone(),
-        kind: ItemKind::Notification,
+        kind,
         repo: notification.repository.full_name.clone(),
         number,
         title: notification.subject.title.clone(),
@@ -1739,6 +1759,14 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
         extra: Some(notification.subject.subject_type.clone()),
+    }
+}
+
+fn notification_item_kind(subject_type: &str) -> ItemKind {
+    match subject_type {
+        "PullRequest" => ItemKind::PullRequest,
+        "Issue" => ItemKind::Issue,
+        _ => ItemKind::Notification,
     }
 }
 
@@ -2006,14 +2034,48 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_notification_maps_to_pull_request_item() {
+        let item = notification_to_work_item(&NotificationRaw {
+            id: "thread-1".to_string(),
+            unread: true,
+            reason: "review_requested".to_string(),
+            updated_at: None,
+            subject: NotificationSubjectRaw {
+                title: "Add fee support".to_string(),
+                url: Some("https://api.github.com/repos/owner/repo/pulls/42".to_string()),
+                subject_type: "PullRequest".to_string(),
+            },
+            repository: NotificationRepositoryRaw {
+                full_name: "owner/repo".to_string(),
+                html_url: "https://github.com/owner/repo".to_string(),
+            },
+        });
+
+        assert_eq!(item.kind, ItemKind::PullRequest);
+        assert_eq!(item.number, Some(42));
+        assert_eq!(item.url, "https://github.com/owner/repo/pull/42");
+        assert_eq!(item.unread, Some(true));
+        assert_eq!(item.reason.as_deref(), Some("review-requested"));
+        assert_eq!(item.extra.as_deref(), Some("PullRequest"));
+    }
+
+    #[test]
     fn global_search_filters_add_default_sort_and_archive_filter() {
         assert_eq!(
             global_search_filters("fiber rpc", None),
-            "fiber rpc archived:false sort:updated-desc"
+            "fiber rpc in:title archived:false sort:updated-desc"
         );
         assert_eq!(
             global_search_filters("fiber archived:true sort:created-desc", None),
-            "fiber archived:true sort:created-desc"
+            "fiber archived:true sort:created-desc in:title"
+        );
+        assert_eq!(
+            global_search_filters("fiber in:body", None),
+            "fiber in:body archived:false sort:updated-desc"
+        );
+        assert_eq!(
+            global_search_filters("author:chenyukang", None),
+            "author:chenyukang archived:false sort:updated-desc"
         );
     }
 
@@ -2021,11 +2083,11 @@ mod tests {
     fn global_search_filters_scope_to_current_repo_when_available() {
         assert_eq!(
             global_search_filters("payment channel", Some("nervosnetwork/fiber")),
-            "payment channel repo:nervosnetwork/fiber archived:false sort:updated-desc"
+            "payment channel in:title repo:nervosnetwork/fiber archived:false sort:updated-desc"
         );
         assert_eq!(
             global_search_filters("rpc repo:rust-lang/rust", Some("nervosnetwork/fiber")),
-            "rpc repo:rust-lang/rust archived:false sort:updated-desc"
+            "rpc repo:rust-lang/rust in:title archived:false sort:updated-desc"
         );
     }
 

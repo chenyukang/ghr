@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
 futures = "0.3"
+md5 = "0.7"
 open = "5"
 pulldown-cmark = "0.13"
 ratatui = "0.30"

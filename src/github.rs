@@ -14,8 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
-    builtin_view_key, global_search_view_key, repo_section_filters, repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, ReviewCommentPreview, SectionKind,
+    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key, repo_section_filters,
+    repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -117,6 +118,20 @@ struct IssueCommentRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct PullRequestReviewCommentRaw {
+    id: Option<u64>,
+    body: Option<String>,
+    html_url: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    user: Option<SearchAuthorRaw>,
+    path: Option<String>,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    side: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestMergeStatusRaw {
     is_draft: Option<bool>,
@@ -195,6 +210,16 @@ enum PullRequestCheckContextRaw {
 #[derive(Debug, Deserialize)]
 struct PullRequestViewerReviewRaw {
     state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHeadRaw {
+    head: PullRequestHeadRefRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHeadRefRaw {
+    sha: String,
 }
 
 pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
@@ -750,6 +775,18 @@ fn search_fields(kind: SectionKind) -> &'static str {
     }
 }
 
+pub async fn fetch_comments(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<Vec<CommentPreview>> {
+    match kind {
+        ItemKind::PullRequest => fetch_pull_request_comments(repository, number).await,
+        ItemKind::Issue => fetch_issue_comments(repository, number).await,
+        ItemKind::Notification => Ok(Vec::new()),
+    }
+}
+
 pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<CommentPreview>> {
     let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
     let output = run_gh_json(&[
@@ -767,6 +804,36 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<C
         }
     };
     parse_issue_comments_output(&output, repository, number, viewer_login.as_deref())
+}
+
+pub async fn fetch_pull_request_comments(
+    repository: &str,
+    number: u64,
+) -> Result<Vec<CommentPreview>> {
+    let mut comments = fetch_issue_comments(repository, number).await?;
+    let path = format!("repos/{repository}/pulls/{number}/comments?per_page=100");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+    ])
+    .await?;
+    let viewer_login = match cached_viewer_login().await {
+        Ok(login) => Some(login),
+        Err(error) => {
+            warn!(error = %error, "failed to resolve current GitHub user for review comment ownership");
+            None
+        }
+    };
+    comments.append(&mut parse_pull_request_review_comments_output(
+        &output,
+        repository,
+        number,
+        viewer_login.as_deref(),
+    )?);
+    comments.sort_by_key(|comment| comment.created_at);
+    Ok(comments)
 }
 
 pub async fn fetch_pull_request_action_hints(repository: &str, number: u64) -> Result<ActionHints> {
@@ -830,6 +897,18 @@ query($owner: String!, $name: String!, $number: Int!) {
     Ok(pull_request_action_hints(&pr))
 }
 
+pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<String> {
+    let path = format!("repos/{repository}/pulls/{number}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.v3.diff".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to fetch diff for {repository}#{number}"))
+}
+
 pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/{number}/comments");
     run_gh_json(&[
@@ -844,6 +923,77 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullRequestReviewCommentTarget<'a> {
+    pub path: &'a str,
+    pub line: usize,
+    pub side: &'a str,
+    pub start_line: Option<usize>,
+    pub start_side: Option<&'a str>,
+}
+
+pub async fn post_pull_request_review_comment(
+    repository: &str,
+    number: u64,
+    target: PullRequestReviewCommentTarget<'_>,
+    body: &str,
+) -> Result<()> {
+    let pr_path = format!("repos/{repository}/pulls/{number}");
+    let pr_output = run_gh_json(&["api".to_string(), pr_path]).await?;
+    let pr = serde_json::from_str::<PullRequestHeadRaw>(&pr_output)
+        .with_context(|| format!("failed to parse pull request head for {repository}#{number}"))?;
+    let comments_path = format!("repos/{repository}/pulls/{number}/comments");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        comments_path,
+        "-f".to_string(),
+        format!("body={body}"),
+        "-f".to_string(),
+        format!("commit_id={}", pr.head.sha),
+        "-f".to_string(),
+        format!("path={}", target.path),
+        "-F".to_string(),
+        format!("line={}", target.line),
+        "-f".to_string(),
+        format!("side={}", target.side),
+    ];
+    if let Some(start_line) = target.start_line {
+        args.push("-F".to_string());
+        args.push(format!("start_line={start_line}"));
+    }
+    if let Some(start_side) = target.start_side {
+        args.push("-f".to_string());
+        args.push(format!("start_side={start_side}"));
+    }
+
+    run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to post review comment for {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn post_pull_request_review_reply(
+    repository: &str,
+    number: u64,
+    comment_id: u64,
+    body: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/pulls/{number}/comments/{comment_id}/replies");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("body={body}"),
+    ])
+    .await
+    .with_context(|| format!("failed to reply to review comment for {repository}#{number}"))?;
+    Ok(())
+}
+
 pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/comments/{comment_id}");
     run_gh_json(&[
@@ -855,6 +1005,25 @@ pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -
         format!("body={body}"),
     ])
     .await?;
+    Ok(())
+}
+
+pub async fn edit_pull_request_review_comment(
+    repository: &str,
+    comment_id: u64,
+    body: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/pulls/comments/{comment_id}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        path,
+        "-f".to_string(),
+        format!("body={body}"),
+    ])
+    .await
+    .with_context(|| format!("failed to edit review comment {comment_id} in {repository}"))?;
     Ok(())
 }
 
@@ -943,6 +1112,47 @@ fn parse_issue_comments_output(
                 updated_at: comment.updated_at,
                 url: comment.html_url,
                 is_mine,
+                review: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    comments.sort_by_key(|comment| comment.created_at);
+    Ok(comments)
+}
+
+fn parse_pull_request_review_comments_output(
+    output: &str,
+    repository: &str,
+    number: u64,
+    viewer_login: Option<&str>,
+) -> Result<Vec<CommentPreview>> {
+    let pages = serde_json::from_str::<Vec<Vec<PullRequestReviewCommentRaw>>>(output)
+        .with_context(|| format!("failed to parse review comments for {repository}#{number}"))?;
+    let mut comments = pages
+        .into_iter()
+        .flatten()
+        .map(|comment| {
+            let author = comment
+                .user
+                .as_ref()
+                .map(|user| user.login.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
+            CommentPreview {
+                id: comment.id,
+                author,
+                body: comment.body.unwrap_or_default(),
+                created_at: comment.created_at,
+                updated_at: comment.updated_at,
+                url: comment.html_url,
+                is_mine,
+                review: Some(ReviewCommentPreview {
+                    path: comment.path.unwrap_or_else(|| "-".to_string()),
+                    line: comment.line.or(comment.original_line),
+                    side: comment.side,
+                }),
             }
         })
         .collect::<Vec<_>>();
@@ -1008,6 +1218,19 @@ async fn fetch_notifications(limit: usize, include_all: bool) -> Result<Vec<Noti
 
     let output = run_gh_json(&["api".to_string(), path]).await?;
     serde_json::from_str(&output).context("failed to parse gh notifications output")
+}
+
+pub async fn mark_notification_thread_read(thread_id: &str) -> Result<()> {
+    let path = format!("notifications/threads/{thread_id}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to mark notification {thread_id} as read"))?;
+    Ok(())
 }
 
 async fn fetch_viewer_login() -> Result<String> {
@@ -1828,6 +2051,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![false, false, true]
         );
+        assert!(comments.iter().all(|comment| comment.review.is_none()));
+    }
+
+    #[test]
+    fn review_comments_parse_inline_location_and_mark_mine() {
+        let output = r##"
+        [
+          [
+            {
+              "id": 10,
+              "body": "inline",
+              "html_url": "https://github.com/owner/repo/pull/1#discussion_r10",
+              "created_at": "2026-01-02T00:00:00Z",
+              "updated_at": "2026-01-02T00:00:00Z",
+              "user": { "login": "alice" },
+              "path": "src/app.rs",
+              "line": 57,
+              "side": "RIGHT"
+            }
+          ]
+        ]
+        "##;
+
+        let comments =
+            parse_pull_request_review_comments_output(output, "owner/repo", 1, Some("alice"))
+                .unwrap();
+
+        assert_eq!(comments.len(), 1);
+        let comment = &comments[0];
+        assert_eq!(comment.id, Some(10));
+        assert_eq!(comment.author, "alice");
+        assert!(comment.is_mine);
+        let review = comment.review.as_ref().expect("review metadata");
+        assert_eq!(review.path, "src/app.rs");
+        assert_eq!(review.line, Some(57));
+        assert_eq!(review.side.as_deref(), Some("RIGHT"));
     }
 
     #[test]

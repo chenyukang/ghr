@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::model::{SectionKind, SectionSnapshot};
+use crate::model::{SectionKind, SectionSnapshot, mark_notification_read_in_section};
 
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
@@ -140,6 +140,17 @@ impl SnapshotStore {
         Ok(())
     }
 
+    pub fn mark_notification_read(&self, thread_id: &str) -> Result<bool> {
+        let mut changed = false;
+        for mut section in self.load_all()?.into_values() {
+            if mark_notification_read_in_section(&mut section, thread_id) {
+                self.save_section(&section)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
     fn connect(&self) -> Result<Connection> {
         Connection::open(&self.path)
             .with_context(|| format!("failed to open {}", self.path.display()))
@@ -163,4 +174,96 @@ fn ensure_snapshot_column(conn: &Connection, name: &str, definition: &str) -> Re
         .with_context(|| format!("failed to migrate snapshot {name} column"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::model::{ItemKind, WorkItem};
+
+    #[test]
+    fn mark_notification_read_updates_cached_notification_sections() {
+        let path = std::env::temp_dir().join(format!(
+            "ghr-snapshot-notification-read-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        let unread_item = notification_item("thread-1", true);
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![unread_item.clone(), notification_item("thread-2", true)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save unread snapshot");
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![unread_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save all snapshot");
+
+        assert!(
+            store
+                .mark_notification_read("thread-1")
+                .expect("mark notification read")
+        );
+
+        let cached = store.load_all().expect("load cached snapshots");
+        let unread = cached.get("notifications:unread").expect("unread section");
+        assert_eq!(unread.items.len(), 1);
+        assert_eq!(unread.items[0].id, "thread-2");
+        let all = cached.get("notifications:all").expect("all section");
+        assert_eq!(all.items[0].unread, Some(false));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn notification_item(id: &str, unread: bool) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind: ItemKind::Notification,
+            repo: "rust-lang/rust".to_string(),
+            number: Some(1),
+            title: format!("Notification {id}"),
+            body: None,
+            author: None,
+            state: None,
+            url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+            updated_at: None,
+            labels: Vec::new(),
+            comments: None,
+            unread: Some(unread),
+            reason: Some("mention".to_string()),
+            extra: Some("PullRequest".to_string()),
+        }
+    }
 }

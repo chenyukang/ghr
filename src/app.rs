@@ -19,7 +19,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    Block, BorderType, Borders, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
+    Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -28,14 +29,17 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    approve_pull_request, close_pull_request, edit_issue_comment, fetch_issue_comments,
-    fetch_pull_request_action_hints, merge_pull_request, post_issue_comment, refresh_dashboard,
+    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
+    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
+    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_section_page, search_global,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
-    builtin_view_key, configured_sections, global_search_view_key, merge_cached_sections,
-    merge_refreshed_sections, section_counts, section_view_key,
+    builtin_view_key, configured_sections, global_search_view_key,
+    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
+    section_counts, section_view_key,
 };
 use crate::snapshot::SnapshotStore;
 use crate::state::{DEFAULT_LIST_WIDTH_PERCENT, UiState, clamp_list_width_percent};
@@ -51,6 +55,10 @@ enum AppMsg {
         comments: std::result::Result<Vec<CommentPreview>, String>,
         actions: Option<std::result::Result<ActionHints, String>>,
     },
+    DiffLoaded {
+        item_id: String,
+        diff: std::result::Result<PullRequestDiff, String>,
+    },
     CommentPosted {
         item_id: String,
         result: std::result::Result<Vec<CommentPreview>, String>,
@@ -60,10 +68,18 @@ enum AppMsg {
         comment_index: usize,
         result: std::result::Result<Vec<CommentPreview>, String>,
     },
+    ReviewCommentPosted {
+        item_id: String,
+        result: std::result::Result<(), String>,
+    },
     PrActionFinished {
         item_id: String,
         action: PrAction,
         result: std::result::Result<(), String>,
+    },
+    NotificationReadFinished {
+        thread_id: String,
+        result: std::result::Result<Option<String>, String>,
     },
     SectionPageLoaded {
         section_key: String,
@@ -87,6 +103,13 @@ enum DetailState {
 enum ActionHintState {
     Loading,
     Loaded(ActionHints),
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+enum DiffState {
+    Loading,
+    Loaded(PullRequestDiff),
     Error(String),
 }
 
@@ -128,6 +151,21 @@ impl FocusTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailsMode {
+    Conversation,
+    Diff,
+}
+
+impl DetailsMode {
+    fn as_state_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Diff => "diff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupDialog {
     MissingGh,
     AuthRequired,
@@ -139,10 +177,15 @@ enum CommentDialogMode {
     Reply {
         comment_index: usize,
         author: String,
+        review_comment_id: Option<u64>,
     },
     Edit {
         comment_index: usize,
         comment_id: u64,
+        is_review: bool,
+    },
+    Review {
+        target: DiffReviewTarget,
     },
 }
 
@@ -176,20 +219,32 @@ struct PrActionDialog {
 struct MessageDialog {
     title: String,
     body: String,
+    auto_close_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingCommentMode {
     Post,
+    ReviewReply {
+        comment_id: u64,
+    },
     Edit {
         comment_index: usize,
         comment_id: u64,
+        is_review: bool,
+    },
+    Review {
+        target: DiffReviewTarget,
     },
 }
 
 const TABLE_HEADER_HEIGHT: u16 = 2;
+const SUCCESS_DIALOG_AUTO_CLOSE: Duration = Duration::from_secs(1);
 const TAB_DIVIDER_WIDTH: u16 = 3;
-const MOUSE_SCROLL_LINES: u16 = 2;
+const MOUSE_LIST_SCROLL_LINES: u16 = 2;
+const MOUSE_DIFF_FILE_SCROLL_LINES: u16 = 1;
+const MOUSE_DETAILS_SCROLL_LINES: u16 = 1;
+const MOUSE_COMMENT_SCROLL_LINES: u16 = 2;
 const COMMENT_DIALOG_WIDTH_PERCENT: u16 = 72;
 const COMMENT_DIALOG_MIN_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_VERTICAL_MARGIN: u16 = 4;
@@ -207,8 +262,10 @@ struct AppState {
     sections: Vec<SectionSnapshot>,
     section_index: HashMap<String, usize>,
     selected_index: HashMap<String, usize>,
+    list_scroll_offset: HashMap<String, usize>,
     focus: FocusTarget,
     details_scroll: u16,
+    details_mode: DetailsMode,
     list_width_percent: u16,
     dragging_split: bool,
     split_drag_changed: bool,
@@ -221,8 +278,14 @@ struct AppState {
     refreshing: bool,
     last_refresh_request: Instant,
     details: HashMap<String, DetailState>,
+    diffs: HashMap<String, DiffState>,
+    selected_diff_file: HashMap<String, usize>,
+    selected_diff_line: HashMap<String, usize>,
+    diff_mark: HashMap<String, DiffMarkState>,
+    diff_mode_state: HashMap<String, DiffModeState>,
     action_hints: HashMap<String, ActionHintState>,
     details_stale: HashSet<String>,
+    notification_read_pending: HashSet<String>,
     selected_comment_index: usize,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
@@ -232,6 +295,7 @@ struct AppState {
     message_dialog: Option<MessageDialog>,
     mouse_capture_enabled: bool,
     help_dialog: bool,
+    diff_return_state: Option<DiffReturnState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +309,28 @@ struct RefreshAnchor {
     active_view: String,
     section_key: Option<String>,
     item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffReturnState {
+    focus: FocusTarget,
+    details_scroll: u16,
+    selected_comment_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffModeState {
+    focus: FocusTarget,
+    details_scroll: u16,
+    selected_file: usize,
+    selected_line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiffMarkState {
+    anchor: usize,
+    focus: usize,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +407,8 @@ async fn run_loop(
             app.handle_msg(message);
         }
         app.ensure_current_details_loading(tx);
+        app.ensure_current_diff_loading(tx);
+        app.dismiss_expired_message_dialog(Instant::now());
 
         if !app.refreshing
             && config.defaults.refetch_interval_seconds > 0
@@ -336,7 +424,7 @@ async fn run_loop(
         if event::poll(Duration::from_millis(120))? {
             match event::read()? {
                 Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
+                    if key.kind == KeyEventKind::Release {
                         continue;
                     }
 
@@ -349,7 +437,13 @@ async fn run_loop(
                 }
                 Event::Mouse(mouse) => {
                     let size = terminal.size()?;
-                    if handle_mouse(app, mouse, Rect::new(0, 0, size.width, size.height)) {
+                    if handle_mouse_with_sync(
+                        app,
+                        mouse,
+                        Rect::new(0, 0, size.width, size.height),
+                        Some(store),
+                        Some(tx),
+                    ) {
                         save_ui_state(app, paths);
                     }
                 }
@@ -474,12 +568,29 @@ fn start_global_search(
     });
 }
 
+fn start_notification_read_sync(
+    thread_id: String,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let result = match mark_notification_thread_read(&thread_id).await {
+            Ok(()) => match store.mark_notification_read(&thread_id) {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(error.to_string())),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(AppMsg::NotificationReadFinished { thread_id, result });
+    });
+}
+
 fn start_details_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
         let number = item.number;
         let comments = match number {
-            Some(number) => fetch_issue_comments(&item.repo, number)
+            Some(number) => fetch_comments(&item.repo, number, item.kind)
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(Vec::new()),
@@ -500,11 +611,25 @@ fn start_details_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     });
 }
 
+fn start_diff_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let diff = match item.number {
+            Some(number) => match fetch_pull_request_diff(&item.repo, number).await {
+                Ok(diff) => parse_pull_request_diff(&diff),
+                Err(error) => Err(error.to_string()),
+            },
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::DiffLoaded { item_id, diff });
+    });
+}
+
 fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let result = match item.number {
             Some(number) => match post_issue_comment(&item.repo, number, &body).await {
-                Ok(()) => fetch_issue_comments(&item.repo, number)
+                Ok(()) => fetch_comments(&item.repo, number, item.kind)
                     .await
                     .map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
@@ -518,17 +643,47 @@ fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg
     });
 }
 
-fn start_comment_edit(
+fn start_review_reply_submit(
     item: WorkItem,
-    comment_index: usize,
     comment_id: u64,
     body: String,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let result = match item.number {
-            Some(number) => match edit_issue_comment(&item.repo, comment_id, &body).await {
-                Ok(()) => fetch_issue_comments(&item.repo, number)
+            Some(number) => {
+                match post_pull_request_review_reply(&item.repo, number, comment_id, &body).await {
+                    Ok(()) => fetch_comments(&item.repo, number, item.kind)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::CommentPosted {
+            item_id: item.id,
+            result,
+        });
+    });
+}
+
+fn start_comment_edit(
+    item: WorkItem,
+    comment_index: usize,
+    comment_id: u64,
+    is_review: bool,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let result = match item.number {
+            Some(number) => match if is_review {
+                edit_pull_request_review_comment(&item.repo, comment_id, &body).await
+            } else {
+                edit_issue_comment(&item.repo, comment_id, &body).await
+            } {
+                Ok(()) => fetch_comments(&item.repo, number, item.kind)
                     .await
                     .map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
@@ -540,6 +695,35 @@ fn start_comment_edit(
             comment_index,
             result,
         });
+    });
+}
+
+fn start_review_comment_submit(
+    item: WorkItem,
+    target: DiffReviewTarget,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => post_pull_request_review_comment(
+                &item.repo,
+                number,
+                PullRequestReviewCommentTarget {
+                    path: &target.path,
+                    line: target.line,
+                    side: target.side.as_api_value(),
+                    start_line: target.start_line,
+                    start_side: target.start_side.map(DiffReviewSide::as_api_value),
+                },
+                &body,
+            )
+            .await
+            .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewCommentPosted { item_id, result });
     });
 }
 
@@ -676,17 +860,35 @@ fn handle_key_in_area(
         return false;
     }
     if matches!(key.code, KeyCode::Char('m')) {
-        app.toggle_mouse_capture();
+        if !app.mouse_capture_enabled {
+            app.toggle_mouse_capture();
+        } else if app.details_mode == DetailsMode::Diff {
+            if app.focus == FocusTarget::Details {
+                app.toggle_diff_mark();
+            } else {
+                app.status = "mark diff lines from Details; press 4 or enter first".to_string();
+            }
+        } else {
+            app.toggle_mouse_capture();
+        }
+        return false;
+    }
+    if is_diff_key(key) {
+        app.show_diff();
         return false;
     }
 
     match key.code {
+        KeyCode::Char('q') if app.details_mode == DetailsMode::Diff => {
+            app.leave_diff();
+            return false;
+        }
         KeyCode::Char('q') => return true,
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
         KeyCode::Char('S') => app.start_global_search_input(),
-        KeyCode::Tab => app.move_view(1),
-        KeyCode::BackTab => app.move_view(-1),
+        KeyCode::Tab => app.move_focused_tab_group(1),
+        KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
         _ => {}
     }
@@ -707,27 +909,47 @@ fn handle_key_in_area(
             KeyCode::Esc => app.focus_list(),
             _ => {}
         },
+        FocusTarget::List if app.details_mode == DetailsMode::Diff => {
+            handle_diff_file_list_key(app, key, area)
+        }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
             KeyCode::Esc => {}
             KeyCode::Char('/') => app.start_search(),
-            KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_selection(1);
+                app.mark_current_notification_read(store, tx);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_selection(-1);
+                app.mark_current_notification_read(store, tx);
+            }
             KeyCode::PageDown | KeyCode::Char('d') => {
                 app.move_selection(list_page_delta(app, area, 1));
+                app.mark_current_notification_read(store, tx);
             }
             KeyCode::PageUp | KeyCode::Char('u') => {
                 app.move_selection(list_page_delta(app, area, -1));
+                app.mark_current_notification_read(store, tx);
             }
-            KeyCode::Char('g') => app.set_selection(0),
-            KeyCode::Char('G') => app.select_last(),
+            KeyCode::Char('g') => {
+                app.set_selection(0);
+                app.mark_current_notification_read(store, tx);
+            }
+            KeyCode::Char('G') => {
+                app.select_last();
+                app.mark_current_notification_read(store, tx);
+            }
             KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
             KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
-            KeyCode::Enter => app.focus_details(),
+            KeyCode::Enter => {
+                app.focus_details();
+                app.mark_current_notification_read(store, tx);
+            }
             _ => {}
         },
         FocusTarget::Details => match key.code {
@@ -735,9 +957,46 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
-            KeyCode::Char('a') => app.start_new_comment_dialog(),
-            KeyCode::Char('R') => app.start_reply_to_selected_comment(),
-            KeyCode::Char('e') => app.start_edit_selected_comment_dialog(),
+            KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
+                app.start_review_comment_dialog()
+            }
+            KeyCode::Char('c') | KeyCode::Char('a')
+                if app.details_mode == DetailsMode::Conversation =>
+            {
+                app.start_new_comment_dialog()
+            }
+            KeyCode::Char('R') if app.details_mode == DetailsMode::Conversation => {
+                app.start_reply_to_selected_comment()
+            }
+            KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
+                app.start_edit_selected_comment_dialog()
+            }
+            KeyCode::Char('n') if app.details_mode == DetailsMode::Diff => {
+                app.page_diff_lines(1, area)
+            }
+            KeyCode::Char('p') if app.details_mode == DetailsMode::Diff => {
+                app.page_diff_lines(-1, area)
+            }
+            KeyCode::Char(']') if app.details_mode == DetailsMode::Diff => app.move_diff_file(1),
+            KeyCode::Char('[') if app.details_mode == DetailsMode::Diff => app.move_diff_file(-1),
+            KeyCode::Down | KeyCode::Char('j') if app.details_mode == DetailsMode::Diff => {
+                app.move_diff_line(1, area)
+            }
+            KeyCode::Up | KeyCode::Char('k') if app.details_mode == DetailsMode::Diff => {
+                app.move_diff_line(-1, area)
+            }
+            KeyCode::PageDown | KeyCode::Char('d') if app.details_mode == DetailsMode::Diff => {
+                app.page_diff_lines(1, area)
+            }
+            KeyCode::PageUp | KeyCode::Char('u') if app.details_mode == DetailsMode::Diff => {
+                app.page_diff_lines(-1, area)
+            }
+            KeyCode::Char('g') if app.details_mode == DetailsMode::Diff => {
+                app.scroll_diff_details_to_top(area)
+            }
+            KeyCode::Char('G') if app.details_mode == DetailsMode::Diff => {
+                app.scroll_diff_details_to_bottom(area)
+            }
             KeyCode::Char('n') => app.move_comment(1),
             KeyCode::Char('p') => app.move_comment(-1),
             KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
@@ -745,6 +1004,7 @@ fn handle_key_in_area(
             KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
             KeyCode::PageUp | KeyCode::Char('u') => app.scroll_details(-8),
             KeyCode::Char('g') => app.details_scroll = 0,
+            KeyCode::Char('G') => app.scroll_details_to_bottom(area),
             _ => {}
         },
     }
@@ -761,6 +1021,50 @@ fn handle_global_focus_key(app: &mut AppState, key: KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rect>) {
+    match key.code {
+        KeyCode::Esc => app.focus_details(),
+        KeyCode::Char('c') => app.start_review_comment_dialog(),
+        KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
+        KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
+        KeyCode::PageDown | KeyCode::Char('d') => {
+            app.move_diff_file(diff_file_page_delta(app, area, 1));
+        }
+        KeyCode::PageUp | KeyCode::Char('u') => {
+            app.move_diff_file(diff_file_page_delta(app, area, -1));
+        }
+        KeyCode::Char('g') => {
+            if let Some(order) = app.current_diff_file_order() {
+                if let Some(file_index) = order.first() {
+                    app.select_diff_file(*file_index);
+                } else {
+                    app.status = "no diff files".to_string();
+                }
+            } else {
+                app.status = "diff still loading".to_string();
+            }
+        }
+        KeyCode::Char('G') => {
+            if let Some(order) = app.current_diff_file_order() {
+                if let Some(file_index) = order.last() {
+                    app.select_diff_file(*file_index);
+                } else {
+                    app.status = "no diff files".to_string();
+                }
+            } else {
+                app.status = "diff still loading".to_string();
+            }
+        }
+        KeyCode::Char('[') => app.move_diff_file(-1),
+        KeyCode::Char(']') => app.move_diff_file(1),
+        KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
+        KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+        KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Enter => app.focus_details(),
+        _ => {}
+    }
 }
 
 fn trigger_refresh(
@@ -784,7 +1088,18 @@ fn save_ui_state(app: &mut AppState, paths: &Paths) {
     }
 }
 
+#[cfg(test)]
 fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
+    handle_mouse_with_sync(app, mouse, area, None, None)
+}
+
+fn handle_mouse_with_sync(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
+) -> bool {
     if !app.mouse_capture_enabled {
         return false;
     }
@@ -805,10 +1120,10 @@ fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
         if rect_contains(dialog_area, mouse.column, mouse.row) {
             match mouse.kind {
                 MouseEventKind::ScrollDown => {
-                    app.scroll_comment_dialog(MOUSE_SCROLL_LINES as i16, Some(area))
+                    app.scroll_comment_dialog(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area))
                 }
                 MouseEventKind::ScrollUp => {
-                    app.scroll_comment_dialog(-(MOUSE_SCROLL_LINES as i16), Some(area))
+                    app.scroll_comment_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area))
                 }
                 _ => {}
             }
@@ -820,14 +1135,26 @@ fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
     let body_area = page[2];
     let body = body_areas_with_ratio(body_area, app.list_width_percent);
     let details_area = body[1];
+    let layout = MouseLayout {
+        view_tabs: page[0],
+        section_tabs: page[1],
+        table: body[0],
+        details: details_area,
+    };
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if splitter_contains(body_area, body[0], details_area, mouse.column, mouse.row) {
+            if splitter_contains(
+                body_area,
+                layout.table,
+                layout.details,
+                mouse.column,
+                mouse.row,
+            ) {
                 app.start_split_drag();
                 return false;
             }
-            handle_left_click(app, mouse, page[0], page[1], body[0], details_area);
+            handle_left_click(app, mouse, layout, store, tx);
         }
         MouseEventKind::Drag(MouseButton::Left) if app.dragging_split => {
             app.update_split_drag(body_area, mouse.column);
@@ -836,17 +1163,20 @@ fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
             app.update_split_drag(body_area, mouse.column);
             return app.finish_split_drag();
         }
-        MouseEventKind::ScrollDown if rect_contains(body[0], mouse.column, mouse.row) => {
-            handle_list_scroll(app, MOUSE_SCROLL_LINES as isize);
+        MouseEventKind::ScrollDown if rect_contains(layout.table, mouse.column, mouse.row) => {
+            handle_list_scroll(app, layout.table, mouse_list_scroll_delta(app, 1));
         }
-        MouseEventKind::ScrollUp if rect_contains(body[0], mouse.column, mouse.row) => {
-            handle_list_scroll(app, -(MOUSE_SCROLL_LINES as isize));
+        MouseEventKind::ScrollUp if rect_contains(layout.table, mouse.column, mouse.row) => {
+            handle_list_scroll(app, layout.table, mouse_list_scroll_delta(app, -1));
         }
-        MouseEventKind::ScrollDown if rect_contains(details_area, mouse.column, mouse.row) => {
-            handle_details_scroll(app, details_area, MOUSE_SCROLL_LINES as i16);
+        MouseEventKind::ScrollDown if rect_contains(layout.details, mouse.column, mouse.row) => {
+            handle_details_scroll(app, layout.details, MOUSE_DETAILS_SCROLL_LINES as i16);
         }
-        MouseEventKind::ScrollUp if rect_contains(details_area, mouse.column, mouse.row) => {
-            handle_details_scroll(app, details_area, -(MOUSE_SCROLL_LINES as i16));
+        MouseEventKind::ScrollUp if rect_contains(layout.details, mouse.column, mouse.row) => {
+            handle_details_scroll(app, layout.details, -(MOUSE_DETAILS_SCROLL_LINES as i16));
+        }
+        MouseEventKind::Moved if rect_contains(layout.table, mouse.column, mouse.row) => {
+            handle_table_hover(app, mouse, layout.table, store, tx);
         }
         _ => {}
     }
@@ -854,15 +1184,22 @@ fn handle_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MouseLayout {
+    view_tabs: Rect,
+    section_tabs: Rect,
+    table: Rect,
+    details: Rect,
+}
+
 fn handle_left_click(
     app: &mut AppState,
     mouse: MouseEvent,
-    view_tabs_area: Rect,
-    section_tabs_area: Rect,
-    table_area: Rect,
-    details_area: Rect,
+    layout: MouseLayout,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
 ) {
-    if let Some(view) = view_tab_at(app, view_tabs_area, mouse.column, mouse.row) {
+    if let Some(view) = view_tab_at(app, layout.view_tabs, mouse.column, mouse.row) {
         app.switch_view(view);
         app.focus = FocusTarget::Ghr;
         app.search_active = false;
@@ -871,17 +1208,17 @@ fn handle_left_click(
         return;
     }
 
-    if let Some(section_index) = section_tab_at(app, section_tabs_area, mouse.column, mouse.row) {
+    if let Some(section_index) = section_tab_at(app, layout.section_tabs, mouse.column, mouse.row) {
         app.select_section(section_index);
         return;
     }
 
-    if rect_contains(table_area, mouse.column, mouse.row) {
-        handle_table_click(app, mouse, table_area);
+    if rect_contains(layout.table, mouse.column, mouse.row) {
+        handle_table_click(app, mouse, layout.table, store, tx);
         return;
     }
 
-    if !rect_contains(details_area, mouse.column, mouse.row) {
+    if !rect_contains(layout.details, mouse.column, mouse.row) {
         return;
     }
 
@@ -889,7 +1226,7 @@ fn handle_left_click(
     app.search_active = false;
     app.global_search_active = false;
 
-    let inner = block_inner(details_area);
+    let inner = block_inner(layout.details);
     if !rect_contains(inner, mouse.column, mouse.row) {
         return;
     }
@@ -897,6 +1234,12 @@ fn handle_left_click(
     let document = build_details_document(app, inner.width);
     let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
     let column = mouse.column - inner.x;
+    if app.details_mode == DetailsMode::Diff
+        && let Some(diff_line) = document.diff_line_at(line_index)
+    {
+        app.handle_diff_line_click(diff_line, None);
+        return;
+    }
     if let Some(comment_index) = document.comment_at(line_index) {
         app.select_comment(comment_index);
     }
@@ -928,11 +1271,24 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
     app.details_scroll = app.details_scroll.min(max_scroll);
 }
 
-fn handle_list_scroll(app: &mut AppState, delta: isize) {
+fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
     app.focus = FocusTarget::List;
     app.search_active = false;
     app.global_search_active = false;
-    app.move_selection(delta);
+    if app.details_mode == DetailsMode::Diff {
+        app.move_diff_file(delta);
+    } else {
+        app.scroll_list_viewport(area, delta);
+    }
+}
+
+fn mouse_list_scroll_delta(app: &AppState, direction: isize) -> isize {
+    let lines = if app.details_mode == DetailsMode::Diff {
+        MOUSE_DIFF_FILE_SCROLL_LINES
+    } else {
+        MOUSE_LIST_SCROLL_LINES
+    };
+    direction.saturating_mul(lines as isize)
 }
 
 fn list_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
@@ -941,6 +1297,23 @@ fn list_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isiz
             let body = body_areas_with_ratio(page_areas(area)[2], app.list_width_percent);
             usize::from(table_visible_rows(body[0]).max(1))
         })
+        .unwrap_or(10);
+    direction.saturating_mul(rows as isize)
+}
+
+fn diff_file_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
+    let rows = area
+        .map(|area| {
+            let body = body_areas_with_ratio(page_areas(area)[2], app.list_width_percent);
+            usize::from(block_inner(body[0]).height.max(1))
+        })
+        .unwrap_or(10);
+    direction.saturating_mul(rows as isize)
+}
+
+fn diff_line_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
+    let rows = area
+        .map(|area| usize::from(block_inner(details_area_for(app, area)).height.max(1)))
         .unwrap_or(10);
     direction.saturating_mul(rows as isize)
 }
@@ -955,13 +1328,70 @@ fn max_details_scroll(app: &AppState, area: Rect) -> u16 {
     max.min(usize::from(u16::MAX)) as u16
 }
 
-fn handle_table_click(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+fn handle_table_click(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
+) {
+    if app.details_mode == DetailsMode::Diff {
+        let Some(file_index) = diff_file_row_at(app, area, mouse.row) else {
+            return;
+        };
+        app.select_diff_file(file_index);
+        app.focus = FocusTarget::Details;
+        return;
+    }
+
     let Some(position) = table_row_at(app, area, mouse.row) else {
         return;
     };
 
     app.set_selection(position);
     app.focus_details();
+    mark_current_notification_read_if_possible(app, store, tx);
+}
+
+fn handle_table_hover(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
+) {
+    if app.details_mode == DetailsMode::Diff {
+        return;
+    }
+
+    let Some(position) = table_row_at(app, area, mouse.row) else {
+        return;
+    };
+
+    if let Some(thread_id) = app.notification_thread_id_at_position(position) {
+        mark_notification_read_if_possible(app, thread_id, store, tx);
+    }
+}
+
+fn mark_current_notification_read_if_possible(
+    app: &mut AppState,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
+) {
+    if let (Some(store), Some(tx)) = (store, tx) {
+        app.mark_current_notification_read(store, tx);
+    }
+}
+
+fn mark_notification_read_if_possible(
+    app: &mut AppState,
+    thread_id: String,
+    store: Option<&SnapshotStore>,
+    tx: Option<&UnboundedSender<AppMsg>>,
+) {
+    if let (Some(store), Some(tx)) = (store, tx) {
+        app.mark_notification_read(thread_id, store, tx);
+    }
 }
 
 fn table_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize> {
@@ -982,21 +1412,45 @@ fn table_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize> {
         return None;
     }
 
-    let offset = table_viewport_offset(app.current_selected_position(), usize::from(visible_rows));
+    let offset = app.current_list_scroll_offset(filtered_len, usize::from(visible_rows));
     let position = offset + usize::from(row - data_start);
     (position < filtered_len).then_some(position)
+}
+
+fn diff_file_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize> {
+    let item = app.current_item()?;
+    let diff = match app.diffs.get(&item.id)? {
+        DiffState::Loaded(diff) => diff,
+        _ => return None,
+    };
+    let entries = diff_tree_entries(diff);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let inner = block_inner(area);
+    if row < inner.y || row >= inner.y.saturating_add(inner.height) {
+        return None;
+    }
+
+    let selected_file = app.selected_diff_file_index_for(&item.id, diff);
+    let selected_row = diff_tree_row_index_for_file(&entries, selected_file).unwrap_or(0);
+    let visible_rows = usize::from(inner.height.max(1));
+    let offset = table_viewport_offset(selected_row, visible_rows);
+    let position = offset + usize::from(row - inner.y);
+    entries.get(position).and_then(|entry| entry.file_index)
 }
 
 fn table_visible_rows(area: Rect) -> u16 {
     block_inner(area).height.saturating_sub(TABLE_HEADER_HEIGHT)
 }
 
-fn table_visible_range(selected: usize, visible_rows: usize, len: usize) -> Option<(usize, usize)> {
+fn table_visible_range(offset: usize, visible_rows: usize, len: usize) -> Option<(usize, usize)> {
     if visible_rows == 0 || len == 0 {
         return None;
     }
 
-    let offset = table_viewport_offset(selected.min(len - 1), visible_rows);
+    let offset = offset.min(max_table_viewport_offset(len, visible_rows));
     let end = offset.saturating_add(visible_rows).min(len);
     Some((offset + 1, end))
 }
@@ -1034,6 +1488,14 @@ fn table_viewport_offset(selected: usize, visible_rows: usize) -> usize {
         return 0;
     }
     selected.saturating_sub(visible_rows - 1)
+}
+
+fn max_table_viewport_offset(len: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        0
+    } else {
+        len.saturating_sub(visible_rows)
+    }
 }
 
 fn view_tab_at(app: &AppState, area: Rect, column: u16, row: u16) -> Option<String> {
@@ -1084,7 +1546,11 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
 
     if app.mouse_capture_enabled {
         let body = body_areas_with_ratio(chunks[2], app.list_width_percent);
-        draw_table(frame, app, body[0]);
+        if app.details_mode == DetailsMode::Diff {
+            draw_diff_files(frame, app, body[0]);
+        } else {
+            draw_table(frame, app, body[0]);
+        }
         draw_details(frame, app, body[1]);
     } else {
         draw_details(frame, app, chunks[2]);
@@ -1107,6 +1573,15 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
 #[cfg(test)]
 fn body_area(area: Rect) -> Rect {
     page_areas(area)[2]
+}
+
+fn details_area_for(app: &AppState, area: Rect) -> Rect {
+    let chunks = page_areas(area);
+    if app.mouse_capture_enabled {
+        body_areas_with_ratio(chunks[2], app.list_width_percent)[1]
+    } else {
+        chunks[2]
+    }
 }
 
 fn page_areas(area: Rect) -> std::rc::Rc<[Rect]> {
@@ -1195,7 +1670,7 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         BorderType::Plain
     };
-    let title = if ghr_focused { "[FOCUS] ghr" } else { "ghr" };
+    let title = if ghr_focused { "[Focus] ghr" } else { "ghr" };
 
     let tabs = Tabs::new(titles)
         .select(active)
@@ -1243,7 +1718,7 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         BorderType::Plain
     };
     let title = if sections_focused {
-        "[FOCUS] Sections"
+        "[Focus] Sections"
     } else {
         "Sections"
     };
@@ -1396,11 +1871,11 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     if let Some(error) = &section.error {
         title.push_str(&format!(" - error: {}", compact_error_label(error)));
     };
-    if let Some((start, end)) = table_visible_range(
-        app.current_selected_position(),
-        usize::from(table_visible_rows(area)),
-        filtered_indices.len(),
-    ) {
+    let visible_rows = usize::from(table_visible_rows(area));
+    let table_offset = app.current_list_scroll_offset(filtered_indices.len(), visible_rows);
+    if let Some((start, end)) =
+        table_visible_range(table_offset, visible_rows, filtered_indices.len())
+    {
         title.push_str(&table_visible_range_label(
             section,
             app.search_query.is_empty(),
@@ -1486,12 +1961,123 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .title(Span::styled(title, title_style)),
     )
     .row_highlight_style(highlight_style)
+    .highlight_spacing(HighlightSpacing::Always)
     .highlight_symbol("> ");
 
-    let mut table_state = TableState::default();
-    if !filtered_indices.is_empty() {
-        table_state.select(Some(app.current_selected_position()));
+    let mut table_state = TableState::default().with_offset(table_offset);
+    let selected = app.current_selected_position();
+    if !filtered_indices.is_empty()
+        && selected >= table_offset
+        && selected < table_offset.saturating_add(visible_rows)
+    {
+        table_state.select(Some(selected));
     }
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let files_focused = app.focus == FocusTarget::List;
+    let (border_style, title_style, border_type, highlight_style) = if app.dragging_split {
+        (
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if files_focused {
+        (
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            BorderType::Thick,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Green),
+            BorderType::Plain,
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        )
+    };
+
+    let title;
+    let mut selected_row = None;
+    let rows = match app.current_diff() {
+        Some(DiffState::Loaded(diff)) => {
+            title = format!(
+                "Files | {} file(s) | +{} -{}",
+                diff.files.len(),
+                diff.additions,
+                diff.deletions
+            );
+            let entries = diff_tree_entries(diff);
+            if let Some(item_id) = app.current_item().map(|item| item.id.as_str()) {
+                let selected_file = app.selected_diff_file_index_for(item_id, diff);
+                selected_row = diff_tree_row_index_for_file(&entries, selected_file);
+            }
+            entries
+                .into_iter()
+                .map(|entry| {
+                    let indent = "  ".repeat(entry.depth);
+                    let (marker, style) = if entry.file_index.is_some() {
+                        (" ", Style::default().fg(Color::White))
+                    } else {
+                        ("▾ ", Style::default().fg(Color::Green))
+                    };
+                    Row::new(vec![
+                        format!("{indent}{marker}{}", entry.label),
+                        entry.stats,
+                    ])
+                    .style(style)
+                })
+                .collect::<Vec<_>>()
+        }
+        Some(DiffState::Error(error)) => {
+            title = "Files | error".to_string();
+            vec![
+                Row::new(vec![compact_error_label(error), String::new()])
+                    .style(Style::default().fg(Color::LightRed)),
+            ]
+        }
+        Some(DiffState::Loading) | None => {
+            title = "Files | loading".to_string();
+            vec![
+                Row::new(vec!["loading diff...".to_string(), String::new()])
+                    .style(Style::default().fg(Color::Gray)),
+            ]
+        }
+    };
+
+    let title = focus_panel_title("List", &title, files_focused);
+    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(12)])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(border_style)
+                .title(Span::styled(title, title_style)),
+        )
+        .row_highlight_style(highlight_style)
+        .highlight_symbol("> ");
+
+    let mut table_state = TableState::default();
+    table_state.select(selected_row);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
@@ -1574,9 +2160,9 @@ fn details_title() -> &'static str {
     "Details:"
 }
 
-fn focus_panel_title(label: &str, title: &str, focused: bool) -> String {
+fn focus_panel_title(_label: &str, title: &str, focused: bool) -> String {
     if focused {
-        format!("[FOCUS {label}] {title}")
+        format!("[Focus] {title}")
     } else {
         title.to_string()
     }
@@ -1638,7 +2224,12 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     push_footer_pair(&mut spans, "r", "refresh", Color::Yellow);
     push_footer_pair(&mut spans, "o", "open", Color::Yellow);
     push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
-    push_footer_pair(&mut spans, "q", "quit", Color::Yellow);
+    let q_action = if app.details_mode == DetailsMode::Diff {
+        "back"
+    } else {
+        "quit"
+    };
+    push_footer_pair(&mut spans, "q", q_action, Color::Yellow);
 
     push_footer_separator(&mut spans);
     push_footer_state(&mut spans, "focus", focus, Color::Cyan);
@@ -1664,38 +2255,68 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
     match app.focus {
         FocusTarget::Ghr => {
             push_footer_context(spans, "ghr", "tabs");
-            push_footer_pair(spans, "h/l", "switch", Color::Cyan);
+            push_footer_pair(spans, "tab/h/l", "switch", Color::Cyan);
             push_footer_pair(spans, "j/enter", "Sections", Color::Cyan);
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::Sections => {
             push_footer_context(spans, "Sections", "tabs");
-            push_footer_pair(spans, "h/l", "switch", Color::Cyan);
+            push_footer_pair(spans, "tab/h/l", "switch", Color::Cyan);
             push_footer_pair(spans, "k", "ghr", Color::Cyan);
             push_footer_pair(spans, "j/enter", "List", Color::Cyan);
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::List => {
-            push_footer_context(spans, "List", "items");
-            push_footer_pair(spans, "j/k", "move", Color::Cyan);
-            push_footer_pair(spans, "pg d/u", "page", Color::Cyan);
-            push_footer_pair(spans, "[ ]", "results", Color::Cyan);
-            push_footer_pair(spans, "g/G", "ends", Color::Cyan);
-            push_footer_pair(spans, "enter", "Details", Color::Cyan);
-            push_footer_pair(spans, "/", "filter", Color::Yellow);
-            push_footer_pair(spans, "a", "comment", Color::LightBlue);
-            push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            if app.details_mode == DetailsMode::Diff {
+                push_footer_context(spans, "List", "files");
+                push_footer_pair(spans, "j/k", "file", Color::Cyan);
+                push_footer_pair(spans, "pg", "page", Color::Cyan);
+                push_footer_pair(spans, "[ ]", "file", Color::Cyan);
+                push_footer_pair(spans, "g/G", "ends", Color::Cyan);
+                push_footer_pair(spans, "enter", "diff", Color::Cyan);
+                push_footer_pair(spans, "c", "comment", Color::LightBlue);
+                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            } else {
+                push_footer_context(spans, "List", "items");
+                push_footer_pair(spans, "j/k", "move", Color::Cyan);
+                push_footer_pair(spans, "pg", "page", Color::Cyan);
+                push_footer_pair(spans, "[ ]", "results", Color::Cyan);
+                push_footer_pair(spans, "g/G", "ends", Color::Cyan);
+                push_footer_pair(spans, "enter", "Details", Color::Cyan);
+                push_footer_pair(spans, "/", "filter", Color::Yellow);
+                push_footer_pair(spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(spans, "a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            }
         }
         FocusTarget::Details => {
-            push_footer_context(spans, "Details", "content");
-            push_footer_pair(spans, "j/k", "scroll", Color::Cyan);
-            push_footer_pair(spans, "pg d/u", "page", Color::Cyan);
-            push_footer_pair(spans, "g", "top", Color::Cyan);
-            push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
-            push_footer_pair(spans, "a", "comment", Color::LightBlue);
-            push_footer_pair(spans, "R", "reply", Color::LightBlue);
-            push_footer_pair(spans, "e", "edit", Color::LightBlue);
-            push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            let context = if app.details_mode == DetailsMode::Diff {
+                "diff"
+            } else {
+                "content"
+            };
+            push_footer_context(spans, "Details", context);
+            if app.details_mode == DetailsMode::Diff {
+                push_footer_pair(spans, "j/k", "line", Color::Cyan);
+                push_footer_pair(spans, "n/p", "page", Color::Cyan);
+            } else {
+                push_footer_pair(spans, "j/k", "scroll", Color::Cyan);
+                push_footer_pair(spans, "pg", "page", Color::Cyan);
+            }
+            push_footer_pair(spans, "g/G", "top/bottom", Color::Cyan);
+            if app.details_mode == DetailsMode::Diff {
+                push_footer_pair(spans, "[ ]", "file", Color::LightBlue);
+                push_footer_pair(spans, "m", "mark", Color::Yellow);
+                push_footer_pair(spans, "c", "comment", Color::LightBlue);
+                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            } else {
+                push_footer_pair(spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
+                push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "R", "reply", Color::LightBlue);
+                push_footer_pair(spans, "e", "edit", Color::LightBlue);
+                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+            }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
     }
@@ -1877,16 +2498,24 @@ fn draw_pr_action_dialog(
 
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
     let dialog_area = centered_rect(78, 14, area);
-    let text = format!("{}\n\nEnter/Esc: close", dialog.body);
+    let footer = if dialog.auto_close_at.is_some() {
+        "Auto closes shortly | Enter/Esc: close"
+    } else {
+        "Enter/Esc: close"
+    };
+    let text = format!("{}\n\n{footer}", dialog.body);
+    let accent = if dialog.auto_close_at.is_some() {
+        Color::LightGreen
+    } else {
+        Color::LightRed
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightRed))
+        .border_style(Style::default().fg(accent))
         .style(Style::default().bg(Color::Black))
         .title(Span::styled(
             dialog.title.clone(),
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(text)
         .block(block)
@@ -1917,13 +2546,16 @@ fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
 
 fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
     let title = match &dialog.mode {
-        CommentDialogMode::New => "New Comment",
+        CommentDialogMode::New => "New Comment".to_string(),
         CommentDialogMode::Reply { author, .. } => {
             return draw_reply_dialog(frame, dialog, author, area);
         }
-        CommentDialogMode::Edit { .. } => "Edit Comment",
+        CommentDialogMode::Edit { .. } => "Edit Comment".to_string(),
+        CommentDialogMode::Review { target } => {
+            format!("Review {}", target.location_label())
+        }
     };
-    draw_comment_editor(frame, title, dialog, area);
+    draw_comment_editor(frame, &title, dialog, area);
 }
 
 fn draw_reply_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, author: &str, area: Rect) {
@@ -2208,11 +2840,9 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_heading("General"),
         help_key_line("? / Esc / Enter / q", "close this help"),
         help_key_line("q", "quit ghr outside help"),
+        help_key_line("q in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
-        help_key_line(
-            "Tab / Shift+Tab",
-            "switch Pull Requests / Issues / Notification",
-        ),
+        help_key_line("Tab / Shift+Tab", "switch the focused tab group"),
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "start fuzzy search filtering"),
         help_key_line("S", "search PRs and issues in the current repo"),
@@ -2220,7 +2850,10 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Esc", "leave details or clear search"),
         Line::from(""),
         help_heading("ghr and Sections"),
-        help_key_line("h/l or Left/Right", "switch the focused tab group"),
+        help_key_line(
+            "Tab / Shift+Tab / h/l or Left/Right",
+            "switch the focused tab group",
+        ),
         help_key_line(
             "j/k or Up/Down",
             "move focus between ghr, Sections, and List",
@@ -2228,23 +2861,37 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("List"),
         help_key_line("j/k or Up/Down", "move selection"),
-        help_key_line("PgDown/PgUp or d/u", "move by visible page"),
+        help_key_line("PgDown/PgUp", "move by visible page"),
         help_key_line("[ / ]", "load previous / next GitHub result page"),
         help_key_line("g / G", "first / last item"),
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("v", "show pull request diff"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
+        help_heading("Diff Files"),
+        help_key_line("3", "focus the changed-file list"),
+        help_key_line("j/k or Up/Down", "choose a changed file"),
+        help_key_line("PgDown/PgUp", "move by visible file page"),
+        help_key_line("[ / ]", "previous / next changed file"),
+        help_key_line("Enter or 4", "focus the file diff"),
+        help_key_line("c", "add review comment on selected diff line"),
+        Line::from(""),
         help_heading("Details"),
-        help_key_line("j/k or Up/Down", "scroll details"),
+        help_key_line("j/k or Up/Down", "scroll details or select diff line"),
+        help_key_line("n / p in diff", "page down / page up"),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
-        help_key_line("g", "scroll details to top"),
+        help_key_line("g / G", "scroll details to top / bottom"),
+        help_key_line("v", "show PR diff"),
+        help_key_line("[ / ]", "jump previous / next diff file"),
+        help_key_line("m in diff", "mark line or finish a review range"),
+        help_key_line("c in diff", "add review comment on selected diff line"),
         help_key_line("n / p", "focus next / previous comment"),
-        help_key_line("a", "add a new comment"),
+        help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("S", "search PRs and issues in the current repo"),
@@ -2275,7 +2922,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
             "toggle between TUI mouse controls and terminal text selection",
         ),
         help_key_line("click tabs / sections", "switch view or section"),
-        help_key_line("click list row", "select item and focus Details"),
+        help_key_line("click list row", "select item or diff file"),
         help_key_line("click links / open / reply / edit", "run that action"),
         help_key_line("wheel over list/details/dialog", "scroll that area"),
         help_key_line("drag split border", "resize list/details ratio"),
@@ -2328,6 +2975,9 @@ struct DetailsDocument {
     links: Vec<LinkRegion>,
     actions: Vec<ActionRegion>,
     comments: Vec<CommentRegion>,
+    diff_files: Vec<usize>,
+    diff_lines: Vec<DiffLineRegion>,
+    selected_diff_line: Option<usize>,
 }
 
 impl DetailsDocument {
@@ -2350,6 +3000,13 @@ impl DetailsDocument {
             .iter()
             .find(|comment| line >= comment.start_line && line < comment.end_line)
             .map(|comment| comment.index)
+    }
+
+    fn diff_line_at(&self, line: usize) -> Option<usize> {
+        self.diff_lines
+            .iter()
+            .find(|diff_line| diff_line.line == line)
+            .map(|diff_line| diff_line.review_index)
     }
 }
 
@@ -2374,6 +3031,99 @@ struct CommentRegion {
     index: usize,
     start_line: usize,
     end_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DiffLineRegion {
+    line: usize,
+    review_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequestDiff {
+    files: Vec<DiffFile>,
+    additions: usize,
+    deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffFile {
+    old_path: String,
+    new_path: String,
+    metadata: Vec<String>,
+    hunks: Vec<DiffHunk>,
+    additions: usize,
+    deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffTreeEntry {
+    file_index: Option<usize>,
+    label: String,
+    stats: String,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffHunk {
+    header: String,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffLine {
+    kind: DiffLineKind,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+    Metadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffReviewSide {
+    Left,
+    Right,
+}
+
+impl DiffReviewSide {
+    fn as_api_value(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffReviewTarget {
+    path: String,
+    line: usize,
+    side: DiffReviewSide,
+    start_line: Option<usize>,
+    start_side: Option<DiffReviewSide>,
+    preview: String,
+}
+
+impl DiffReviewTarget {
+    fn location_label(&self) -> String {
+        match self.start_line {
+            Some(start_line) if start_line != self.line => {
+                format!("{}:{start_line}-{}", self.path, self.line)
+            }
+            _ => format!("{}:{}", self.path, self.line),
+        }
+    }
+
+    fn is_range(&self) -> bool {
+        self.start_line.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2461,6 +3211,9 @@ impl DetailsBuilder {
                 links: Vec::new(),
                 actions: Vec::new(),
                 comments: Vec::new(),
+                diff_files: Vec::new(),
+                diff_lines: Vec::new(),
+                selected_diff_line: None,
             },
             width: usize::from(width.max(1)),
         }
@@ -2472,6 +3225,20 @@ impl DetailsBuilder {
 
     fn push_blank(&mut self) {
         self.document.lines.push(Line::from(""));
+    }
+
+    fn mark_diff_file(&mut self) {
+        self.document.diff_files.push(self.document.lines.len());
+    }
+
+    fn mark_diff_line(&mut self, review_index: usize, selected: bool) {
+        let line = self.document.lines.len();
+        self.document
+            .diff_lines
+            .push(DiffLineRegion { line, review_index });
+        if selected {
+            self.document.selected_diff_line = Some(line);
+        }
     }
 
     fn push_line(&mut self, segments: Vec<DetailSegment>) {
@@ -2920,11 +3687,23 @@ fn padding_prefix(width: usize) -> Vec<DetailSegment> {
 }
 
 fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
+    if app.details_mode == DetailsMode::Diff {
+        return build_diff_document(app, width);
+    }
+    build_conversation_document(app, width)
+}
+
+fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     let mut builder = DetailsBuilder::new(width);
     let Some(item) = app.current_item() else {
         builder.push_plain("No item selected");
         return builder.finish();
     };
+
+    if matches!(item.kind, ItemKind::PullRequest) {
+        push_details_mode_tabs(&mut builder, DetailsMode::Conversation);
+        builder.push_blank();
+    }
 
     builder.push_line(vec![DetailSegment::styled(
         item.title.clone(),
@@ -2966,7 +3745,7 @@ fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
             )],
         ));
     }
-    if let Some(comments) = item.comments {
+    if let Some(comments) = details_comment_count(app, item) {
         secondary_meta.push(("comments", vec![DetailSegment::raw(comments.to_string())]));
     }
     if let Some(reason) = useful_meta_value(item.reason.as_deref()) {
@@ -3043,6 +3822,384 @@ fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
     builder.finish()
 }
 
+fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
+    let mut builder = DetailsBuilder::new(width);
+    let Some(item) = app.current_item() else {
+        builder.push_plain("No item selected");
+        return builder.finish();
+    };
+
+    if !matches!(item.kind, ItemKind::PullRequest) {
+        builder.push_plain("Diff is available for pull requests only.");
+        return builder.finish();
+    }
+
+    push_details_mode_tabs(&mut builder, DetailsMode::Diff);
+    builder.push_blank();
+    builder.push_line(vec![DetailSegment::styled(
+        item.title.clone(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    builder.push_meta_line(vec![
+        ("repo", vec![DetailSegment::raw(item.repo.clone())]),
+        (
+            "number",
+            vec![DetailSegment::raw(
+                item.number
+                    .map(|number| format!("#{number}"))
+                    .unwrap_or_else(|| "-".to_string()),
+            )],
+        ),
+    ]);
+    builder.push_blank();
+
+    match app.diffs.get(&item.id) {
+        Some(DiffState::Loaded(diff)) => {
+            let selected_file = app.selected_diff_file_index_for(&item.id, diff);
+            let selected_line = diff
+                .files
+                .get(selected_file)
+                .map(|file| app.selected_diff_line_index_for(&item.id, file))
+                .unwrap_or(0);
+            push_diff(
+                &mut builder,
+                diff,
+                selected_file,
+                selected_line,
+                app.selected_diff_range_for(&item.id),
+            );
+        }
+        Some(DiffState::Error(error)) => {
+            builder.push_heading("Diff");
+            builder.push_plain(format!("Failed to load diff: {error}"));
+        }
+        Some(DiffState::Loading) | None => {
+            builder.push_heading("Diff");
+            builder.push_plain("loading diff...");
+        }
+    }
+
+    builder.finish()
+}
+
+fn push_details_mode_tabs(builder: &mut DetailsBuilder, active: DetailsMode) {
+    let tab = |label: &'static str, mode: DetailsMode| {
+        let style = if active == mode {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        DetailSegment::styled(label, style)
+    };
+    builder.push_line(vec![
+        tab("Conversation", DetailsMode::Conversation),
+        DetailSegment::styled(" | ", Style::default().fg(Color::DarkGray)),
+        tab("Diff", DetailsMode::Diff),
+    ]);
+}
+
+fn push_diff(
+    builder: &mut DetailsBuilder,
+    diff: &PullRequestDiff,
+    selected_file: usize,
+    selected_line: usize,
+    selected_range: Option<(usize, usize)>,
+) {
+    builder.push_line(vec![
+        DetailSegment::styled("Diff", heading_style()),
+        DetailSegment::raw(format!("  files: {}  ", diff.files.len())),
+        DetailSegment::styled(format!("+{}", diff.additions), diff_added_style()),
+        DetailSegment::raw(" "),
+        DetailSegment::styled(format!("-{}", diff.deletions), diff_removed_style()),
+    ]);
+
+    if diff.files.is_empty() {
+        builder.push_plain("No diff.");
+        return;
+    }
+
+    let selected_file = selected_file.min(diff.files.len().saturating_sub(1));
+    let file = &diff.files[selected_file];
+
+    builder.push_line(vec![DetailSegment::styled(
+        format!("file {}/{}", selected_file + 1, diff.files.len()),
+        diff_metadata_style(),
+    )]);
+
+    builder.push_blank();
+    builder.mark_diff_file();
+    push_diff_file_header(builder, file);
+    for metadata in &file.metadata {
+        builder.push_line(vec![DetailSegment::styled(
+            truncate_inline(metadata, builder.width),
+            diff_metadata_style(),
+        )]);
+    }
+    let mut review_index = 0;
+    for hunk in &file.hunks {
+        builder.push_line(vec![DetailSegment::styled(
+            truncate_inline(&hunk.header, builder.width),
+            diff_hunk_style(),
+        )]);
+        for line in &hunk.lines {
+            let line_review_index = diff_review_target(file, line).map(|_| {
+                let index = review_index;
+                review_index += 1;
+                index
+            });
+            push_diff_line(
+                builder,
+                line,
+                line_review_index,
+                line_review_index.is_some_and(|index| {
+                    index == selected_line || index_in_range(index, selected_range)
+                }),
+            );
+        }
+    }
+}
+
+fn push_diff_file_header(builder: &mut DetailsBuilder, file: &DiffFile) {
+    let path = if file.old_path == file.new_path {
+        file.new_path.clone()
+    } else {
+        format!("{} -> {}", file.old_path, file.new_path)
+    };
+    builder.push_line(vec![
+        DetailSegment::styled("▾ ", diff_file_style()),
+        DetailSegment::styled(
+            truncate_inline(&path, builder.width.saturating_sub(16).max(1)),
+            diff_file_style(),
+        ),
+        DetailSegment::raw("  "),
+        DetailSegment::styled(format!("+{}", file.additions), diff_added_style()),
+        DetailSegment::raw(" "),
+        DetailSegment::styled(format!("-{}", file.deletions), diff_removed_style()),
+    ]);
+}
+
+fn push_diff_line(
+    builder: &mut DetailsBuilder,
+    line: &DiffLine,
+    review_index: Option<usize>,
+    selected: bool,
+) {
+    if let Some(review_index) = review_index {
+        builder.mark_diff_line(review_index, selected);
+    }
+    let gutter = diff_gutter(line.old_line, line.new_line);
+    let (marker, mut style) = match line.kind {
+        DiffLineKind::Context => (" ", diff_context_style()),
+        DiffLineKind::Added => ("+", diff_added_style()),
+        DiffLineKind::Removed => ("-", diff_removed_style()),
+        DiffLineKind::Metadata => ("\\", diff_metadata_style()),
+    };
+    let gutter_style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        diff_gutter_style()
+    };
+    if selected {
+        style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    }
+    let prefix_width = display_width(&gutter) + display_width(marker) + 1;
+    let content_width = builder.width.saturating_sub(prefix_width).max(1);
+    builder.push_line(vec![
+        DetailSegment::styled(gutter, gutter_style),
+        DetailSegment::styled(marker, style),
+        DetailSegment::styled(" ", style),
+        DetailSegment::styled(truncate_inline(&line.text, content_width), style),
+    ]);
+}
+
+fn diff_tree_entries(diff: &PullRequestDiff) -> Vec<DiffTreeEntry> {
+    let mut files = diff
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| (index, diff_display_path(file)))
+        .collect::<Vec<_>>();
+    files.sort_by(|(_, left), (_, right)| left.cmp(right));
+
+    let mut entries = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    for (file_index, path) in files {
+        let parts = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            entries.push(DiffTreeEntry {
+                file_index: Some(file_index),
+                label: path,
+                stats: diff_file_stats(&diff.files[file_index]),
+                depth: 0,
+            });
+            continue;
+        }
+
+        let mut prefix = String::new();
+        for (depth, directory) in parts.iter().take(parts.len().saturating_sub(1)).enumerate() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(directory);
+            if seen_dirs.insert(prefix.clone()) {
+                entries.push(DiffTreeEntry {
+                    file_index: None,
+                    label: (*directory).to_string(),
+                    stats: String::new(),
+                    depth,
+                });
+            }
+        }
+
+        entries.push(DiffTreeEntry {
+            file_index: Some(file_index),
+            label: parts
+                .last()
+                .map(|part| (*part).to_string())
+                .unwrap_or_else(|| path.clone()),
+            stats: diff_file_stats(&diff.files[file_index]),
+            depth: parts.len().saturating_sub(1),
+        });
+    }
+
+    entries
+}
+
+fn diff_tree_row_index_for_file(entries: &[DiffTreeEntry], file_index: usize) -> Option<usize> {
+    entries
+        .iter()
+        .position(|entry| entry.file_index == Some(file_index))
+}
+
+fn diff_display_path(file: &DiffFile) -> String {
+    if file.new_path != "/dev/null" {
+        file.new_path.clone()
+    } else {
+        file.old_path.clone()
+    }
+}
+
+fn diff_file_stats(file: &DiffFile) -> String {
+    format!(
+        "{} +{} -{}",
+        diff_file_status(file),
+        file.additions,
+        file.deletions
+    )
+}
+
+fn diff_file_status(file: &DiffFile) -> &'static str {
+    match (file.old_path.as_str(), file.new_path.as_str()) {
+        ("/dev/null", _) => "A",
+        (_, "/dev/null") => "D",
+        (old, new) if old != new => "R",
+        _ => "M",
+    }
+}
+
+fn diff_review_targets(file: &DiffFile) -> Vec<DiffReviewTarget> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .filter_map(|line| diff_review_target(file, line))
+        .collect()
+}
+
+fn ordered_range(left: usize, right: usize) -> (usize, usize) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn index_in_range(index: usize, range: Option<(usize, usize)>) -> bool {
+    let Some((start, end)) = range.map(|(start, end)| ordered_range(start, end)) else {
+        return false;
+    };
+    index >= start && index <= end
+}
+
+fn diff_review_target_from_range(
+    targets: &[DiffReviewTarget],
+    start: usize,
+    end: usize,
+) -> Result<DiffReviewTarget, String> {
+    if targets.is_empty() {
+        return Err("no reviewable diff lines".to_string());
+    }
+    let (start, end) = ordered_range(start, end);
+    let start = start.min(targets.len() - 1);
+    let end = end.min(targets.len() - 1);
+    let first = &targets[start];
+    let last = &targets[end];
+    if targets[start..=end]
+        .iter()
+        .any(|target| target.path != first.path)
+    {
+        return Err("range must stay in one file".to_string());
+    }
+    if targets[start..=end]
+        .iter()
+        .any(|target| target.side != first.side)
+    {
+        return Err("range must stay on one diff side".to_string());
+    }
+
+    let mut target = last.clone();
+    if start != end {
+        target.start_line = Some(first.line);
+        target.start_side = Some(first.side);
+        target.preview = format!("{} lines selected", end.saturating_sub(start) + 1);
+    }
+    Ok(target)
+}
+
+fn diff_review_target(file: &DiffFile, line: &DiffLine) -> Option<DiffReviewTarget> {
+    let (line_number, side) = match line.kind {
+        DiffLineKind::Removed => (line.old_line?, DiffReviewSide::Left),
+        DiffLineKind::Context | DiffLineKind::Added => (line.new_line?, DiffReviewSide::Right),
+        DiffLineKind::Metadata => return None,
+    };
+
+    Some(DiffReviewTarget {
+        path: diff_review_path(file, side),
+        line: line_number,
+        side,
+        start_line: None,
+        start_side: None,
+        preview: truncate_inline(&line.text, 80),
+    })
+}
+
+fn diff_review_path(file: &DiffFile, side: DiffReviewSide) -> String {
+    match side {
+        DiffReviewSide::Left if file.new_path == "/dev/null" => file.old_path.clone(),
+        _ if file.new_path != "/dev/null" => file.new_path.clone(),
+        _ => file.old_path.clone(),
+    }
+}
+
+fn diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
+    let old = old_line
+        .map(|line| format!("{line:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let new = new_line
+        .map(|line| format!("{line:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    format!("{old} {new} │ ")
+}
+
 fn useful_meta_value(value: Option<&str>) -> Option<&str> {
     let value = value?.trim();
     if value.is_empty() || value == "-" {
@@ -3082,6 +4239,13 @@ fn push_comment(
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::link("open", url.clone()));
     }
+    if let Some(review) = &comment.review {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::styled(
+            review_comment_label(review),
+            diff_metadata_style(),
+        ));
+    }
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
         "reply",
@@ -3108,6 +4272,26 @@ fn push_comment(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {
+    match app.details.get(&item.id) {
+        Some(DetailState::Loaded(comments)) => Some(comments.len()),
+        _ => item.comments.map(|comments| comments as usize),
+    }
+}
+
+fn review_comment_label(review: &crate::model::ReviewCommentPreview) -> String {
+    let line = review
+        .line
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let side = review
+        .side
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "line".to_string());
+    format!("inline {}:{line} {side}", review.path)
 }
 
 fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool) {
@@ -3494,6 +4678,36 @@ fn quote_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+fn diff_file_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn diff_hunk_style() -> Style {
+    Style::default().fg(Color::LightBlue)
+}
+
+fn diff_gutter_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn diff_added_style() -> Style {
+    Style::default().fg(Color::LightGreen)
+}
+
+fn diff_removed_style() -> Style {
+    Style::default().fg(Color::LightRed)
+}
+
+fn diff_context_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn diff_metadata_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 fn comment_author_style(selected: bool) -> Style {
     let style = if selected {
         Style::default().fg(Color::Yellow)
@@ -3540,6 +4754,183 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     let mut truncated = text.chars().take(max_chars).collect::<String>();
     truncated.push_str("\n...");
     truncated
+}
+
+fn parse_pull_request_diff(raw: &str) -> std::result::Result<PullRequestDiff, String> {
+    let mut diff = PullRequestDiff {
+        files: Vec::new(),
+        additions: 0,
+        deletions: 0,
+    };
+    let mut file: Option<DiffFile> = None;
+    let mut hunk: Option<DiffHunk> = None;
+    let mut old_line = 0_usize;
+    let mut new_line = 0_usize;
+
+    for raw_line in raw.replace('\r', "").lines() {
+        if raw_line.starts_with("diff --git ") {
+            flush_diff_file(&mut diff, &mut file, &mut hunk);
+            let (old_path, new_path) = parse_diff_git_paths(raw_line);
+            file = Some(DiffFile {
+                old_path,
+                new_path,
+                metadata: Vec::new(),
+                hunks: Vec::new(),
+                additions: 0,
+                deletions: 0,
+            });
+            continue;
+        }
+
+        let Some(current_file) = file.as_mut() else {
+            continue;
+        };
+
+        if raw_line.starts_with("@@ ") {
+            flush_diff_hunk(current_file, &mut hunk);
+            let (next_old, next_new) = parse_hunk_line_starts(raw_line);
+            old_line = next_old;
+            new_line = next_new;
+            hunk = Some(DiffHunk {
+                header: raw_line.to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(current_hunk) = hunk.as_mut() {
+            push_diff_hunk_line(
+                current_file,
+                current_hunk,
+                raw_line,
+                &mut old_line,
+                &mut new_line,
+            );
+        } else if let Some(path) = raw_line.strip_prefix("--- ") {
+            current_file.old_path = normalize_diff_path(path.trim());
+        } else if let Some(path) = raw_line.strip_prefix("+++ ") {
+            current_file.new_path = normalize_diff_path(path.trim());
+        } else if !raw_line.trim().is_empty() {
+            current_file.metadata.push(raw_line.to_string());
+        }
+    }
+
+    flush_diff_file(&mut diff, &mut file, &mut hunk);
+    diff.additions = diff.files.iter().map(|file| file.additions).sum();
+    diff.deletions = diff.files.iter().map(|file| file.deletions).sum();
+    Ok(diff)
+}
+
+fn flush_diff_file(
+    diff: &mut PullRequestDiff,
+    file: &mut Option<DiffFile>,
+    hunk: &mut Option<DiffHunk>,
+) {
+    if let Some(current_file) = file.as_mut() {
+        flush_diff_hunk(current_file, hunk);
+    }
+    if let Some(current_file) = file.take() {
+        diff.files.push(current_file);
+    }
+}
+
+fn flush_diff_hunk(file: &mut DiffFile, hunk: &mut Option<DiffHunk>) {
+    if let Some(current_hunk) = hunk.take() {
+        file.hunks.push(current_hunk);
+    }
+}
+
+fn parse_diff_git_paths(line: &str) -> (String, String) {
+    let mut parts = line
+        .strip_prefix("diff --git ")
+        .unwrap_or_default()
+        .split_whitespace();
+    let old_path = parts
+        .next()
+        .map(normalize_diff_path)
+        .unwrap_or_else(|| "-".to_string());
+    let new_path = parts
+        .next()
+        .map(normalize_diff_path)
+        .unwrap_or_else(|| old_path.clone());
+    (old_path, new_path)
+}
+
+fn normalize_diff_path(path: &str) -> String {
+    let path = path.trim().trim_matches('"');
+    if path == "/dev/null" {
+        return path.to_string();
+    }
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn parse_hunk_line_starts(header: &str) -> (usize, usize) {
+    let mut parts = header.split_whitespace();
+    let _marker = parts.next();
+    let old = parts.next().and_then(parse_diff_range).unwrap_or(0);
+    let new = parts.next().and_then(parse_diff_range).unwrap_or(0);
+    (old, new)
+}
+
+fn parse_diff_range(range: &str) -> Option<usize> {
+    let range = range.trim_start_matches(['-', '+']);
+    range
+        .split_once(',')
+        .map(|(start, _)| start)
+        .unwrap_or(range)
+        .parse()
+        .ok()
+}
+
+fn push_diff_hunk_line(
+    file: &mut DiffFile,
+    hunk: &mut DiffHunk,
+    raw_line: &str,
+    old_line: &mut usize,
+    new_line: &mut usize,
+) {
+    let line = if raw_line.starts_with('+') && !raw_line.starts_with("+++") {
+        file.additions += 1;
+        let line = DiffLine {
+            kind: DiffLineKind::Added,
+            old_line: None,
+            new_line: Some(*new_line),
+            text: raw_line[1..].to_string(),
+        };
+        *new_line = new_line.saturating_add(1);
+        line
+    } else if raw_line.starts_with('-') && !raw_line.starts_with("---") {
+        file.deletions += 1;
+        let line = DiffLine {
+            kind: DiffLineKind::Removed,
+            old_line: Some(*old_line),
+            new_line: None,
+            text: raw_line[1..].to_string(),
+        };
+        *old_line = old_line.saturating_add(1);
+        line
+    } else if let Some(text) = raw_line.strip_prefix(' ') {
+        let line = DiffLine {
+            kind: DiffLineKind::Context,
+            old_line: Some(*old_line),
+            new_line: Some(*new_line),
+            text: text.to_string(),
+        };
+        *old_line = old_line.saturating_add(1);
+        *new_line = new_line.saturating_add(1);
+        line
+    } else {
+        DiffLine {
+            kind: DiffLineKind::Metadata,
+            old_line: None,
+            new_line: None,
+            text: raw_line.trim_start_matches('\\').trim_start().to_string(),
+        }
+    };
+    hunk.lines.push(line);
 }
 
 fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
@@ -3621,6 +5012,10 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'c'))
 }
 
+fn is_diff_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'v'))
+}
+
 fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
     if error.contains("GitHub CLI `gh` is required") {
         return Some(SetupDialog::MissingGh);
@@ -3631,6 +5026,38 @@ fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
     }
 
     None
+}
+
+fn message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
+    MessageDialog {
+        title: title.into(),
+        body: body.into(),
+        auto_close_at: None,
+    }
+}
+
+fn success_message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
+    MessageDialog {
+        title: title.into(),
+        body: body.into(),
+        auto_close_at: Some(Instant::now() + SUCCESS_DIALOG_AUTO_CLOSE),
+    }
+}
+
+fn pr_action_success_title(action: PrAction) -> &'static str {
+    match action {
+        PrAction::Merge => "Pull Request Merged",
+        PrAction::Close => "Pull Request Closed",
+        PrAction::Approve => "Pull Request Approved",
+    }
+}
+
+fn pr_action_success_body(action: PrAction) -> &'static str {
+    match action {
+        PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
+        PrAction::Close => "GitHub accepted the close action. Refreshing details.",
+        PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
+    }
 }
 
 fn pr_action_error_title(action: PrAction) -> &'static str {
@@ -3662,16 +5089,24 @@ fn operation_error_body(error: &str) -> String {
     truncate_inline(message, 900)
 }
 
-fn comment_pending_dialog(mode: PendingCommentMode) -> MessageDialog {
+fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog {
     match mode {
-        PendingCommentMode::Post => MessageDialog {
-            title: "Posting Comment".to_string(),
-            body: "Waiting for GitHub to accept the comment...".to_string(),
-        },
-        PendingCommentMode::Edit { .. } => MessageDialog {
-            title: "Updating Comment".to_string(),
-            body: "Waiting for GitHub to accept the update...".to_string(),
-        },
+        PendingCommentMode::Post => message_dialog(
+            "Posting Comment",
+            "Waiting for GitHub to accept the comment...",
+        ),
+        PendingCommentMode::ReviewReply { .. } => message_dialog(
+            "Posting Review Reply",
+            "Waiting for GitHub to accept the review reply...",
+        ),
+        PendingCommentMode::Edit { .. } => message_dialog(
+            "Updating Comment",
+            "Waiting for GitHub to accept the update...",
+        ),
+        PendingCommentMode::Review { .. } => message_dialog(
+            "Posting Review Comment",
+            "Waiting for GitHub to accept the review comment...",
+        ),
     }
 }
 
@@ -3701,8 +5136,10 @@ impl AppState {
             sections,
             section_index: ui_state.section_index.clone(),
             selected_index: ui_state.selected_index.clone(),
+            list_scroll_offset: HashMap::new(),
             focus: FocusTarget::List,
             details_scroll,
+            details_mode: DetailsMode::Conversation,
             list_width_percent: ui_state.list_width_percent,
             dragging_split: false,
             split_drag_changed: false,
@@ -3715,8 +5152,14 @@ impl AppState {
             refreshing: false,
             last_refresh_request: Instant::now(),
             details: HashMap::new(),
+            diffs: HashMap::new(),
+            selected_diff_file: ui_state.selected_diff_file.clone(),
+            selected_diff_line: ui_state.selected_diff_line.clone(),
+            diff_mark: HashMap::new(),
+            diff_mode_state: HashMap::new(),
             action_hints: HashMap::new(),
             details_stale: HashSet::new(),
+            notification_read_pending: HashSet::new(),
             selected_comment_index: 0,
             comment_dialog: None,
             posting_comment: false,
@@ -3726,6 +5169,7 @@ impl AppState {
             message_dialog: None,
             mouse_capture_enabled: true,
             help_dialog: false,
+            diff_return_state: None,
         };
         state.clamp_positions();
         state.focus = if matches!(focus, FocusTarget::Details) && state.current_item().is_none() {
@@ -3735,6 +5179,9 @@ impl AppState {
         };
         state.details_scroll = details_scroll;
         state.selected_comment_index = selected_comment_index;
+        if ui_state.details_mode == "diff" {
+            state.restore_saved_details_mode();
+        }
         state
     }
 
@@ -3745,8 +5192,11 @@ impl AppState {
             section_index: self.section_index.clone(),
             selected_index: self.selected_index.clone(),
             focus: self.focus.as_state_str().to_string(),
+            details_mode: self.details_mode.as_state_str().to_string(),
             details_scroll: self.details_scroll,
             selected_comment_index: self.selected_comment_index,
+            selected_diff_file: self.selected_diff_file.clone(),
+            selected_diff_line: self.selected_diff_line.clone(),
         }
     }
 
@@ -3904,6 +5354,35 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::DiffLoaded { item_id, diff } => match diff {
+                Ok(diff) => {
+                    let file_count = diff.files.len();
+                    if file_count == 0 {
+                        self.selected_diff_file.insert(item_id.clone(), 0);
+                        self.selected_diff_line.insert(item_id.clone(), 0);
+                    } else {
+                        let selected = self.selected_diff_file.entry(item_id.clone()).or_insert(0);
+                        *selected = (*selected).min(file_count - 1);
+                        let selected_line =
+                            self.selected_diff_line.entry(item_id.clone()).or_insert(0);
+                        let line_count = diff_review_targets(&diff.files[*selected]).len();
+                        if line_count == 0 {
+                            *selected_line = 0;
+                        } else {
+                            *selected_line = (*selected_line).min(line_count - 1);
+                        }
+                    }
+                    self.diffs.insert(item_id, DiffState::Loaded(diff));
+                    self.status = format!("diff loaded: {file_count} file(s)");
+                }
+                Err(error) => {
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog_from_error(&error);
+                    }
+                    self.diffs.insert(item_id, DiffState::Error(error));
+                    self.status = "diff load failed".to_string();
+                }
+            },
             AppMsg::CommentPosted { item_id, result } => match result {
                 Ok(comments) => {
                     self.selected_comment_index = comments.len().saturating_sub(1);
@@ -3912,11 +5391,10 @@ impl AppState {
                     self.clamp_selected_comment();
                     self.posting_comment = false;
                     self.status = "comment posted".to_string();
-                    self.message_dialog = Some(MessageDialog {
-                        title: "Comment Posted".to_string(),
-                        body: "GitHub accepted the comment and comments were refreshed."
-                            .to_string(),
-                    });
+                    self.message_dialog = Some(success_message_dialog(
+                        "Comment Posted",
+                        "GitHub accepted the comment and comments were refreshed.",
+                    ));
                 }
                 Err(error) => {
                     let setup_dialog = setup_dialog_from_error(&error);
@@ -3924,10 +5402,12 @@ impl AppState {
                         self.setup_dialog = setup_dialog;
                     }
                     if setup_dialog.is_none() {
-                        self.message_dialog = Some(MessageDialog {
-                            title: "Comment Failed".to_string(),
-                            body: operation_error_body(&error),
-                        });
+                        self.message_dialog = Some(message_dialog(
+                            "Comment Failed",
+                            operation_error_body(&error),
+                        ));
+                    } else {
+                        self.message_dialog = None;
                     }
                     self.posting_comment = false;
                     self.status = "comment post failed".to_string();
@@ -3946,10 +5426,10 @@ impl AppState {
                     self.clamp_selected_comment();
                     self.posting_comment = false;
                     self.status = "comment updated".to_string();
-                    self.message_dialog = Some(MessageDialog {
-                        title: "Comment Updated".to_string(),
-                        body: "GitHub accepted the update and comments were refreshed.".to_string(),
-                    });
+                    self.message_dialog = Some(success_message_dialog(
+                        "Comment Updated",
+                        "GitHub accepted the update and comments were refreshed.",
+                    ));
                 }
                 Err(error) => {
                     let setup_dialog = setup_dialog_from_error(&error);
@@ -3957,13 +5437,42 @@ impl AppState {
                         self.setup_dialog = setup_dialog;
                     }
                     if setup_dialog.is_none() {
-                        self.message_dialog = Some(MessageDialog {
-                            title: "Update Failed".to_string(),
-                            body: operation_error_body(&error),
-                        });
+                        self.message_dialog = Some(message_dialog(
+                            "Update Failed",
+                            operation_error_body(&error),
+                        ));
+                    } else {
+                        self.message_dialog = None;
                     }
                     self.posting_comment = false;
                     self.status = "comment update failed".to_string();
+                }
+            },
+            AppMsg::ReviewCommentPosted { item_id, result } => match result {
+                Ok(()) => {
+                    self.details_stale.insert(item_id);
+                    self.posting_comment = false;
+                    self.status = "review comment posted".to_string();
+                    self.message_dialog = Some(success_message_dialog(
+                        "Review Comment Posted",
+                        "GitHub accepted the review comment.",
+                    ));
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    if setup_dialog.is_none() {
+                        self.message_dialog = Some(message_dialog(
+                            "Review Comment Failed",
+                            operation_error_body(&error),
+                        ));
+                    } else {
+                        self.message_dialog = None;
+                    }
+                    self.posting_comment = false;
+                    self.status = "review comment failed".to_string();
                 }
             },
             AppMsg::PrActionFinished {
@@ -3982,6 +5491,10 @@ impl AppState {
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
                         };
+                        self.message_dialog = Some(success_message_dialog(
+                            pr_action_success_title(action),
+                            pr_action_success_body(action),
+                        ));
                     }
                     Err(error) => {
                         let setup_dialog = setup_dialog_from_error(&error);
@@ -3989,12 +5502,39 @@ impl AppState {
                             self.setup_dialog = setup_dialog;
                         }
                         if setup_dialog.is_none() {
-                            self.message_dialog = Some(MessageDialog {
-                                title: pr_action_error_title(action).to_string(),
-                                body: pr_action_error_body(&error),
-                            });
+                            self.message_dialog = Some(message_dialog(
+                                pr_action_error_title(action),
+                                pr_action_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
                         }
                         self.status = pr_action_error_status(action).to_string();
+                    }
+                }
+            }
+            AppMsg::NotificationReadFinished { thread_id, result } => {
+                self.notification_read_pending.remove(&thread_id);
+                match result {
+                    Ok(save_error) => {
+                        let changed = self.apply_notification_read_local(&thread_id);
+                        self.status = match (changed, save_error) {
+                            (_, Some(error)) => {
+                                format!("notification marked read; snapshot save failed: {error}")
+                            }
+                            (true, None) => "notification marked read".to_string(),
+                            (false, None) => "notification read synced".to_string(),
+                        };
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        self.status = format!(
+                            "notification read sync failed: {}",
+                            operation_error_body(&error)
+                        );
                     }
                 }
             }
@@ -4067,6 +5607,17 @@ impl AppState {
         self.status = "message dismissed".to_string();
     }
 
+    fn dismiss_expired_message_dialog(&mut self, now: Instant) {
+        if self
+            .message_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.auto_close_at)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.message_dialog = None;
+        }
+    }
+
     fn toggle_mouse_capture(&mut self) {
         self.mouse_capture_enabled = !self.mouse_capture_enabled;
         self.status = if self.mouse_capture_enabled {
@@ -4104,6 +5655,56 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn mark_current_notification_read(
+        &mut self,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Notification) || !item.unread.unwrap_or(false) {
+            return;
+        }
+
+        let thread_id = item.id.clone();
+        self.mark_notification_read(thread_id, store, tx);
+    }
+
+    fn mark_notification_read(
+        &mut self,
+        thread_id: String,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        if !self.notification_read_pending.insert(thread_id.clone()) {
+            return;
+        }
+
+        self.status = "marking notification read".to_string();
+        start_notification_read_sync(thread_id, store.clone(), tx.clone());
+    }
+
+    fn notification_thread_id_at_position(&self, position: usize) -> Option<String> {
+        let section = self.current_section()?;
+        let filtered_indices = self.filtered_indices(section);
+        let item_index = filtered_indices.get(position)?;
+        let item = section.items.get(*item_index)?;
+        (matches!(item.kind, ItemKind::Notification) && item.unread.unwrap_or(false))
+            .then(|| item.id.clone())
+    }
+
+    fn apply_notification_read_local(&mut self, thread_id: &str) -> bool {
+        let mut changed = false;
+        for section in &mut self.sections {
+            changed |= mark_notification_read_in_section(section, thread_id);
+        }
+        if changed {
+            self.clamp_positions();
+        }
+        changed
     }
 
     fn replace_section_page(&mut self, section_key: &str, refreshed: SectionSnapshot) {
@@ -4210,6 +5811,118 @@ impl AppState {
         start_details_load(item, tx.clone());
     }
 
+    fn ensure_current_diff_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
+        if self.details_mode != DetailsMode::Diff {
+            return;
+        }
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if !matches!(item.kind, ItemKind::PullRequest) || item.number.is_none() {
+            return;
+        }
+        if self.diffs.contains_key(&item.id) {
+            return;
+        }
+
+        self.diffs.insert(item.id.clone(), DiffState::Loading);
+        start_diff_load(item, tx.clone());
+    }
+
+    fn current_diff(&self) -> Option<&DiffState> {
+        self.current_item()
+            .and_then(|item| self.diffs.get(&item.id))
+    }
+
+    fn selected_diff_file_index_for(&self, item_id: &str, diff: &PullRequestDiff) -> usize {
+        if diff.files.is_empty() {
+            return 0;
+        }
+        self.selected_diff_file
+            .get(item_id)
+            .copied()
+            .unwrap_or(0)
+            .min(diff.files.len() - 1)
+    }
+
+    fn selected_diff_line_index_for(&self, item_id: &str, file: &DiffFile) -> usize {
+        let count = diff_review_targets(file).len();
+        if count == 0 {
+            return 0;
+        }
+        self.selected_diff_line
+            .get(item_id)
+            .copied()
+            .unwrap_or(0)
+            .min(count - 1)
+    }
+
+    fn selected_diff_range_for(&self, item_id: &str) -> Option<(usize, usize)> {
+        let mark = self.diff_mark.get(item_id)?;
+        Some(ordered_range(mark.anchor, mark.focus))
+    }
+
+    fn current_diff_review_targets(&self) -> Option<Vec<DiffReviewTarget>> {
+        let item = self.current_item()?;
+        let diff = match self.diffs.get(&item.id)? {
+            DiffState::Loaded(diff) => diff,
+            _ => return None,
+        };
+        if diff.files.is_empty() {
+            return Some(Vec::new());
+        }
+        let file_index = self.selected_diff_file_index_for(&item.id, diff);
+        Some(diff_review_targets(&diff.files[file_index]))
+    }
+
+    #[cfg(test)]
+    fn current_diff_review_target(&self) -> Option<DiffReviewTarget> {
+        self.current_diff_review_target_result().ok().flatten()
+    }
+
+    fn current_diff_review_target_result(&self) -> Result<Option<DiffReviewTarget>, String> {
+        let Some(item) = self.current_item() else {
+            return Ok(None);
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            return Ok(None);
+        };
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        if let Some((start, end)) = self.selected_diff_range_for(&item.id) {
+            return diff_review_target_from_range(&targets, start, end).map(Some);
+        }
+        let index = self
+            .selected_diff_line
+            .get(&item.id)
+            .copied()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+        Ok(targets.get(index).cloned())
+    }
+
+    fn current_diff_file_count(&self) -> Option<usize> {
+        self.current_item()
+            .and_then(|item| match self.diffs.get(&item.id) {
+                Some(DiffState::Loaded(diff)) => Some(diff.files.len()),
+                _ => None,
+            })
+    }
+
+    fn current_diff_file_order(&self) -> Option<Vec<usize>> {
+        self.current_item()
+            .and_then(|item| match self.diffs.get(&item.id) {
+                Some(DiffState::Loaded(diff)) => Some(
+                    diff_tree_entries(diff)
+                        .into_iter()
+                        .filter_map(|entry| entry.file_index)
+                        .collect(),
+                ),
+                _ => None,
+            })
+    }
+
     fn should_start_details_load(&mut self, item: &WorkItem) -> bool {
         let should_refresh = self.details_stale.remove(&item.id);
         !self.details.contains_key(&item.id)
@@ -4250,15 +5963,29 @@ impl AppState {
         }
     }
 
+    fn move_focused_tab_group(&mut self, delta: isize) {
+        if self.focus == FocusTarget::Sections {
+            self.move_section(delta);
+        } else {
+            self.move_view(delta);
+        }
+    }
+
     fn focus_primary_list(&mut self) {
         self.focus = FocusTarget::List;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        if self.details_mode != DetailsMode::Diff {
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+        }
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
         self.global_search_active = false;
-        self.status = "list focused".to_string();
+        self.status = if self.details_mode == DetailsMode::Diff {
+            "files focused".to_string()
+        } else {
+            "list focused".to_string()
+        };
         self.clamp_positions();
     }
 
@@ -4290,6 +6017,7 @@ impl AppState {
         let next = move_wrapping(current, len, delta);
         self.set_current_section_position(next);
         self.set_current_selected_position(0);
+        self.clear_current_list_scroll_offset();
         self.focus = FocusTarget::Sections;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
@@ -4305,6 +6033,7 @@ impl AppState {
         }
         self.set_current_section_position(index.min(len - 1));
         self.set_current_selected_position(0);
+        self.clear_current_list_scroll_offset();
         self.focus = FocusTarget::Sections;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
@@ -4325,6 +6054,7 @@ impl AppState {
         }
         let current = self.current_selected_position().min(len - 1);
         self.set_current_selected_position(move_bounded(current, len, delta));
+        self.clear_current_list_scroll_offset();
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
@@ -4334,12 +6064,376 @@ impl AppState {
 
     fn set_selection(&mut self, index: usize) {
         self.set_current_selected_position(index);
+        self.clear_current_list_scroll_offset();
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
         self.clamp_positions();
+    }
+
+    fn scroll_list_viewport(&mut self, area: Rect, delta: isize) {
+        let Some(section) = self.current_section() else {
+            return;
+        };
+        let len = self.filtered_indices(section).len();
+        if len == 0 {
+            return;
+        }
+
+        let visible_rows = usize::from(table_visible_rows(area).max(1));
+        let current = self.current_list_scroll_offset(len, visible_rows);
+        let max_offset = max_table_viewport_offset(len, visible_rows);
+        let next = move_bounded(current, max_offset.saturating_add(1), delta);
+        self.set_current_list_scroll_offset(next);
+        self.status = "list scrolled".to_string();
+    }
+
+    fn select_diff_file(&mut self, index: usize) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let Some(count) = self.current_diff_file_count() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if count == 0 {
+            self.selected_diff_file.insert(item_id.clone(), 0);
+            self.selected_diff_line.insert(item_id.clone(), 0);
+            self.diff_mark.remove(&item_id);
+            self.details_scroll = 0;
+            self.status = "no diff files".to_string();
+            return;
+        }
+
+        let next = index.min(count - 1);
+        self.selected_diff_file.insert(item_id.clone(), next);
+        self.selected_diff_line.insert(item_id.clone(), 0);
+        self.diff_mark.remove(&item_id);
+        self.details_scroll = 0;
+        let position = self
+            .current_diff_file_order()
+            .and_then(|order| {
+                order
+                    .iter()
+                    .position(|file_index| *file_index == next)
+                    .map(|position| position + 1)
+            })
+            .unwrap_or(next + 1);
+        self.status = format!("file {position}/{count} focused");
+    }
+
+    fn select_diff_line(&mut self, index: usize, area: Option<Rect>) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if targets.is_empty() {
+            self.selected_diff_line.insert(item_id.clone(), 0);
+            self.diff_mark.remove(&item_id);
+            self.status = "no reviewable diff lines".to_string();
+            return;
+        }
+
+        let next = index.min(targets.len() - 1);
+        self.selected_diff_line.insert(item_id.clone(), next);
+        self.update_diff_mark_after_line_select(next);
+        self.ensure_selected_diff_line_visible(area);
+        if let Some(target) = targets.get(next) {
+            self.status = format!("line {}:{} selected", target.path, target.line);
+        }
+    }
+
+    fn handle_diff_line_click(&mut self, index: usize, area: Option<Rect>) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let completing_mark = self
+            .diff_mark
+            .get(&item_id)
+            .map(|mark| !mark.complete)
+            .unwrap_or(false);
+        self.select_diff_line(index, area);
+        let current = self
+            .selected_diff_line
+            .get(&item_id)
+            .copied()
+            .unwrap_or(index);
+        if completing_mark {
+            if let Some(mark) = self.diff_mark.get_mut(&item_id) {
+                mark.focus = current;
+                mark.complete = true;
+            }
+            self.update_diff_mark_status(&item_id);
+        } else {
+            self.diff_mark.insert(
+                item_id.clone(),
+                DiffMarkState {
+                    anchor: current,
+                    focus: current,
+                    complete: false,
+                },
+            );
+            self.update_diff_mark_status(&item_id);
+        }
+    }
+
+    fn toggle_diff_mark(&mut self) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to mark".to_string();
+            return;
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if targets.is_empty() {
+            self.status = "no reviewable diff lines".to_string();
+            return;
+        }
+        let current = self
+            .selected_diff_line
+            .get(&item_id)
+            .copied()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+
+        match self.diff_mark.get(&item_id).copied() {
+            Some(mark) if !mark.complete => {
+                self.diff_mark.insert(
+                    item_id.clone(),
+                    DiffMarkState {
+                        anchor: mark.anchor,
+                        focus: current,
+                        complete: true,
+                    },
+                );
+            }
+            _ => {
+                self.diff_mark.insert(
+                    item_id.clone(),
+                    DiffMarkState {
+                        anchor: current,
+                        focus: current,
+                        complete: false,
+                    },
+                );
+            }
+        }
+        self.update_diff_mark_status(&item_id);
+    }
+
+    fn update_diff_mark_after_line_select(&mut self, selected: usize) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            return;
+        };
+        if let Some(mark) = self.diff_mark.get_mut(&item_id) {
+            if mark.complete {
+                self.diff_mark.remove(&item_id);
+            } else {
+                mark.focus = selected;
+            }
+        }
+    }
+
+    fn update_diff_mark_status(&mut self, item_id: &str) {
+        let Some(mark) = self.diff_mark.get(item_id).copied() else {
+            return;
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if targets.is_empty() {
+            self.status = "no reviewable diff lines".to_string();
+            return;
+        }
+        let (start, end) = ordered_range(mark.anchor, mark.focus);
+        match diff_review_target_from_range(&targets, start, end) {
+            Ok(target) if target.is_range() => {
+                let verb = if mark.complete { "selected" } else { "marking" };
+                self.status = format!("{verb} {}", target.location_label());
+            }
+            Ok(target) => {
+                self.status = format!(
+                    "mark started at {}; move highlight or click another line, then press m/c",
+                    target.location_label()
+                );
+            }
+            Err(error) => {
+                self.status = error;
+            }
+        }
+    }
+
+    fn move_diff_line(&mut self, delta: isize, area: Option<Rect>) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if targets.is_empty() {
+            self.selected_diff_line.insert(item_id, 0);
+            self.status = "no reviewable diff lines".to_string();
+            return;
+        }
+
+        let current = self
+            .selected_diff_line
+            .get(&item_id)
+            .copied()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+        self.select_diff_line(move_bounded(current, targets.len(), delta), area);
+    }
+
+    fn page_diff_lines(&mut self, direction: isize, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.move_diff_line(diff_line_page_delta(self, None, direction), None);
+            return;
+        };
+
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        let page_height = usize::from(inner.height.max(1));
+        let max_scroll = usize::from(max_details_scroll(self, details_area));
+        let current_scroll = usize::from(self.details_scroll);
+        let next_scroll = if direction < 0 {
+            current_scroll.saturating_sub(page_height)
+        } else {
+            current_scroll.saturating_add(page_height).min(max_scroll)
+        };
+        self.details_scroll = next_scroll.min(usize::from(u16::MAX)) as u16;
+        self.select_first_visible_diff_line(area);
+    }
+
+    fn scroll_diff_details_to_top(&mut self, area: Option<Rect>) {
+        self.details_scroll = 0;
+        if let Some(area) = area {
+            self.select_first_visible_diff_line(area);
+        } else {
+            self.select_diff_line(0, None);
+        }
+    }
+
+    fn scroll_diff_details_to_bottom(&mut self, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.select_last_diff_line(None);
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        self.details_scroll = max_details_scroll(self, details_area);
+        if !self.select_first_visible_diff_line(area) {
+            self.select_last_diff_line(None);
+        }
+    }
+
+    fn select_last_diff_line(&mut self, area: Option<Rect>) {
+        let Some(targets) = self.current_diff_review_targets() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if targets.is_empty() {
+            self.status = "no reviewable diff lines".to_string();
+            return;
+        }
+        self.select_diff_line(targets.len() - 1, area);
+    }
+
+    fn select_first_visible_diff_line(&mut self, area: Rect) -> bool {
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        let start = usize::from(self.details_scroll);
+        let end = start.saturating_add(usize::from(inner.height.max(1)));
+        let next = {
+            let document = build_details_document(self, inner.width);
+            document
+                .diff_lines
+                .iter()
+                .find(|line| line.line >= start && line.line < end)
+                .map(|line| line.review_index)
+        };
+
+        if let Some(index) = next {
+            self.select_diff_line(index, Some(area));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn scroll_details_to_bottom(&mut self, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.details_scroll = u16::MAX;
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        self.details_scroll = max_details_scroll(self, details_area);
+    }
+
+    fn ensure_selected_diff_line_visible(&mut self, area: Option<Rect>) {
+        let Some(area) = area else {
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(self, inner.width);
+        let Some(selected_line) = document.selected_diff_line else {
+            return;
+        };
+
+        let visible_height = usize::from(inner.height.max(1));
+        let current_scroll = usize::from(self.details_scroll);
+        let next_scroll = if selected_line < current_scroll {
+            selected_line
+        } else if selected_line >= current_scroll.saturating_add(visible_height) {
+            selected_line.saturating_sub(visible_height.saturating_sub(1))
+        } else {
+            current_scroll
+        };
+        self.details_scroll = next_scroll
+            .min(usize::from(max_details_scroll(self, details_area)))
+            .min(usize::from(u16::MAX)) as u16;
+    }
+
+    fn move_diff_file(&mut self, delta: isize) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let Some(order) = self.current_diff_file_order() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if order.is_empty() {
+            self.selected_diff_file.insert(item_id.clone(), 0);
+            self.selected_diff_line.insert(item_id, 0);
+            self.details_scroll = 0;
+            self.status = "no diff files".to_string();
+            return;
+        }
+
+        let count = order.len();
+        let current = self
+            .selected_diff_file
+            .get(&item_id)
+            .copied()
+            .unwrap_or_else(|| order[0]);
+        let current_position = order
+            .iter()
+            .position(|file_index| *file_index == current)
+            .unwrap_or(0);
+        self.select_diff_file(order[move_wrapping(current_position, count, delta)]);
     }
 
     fn select_last(&mut self) {
@@ -4369,9 +6463,149 @@ impl AppState {
         }
     }
 
+    fn restore_saved_details_mode(&mut self) {
+        let Some(item) = self.current_item() else {
+            return;
+        };
+        if !matches!(item.kind, ItemKind::PullRequest) {
+            return;
+        }
+
+        let item_id = item.id.clone();
+        self.details_mode = DetailsMode::Diff;
+        self.selected_diff_file.entry(item_id.clone()).or_insert(0);
+        self.selected_diff_line.entry(item_id).or_insert(0);
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.diff_return_state = Some(DiffReturnState {
+            focus: FocusTarget::Details,
+            details_scroll: 0,
+            selected_comment_index: 0,
+        });
+    }
+
+    fn show_diff(&mut self) {
+        let Some(item) = self.current_item() else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::PullRequest) {
+            self.status = "diff only available for pull requests".to_string();
+            return;
+        }
+
+        let item_id = item.id.clone();
+        let loading = !self.diffs.contains_key(&item_id);
+        let saved_diff_state = self.diff_mode_state.get(&item_id).cloned();
+        if let Some(saved) = saved_diff_state.as_ref() {
+            self.restore_diff_mode_state_for(&item_id, saved);
+        } else {
+            self.selected_diff_file.entry(item_id.clone()).or_insert(0);
+            self.selected_diff_line.entry(item_id.clone()).or_insert(0);
+        }
+        if self.details_mode != DetailsMode::Diff {
+            self.diff_return_state = Some(DiffReturnState {
+                focus: self.focus,
+                details_scroll: self.details_scroll,
+                selected_comment_index: self.selected_comment_index,
+            });
+        }
+        self.details_mode = DetailsMode::Diff;
+        self.focus = saved_diff_state
+            .as_ref()
+            .map(|saved| saved.focus)
+            .unwrap_or(FocusTarget::List);
+        self.details_scroll = saved_diff_state
+            .as_ref()
+            .map(|saved| saved.details_scroll)
+            .unwrap_or(0);
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.status = if loading {
+            "loading diff".to_string()
+        } else {
+            "files focused".to_string()
+        };
+    }
+
+    fn leave_diff(&mut self) {
+        self.save_current_diff_mode_state();
+        self.details_mode = DetailsMode::Conversation;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        if let Some(previous) = self.diff_return_state.take() {
+            self.focus = previous.focus;
+            self.details_scroll = previous.details_scroll;
+            self.selected_comment_index = previous.selected_comment_index;
+            self.clamp_selected_comment();
+            if self.focus == FocusTarget::Details && self.current_item().is_none() {
+                self.focus = FocusTarget::List;
+            }
+        } else {
+            self.focus = FocusTarget::Details;
+            self.details_scroll = 0;
+        }
+        self.status = "returned from diff".to_string();
+    }
+
+    fn save_current_diff_mode_state(&mut self) {
+        if self.details_mode != DetailsMode::Diff {
+            return;
+        }
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            return;
+        };
+        self.diff_mode_state.insert(
+            item_id.clone(),
+            DiffModeState {
+                focus: self.focus,
+                details_scroll: self.details_scroll,
+                selected_file: self.selected_diff_file.get(&item_id).copied().unwrap_or(0),
+                selected_line: self.selected_diff_line.get(&item_id).copied().unwrap_or(0),
+            },
+        );
+    }
+
+    fn restore_diff_mode_state_for(&mut self, item_id: &str, saved: &DiffModeState) {
+        let (selected_file, selected_line) = match self.diffs.get(item_id) {
+            Some(DiffState::Loaded(diff)) if !diff.files.is_empty() => {
+                let selected_file = saved.selected_file.min(diff.files.len() - 1);
+                let line_count = diff_review_targets(&diff.files[selected_file]).len();
+                let selected_line = if line_count == 0 {
+                    0
+                } else {
+                    saved.selected_line.min(line_count - 1)
+                };
+                (selected_file, selected_line)
+            }
+            _ => (saved.selected_file, saved.selected_line),
+        };
+        self.selected_diff_file
+            .insert(item_id.to_string(), selected_file);
+        self.selected_diff_line
+            .insert(item_id.to_string(), selected_line);
+    }
+
+    #[cfg(test)]
+    fn show_conversation(&mut self) {
+        self.details_mode = DetailsMode::Conversation;
+        self.diff_return_state = None;
+        self.focus = FocusTarget::Details;
+        self.details_scroll = 0;
+        self.status = "conversation focused".to_string();
+    }
+
     fn focus_list(&mut self) {
         self.focus = FocusTarget::List;
-        self.status = "list focused".to_string();
+        self.status = if self.details_mode == DetailsMode::Diff {
+            "files focused".to_string()
+        } else {
+            "list focused".to_string()
+        };
     }
 
     fn scroll_details(&mut self, delta: i16) {
@@ -4515,6 +6749,7 @@ impl AppState {
             return;
         };
         let author = comment.author.clone();
+        let review_comment_id = comment.review.as_ref().and(comment.id);
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.global_search_active = false;
@@ -4523,6 +6758,7 @@ impl AppState {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
                 author: author.clone(),
+                review_comment_id,
             },
             body: quote_comment_for_reply(&comment),
             scroll: 0,
@@ -4557,12 +6793,53 @@ impl AppState {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
                 comment_id,
+                is_review: comment.review.is_some(),
             },
             body: comment.body,
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
         self.status = "editing comment".to_string();
+    }
+
+    fn start_review_comment_dialog(&mut self) {
+        if self.details_mode != DetailsMode::Diff {
+            self.status = "review comments are available in diff mode".to_string();
+            return;
+        }
+        let Some(item) = self.current_item() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        let target = match self.current_diff_review_target_result() {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                self.status = "no diff line selected".to_string();
+                return;
+            }
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.pr_action_dialog = None;
+        self.comment_dialog = Some(CommentDialog {
+            mode: CommentDialogMode::Review {
+                target: target.clone(),
+            },
+            body: String::new(),
+            scroll: 0,
+        });
+        self.scroll_comment_dialog_to_cursor();
+        self.status = format!("reviewing {}", target.location_label());
     }
 
     fn handle_comment_dialog_key(
@@ -4576,17 +6853,25 @@ impl AppState {
             PendingCommentMode::Post => {
                 start_comment_submit(submit.item, submit.body, tx.clone());
             }
+            PendingCommentMode::ReviewReply { comment_id } => {
+                start_review_reply_submit(submit.item, comment_id, submit.body, tx.clone());
+            }
             PendingCommentMode::Edit {
                 comment_index,
                 comment_id,
+                is_review,
             } => {
                 start_comment_edit(
                     submit.item,
                     comment_index,
                     comment_id,
+                    is_review,
                     submit.body,
                     tx.clone(),
                 );
+            }
+            PendingCommentMode::Review { target } => {
+                start_review_comment_submit(submit.item, target, submit.body, tx.clone());
             }
         });
     }
@@ -4677,20 +6962,30 @@ impl AppState {
             return None;
         };
         let mode = match dialog.mode {
-            CommentDialogMode::New | CommentDialogMode::Reply { .. } => PendingCommentMode::Post,
+            CommentDialogMode::New => PendingCommentMode::Post,
+            CommentDialogMode::Reply {
+                review_comment_id: Some(comment_id),
+                ..
+            } => PendingCommentMode::ReviewReply { comment_id },
+            CommentDialogMode::Reply { .. } => PendingCommentMode::Post,
             CommentDialogMode::Edit {
                 comment_index,
                 comment_id,
+                is_review,
             } => PendingCommentMode::Edit {
                 comment_index,
                 comment_id,
+                is_review,
             },
+            CommentDialogMode::Review { target } => PendingCommentMode::Review { target },
         };
         self.posting_comment = true;
-        self.message_dialog = Some(comment_pending_dialog(mode));
-        self.status = match mode {
+        self.message_dialog = Some(comment_pending_dialog(&mode));
+        self.status = match &mode {
             PendingCommentMode::Post => "posting comment".to_string(),
+            PendingCommentMode::ReviewReply { .. } => "posting review reply".to_string(),
             PendingCommentMode::Edit { .. } => "updating comment".to_string(),
+            PendingCommentMode::Review { .. } => "posting review comment".to_string(),
         };
         Some(PendingCommentSubmit { item, body, mode })
     }
@@ -4873,6 +7168,23 @@ impl AppState {
         self.selected_position(&self.active_view)
     }
 
+    fn current_list_scroll_offset(&self, len: usize, visible_rows: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+
+        let default =
+            table_viewport_offset(self.current_selected_position().min(len - 1), visible_rows);
+        let Some(section) = self.current_section() else {
+            return default;
+        };
+        self.list_scroll_offset
+            .get(&section.key)
+            .copied()
+            .unwrap_or(default)
+            .min(max_table_viewport_offset(len, visible_rows))
+    }
+
     fn section_position(&self, view: &str) -> usize {
         self.section_index.get(view).copied().unwrap_or(0)
     }
@@ -4889,6 +7201,18 @@ impl AppState {
     fn set_current_selected_position(&mut self, position: usize) {
         self.selected_index
             .insert(self.active_view.clone(), position);
+    }
+
+    fn set_current_list_scroll_offset(&mut self, offset: usize) {
+        if let Some(section_key) = self.current_section().map(|section| section.key.clone()) {
+            self.list_scroll_offset.insert(section_key, offset);
+        }
+    }
+
+    fn clear_current_list_scroll_offset(&mut self) {
+        if let Some(section_key) = self.current_section().map(|section| section.key.clone()) {
+            self.list_scroll_offset.remove(&section_key);
+        }
     }
 
     fn view_exists(&self, view: &str) -> bool {
@@ -5260,6 +7584,930 @@ mod tests {
     }
 
     #[test]
+    fn parse_pull_request_diff_tracks_files_hunks_and_lines() {
+        let diff = parse_pull_request_diff(
+            r#"diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+ pub fn old() {
+-    println!("old");
++    println!("new");
++    println!("extra");
+ }
+diff --git a/README.md b/README.md
+deleted file mode 100644
+--- a/README.md
++++ /dev/null
+@@ -1 +0,0 @@
+-hello
+"#,
+        )
+        .expect("parse diff");
+
+        assert_eq!(diff.files.len(), 2);
+        assert_eq!(diff.additions, 2);
+        assert_eq!(diff.deletions, 2);
+        assert_eq!(diff.files[0].new_path, "src/lib.rs");
+        assert_eq!(diff.files[0].hunks.len(), 1);
+        assert_eq!(diff.files[0].hunks[0].lines[1].kind, DiffLineKind::Removed);
+        assert_eq!(diff.files[0].hunks[0].lines[2].new_line, Some(2));
+        assert_eq!(diff.files[1].new_path, "/dev/null");
+    }
+
+    #[test]
+    fn diff_document_renders_lazygit_style_gutter() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let document = build_details_document(&app, 96);
+        let rendered = document
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Conversation | Diff"));
+        assert!(rendered.contains("▾ src/lib.rs"));
+        assert!(rendered.contains("@@ -1,2 +1,2 @@"));
+        assert!(rendered.contains("   1      │ - old"));
+        assert!(rendered.contains("        1 │ + new"));
+        assert!(!rendered.contains("selected:"));
+        assert!(!rendered.contains("selected range:"));
+        assert_eq!(document.diff_files, vec![8]);
+        assert_eq!(document.diff_line_at(10), Some(0));
+        assert_eq!(document.diff_line_at(11), Some(1));
+    }
+
+    #[test]
+    fn diff_review_targets_map_sides_and_paths() {
+        let diff = parse_pull_request_diff(
+            r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+        )
+        .expect("parse diff");
+
+        let targets = diff_review_targets(&diff.files[0]);
+
+        assert_eq!(
+            targets,
+            vec![
+                DiffReviewTarget {
+                    path: "src/lib.rs".to_string(),
+                    line: 1,
+                    side: DiffReviewSide::Left,
+                    start_line: None,
+                    start_side: None,
+                    preview: "old".to_string(),
+                },
+                DiffReviewTarget {
+                    path: "src/lib.rs".to_string(),
+                    line: 1,
+                    side: DiffReviewSide::Right,
+                    start_line: None,
+                    start_side: None,
+                    preview: "new".to_string(),
+                },
+                DiffReviewTarget {
+                    path: "src/lib.rs".to_string(),
+                    line: 2,
+                    side: DiffReviewSide::Right,
+                    start_line: None,
+                    start_side: None,
+                    preview: "context".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_details_selects_review_line_with_keyboard_and_mouse() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 34);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_diff_line.get("1"), Some(&1));
+        assert_eq!(
+            app.current_diff_review_target().map(|target| target.side),
+            Some(DiffReviewSide::Right)
+        );
+
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let line = document
+            .diff_lines
+            .iter()
+            .find(|line| line.review_index == 2)
+            .expect("third review line")
+            .line;
+        let page = page_areas(area);
+        let body = body_areas_with_ratio(body_area(area), app.list_width_percent);
+        handle_left_click(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 2,
+                row: inner.y + line as u16,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            MouseLayout {
+                view_tabs: page[0],
+                section_tabs: page[1],
+                table: body[0],
+                details: details_area,
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(app.selected_diff_line.get("1"), Some(&2));
+    }
+
+    #[test]
+    fn diff_details_page_keys_select_first_visible_review_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut diff_lines = String::new();
+        for line in 1..=40 {
+            diff_lines.push_str(&format!(" line {line}\n"));
+        }
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(&format!(
+                    "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,40 +1,40 @@\n{diff_lines}"
+                ))
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 28);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::PageDown),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(app.details_scroll > 0);
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::PageUp),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+    }
+
+    #[test]
+    fn n_and_p_page_diff_details_instead_of_jumping_hunks() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut diff_lines = String::new();
+        for line in 1..=40 {
+            diff_lines.push_str(&format!(" line {line}\n"));
+        }
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(&format!(
+                    "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,40 +1,40 @@\n{diff_lines}"
+                ))
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 28);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(app.details_scroll > 0);
+        let after_next = app.details_scroll;
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(app.details_scroll < after_next);
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+    }
+
+    #[test]
+    fn g_and_upper_g_jump_diff_details_top_and_bottom() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut diff_lines = String::new();
+        for line in 1..=40 {
+            diff_lines.push_str(&format!(" line {line}\n"));
+        }
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(&format!(
+                    "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,40 +1,40 @@\n{diff_lines}"
+                ))
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 28);
+        let max_scroll = max_details_scroll(&app, details_area_for(&app, area));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('G')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.details_scroll, max_scroll);
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('g')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn m_marks_diff_range_for_review_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -0,0 +1,3 @@
++one
++two
++three
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 24);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('m')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(app.mouse_capture_enabled);
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('m')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('c')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+
+        assert!(matches!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(CommentDialogMode::Review { target })
+                if target.path == "src/lib.rs"
+                    && target.start_line == Some(1)
+                    && target.start_side == Some(DiffReviewSide::Right)
+                    && target.line == 3
+                    && target.side == DiffReviewSide::Right
+        ));
+        assert_eq!(app.status, "reviewing src/lib.rs:1-3");
+    }
+
+    #[test]
+    fn mixed_side_diff_range_is_rejected_for_review_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 24);
+
+        for code in [
+            KeyCode::Char('m'),
+            KeyCode::Char('j'),
+            KeyCode::Char('m'),
+            KeyCode::Char('c'),
+        ] {
+            assert!(!handle_key_in_area(
+                &mut app,
+                key(code),
+                &config,
+                &store,
+                &tx,
+                Some(area)
+            ));
+        }
+
+        assert!(app.comment_dialog.is_none());
+        assert_eq!(app.status, "range must stay on one diff side");
+    }
+
+    #[test]
+    fn two_mouse_clicks_mark_diff_range() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -0,0 +1,3 @@
++one
++two
++three
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 24);
+        let page = page_areas(area);
+        let body = body_areas_with_ratio(body_area(area), app.list_width_percent);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let line_for = |review_index| {
+            document
+                .diff_lines
+                .iter()
+                .find(|line| line.review_index == review_index)
+                .expect("review line")
+                .line as u16
+        };
+
+        for review_index in [0, 2] {
+            handle_left_click(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: inner.x + 2,
+                    row: inner.y + line_for(review_index),
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                MouseLayout {
+                    view_tabs: page[0],
+                    section_tabs: page[1],
+                    table: body[0],
+                    details: details_area,
+                },
+                None,
+                None,
+            );
+        }
+
+        let target = app.current_diff_review_target().expect("review range");
+        assert_eq!(target.start_line, Some(1));
+        assert_eq!(target.line, 3);
+        assert_eq!(target.side, DiffReviewSide::Right);
+    }
+
+    #[test]
+    fn show_diff_focuses_diff_files_for_pull_requests() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.show_diff();
+
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.status, "loading diff");
+
+        app.show_conversation();
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.status, "conversation focused");
+    }
+
+    #[test]
+    fn q_in_diff_returns_to_state_before_diff_instead_of_quitting() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_list();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.details_scroll = 7;
+        app.selected_comment_index = 1;
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8 +8 @@
+-main_old
++main_new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.focus_list();
+        app.details_scroll = 21;
+        app.selected_comment_index = 0;
+        app.selected_diff_file.insert("1".to_string(), 1);
+        app.selected_diff_line.insert("1".to_string(), 1);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('q')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_scroll, 7);
+        assert_eq!(app.selected_comment_index, 1);
+        assert_eq!(app.status, "returned from diff");
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_scroll, 21);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.selected_diff_line.get("1"), Some(&1));
+    }
+
+    #[test]
+    fn esc_in_diff_details_refocuses_diff_files() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.focus_sections();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+
+        app.focus_details();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.status, "files focused");
+    }
+
+    #[test]
+    fn v_opens_diff_from_any_focus_region() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.focus_ghr();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+
+        app.show_conversation();
+        app.focus_list();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('V')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+
+        app.show_conversation();
+        app.focus_sections();
+        assert!(!handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SHIFT),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+    }
+
+    #[test]
+    fn diff_file_navigation_switches_between_files() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8 +8 @@
+-main_old
++main_new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        app.move_diff_file(1);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.details_scroll, 0);
+
+        app.move_diff_file(1);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+    }
+
+    #[test]
+    fn diff_tree_groups_changed_files_by_directory() {
+        let diff = parse_pull_request_diff(
+            r#"diff --git a/src/app.rs b/src/app.rs
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/github.rs b/src/github.rs
+--- a/src/github.rs
++++ b/src/github.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-old
++new
+"#,
+        )
+        .expect("parse diff");
+
+        let entries = diff_tree_entries(&diff);
+        let labels = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.depth,
+                    entry.file_index,
+                    entry.label.as_str(),
+                    entry.stats.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&(0, None, "src", "")));
+        assert!(labels.contains(&(1, Some(0), "app.rs", "M +1 -1")));
+        assert!(labels.contains(&(1, Some(1), "github.rs", "M +1 -1")));
+        assert!(labels.contains(&(0, Some(2), "README.md", "M +1 -1")));
+    }
+
+    #[test]
+    fn diff_file_list_keys_select_files_and_keep_right_side_diff() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_list();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/app.rs b/src/app.rs
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1 +1 @@
+-old
++app
+diff --git a/src/github.rs b/src/github.rs
+--- a/src/github.rs
++++ b/src/github.rs
+@@ -1 +1 @@
+-old
++github
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.focus, FocusTarget::List);
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("▾ src/github.rs"));
+        assert!(rendered.contains("+ github"));
+        assert!(!rendered.contains("+ app"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::Details);
+    }
+
+    #[test]
+    fn m_in_diff_file_list_keeps_files_open_instead_of_text_selection_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_list();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('m')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.mouse_capture_enabled);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert!(app.status.contains("mark diff lines from Details"));
+    }
+
+    #[test]
+    fn m_restores_mouse_capture_even_in_diff_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_details();
+        app.mouse_capture_enabled = false;
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('m')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.mouse_capture_enabled);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.status, "mouse controls enabled");
+    }
+
+    #[test]
+    fn c_in_diff_file_list_opens_review_comment_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_list();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/app.rs b/src/app.rs
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1 +1 @@
+-old
++app
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('c')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert!(matches!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(CommentDialogMode::Review { target })
+                if target.path == "src/app.rs" && target.line == 1
+        ));
+    }
+
+    #[test]
     fn setup_dialog_from_error_classifies_gh_setup_failures() {
         assert_eq!(
             setup_dialog_from_error("GitHub CLI `gh` is required but was not found."),
@@ -5322,8 +8570,11 @@ mod tests {
             section_index: HashMap::from([(builtin_view_key(SectionKind::Issues), 0)]),
             selected_index: HashMap::from([(builtin_view_key(SectionKind::Issues), 1)]),
             focus: "details".to_string(),
+            details_mode: "conversation".to_string(),
             details_scroll: 7,
             selected_comment_index: 2,
+            selected_diff_file: HashMap::new(),
+            selected_diff_line: HashMap::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -5342,7 +8593,34 @@ mod tests {
         assert_eq!(saved.active_view, builtin_view_key(SectionKind::Issues));
         assert_eq!(saved.selected_index.get("issues"), Some(&1));
         assert_eq!(saved.focus, "details");
+        assert_eq!(saved.details_mode, "conversation");
         assert_eq!(saved.details_scroll, 7);
+    }
+
+    #[test]
+    fn ui_state_restores_diff_mode_for_selected_pull_request() {
+        let state = UiState {
+            active_view: builtin_view_key(SectionKind::PullRequests),
+            selected_index: HashMap::from([(builtin_view_key(SectionKind::PullRequests), 0)]),
+            focus: "details".to_string(),
+            details_mode: "diff".to_string(),
+            details_scroll: 19,
+            selected_diff_file: HashMap::from([("1".to_string(), 2)]),
+            selected_diff_line: HashMap::from([("1".to_string(), 7)]),
+            ..UiState::default()
+        };
+
+        let app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
+        let saved = app.ui_state();
+
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.details_scroll, 19);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&2));
+        assert_eq!(app.selected_diff_line.get("1"), Some(&7));
+        assert_eq!(saved.details_mode, "diff");
+        assert_eq!(saved.selected_diff_file.get("1"), Some(&2));
+        assert_eq!(saved.selected_diff_line.get("1"), Some(&7));
     }
 
     #[test]
@@ -5653,6 +8931,34 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_in_diff_keeps_diff_state_available_for_save() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_details();
+        app.details_scroll = 11;
+        app.selected_diff_file.insert("1".to_string(), 3);
+        app.selected_diff_line.insert("1".to_string(), 5);
+
+        assert!(handle_key(
+            &mut app,
+            ctrl_key(KeyCode::Char('c')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let saved = app.ui_state();
+        assert_eq!(saved.details_mode, "diff");
+        assert_eq!(saved.focus, "details");
+        assert_eq!(saved.details_scroll, 11);
+        assert_eq!(saved.selected_diff_file.get("1"), Some(&3));
+        assert_eq!(saved.selected_diff_line.get("1"), Some(&5));
+    }
+
+    #[test]
     fn question_mark_opens_and_dismisses_help_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -5828,11 +9134,10 @@ mod tests {
         let text = footer_line(&app, &paths).to_string();
 
         assert!(
-            text.contains(
-                "List items  j/k move  pg d/u page  [ ] results  g/G ends  enter Details"
-            )
+            text.contains("List items  j/k move  pg page  [ ] results  g/G ends  enter Details")
         );
         assert!(text.contains("/ filter"));
+        assert!(text.contains("v diff"));
         assert!(text.contains("M/C/A pr action"));
         assert!(
             text.contains(
@@ -5851,20 +9156,29 @@ mod tests {
 
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
-        assert!(ghr.contains("ghr tabs  h/l switch  j/enter Sections  esc List"));
+        assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
         assert!(!ghr.contains("M/C/A pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
-        assert!(sections.contains("Sections tabs  h/l switch  k ghr  j/enter List"));
+        assert!(sections.contains("Sections tabs  tab/h/l switch  k ghr  j/enter List"));
         assert!(!sections.contains("a comment"));
 
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  a comment  R reply  e edit"));
+        assert!(details.contains("n/p comment  c/a comment  R reply  e edit"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
+
+        app.show_diff();
+        app.focus_details();
+        let diff = footer_line(&app, &paths).to_string();
+        assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
+        assert!(diff.contains("[ ] file  m mark  c comment  M/C/A pr action"));
+        assert!(diff.contains("q back"));
+        assert!(!diff.contains("q quit"));
+        assert!(!diff.contains("R reply"));
     }
 
     #[test]
@@ -6517,6 +9831,7 @@ mod tests {
                     updated_at: None,
                     url: None,
                     is_mine: false,
+                    review: None,
                 },
                 CommentPreview {
                     id: None,
@@ -6528,6 +9843,7 @@ mod tests {
                         "https://github.com/rust-lang/rust/pull/1#issuecomment-2".to_string(),
                     ),
                     is_mine: false,
+                    review: None,
                 },
             ]),
         );
@@ -6585,6 +9901,35 @@ mod tests {
             document.link_at(line_index, column),
             Some("https://example.com/one".to_string())
         );
+    }
+
+    #[test]
+    fn details_comments_show_inline_review_location() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut inline = own_comment(
+            88,
+            "chenyukang",
+            "This is a review comment?",
+            Some("https://github.com/chenyukang/ghr/pull/8#discussion_r88"),
+        );
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/github.rs".to_string(),
+            line: Some(876),
+            side: Some("RIGHT".to_string()),
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("inline src/github.rs:876 right"));
+        assert!(rendered.contains("This is a review comment?"));
+        assert!(rendered.contains("comments: 1"));
     }
 
     #[test]
@@ -6666,7 +10011,8 @@ mod tests {
             dialog.mode,
             CommentDialogMode::Edit {
                 comment_index: 0,
-                comment_id: 42
+                comment_id: 42,
+                is_review: false,
             }
         );
         assert_eq!(dialog.body, "Original body");
@@ -6688,7 +10034,8 @@ mod tests {
             dialog.mode,
             CommentDialogMode::Reply {
                 comment_index: 0,
-                author: "alice".to_string()
+                author: "alice".to_string(),
+                review_comment_id: None,
             }
         );
         assert!(dialog.body.contains("> @alice wrote:"));
@@ -6756,7 +10103,8 @@ mod tests {
             app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
             Some(&CommentDialogMode::Edit {
                 comment_index: 0,
-                comment_id: 42
+                comment_id: 42,
+                is_review: false,
             })
         );
         assert_eq!(
@@ -6810,6 +10158,29 @@ mod tests {
             app.comment_dialog.map(|dialog| dialog.mode),
             Some(CommentDialogMode::New)
         );
+    }
+
+    #[test]
+    fn c_key_in_details_opens_new_comment_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('c')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(
+            app.comment_dialog.map(|dialog| dialog.mode),
+            Some(CommentDialogMode::New)
+        );
+        assert!(app.pr_action_dialog.is_none());
     }
 
     #[test]
@@ -6956,6 +10327,9 @@ mod tests {
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("merged"));
         assert!(app.details_stale.contains("1"));
         assert_eq!(app.status, "pull request merged; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Merged");
+        assert!(dialog.auto_close_at.is_some());
     }
 
     #[test]
@@ -6975,6 +10349,9 @@ mod tests {
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
         assert!(app.details_stale.contains("1"));
         assert_eq!(app.status, "pull request approved; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Approved");
+        assert!(dialog.auto_close_at.is_some());
     }
 
     #[test]
@@ -6998,6 +10375,7 @@ mod tests {
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));
+        assert!(dialog.auto_close_at.is_none());
     }
 
     #[test]
@@ -7006,10 +10384,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
         let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
-        app.message_dialog = Some(MessageDialog {
-            title: "Merge Failed".to_string(),
-            body: "review approval required".to_string(),
-        });
+        app.message_dialog = Some(message_dialog("Merge Failed", "review approval required"));
 
         assert!(!handle_key(
             &mut app,
@@ -7021,6 +10396,36 @@ mod tests {
 
         assert!(app.message_dialog.is_none());
         assert_eq!(app.status, "message dismissed");
+    }
+
+    #[test]
+    fn success_message_dialog_auto_dismisses_after_deadline() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let deadline = Instant::now() + Duration::from_millis(5);
+        app.message_dialog = Some(MessageDialog {
+            title: "Comment Posted".to_string(),
+            body: "ok".to_string(),
+            auto_close_at: Some(deadline),
+        });
+
+        app.dismiss_expired_message_dialog(deadline - Duration::from_millis(1));
+        assert!(app.message_dialog.is_some());
+
+        app.dismiss_expired_message_dialog(deadline);
+        assert!(app.message_dialog.is_none());
+        assert_eq!(app.status, "loading snapshot; background refresh started");
+    }
+
+    #[test]
+    fn blocking_message_dialog_does_not_auto_dismiss() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.message_dialog = Some(message_dialog("Comment Failed", "HTTP 403"));
+
+        app.dismiss_expired_message_dialog(Instant::now() + Duration::from_secs(60));
+
+        let dialog = app.message_dialog.as_ref().expect("blocking dialog");
+        assert_eq!(dialog.title, "Comment Failed");
+        assert!(dialog.auto_close_at.is_none());
     }
 
     #[test]
@@ -7112,7 +10517,218 @@ mod tests {
                 "updated".to_string(),
                 PendingCommentMode::Edit {
                     comment_index: 0,
-                    comment_id: 42
+                    comment_id: 42,
+                    is_review: false,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn inline_review_comment_edit_uses_review_edit_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut inline = own_comment(88, "chenyukang", "old inline", None);
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/github.rs".to_string(),
+            line: Some(876),
+            side: Some("RIGHT".to_string()),
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+
+        app.start_edit_selected_comment_dialog();
+
+        assert_eq!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(&CommentDialogMode::Edit {
+                comment_index: 0,
+                comment_id: 88,
+                is_review: true,
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_in_inline_review_reply_submits_review_reply() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut inline = comment(
+            "alice",
+            "inline question",
+            Some("https://github.com/owner/repo/pull/1#discussion_r88"),
+        );
+        inline.id = Some(88);
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/github.rs".to_string(),
+            line: Some(876),
+            side: Some("RIGHT".to_string()),
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+        app.start_reply_to_selected_comment();
+        app.comment_dialog.as_mut().unwrap().body = "reply inline".to_string();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "posting review reply");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Posting Review Reply",
+                "Waiting for GitHub to accept the review reply..."
+            ))
+        );
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                "reply inline".to_string(),
+                PendingCommentMode::ReviewReply { comment_id: 88 }
+            ))
+        );
+    }
+
+    #[test]
+    fn c_in_diff_details_opens_review_comment_dialog_and_a_is_unbound() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('a')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.comment_dialog.is_none());
+        assert!(app.pr_action_dialog.is_none());
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('c')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(CommentDialogMode::Review { target })
+                if target.path == "src/lib.rs"
+                    && target.line == 1
+                    && target.side == DiffReviewSide::Left
+        ));
+        assert_eq!(app.status, "reviewing src/lib.rs:1");
+
+        app.comment_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('A')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.comment_dialog.is_none());
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::Approve)
+        ));
+
+        app.pr_action_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('M')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::Merge)
+        ));
+    }
+
+    #[test]
+    fn ctrl_enter_in_review_dialog_submits_review_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.move_diff_line(1, None);
+        app.start_review_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "please tighten this".to_string();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "posting review comment");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Posting Review Comment",
+                "Waiting for GitHub to accept the review comment..."
+            ))
+        );
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                "please tighten this".to_string(),
+                PendingCommentMode::Review {
+                    target: DiffReviewTarget {
+                        path: "src/lib.rs".to_string(),
+                        line: 1,
+                        side: DiffReviewSide::Right,
+                        start_line: None,
+                        start_side: None,
+                        preview: "new".to_string(),
+                    }
                 }
             ))
         );
@@ -7122,7 +10738,7 @@ mod tests {
     fn comment_post_success_opens_result_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.posting_comment = true;
-        app.message_dialog = Some(comment_pending_dialog(PendingCommentMode::Post));
+        app.message_dialog = Some(comment_pending_dialog(&PendingCommentMode::Post));
 
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
@@ -7140,6 +10756,12 @@ mod tests {
                 "GitHub accepted the comment and comments were refreshed."
             ))
         );
+        assert!(
+            app.message_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.auto_close_at)
+                .is_some()
+        );
         assert_eq!(app.selected_comment_index, 0);
     }
 
@@ -7147,7 +10769,7 @@ mod tests {
     fn comment_post_failure_opens_result_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.posting_comment = true;
-        app.message_dialog = Some(comment_pending_dialog(PendingCommentMode::Post));
+        app.message_dialog = Some(comment_pending_dialog(&PendingCommentMode::Post));
 
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
@@ -7159,15 +10781,17 @@ mod tests {
         let dialog = app.message_dialog.as_ref().expect("failure dialog");
         assert_eq!(dialog.title, "Comment Failed");
         assert_eq!(dialog.body, "HTTP 403");
+        assert!(dialog.auto_close_at.is_none());
     }
 
     #[test]
     fn comment_update_success_opens_result_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.posting_comment = true;
-        app.message_dialog = Some(comment_pending_dialog(PendingCommentMode::Edit {
+        app.message_dialog = Some(comment_pending_dialog(&PendingCommentMode::Edit {
             comment_index: 0,
             comment_id: 42,
+            is_review: false,
         }));
 
         app.handle_msg(AppMsg::CommentUpdated {
@@ -7187,15 +10811,22 @@ mod tests {
                 "GitHub accepted the update and comments were refreshed."
             ))
         );
+        assert!(
+            app.message_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.auto_close_at)
+                .is_some()
+        );
     }
 
     #[test]
     fn comment_update_failure_opens_result_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.posting_comment = true;
-        app.message_dialog = Some(comment_pending_dialog(PendingCommentMode::Edit {
+        app.message_dialog = Some(comment_pending_dialog(&PendingCommentMode::Edit {
             comment_index: 0,
             comment_id: 42,
+            is_review: false,
         }));
 
         app.handle_msg(AppMsg::CommentUpdated {
@@ -7211,6 +10842,52 @@ mod tests {
         let dialog = app.message_dialog.as_ref().expect("failure dialog");
         assert_eq!(dialog.title, "Update Failed");
         assert_eq!(dialog.body, "validation failed");
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn review_comment_result_dialog_reports_success_and_failure() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.posting_comment = true;
+
+        app.handle_msg(AppMsg::ReviewCommentPosted {
+            item_id: "1".to_string(),
+            result: Ok(()),
+        });
+
+        assert!(!app.posting_comment);
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "review comment posted");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Review Comment Posted",
+                "GitHub accepted the review comment."
+            ))
+        );
+        assert!(
+            app.message_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.auto_close_at)
+                .is_some()
+        );
+
+        app.posting_comment = true;
+        app.handle_msg(AppMsg::ReviewCommentPosted {
+            item_id: "1".to_string(),
+            result: Err(
+                "gh api repos/owner/repo/pulls/1/comments failed: validation failed".to_string(),
+            ),
+        });
+
+        assert!(!app.posting_comment);
+        assert_eq!(app.status, "review comment failed");
+        let dialog = app.message_dialog.as_ref().expect("failure dialog");
+        assert_eq!(dialog.title, "Review Comment Failed");
+        assert_eq!(dialog.body, "validation failed");
+        assert!(dialog.auto_close_at.is_none());
     }
 
     #[test]
@@ -7303,7 +10980,7 @@ mod tests {
         );
         assert_eq!(
             app.comment_dialog.as_ref().map(|dialog| dialog.scroll),
-            Some(6 + MOUSE_SCROLL_LINES)
+            Some(6 + MOUSE_COMMENT_SCROLL_LINES)
         );
     }
 
@@ -7364,6 +11041,7 @@ mod tests {
                 updated_at: None,
                 url: None,
                 is_mine: false,
+                review: None,
             }]),
         );
 
@@ -7658,6 +11336,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, 40);
         let table = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
         let inner = block_inner(table);
+        let visible_rows = usize::from(table_visible_rows(table));
 
         handle_mouse(
             &mut app,
@@ -7672,16 +11351,96 @@ mod tests {
 
         assert_eq!(app.focus, FocusTarget::List);
         assert!(!app.search_active);
+        assert_eq!(app.current_selected_position(), 0);
         assert_eq!(
-            app.current_selected_position(),
-            usize::from(MOUSE_SCROLL_LINES)
+            app.current_list_scroll_offset(30, visible_rows),
+            usize::from(MOUSE_LIST_SCROLL_LINES)
         );
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn mouse_move_over_list_does_not_select_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![many_items_section(30)]);
+        app.focus_details();
+        let area = Rect::new(0, 0, 120, 40);
+        let table = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let inner = block_inner(table);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: inner.x + 2,
+                row: inner.y + TABLE_HEADER_HEIGHT + 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.current_selected_position(), 0);
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_diff_file_list_one_file_at_a_time() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/c.rs b/c.rs
+--- a/c.rs
++++ b/c.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        let files_area = body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let inner = block_inner(files_area);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: inner.x + 2,
+                row: inner.y + 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(
+            app.selected_diff_file.get("1"),
+            Some(&(MOUSE_DIFF_FILE_SCROLL_LINES as usize))
+        );
+        assert_eq!(app.details_scroll, 0);
     }
 
     #[test]
     fn table_visible_range_tracks_current_page() {
         assert_eq!(table_visible_range(0, 10, 25), Some((1, 10)));
-        assert_eq!(table_visible_range(10, 10, 25), Some((2, 11)));
+        assert_eq!(table_visible_range(10, 10, 25), Some((11, 20)));
         assert_eq!(table_visible_range(24, 10, 25), Some((16, 25)));
         assert_eq!(table_visible_range(0, 10, 0), None);
     }
@@ -7695,7 +11454,7 @@ mod tests {
     fn focus_panel_title_marks_active_panel() {
         assert_eq!(
             focus_panel_title("Details", "Details:", true),
-            "[FOCUS Details] Details:"
+            "[Focus] Details:"
         );
         assert_eq!(focus_panel_title("Details", "Details:", false), "Details:");
     }
@@ -7738,7 +11497,7 @@ mod tests {
         );
 
         assert_eq!(app.focus, FocusTarget::Details);
-        assert_eq!(app.details_scroll, MOUSE_SCROLL_LINES);
+        assert_eq!(app.details_scroll, MOUSE_DETAILS_SCROLL_LINES);
 
         handle_mouse(
             &mut app,
@@ -7933,6 +11692,80 @@ mod tests {
     }
 
     #[test]
+    fn tab_switches_the_current_focused_tab_group() {
+        let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/nervosnetwork/fiber/issues/1".to_string();
+        let sections = vec![
+            test_section(),
+            SectionSnapshot {
+                key: "pull_requests:assigned".to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Assigned".to_string(),
+                filters: String::new(),
+                items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "issues:test".to_string(),
+                kind: SectionKind::Issues,
+                title: "Issues".to_string(),
+                filters: String::new(),
+                items: vec![issue],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.focus_ghr();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+
+        app.switch_view(builtin_view_key(SectionKind::PullRequests));
+        app.focus_sections();
+        assert_eq!(app.current_section_position(), 0);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 1);
+        assert_eq!(app.focus, FocusTarget::Sections);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::BackTab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 0);
+        assert_eq!(app.focus, FocusTarget::Sections);
+    }
+
+    #[test]
     fn h_and_l_wrap_focused_tab_groups_at_edges() {
         let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
         issue.kind = ItemKind::Issue;
@@ -8019,18 +11852,18 @@ mod tests {
             .draw(|frame| draw(frame, &app, &paths))
             .expect("draw sections focus");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert_eq!(rendered.matches("[FOCUS").count(), 1);
-        assert!(rendered.contains("[FOCUS] Sections"));
-        assert!(!rendered.contains("[FOCUS List]"));
+        assert_eq!(rendered.matches("[Focus").count(), 1);
+        assert!(rendered.contains("[Focus] Sections"));
+        assert!(!rendered.contains("[Focus] List"));
 
         app.focus_list();
         terminal
             .draw(|frame| draw(frame, &app, &paths))
             .expect("draw list focus");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-        assert_eq!(rendered.matches("[FOCUS").count(), 1);
-        assert!(rendered.contains("[FOCUS List]"));
-        assert!(!rendered.contains("[FOCUS] Sections"));
+        assert_eq!(rendered.matches("[Focus").count(), 1);
+        assert!(rendered.contains("[Focus] Test"));
+        assert!(!rendered.contains("[Focus] Sections"));
     }
 
     #[test]
@@ -8092,6 +11925,76 @@ mod tests {
 
         assert_eq!(app.current_selected_position(), 0);
         assert_eq!(app.details_scroll, 1);
+    }
+
+    #[test]
+    fn notification_read_local_removes_unread_and_marks_all_items_read() {
+        let unread_item = notification_item("thread-1", true);
+        let other_item = notification_item("thread-2", true);
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![unread_item.clone(), other_item.clone()],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![unread_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+
+        assert!(app.apply_notification_read_local("thread-1"));
+
+        assert_eq!(app.sections[0].items.len(), 1);
+        assert_eq!(app.sections[0].items[0].id, "thread-2");
+        assert_eq!(app.sections[1].items[0].unread, Some(false));
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-2")
+        );
+    }
+
+    #[test]
+    fn notification_read_finished_updates_local_state_and_clears_pending() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:unread".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Unread".to_string(),
+            filters: "is:unread".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        app.notification_read_pending.insert("thread-1".to_string());
+
+        app.handle_msg(AppMsg::NotificationReadFinished {
+            thread_id: "thread-1".to_string(),
+            result: Ok(None),
+        });
+
+        assert!(!app.notification_read_pending.contains("thread-1"));
+        assert!(app.sections[0].items.is_empty());
+        assert_eq!(app.status, "notification marked read");
     }
 
     #[test]
@@ -8249,6 +12152,26 @@ mod tests {
         }
     }
 
+    fn first_visible_diff_line(app: &AppState, area: Rect) -> (usize, usize) {
+        let details_area = details_area_for(app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(app, inner.width);
+        let start = usize::from(app.details_scroll);
+        let end = start.saturating_add(usize::from(inner.height.max(1)));
+        document
+            .diff_lines
+            .iter()
+            .find(|line| line.line >= start && line.line < end)
+            .map(|line| (line.review_index, line.line))
+            .expect("visible reviewable diff line")
+    }
+
+    fn selected_diff_document_line(app: &AppState, area: Rect) -> Option<usize> {
+        let details_area = details_area_for(app, area);
+        let inner = block_inner(details_area);
+        build_details_document(app, inner.width).selected_diff_line
+    }
+
     fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         CommentPreview {
             id: None,
@@ -8258,6 +12181,7 @@ mod tests {
             updated_at: None,
             url: url.map(str::to_string),
             is_mine: false,
+            review: None,
         }
     }
 
@@ -8270,6 +12194,7 @@ mod tests {
             updated_at: None,
             url: url.map(str::to_string),
             is_mine: true,
+            review: None,
         }
     }
 
@@ -8290,6 +12215,26 @@ mod tests {
             unread: None,
             reason: None,
             extra: None,
+        }
+    }
+
+    fn notification_item(id: &str, unread: bool) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind: ItemKind::Notification,
+            repo: "rust-lang/rust".to_string(),
+            number: Some(1),
+            title: format!("Notification {id}"),
+            body: None,
+            author: None,
+            state: None,
+            url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+            updated_at: None,
+            labels: Vec::new(),
+            comments: None,
+            unread: Some(unread),
+            reason: Some("mention".to_string()),
+            extra: Some("PullRequest".to_string()),
         }
     }
 }

@@ -184,8 +184,8 @@ CI runs formatting, `cargo check`, strict `clippy`, tests on Linux and macOS, an
 Publishing is automatic on version tags:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The release workflow verifies that the tag matches `Cargo.toml`, publishes `ghr-cli` to crates.io, and creates a GitHub release. Configure the repository environment `crates-io` with a `CARGO_REGISTRY_TOKEN` secret before pushing a release tag.

@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,118 @@ impl Config {
         let content = toml::to_string_pretty(&config).context("failed to encode default config")?;
         fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(config)
+    }
+
+    pub fn include_current_git_repo(mut self) -> Self {
+        if let Some(repo) = current_github_repo() {
+            self.add_runtime_repo(repo);
+        }
+        self
+    }
+
+    fn add_runtime_repo(&mut self, repo: String) -> bool {
+        if self
+            .repos
+            .iter()
+            .any(|configured| configured.repo.eq_ignore_ascii_case(&repo))
+        {
+            return false;
+        }
+
+        let name = runtime_repo_name(&self.repos, &repo);
+        self.repos.push(RepoConfig {
+            name,
+            repo,
+            show_prs: true,
+            show_issues: true,
+        });
+        true
+    }
+}
+
+fn current_github_repo() -> Option<String> {
+    if git_output(["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return None;
+    }
+
+    git_remote_candidates()
+        .into_iter()
+        .filter_map(|remote| git_output(["remote", "get-url", remote.as_str()]))
+        .find_map(|url| github_repo_from_remote_url(url.trim()))
+}
+
+fn git_remote_candidates() -> Vec<String> {
+    let mut remotes = Vec::new();
+
+    if let Some(branch) = git_output(["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        let key = format!("branch.{}.remote", branch.trim());
+        if let Some(remote) = git_output(["config", "--get", key.as_str()]) {
+            push_unique_remote(&mut remotes, remote.trim());
+        }
+    }
+
+    push_unique_remote(&mut remotes, "origin");
+
+    if let Some(output) = git_output(["remote"]) {
+        for remote in output.lines() {
+            push_unique_remote(&mut remotes, remote.trim());
+        }
+    }
+
+    remotes
+}
+
+fn push_unique_remote(remotes: &mut Vec<String>, remote: &str) {
+    if remote.is_empty() || remotes.iter().any(|existing| existing == remote) {
+        return;
+    }
+    remotes.push(remote.to_string());
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout).ok()
+}
+
+fn github_repo_from_remote_url(url: &str) -> Option<String> {
+    let path = if let Some(path) = url.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = url.strip_prefix("ssh://git@github.com/") {
+        path
+    } else if let Some((_, path)) = url.split_once("github.com/") {
+        path
+    } else {
+        return None;
+    };
+
+    let path = path
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim().trim_end_matches('/'));
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return None;
+    }
+
+    Some(format!("{owner}/{name}"))
+}
+
+fn runtime_repo_name(configured_repos: &[RepoConfig], repo: &str) -> String {
+    let short_name = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
+    if configured_repos
+        .iter()
+        .any(|configured| configured.name.eq_ignore_ascii_case(short_name))
+    {
+        repo.to_string()
+    } else {
+        short_name.to_string()
     }
 }
 
@@ -229,6 +342,52 @@ mod tests {
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
         assert!(!decoded.notification_sections.is_empty());
+    }
+
+    #[test]
+    fn parses_github_remote_urls() {
+        for (url, expected) in [
+            ("https://github.com/chenyukang/ghr.git", "chenyukang/ghr"),
+            ("https://github.com/chenyukang/ghr", "chenyukang/ghr"),
+            ("git@github.com:chenyukang/ghr.git", "chenyukang/ghr"),
+            ("ssh://git@github.com/chenyukang/ghr.git", "chenyukang/ghr"),
+        ] {
+            assert_eq!(github_repo_from_remote_url(url), Some(expected.to_string()));
+        }
+
+        assert_eq!(
+            github_repo_from_remote_url("git@example.com:chenyukang/ghr.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_repo_is_added_once() {
+        let mut config = Config::default();
+        assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "ghr");
+        assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+        assert!(config.repos[0].show_prs);
+        assert!(config.repos[0].show_issues);
+
+        assert!(!config.add_runtime_repo("chenyukang/GHR".to_string()));
+        assert_eq!(config.repos.len(), 1);
+    }
+
+    #[test]
+    fn runtime_repo_uses_full_name_when_short_name_collides() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "ghr".to_string(),
+            repo: "someone-else/ghr".to_string(),
+            show_prs: true,
+            show_issues: true,
+        });
+
+        assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
+        assert_eq!(config.repos[1].name, "chenyukang/ghr");
+        assert_eq!(config.repos[1].repo, "chenyukang/ghr");
     }
 
     #[test]

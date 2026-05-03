@@ -18,8 +18,11 @@ pub struct UiState {
     pub section_index: HashMap<String, usize>,
     pub selected_index: HashMap<String, usize>,
     pub focus: String,
+    pub details_mode: String,
     pub details_scroll: u16,
     pub selected_comment_index: usize,
+    pub selected_diff_file: HashMap<String, usize>,
+    pub selected_diff_line: HashMap<String, usize>,
 }
 
 impl UiState {
@@ -52,6 +55,9 @@ impl UiState {
         if !matches!(self.focus.as_str(), "ghr" | "sections" | "list" | "details") {
             self.focus = "list".to_string();
         }
+        if !matches!(self.details_mode.as_str(), "conversation" | "diff") {
+            self.details_mode = "conversation".to_string();
+        }
         self
     }
 }
@@ -64,8 +70,11 @@ impl Default for UiState {
             section_index: HashMap::new(),
             selected_index: HashMap::new(),
             focus: "list".to_string(),
+            details_mode: "conversation".to_string(),
             details_scroll: 0,
             selected_comment_index: 0,
+            selected_diff_file: HashMap::new(),
+            selected_diff_line: HashMap::new(),
         }
     }
 }
@@ -93,8 +102,11 @@ mod tests {
             section_index: HashMap::from([("issues".to_string(), 1)]),
             selected_index: HashMap::from([("issues".to_string(), 3)]),
             focus: "details".to_string(),
+            details_mode: "diff".to_string(),
             details_scroll: 8,
             selected_comment_index: 2,
+            selected_diff_file: HashMap::from([("issue-3".to_string(), 4)]),
+            selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
         }
         .save(&path)
         .expect("save state");
@@ -106,8 +118,11 @@ mod tests {
         assert_eq!(state.section_index.get("issues"), Some(&1));
         assert_eq!(state.selected_index.get("issues"), Some(&3));
         assert_eq!(state.focus, "details");
+        assert_eq!(state.details_mode, "diff");
         assert_eq!(state.details_scroll, 8);
         assert_eq!(state.selected_comment_index, 2);
+        assert_eq!(state.selected_diff_file.get("issue-3"), Some(&4));
+        assert_eq!(state.selected_diff_line.get("issue-3"), Some(&9));
 
         let _ = fs::remove_file(path);
     }
@@ -121,10 +136,12 @@ mod tests {
     fn invalid_focus_falls_back_to_list() {
         let state = UiState {
             focus: "somewhere".to_string(),
+            details_mode: "elsewhere".to_string(),
             ..UiState::default()
         }
         .normalized();
 
         assert_eq!(state.focus, "list");
+        assert_eq!(state.details_mode, "conversation");
     }
 }

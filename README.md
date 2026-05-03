@@ -129,8 +129,6 @@ The config file is created at:
 Example:
 
 ```toml
-exclude_repos = ["some-org/archive-*"]
-
 [[repos]]
 name = "Rust"
 repo = "rust-lang/rust"
@@ -156,6 +154,8 @@ queries = [
   "involves:@me -author:@me archived:false sort:updated-desc",
   "reviewed-by:@me -author:@me archived:false sort:updated-desc",
 ]
+
+exclude_repos = ["some-org/archive-*"]
 ```
 
 Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list.

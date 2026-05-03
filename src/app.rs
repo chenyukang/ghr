@@ -34,6 +34,7 @@ use crate::github::{
     fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_dashboard_with_progress, refresh_section_page, search_global,
+    with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -288,6 +289,8 @@ struct AppState {
     split_drag_changed: bool,
     search_active: bool,
     search_query: String,
+    comment_search_active: bool,
+    comment_search_query: String,
     global_search_active: bool,
     global_search_query: String,
     global_search_running: bool,
@@ -412,6 +415,12 @@ struct SectionPageRequest {
     total_is_capped: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshPriority {
+    User,
+    Background,
+}
+
 pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
     let cached = store.load_all()?;
     let show_startup_dialog = should_show_startup_dialog(&cached);
@@ -423,7 +432,12 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    start_refresh(config.clone(), store.clone(), tx.clone());
+    start_refresh(
+        config.clone(),
+        store.clone(),
+        tx.clone(),
+        RefreshPriority::Background,
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -489,7 +503,12 @@ async fn run_loop(
             && app.last_refresh_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
         {
-            start_refresh(config.clone(), store.clone(), tx.clone());
+            start_refresh(
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+                RefreshPriority::Background,
+            );
         }
 
         terminal.draw(|frame| draw(frame, app, paths))?;
@@ -704,26 +723,37 @@ fn sync_mouse_capture(
     Ok(())
 }
 
-fn start_refresh(config: Config, store: SnapshotStore, tx: UnboundedSender<AppMsg>) {
+fn start_refresh(
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+    priority: RefreshPriority,
+) {
     let _ = tx.send(AppMsg::RefreshStarted);
     tokio::spawn(async move {
         let mut save_error = None;
-        let sections = refresh_dashboard_with_progress(&config, |section| {
-            if save_error.is_none()
-                && section.error.is_none()
-                && let Err(error) = store.save_section(section)
-            {
-                let message = error.to_string();
-                warn!(error = %message, "failed to save refreshed snapshot");
-                save_error = Some(message);
-            }
+        let refresh = async {
+            refresh_dashboard_with_progress(&config, |section| {
+                if save_error.is_none()
+                    && section.error.is_none()
+                    && let Err(error) = store.save_section(section)
+                {
+                    let message = error.to_string();
+                    warn!(error = %message, "failed to save refreshed snapshot");
+                    save_error = Some(message);
+                }
 
-            let _ = tx.send(AppMsg::RefreshSectionLoaded {
-                section: section.clone(),
-                save_error: save_error.clone(),
-            });
-        })
-        .await;
+                let _ = tx.send(AppMsg::RefreshSectionLoaded {
+                    section: section.clone(),
+                    save_error: save_error.clone(),
+                });
+            })
+            .await
+        };
+        let sections = match priority {
+            RefreshPriority::User => refresh.await,
+            RefreshPriority::Background => with_background_github_priority(refresh).await,
+        };
         let _ = tx.send(AppMsg::RefreshFinished {
             sections,
             save_error,
@@ -989,7 +1019,7 @@ fn start_pr_action(
 
         if should_refresh {
             let _ = tx.send(AppMsg::RefreshStarted);
-            let sections = refresh_dashboard(&config).await;
+            let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
             for section in &sections {
                 if section.error.is_some() {
@@ -1072,6 +1102,11 @@ fn handle_key_in_area(
 
     if app.pr_action_dialog.is_some() {
         app.handle_pr_action_dialog_key(key, config, store, tx);
+        return false;
+    }
+
+    if app.comment_search_active {
+        app.handle_comment_search_key(key, area);
         return false;
     }
 
@@ -1187,7 +1222,16 @@ fn handle_key_in_area(
             _ => {}
         },
         FocusTarget::Details => match key.code {
+            KeyCode::Esc
+                if app.details_mode == DetailsMode::Conversation
+                    && !app.comment_search_query.is_empty() =>
+            {
+                app.clear_comment_search()
+            }
             KeyCode::Esc => app.focus_list(),
+            KeyCode::Char('/') if app.details_mode == DetailsMode::Conversation => {
+                app.start_comment_search()
+            }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
@@ -1334,7 +1378,12 @@ fn trigger_refresh(
     if app.refreshing {
         app.status = "refresh already running".to_string();
     } else {
-        start_refresh(config.clone(), store.clone(), tx.clone());
+        start_refresh(
+            config.clone(),
+            store.clone(),
+            tx.clone(),
+            RefreshPriority::User,
+        );
     }
 }
 
@@ -1485,6 +1534,7 @@ fn handle_left_click(
         app.switch_view(view);
         app.focus = FocusTarget::Ghr;
         app.search_active = false;
+        app.comment_search_active = false;
         app.global_search_active = false;
         app.status = "ghr focused".to_string();
         return;
@@ -1514,6 +1564,7 @@ fn handle_left_click(
     let column = mouse.column - inner.x;
     app.focus = FocusTarget::Details;
     app.search_active = false;
+    app.comment_search_active = false;
     app.global_search_active = false;
 
     if app.details_mode == DetailsMode::Diff
@@ -1537,6 +1588,7 @@ fn handle_left_click(
 fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
     app.focus = FocusTarget::Details;
     app.search_active = false;
+    app.comment_search_active = false;
     app.global_search_active = false;
 
     let max_scroll = max_details_scroll(app, area);
@@ -1556,6 +1608,7 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
 fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
     app.focus = FocusTarget::List;
     app.search_active = false;
+    app.comment_search_active = false;
     app.global_search_active = false;
     if app.details_mode == DetailsMode::Diff {
         app.move_diff_file(delta);
@@ -2396,9 +2449,26 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
     None
 }
 
+fn active_details_input_prompt(app: &AppState) -> Option<(String, Color)> {
+    if app.comment_search_active {
+        return Some((
+            format!(
+                "Comment Search: /{}_  Enter keep  Esc clear",
+                app.comment_search_query
+            ),
+            Color::Yellow,
+        ));
+    }
+
+    None
+}
+
 fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let details_focused = app.focus == FocusTarget::Details;
-    let title = focus_panel_title("Details", details_title(), details_focused);
+    let raw_title = active_details_input_prompt(app)
+        .map(|(prompt, _)| format!("{} {prompt}", details_title()))
+        .unwrap_or_else(|| details_title().to_string());
+    let title = focus_panel_title("Details", &raw_title, details_focused);
     let (border_style, title_style, border_type) = if app.dragging_split {
         (
             Style::default()
@@ -2495,7 +2565,14 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
 fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     let refresh = if app.refreshing { "refreshing" } else { "idle" };
     let focus = app.focus.label();
-    let search = if app.global_search_active {
+    let search = if app.comment_search_active {
+        Some(format!("comment-search: /{}_", app.comment_search_query))
+    } else if app.focus == FocusTarget::Details
+        && app.details_mode == DetailsMode::Conversation
+        && !app.comment_search_query.is_empty()
+    {
+        Some(format!("comment-search: /{}", app.comment_search_query))
+    } else if app.global_search_active {
         Some(format!("repo-search: S{}_", app.global_search_query))
     } else if app.global_search_running {
         Some("repo search running".to_string())
@@ -2620,6 +2697,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(spans, "/", "search", Color::Yellow);
                 push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
@@ -2696,6 +2774,14 @@ fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
         .unwrap_or(false)
 }
 
+fn modal_surface_style() -> Style {
+    Style::default()
+}
+
+fn modal_text_style() -> Style {
+    Style::default().fg(Color::White)
+}
+
 fn draw_startup_dialog(
     frame: &mut Frame<'_>,
     app: &AppState,
@@ -2713,14 +2799,14 @@ fn draw_startup_dialog(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             title,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
@@ -2868,7 +2954,7 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             title,
             Style::default()
@@ -2877,7 +2963,7 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
@@ -2891,7 +2977,7 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightMagenta))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             "Help",
             Style::default()
@@ -2900,7 +2986,7 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
@@ -2951,7 +3037,7 @@ fn draw_pr_action_dialog(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             match dialog.action {
                 PrAction::Merge => "Merge Pull Request",
@@ -2964,7 +3050,7 @@ fn draw_pr_action_dialog(
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
@@ -2987,14 +3073,14 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             dialog.title.clone(),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(text)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
@@ -3070,7 +3156,7 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightMagenta))
-        .style(Style::default().bg(Color::Black))
+        .style(modal_surface_style())
         .title(Span::styled(
             title.to_string(),
             Style::default()
@@ -3079,7 +3165,7 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(modal_text_style());
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
@@ -3319,7 +3405,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("r", "refresh from GitHub"),
         help_key_line("Tab / Shift+Tab", "switch the focused tab group"),
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
-        help_key_line("/", "start fuzzy search filtering"),
+        help_key_line("/", "start list filtering or Details comment search"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("m", "toggle mouse text selection mode"),
         help_key_line("Esc", "leave details or clear search"),
@@ -3359,6 +3445,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
+        help_key_line("/", "search loaded comments by keyword"),
         help_key_line("n / p in conversation", "focus next / previous comment"),
         help_key_line("n / p in diff", "page down / page up"),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
@@ -4448,15 +4535,31 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
                 builder.push_plain("No comments.");
             }
             Some(DetailState::Loaded(comments)) => {
+                let comment_search_query = app.comment_search_query.trim();
+                let search_matches = (!comment_search_query.is_empty())
+                    .then(|| comment_search_matches(comments, comment_search_query));
+                if let Some(matches) = &search_matches {
+                    builder.push_plain(format!(
+                        "Comment search: {}/{} matches for /{}",
+                        matches.len(),
+                        comments.len(),
+                        comment_search_query
+                    ));
+                    builder.push_blank();
+                }
                 for (index, comment) in comments.iter().enumerate() {
                     if index > 0 {
                         builder.push_blank();
                     }
+                    let search_match = search_matches
+                        .as_ref()
+                        .is_some_and(|matches| matches.contains(&index));
                     push_comment(
                         &mut builder,
                         index,
                         comment,
                         app.focus == FocusTarget::Details && index == app.selected_comment_index,
+                        search_match,
                     );
                 }
             }
@@ -4864,6 +4967,7 @@ fn push_comment(
     index: usize,
     comment: &CommentPreview,
     selected: bool,
+    search_match: bool,
 ) {
     let timestamp = comment
         .updated_at
@@ -4872,6 +4976,7 @@ fn push_comment(
         .cloned();
     let start_line = builder.document.lines.len();
     push_comment_separator(builder, selected);
+    let content_start_line = builder.document.lines.len();
 
     let mut header = vec![
         DetailSegment::styled(
@@ -4890,6 +4995,12 @@ fn push_comment(
         header.push(DetailSegment::styled(
             review_comment_label(review),
             diff_metadata_style(),
+        ));
+    }
+    if search_match {
+        header.push(DetailSegment::styled(
+            "  match",
+            comment_search_match_style(),
         ));
     }
     header.push(DetailSegment::raw("  "));
@@ -4922,6 +5033,7 @@ fn push_comment(
         },
     );
     if selected {
+        add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
         push_comment_separator(builder, true);
         add_comment_right_border(builder, start_line, builder.document.lines.len());
     }
@@ -4930,6 +5042,26 @@ fn push_comment(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+fn add_selected_comment_text_weight(
+    builder: &mut DetailsBuilder,
+    start_line: usize,
+    end_line: usize,
+) {
+    for line in builder
+        .document
+        .lines
+        .iter_mut()
+        .take(end_line)
+        .skip(start_line)
+    {
+        for span in &mut line.spans {
+            if !span.content.trim().is_empty() {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+        }
+    }
 }
 
 fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {
@@ -5819,6 +5951,12 @@ fn comment_separator_style(selected: bool) -> Style {
     }
 }
 
+fn comment_search_match_style() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn comment_selected_rail_style() -> Style {
     Style::default()
         .fg(Color::Yellow)
@@ -6235,6 +6373,8 @@ impl AppState {
             split_drag_changed: false,
             search_active: false,
             search_query: String::new(),
+            comment_search_active: false,
+            comment_search_query: String::new(),
             global_search_active: false,
             global_search_query: String::new(),
             global_search_running: false,
@@ -6782,6 +6922,7 @@ impl AppState {
     fn show_help_dialog(&mut self) {
         self.help_dialog = true;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.status = "help".to_string();
     }
@@ -7146,6 +7287,8 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
         self.clamp_positions();
         self.focus = if matches!(focus, FocusTarget::Details) && self.current_item().is_none() {
             FocusTarget::List
@@ -7186,6 +7329,7 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.status = if self.details_mode == DetailsMode::Diff {
             "files focused".to_string()
@@ -7198,6 +7342,7 @@ impl AppState {
     fn focus_ghr(&mut self) {
         self.focus = FocusTarget::Ghr;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
@@ -7207,6 +7352,7 @@ impl AppState {
     fn focus_sections(&mut self) {
         self.focus = FocusTarget::Sections;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
@@ -7230,6 +7376,8 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
     }
 
     fn select_section(&mut self, index: usize) {
@@ -7246,6 +7394,8 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
         self.global_search_active = false;
         self.status = "Sections focused".to_string();
     }
@@ -7266,6 +7416,8 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
     }
 
     fn set_selection(&mut self, index: usize) {
@@ -7276,6 +7428,8 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
         self.clamp_positions();
     }
 
@@ -7671,6 +7825,8 @@ impl AppState {
             self.comment_dialog = None;
             self.pr_action_dialog = None;
             self.global_search_active = false;
+            self.comment_search_active = false;
+            self.comment_search_query.clear();
         }
     }
 
@@ -7678,6 +7834,7 @@ impl AppState {
         if self.current_item().is_some() {
             self.focus = FocusTarget::Details;
             self.search_active = false;
+            self.comment_search_active = false;
             self.global_search_active = false;
             self.clamp_selected_comment();
             self.status = "details focused".to_string();
@@ -7743,6 +7900,8 @@ impl AppState {
             .map(|saved| saved.details_scroll)
             .unwrap_or(0);
         self.search_active = false;
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
         self.global_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
@@ -7757,6 +7916,7 @@ impl AppState {
         self.save_current_diff_mode_state();
         self.details_mode = DetailsMode::Conversation;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
@@ -7860,6 +8020,10 @@ impl AppState {
     }
 
     fn move_comment_in_view(&mut self, delta: isize, area: Option<Rect>) {
+        if self.move_comment_search_match(delta, area) {
+            return;
+        }
+
         let before = self.selected_comment_index;
         self.move_comment(delta);
         if before == self.selected_comment_index {
@@ -7867,6 +8031,55 @@ impl AppState {
         } else {
             self.scroll_selected_comment_into_view(area);
         }
+    }
+
+    fn move_comment_search_match(&mut self, delta: isize, area: Option<Rect>) -> bool {
+        if self.comment_search_query.trim().is_empty() {
+            return false;
+        }
+
+        let matches = self.current_comment_search_matches();
+        if matches.is_empty() {
+            self.status = format!("no comments match '{}'", self.comment_search_query.trim());
+            return true;
+        }
+
+        let current = self.selected_comment_index;
+        let next_position = match matches.iter().position(|index| *index == current) {
+            Some(position) => move_wrapping(position, matches.len(), delta),
+            None if delta < 0 => matches
+                .iter()
+                .rposition(|index| *index < current)
+                .unwrap_or(matches.len() - 1),
+            None => matches
+                .iter()
+                .position(|index| *index > current)
+                .unwrap_or(0),
+        };
+        self.selected_comment_index = matches[next_position];
+        self.scroll_selected_comment_into_view(area);
+        self.status = self.comment_search_status(&matches);
+        true
+    }
+
+    fn current_comment_search_matches(&self) -> Vec<usize> {
+        let Some(comments) = self.current_comments() else {
+            return Vec::new();
+        };
+        comment_search_matches(comments, &self.comment_search_query)
+    }
+
+    fn comment_search_status(&self, matches: &[usize]) -> String {
+        let position = matches
+            .iter()
+            .position(|index| *index == self.selected_comment_index)
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        format!(
+            "comment search: {position}/{} for '{}'",
+            matches.len(),
+            self.comment_search_query.trim()
+        )
     }
 
     fn scroll_details_past_comment_edge(&mut self, delta: isize, area: Option<Rect>) {
@@ -7945,6 +8158,7 @@ impl AppState {
         }
         self.search_active = false;
         self.global_search_active = false;
+        self.comment_search_active = false;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
         self.pr_action_running = false;
         self.status = match action {
@@ -8013,6 +8227,7 @@ impl AppState {
         }
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
@@ -8037,6 +8252,7 @@ impl AppState {
         let review_comment_id = comment.review.as_ref().and(comment.id);
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
@@ -8072,6 +8288,7 @@ impl AppState {
 
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
@@ -8114,6 +8331,7 @@ impl AppState {
 
         self.focus = FocusTarget::Details;
         self.search_active = false;
+        self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
@@ -8280,6 +8498,7 @@ impl AppState {
         self.global_search_active = true;
         self.global_search_query.clear();
         self.search_active = false;
+        self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.status = match self.current_repo_scope() {
@@ -8323,6 +8542,7 @@ impl AppState {
                 self.global_search_running = true;
                 self.search_active = false;
                 self.search_query.clear();
+                self.comment_search_active = false;
                 self.status = match self.current_repo_scope() {
                     Some(repo) => format!("searching {repo} for '{query}'"),
                     None => format!("searching GitHub for '{query}'"),
@@ -8343,6 +8563,7 @@ impl AppState {
         self.focus = FocusTarget::List;
         self.search_active = true;
         self.global_search_active = false;
+        self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.status = "search mode".to_string();
@@ -8371,6 +8592,69 @@ impl AppState {
         self.set_current_selected_position(0);
         self.details_scroll = 0;
         self.clamp_positions();
+    }
+
+    fn start_comment_search(&mut self) {
+        if self.details_mode != DetailsMode::Conversation {
+            self.status = "comment search is available in conversation details".to_string();
+            return;
+        }
+        if self.current_comments().is_none() {
+            self.status = "comments are still loading".to_string();
+        } else {
+            self.status = "comment search mode".to_string();
+        }
+        self.focus = FocusTarget::Details;
+        self.comment_search_active = true;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+    }
+
+    fn handle_comment_search_key(&mut self, key: KeyEvent, area: Option<Rect>) {
+        match key.code {
+            KeyCode::Esc => self.clear_comment_search(),
+            KeyCode::Enter => {
+                self.comment_search_active = false;
+                self.update_comment_search_selection(area);
+            }
+            KeyCode::Backspace => {
+                self.comment_search_query.pop();
+                self.update_comment_search_selection(area);
+            }
+            KeyCode::Char(value) => {
+                self.comment_search_query.push(value);
+                self.update_comment_search_selection(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_comment_search(&mut self) {
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
+        self.focus = FocusTarget::Details;
+        self.status = "comment search cleared".to_string();
+    }
+
+    fn update_comment_search_selection(&mut self, area: Option<Rect>) {
+        let query = self.comment_search_query.trim();
+        if query.is_empty() {
+            self.status = "comment search mode".to_string();
+            return;
+        }
+        let matches = self.current_comment_search_matches();
+        if matches.is_empty() {
+            self.status = format!("no comments match '{query}'");
+            return;
+        }
+
+        if !matches.contains(&self.selected_comment_index) {
+            self.selected_comment_index = matches[0];
+        }
+        self.scroll_selected_comment_into_view(area);
+        self.status = self.comment_search_status(&matches);
     }
 
     fn open_selected(&mut self) {
@@ -8705,6 +8989,40 @@ fn filtered_indices(section: &SectionSnapshot, query: &str) -> Vec<usize> {
             .then_with(|| left_index.cmp(right_index))
     });
     scored.into_iter().map(|(index, _)| index).collect()
+}
+
+fn comment_search_matches(comments: &[CommentPreview], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..comments.len()).collect();
+    }
+
+    comments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, comment)| comment_matches_search(comment, query).then_some(index))
+        .collect()
+}
+
+fn comment_matches_search(comment: &CommentPreview, query: &str) -> bool {
+    let haystack = searchable_comment_text(comment);
+    query
+        .split_whitespace()
+        .all(|token| fuzzy_score(token, &haystack).is_some())
+}
+
+fn searchable_comment_text(comment: &CommentPreview) -> String {
+    let mut parts = vec![comment.author.clone(), comment.body.clone()];
+    if let Some(url) = &comment.url {
+        parts.push(url.clone());
+    }
+    if let Some(review) = &comment.review {
+        parts.push(review.path.clone());
+        if let Some(line) = review.line {
+            parts.push(line.to_string());
+        }
+    }
+    parts.join(" ").to_lowercase()
 }
 
 fn fuzzy_score_item(item: &WorkItem, query: &str) -> Option<i64> {
@@ -11084,6 +11402,82 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn details_comment_search_input_focuses_matching_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("item").id.clone();
+        app.details.insert(
+            item_id,
+            DetailState::Loaded(vec![
+                comment("alice", "first compiler note", None),
+                comment("bob", "fiber routing regression", None),
+                comment("carol", "another compiler note", None),
+            ]),
+        );
+        app.focus_details();
+
+        app.start_comment_search();
+        for value in "routing".chars() {
+            app.handle_comment_search_key(key(KeyCode::Char(value)), None);
+        }
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert!(app.comment_search_active);
+        assert_eq!(app.comment_search_query, "routing");
+        assert_eq!(app.selected_comment_index, 1);
+        assert_eq!(app.status, "comment search: 1/1 for 'routing'");
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn comment_search_n_and_p_cycle_matching_comments() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("item").id.clone();
+        app.details.insert(
+            item_id,
+            DetailState::Loaded(vec![
+                comment("alice", "compiler first", None),
+                comment("bob", "fiber only", None),
+                comment("carol", "compiler second", None),
+            ]),
+        );
+        app.focus_details();
+        app.comment_search_query = "compiler".to_string();
+        app.selected_comment_index = 0;
+
+        app.move_comment_in_view(1, None);
+        assert_eq!(app.selected_comment_index, 2);
+        assert_eq!(app.status, "comment search: 2/2 for 'compiler'");
+
+        app.move_comment_in_view(1, None);
+        assert_eq!(app.selected_comment_index, 0);
+        assert_eq!(app.status, "comment search: 1/2 for 'compiler'");
+    }
+
+    #[test]
+    fn details_title_shows_comment_search_input_prompt() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("item").id.clone();
+        app.details.insert(
+            item_id,
+            DetailState::Loaded(vec![comment("alice", "borrow checker", None)]),
+        );
+        app.focus_details();
+        app.start_comment_search();
+        app.comment_search_query = "borrow".to_string();
+        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Comment Search: /borrow_  Enter keep  Esc clear"));
+        assert!(rendered.contains("Comment search: 1/1 matches for /borrow"));
+    }
+
+    #[test]
     fn section_tab_label_shows_loaded_and_total_count() {
         let mut section = test_section();
         section.total_count = Some(120);
@@ -11856,6 +12250,13 @@ diff --git a/src/github.rs b/src/github.rs
             .find(|line| line.to_string().contains("┃ Second comment"))
             .expect("selected comment body");
         assert!(selected_body_line.to_string().ends_with('┃'));
+        assert!(
+            selected_body_line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("Second")
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
         assert!(
             document
                 .lines

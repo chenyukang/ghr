@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,10 +20,58 @@ use crate::model::{
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
+static USER_GH_REQUESTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
 const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
+const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhRequestPriority {
+    User,
+    Background,
+}
+
+tokio::task_local! {
+    static GH_REQUEST_PRIORITY: GhRequestPriority;
+}
+
+pub async fn with_background_github_priority<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    GH_REQUEST_PRIORITY
+        .scope(GhRequestPriority::Background, future)
+        .await
+}
+
+fn current_gh_request_priority() -> GhRequestPriority {
+    GH_REQUEST_PRIORITY
+        .try_with(|priority| *priority)
+        .unwrap_or(GhRequestPriority::User)
+}
+
+struct UserGhRequestGuard;
+
+impl UserGhRequestGuard {
+    fn new() -> Self {
+        USER_GH_REQUESTS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for UserGhRequestGuard {
+    fn drop(&mut self) {
+        USER_GH_REQUESTS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn wait_for_user_gh_requests() {
+    while USER_GH_REQUESTS_IN_FLIGHT.load(Ordering::Acquire) > 0 {
+        sleep(BACKGROUND_GH_YIELD_INTERVAL).await;
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1237,6 +1287,19 @@ fn should_fetch_all_notifications(config: &Config) -> bool {
 }
 
 async fn run_gh_json(args: &[String]) -> Result<String> {
+    match current_gh_request_priority() {
+        GhRequestPriority::User => {
+            let _guard = UserGhRequestGuard::new();
+            run_gh_json_raw(args).await
+        }
+        GhRequestPriority::Background => {
+            wait_for_user_gh_requests().await;
+            run_gh_json_raw(args).await
+        }
+    }
+}
+
+async fn run_gh_json_raw(args: &[String]) -> Result<String> {
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .args(args)
@@ -1798,6 +1861,20 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh_request_priority_defaults_to_user() {
+        assert_eq!(current_gh_request_priority(), GhRequestPriority::User);
+    }
+
+    #[tokio::test]
+    async fn background_github_priority_marks_current_task() {
+        let priority =
+            with_background_github_priority(async { current_gh_request_priority() }).await;
+
+        assert_eq!(priority, GhRequestPriority::Background);
+        assert_eq!(current_gh_request_priority(), GhRequestPriority::User);
+    }
 
     #[test]
     fn wildcard_excludes_repositories() {

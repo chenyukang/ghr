@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -448,17 +449,22 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     let sections = merge_cached_sections(configured_sections(&config), cached);
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
-    if show_startup_dialog {
+    let startup_setup_dialog = startup_setup_dialog();
+    if let Some(dialog) = startup_setup_dialog {
+        app.show_setup_dialog(dialog);
+    } else if show_startup_dialog {
         app.show_startup_initializing();
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    start_refresh(
-        config.clone(),
-        store.clone(),
-        tx.clone(),
-        RefreshPriority::Background,
-    );
+    if startup_setup_dialog.is_none() {
+        start_refresh(
+            config.clone(),
+            store.clone(),
+            tx.clone(),
+            RefreshPriority::Background,
+        );
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -499,6 +505,24 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
 
 fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool {
     cached.is_empty()
+}
+
+fn startup_setup_dialog() -> Option<SetupDialog> {
+    startup_setup_dialog_from_gh_probe(
+        Command::new("gh")
+            .env("GH_PROMPT_DISABLED", "1")
+            .arg("--version")
+            .output()
+            .map(|_| ()),
+    )
+}
+
+fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {
+    match result {
+        Ok(()) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(SetupDialog::MissingGh),
+        Err(_) => None,
+    }
 }
 
 async fn run_loop(
@@ -3002,7 +3026,7 @@ fn startup_loaded_summary(app: &AppState) -> String {
 
 fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     let (title, lines) = setup_dialog_content(dialog);
-    let dialog_area = centered_rect(66, 15, area);
+    let dialog_area = centered_rect(90, 17, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -3452,9 +3476,11 @@ fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>
             vec![
                 Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
                 Line::from(""),
-                Line::from("Install GitHub CLI for your system: cli.github.com"),
+                Line::from("Install GitHub CLI: https://cli.github.com/"),
                 command_line("macOS: brew install gh"),
                 command_line("Debian/Ubuntu: sudo apt install gh"),
+                Line::from("Linux package details:"),
+                Line::from("https://github.com/cli/cli/blob/trunk/docs/install_linux.md"),
                 Line::from(""),
                 Line::from("Then authenticate:"),
                 command_line("gh auth login"),
@@ -7791,6 +7817,19 @@ impl AppState {
         self.status = "initializing; refreshing from GitHub".to_string();
     }
 
+    fn show_setup_dialog(&mut self, dialog: SetupDialog) {
+        self.setup_dialog = Some(dialog);
+        self.startup_dialog = None;
+        self.status = match dialog {
+            SetupDialog::MissingGh => {
+                "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string()
+            }
+            SetupDialog::AuthRequired => {
+                "GitHub CLI auth required: run `gh auth login`".to_string()
+            }
+        };
+    }
+
     fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
@@ -11863,6 +11902,37 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn startup_setup_dialog_detects_missing_gh_before_refresh() {
+        assert_eq!(
+            startup_setup_dialog_from_gh_probe(Err(io::Error::new(io::ErrorKind::NotFound, "gh"))),
+            Some(SetupDialog::MissingGh)
+        );
+        assert_eq!(
+            startup_setup_dialog_from_gh_probe(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gh"
+            ))),
+            None
+        );
+        assert_eq!(startup_setup_dialog_from_gh_probe(Ok(())), None);
+    }
+
+    #[test]
+    fn startup_setup_dialog_sets_status_without_initializing_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_startup_initializing();
+
+        app.show_setup_dialog(SetupDialog::MissingGh);
+
+        assert_eq!(app.setup_dialog, Some(SetupDialog::MissingGh));
+        assert_eq!(app.startup_dialog, None);
+        assert_eq!(
+            app.status,
+            "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        );
+    }
+
+    #[test]
     fn refresh_failure_opens_setup_dialog() {
         let mut failed_section = test_section();
         failed_section.items.clear();
@@ -13043,6 +13113,8 @@ diff --git a/src/github.rs b/src/github.rs
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(missing_text.contains("https://cli.github.com/"));
+        assert!(missing_text.contains("install_linux.md"));
         assert!(missing_text.contains("brew install gh"));
         assert!(missing_text.contains("sudo apt install gh"));
         assert!(missing_text.contains("gh auth login"));

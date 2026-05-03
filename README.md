@@ -32,7 +32,7 @@
 
 ## Requirements
 
-- GitHub CLI (`gh`)
+- GitHub CLI [gh](https://cli.github.com/)
 - An authenticated GitHub CLI session:
 
 ```bash

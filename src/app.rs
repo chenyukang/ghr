@@ -13,7 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use pulldown_cmark::{Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -50,10 +50,13 @@ enum AppMsg {
         sections: Vec<SectionSnapshot>,
         save_error: Option<String>,
     },
-    DetailsLoaded {
+    CommentsLoaded {
         item_id: String,
         comments: std::result::Result<Vec<CommentPreview>, String>,
-        actions: Option<std::result::Result<ActionHints, String>>,
+    },
+    ActionHintsLoaded {
+        item_id: String,
+        actions: std::result::Result<ActionHints, String>,
     },
     DiffLoaded {
         item_id: String,
@@ -245,6 +248,8 @@ const MOUSE_LIST_SCROLL_LINES: u16 = 2;
 const MOUSE_DIFF_FILE_SCROLL_LINES: u16 = 1;
 const MOUSE_DETAILS_SCROLL_LINES: u16 = 1;
 const MOUSE_COMMENT_SCROLL_LINES: u16 = 2;
+const EVENT_BATCH_LIMIT: usize = 512;
+const MAX_COALESCED_MOUSE_SCROLL_STEPS: i16 = 6;
 const COMMENT_DIALOG_WIDTH_PERCENT: u16 = 72;
 const COMMENT_DIALOG_MIN_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_VERTICAL_MARGIN: u16 = 4;
@@ -256,6 +261,8 @@ const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
 const SEARCH_RESULT_WINDOW: usize = 1000;
+const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
+const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 
 struct AppState {
     active_view: String,
@@ -282,9 +289,11 @@ struct AppState {
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
     diff_mark: HashMap<String, DiffMarkState>,
+    last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
     action_hints: HashMap<String, ActionHintState>,
     details_stale: HashSet<String>,
+    pending_details_load: Option<PendingDetailsLoad>,
     notification_read_pending: HashSet<String>,
     selected_comment_index: usize,
     comment_dialog: Option<CommentDialog>,
@@ -331,6 +340,52 @@ struct DiffMarkState {
     anchor: usize,
     focus: usize,
     complete: bool,
+}
+
+impl DiffMarkState {
+    fn pending(anchor: usize) -> Self {
+        Self {
+            anchor,
+            focus: anchor,
+            complete: false,
+        }
+    }
+
+    fn is_pending(self) -> bool {
+        !self.complete
+    }
+
+    fn complete_at(&mut self, focus: usize) {
+        self.focus = focus;
+        self.complete = true;
+    }
+
+    fn range(self) -> (usize, usize) {
+        ordered_range(self.anchor, self.focus)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffClickState {
+    item_id: String,
+    file_index: usize,
+    review_index: usize,
+    at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDetailsLoad {
+    item_id: String,
+    ready_at: Instant,
+}
+
+impl DiffClickState {
+    fn matches(&self, item_id: &str, file_index: usize, review_index: usize, now: Instant) -> bool {
+        self.item_id == item_id
+            && self.file_index == file_index
+            && self.review_index == review_index
+            && now.saturating_duration_since(self.at) <= DIFF_DOUBLE_CLICK_MAX
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,33 +477,10 @@ async fn run_loop(
 
         let mut should_quit = false;
         if event::poll(Duration::from_millis(120))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
-                    }
-
-                    let size = terminal.size()?;
-                    let area = Rect::new(0, 0, size.width, size.height);
-                    if handle_key_in_area(app, key, config, store, tx, Some(area)) {
-                        save_ui_state(app, paths);
-                        should_quit = true;
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    let size = terminal.size()?;
-                    if handle_mouse_with_sync(
-                        app,
-                        mouse,
-                        Rect::new(0, 0, size.width, size.height),
-                        Some(store),
-                        Some(tx),
-                    ) {
-                        save_ui_state(app, paths);
-                    }
-                }
-                _ => {}
-            }
+            let events = read_event_batch(event::read()?)?;
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            should_quit = handle_event_batch(app, events, area, config, paths, store, tx);
         }
         sync_mouse_capture(terminal, app, &mut mouse_capture_enabled)?;
         if should_quit {
@@ -458,6 +490,180 @@ async fn run_loop(
 
     save_ui_state(app, paths);
     Ok(())
+}
+
+fn read_event_batch(first: Event) -> Result<Vec<Event>> {
+    let mut events = vec![first];
+    while events.len() < EVENT_BATCH_LIMIT && event::poll(Duration::from_millis(0))? {
+        events.push(event::read()?);
+    }
+    Ok(events)
+}
+
+fn handle_event_batch(
+    app: &mut AppState,
+    events: Vec<Event>,
+    area: Rect,
+    config: &Config,
+    paths: &Paths,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+) -> bool {
+    let mut pending_scroll = None;
+
+    for event in events {
+        match event {
+            Event::Key(key) => {
+                flush_pending_mouse_scroll(app, &mut pending_scroll);
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if handle_key_in_area(app, key, config, store, tx, Some(area)) {
+                    save_ui_state(app, paths);
+                    return true;
+                }
+            }
+            Event::Mouse(mouse) => {
+                if try_accumulate_mouse_scroll(app, mouse, area, &mut pending_scroll) {
+                    continue;
+                }
+                flush_pending_mouse_scroll(app, &mut pending_scroll);
+                if handle_mouse_with_sync(app, mouse, area, Some(store), Some(tx)) {
+                    save_ui_state(app, paths);
+                }
+            }
+            _ => flush_pending_mouse_scroll(app, &mut pending_scroll),
+        }
+    }
+
+    flush_pending_mouse_scroll(app, &mut pending_scroll);
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseWheelTargetKind {
+    CommentDialog,
+    List,
+    Details,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseWheelTarget {
+    kind: MouseWheelTargetKind,
+    area: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMouseScroll {
+    target: MouseWheelTarget,
+    steps: i16,
+}
+
+fn try_accumulate_mouse_scroll(
+    app: &AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    pending: &mut Option<PendingMouseScroll>,
+) -> bool {
+    let Some(step) = mouse_scroll_step(mouse.kind) else {
+        return false;
+    };
+    let Some(target) = mouse_wheel_target(app, mouse, area) else {
+        return false;
+    };
+
+    match pending {
+        Some(pending_scroll) if pending_scroll.target.kind == target.kind => {
+            pending_scroll.steps = pending_scroll.steps.saturating_add(step);
+        }
+        Some(_) => {
+            // The caller will flush and re-process this event as a normal mouse event.
+            return false;
+        }
+        None => {
+            *pending = Some(PendingMouseScroll {
+                target,
+                steps: step,
+            });
+        }
+    }
+    true
+}
+
+fn flush_pending_mouse_scroll(app: &mut AppState, pending: &mut Option<PendingMouseScroll>) {
+    let Some(scroll) = pending.take() else {
+        return;
+    };
+    let steps = scroll.steps.clamp(
+        -MAX_COALESCED_MOUSE_SCROLL_STEPS,
+        MAX_COALESCED_MOUSE_SCROLL_STEPS,
+    );
+    if steps == 0 {
+        return;
+    }
+
+    match scroll.target.kind {
+        MouseWheelTargetKind::CommentDialog => app.scroll_comment_dialog(
+            steps.saturating_mul(MOUSE_COMMENT_SCROLL_LINES as i16),
+            Some(scroll.target.area),
+        ),
+        MouseWheelTargetKind::List => handle_list_scroll(
+            app,
+            scroll.target.area,
+            mouse_list_scroll_delta(app, steps as isize),
+        ),
+        MouseWheelTargetKind::Details => handle_details_scroll(
+            app,
+            scroll.target.area,
+            steps.saturating_mul(MOUSE_DETAILS_SCROLL_LINES as i16),
+        ),
+    }
+}
+
+fn mouse_scroll_step(kind: MouseEventKind) -> Option<i16> {
+    match kind {
+        MouseEventKind::ScrollDown => Some(1),
+        MouseEventKind::ScrollUp => Some(-1),
+        _ => None,
+    }
+}
+
+fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<MouseWheelTarget> {
+    if !app.mouse_capture_enabled
+        || app.setup_dialog.is_some()
+        || app.help_dialog
+        || app.message_dialog.is_some()
+        || app.pr_action_dialog.is_some()
+    {
+        return None;
+    }
+
+    if let Some(dialog) = &app.comment_dialog {
+        let dialog_area = comment_dialog_area(dialog, area);
+        return rect_contains(dialog_area, mouse.column, mouse.row).then_some(MouseWheelTarget {
+            kind: MouseWheelTargetKind::CommentDialog,
+            area,
+        });
+    }
+
+    let page = page_areas(area);
+    let body_area = page[2];
+    let body = body_areas_with_ratio(body_area, app.list_width_percent);
+    let table = body[0];
+    let details = body[1];
+    if rect_contains(table, mouse.column, mouse.row) {
+        Some(MouseWheelTarget {
+            kind: MouseWheelTargetKind::List,
+            area: table,
+        })
+    } else if rect_contains(details, mouse.column, mouse.row) {
+        Some(MouseWheelTarget {
+            kind: MouseWheelTargetKind::Details,
+            area: details,
+        })
+    } else {
+        None
+    }
 }
 
 fn sync_mouse_capture(
@@ -585,29 +791,29 @@ fn start_notification_read_sync(
     });
 }
 
-fn start_details_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
-        let number = item.number;
-        let comments = match number {
+        let comments = match item.number {
             Some(number) => fetch_comments(&item.repo, number, item.kind)
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(Vec::new()),
         };
-        let actions = match (item.kind, number) {
-            (ItemKind::PullRequest, Some(number)) => Some(
-                fetch_pull_request_action_hints(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-            ),
-            _ => None,
+        let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
+    });
+}
+
+fn start_action_hints_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let actions = match item.number {
+            Some(number) => fetch_pull_request_action_hints(&item.repo, number)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
         };
-        let _ = tx.send(AppMsg::DetailsLoaded {
-            item_id,
-            comments,
-            actions,
-        });
+        let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
     });
 }
 
@@ -859,18 +1065,7 @@ fn handle_key_in_area(
     if handle_global_focus_key(app, key) {
         return false;
     }
-    if matches!(key.code, KeyCode::Char('m')) {
-        if !app.mouse_capture_enabled {
-            app.toggle_mouse_capture();
-        } else if app.details_mode == DetailsMode::Diff {
-            if app.focus == FocusTarget::Details {
-                app.toggle_diff_mark();
-            } else {
-                app.status = "mark diff lines from Details; press 4 or enter first".to_string();
-            }
-        } else {
-            app.toggle_mouse_capture();
-        }
+    if handle_mouse_or_mark_key(app, key) {
         return false;
     }
     if is_diff_key(key) {
@@ -960,6 +1155,9 @@ fn handle_key_in_area(
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
+            KeyCode::Char('a') if app.details_mode == DetailsMode::Diff => {
+                app.start_new_comment_dialog()
+            }
             KeyCode::Char('c') | KeyCode::Char('a')
                 if app.details_mode == DetailsMode::Conversation =>
             {
@@ -997,8 +1195,9 @@ fn handle_key_in_area(
             KeyCode::Char('G') if app.details_mode == DetailsMode::Diff => {
                 app.scroll_diff_details_to_bottom(area)
             }
-            KeyCode::Char('n') => app.move_comment(1),
-            KeyCode::Char('p') => app.move_comment(-1),
+            KeyCode::Char('e') if app.details_mode == DetailsMode::Diff => app.end_diff_mark(),
+            KeyCode::Char('n') => app.move_comment_in_view(1, area),
+            KeyCode::Char('p') => app.move_comment_in_view(-1, area),
             KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
             KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
             KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
@@ -1023,10 +1222,30 @@ fn handle_global_focus_key(app: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_mouse_or_mark_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('m')) {
+        return false;
+    }
+
+    if !app.mouse_capture_enabled {
+        app.toggle_mouse_capture();
+    } else if app.details_mode == DetailsMode::Diff {
+        if app.focus == FocusTarget::Details {
+            app.begin_diff_mark();
+        } else {
+            app.status = "mark diff lines from Details; press 4 or enter first".to_string();
+        }
+    } else {
+        app.toggle_mouse_capture();
+    }
+    true
+}
+
 fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rect>) {
     match key.code {
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
+        KeyCode::Char('a') => app.start_new_comment_dialog(),
         KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
@@ -1222,10 +1441,6 @@ fn handle_left_click(
         return;
     }
 
-    app.focus = FocusTarget::Details;
-    app.search_active = false;
-    app.global_search_active = false;
-
     let inner = block_inner(layout.details);
     if !rect_contains(inner, mouse.column, mouse.row) {
         return;
@@ -1234,6 +1449,10 @@ fn handle_left_click(
     let document = build_details_document(app, inner.width);
     let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
     let column = mouse.column - inner.x;
+    app.focus = FocusTarget::Details;
+    app.search_active = false;
+    app.global_search_active = false;
+
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)
     {
@@ -1682,11 +1901,7 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .title(Span::styled(title, border_style)),
         )
         .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(active_view_tab_style());
     frame.render_widget(tabs, area);
 }
 
@@ -1733,12 +1948,22 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .title(Span::styled(title, border_style)),
         )
         .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(active_section_tab_style());
     frame.render_widget(tabs, area);
+}
+
+fn active_view_tab_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn active_section_tab_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
@@ -2151,8 +2376,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .border_style(border_style)
                 .title(Span::styled(title, title_style)),
         )
-        .scroll((app.details_scroll, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((app.details_scroll, 0));
     frame.render_widget(details, area);
 }
 
@@ -2165,6 +2389,15 @@ fn focus_panel_title(_label: &str, title: &str, focused: bool) -> String {
         format!("[Focus] {title}")
     } else {
         title.to_string()
+    }
+}
+
+fn pull_request_changes_url(item: &WorkItem) -> String {
+    match item.number {
+        Some(number) if !item.repo.trim().is_empty() => {
+            format!("https://github.com/{}/pull/{number}/changes", item.repo)
+        }
+        _ => format!("{}/changes", item.url.trim_end_matches('/')),
     }
 }
 
@@ -2208,11 +2441,7 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     } else {
         Some(format!("filter: /{}", app.search_query))
     };
-    let (mouse, text_selection_state) = if app.mouse_capture_enabled {
-        ("text-select", None)
-    } else {
-        ("restore mouse", Some("text-select: drag copy"))
-    };
+    let (mouse, text_selection_state) = footer_mouse_shortcut(app);
 
     let mut spans = Vec::new();
     push_footer_focus_shortcuts(&mut spans, app);
@@ -2223,7 +2452,9 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     push_footer_pair(&mut spans, "S", "repo", Color::Yellow);
     push_footer_pair(&mut spans, "r", "refresh", Color::Yellow);
     push_footer_pair(&mut spans, "o", "open", Color::Yellow);
-    push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
+    if let Some(mouse) = mouse {
+        push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
+    }
     let q_action = if app.details_mode == DetailsMode::Diff {
         "back"
     } else {
@@ -2251,6 +2482,16 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     Line::from(spans)
 }
 
+fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'static str>) {
+    if !app.mouse_capture_enabled {
+        return (Some("restore mouse"), Some("text-select: drag copy"));
+    }
+    if app.details_mode == DetailsMode::Diff {
+        return (None, None);
+    }
+    (Some("text-select"), None)
+}
+
 fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
     match app.focus {
         FocusTarget::Ghr => {
@@ -2274,7 +2515,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "[ ]", "file", Color::Cyan);
                 push_footer_pair(spans, "g/G", "ends", Color::Cyan);
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
-                push_footer_pair(spans, "c", "comment", Color::LightBlue);
+                push_footer_pair(spans, "c", "inline", Color::LightBlue);
+                push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
@@ -2306,8 +2548,10 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
             push_footer_pair(spans, "g/G", "top/bottom", Color::Cyan);
             if app.details_mode == DetailsMode::Diff {
                 push_footer_pair(spans, "[ ]", "file", Color::LightBlue);
-                push_footer_pair(spans, "m", "mark", Color::Yellow);
-                push_footer_pair(spans, "c", "comment", Color::LightBlue);
+                push_footer_pair(spans, "m", "begin", Color::Yellow);
+                push_footer_pair(spans, "e", "end", Color::Yellow);
+                push_footer_pair(spans, "c", "inline", Color::LightBlue);
+                push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
@@ -2880,17 +3124,22 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("[ / ]", "previous / next changed file"),
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
+        help_key_line("a", "add a normal PR comment"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
+        help_key_line("n / p in conversation", "focus next / previous comment"),
         help_key_line("n / p in diff", "page down / page up"),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
         help_key_line("g / G", "scroll details to top / bottom"),
         help_key_line("v", "show PR diff"),
         help_key_line("[ / ]", "jump previous / next diff file"),
-        help_key_line("m in diff", "mark line or finish a review range"),
+        help_key_line("m in diff", "begin a review range"),
+        help_key_line("e in diff", "end the review range"),
+        help_key_line("single click in diff", "begin or move a review range"),
+        help_key_line("double click in diff", "end the review range"),
         help_key_line("c in diff", "add review comment on selected diff line"),
-        help_key_line("n / p", "focus next / previous comment"),
+        help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
@@ -3002,6 +3251,10 @@ impl DetailsDocument {
             .map(|comment| comment.index)
     }
 
+    fn comment_region(&self, index: usize) -> Option<&CommentRegion> {
+        self.comments.iter().find(|comment| comment.index == index)
+    }
+
     fn diff_line_at(&self, line: usize) -> Option<usize> {
         self.diff_lines
             .iter()
@@ -3031,6 +3284,14 @@ struct CommentRegion {
     index: usize,
     start_line: usize,
     end_line: usize,
+}
+
+impl CommentRegion {
+    fn focus_line(&self) -> usize {
+        self.start_line
+            .saturating_add(1)
+            .min(self.end_line.saturating_sub(1))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3099,6 +3360,13 @@ impl DiffReviewSide {
             Self::Right => "RIGHT",
         }
     }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Left => "L",
+            Self::Right => "R",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3113,8 +3381,17 @@ struct DiffReviewTarget {
 
 impl DiffReviewTarget {
     fn location_label(&self) -> String {
-        match self.start_line {
-            Some(start_line) if start_line != self.line => {
+        match (self.start_line, self.start_side) {
+            (Some(start_line), Some(start_side)) if start_side != self.side => {
+                format!(
+                    "{}:{start_line}{}-{}{}",
+                    self.path,
+                    start_side.short_label(),
+                    self.line,
+                    self.side.short_label()
+                )
+            }
+            (Some(start_line), _) if start_line != self.line => {
                 format!("{}:{start_line}-{}", self.path, self.line)
             }
             _ => format!("{}:{}", self.path, self.line),
@@ -3181,7 +3458,34 @@ impl DetailSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MarkdownBlock {
     quote_depth: u8,
+    kind: MarkdownBlockKind,
+    gap_before: bool,
     segments: Vec<DetailSegment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkdownBlockKind {
+    Text,
+    ListItem,
+    Code { language: CodeLanguage },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeLanguage {
+    Rust,
+    Plain,
+    Other,
+}
+
+impl CodeLanguage {
+    fn from_code_block(kind: &CodeBlockKind<'_>) -> Self {
+        match kind {
+            CodeBlockKind::Fenced(info) if is_rust_code_info(info) => Self::Rust,
+            CodeBlockKind::Fenced(info) if is_plain_code_info(info) => Self::Plain,
+            CodeBlockKind::Indented => Self::Plain,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3196,6 +3500,11 @@ struct WrapToken {
     kind: WrapTokenKind,
     segments: Vec<DetailSegment>,
     width: usize,
+}
+
+struct MarkdownRenderOptions {
+    prefix: Vec<DetailSegment>,
+    right_padding: usize,
 }
 
 struct DetailsBuilder {
@@ -3332,17 +3641,37 @@ impl DetailsBuilder {
         let mut emitted = 0;
         for block in blocks {
             let prefix = quote_prefix(block.quote_depth);
-            if !self.push_wrapped_prefixed(
-                &block.segments,
-                prefix.as_slice(),
-                &mut emitted,
-                max_lines,
-            ) {
+            if block.gap_before
+                && !self.push_markdown_gap(prefix.as_slice(), &mut emitted, max_lines)
+            {
                 return;
+            }
+            match block.kind {
+                MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
+                    if !self.push_wrapped_prefixed(
+                        &block.segments,
+                        prefix.as_slice(),
+                        &mut emitted,
+                        max_lines,
+                    ) {
+                        return;
+                    }
+                }
+                MarkdownBlockKind::Code { .. } => {
+                    if !self.push_preformatted_prefixed(
+                        &block.segments,
+                        prefix.as_slice(),
+                        &mut emitted,
+                        max_lines,
+                    ) {
+                        return;
+                    }
+                }
             }
         }
     }
 
+    #[cfg(test)]
     fn push_markdown_block_indented(
         &mut self,
         text: &str,
@@ -3352,35 +3681,84 @@ impl DetailsBuilder {
         left_padding: usize,
         right_padding: usize,
     ) {
+        self.push_markdown_block_prefixed(
+            text,
+            empty_message,
+            max_lines,
+            max_chars,
+            MarkdownRenderOptions {
+                prefix: padding_prefix(left_padding),
+                right_padding,
+            },
+        );
+    }
+
+    fn push_markdown_block_prefixed(
+        &mut self,
+        text: &str,
+        empty_message: &str,
+        max_lines: usize,
+        max_chars: usize,
+        options: MarkdownRenderOptions,
+    ) {
         let text = truncate_text(&normalize_text(text), max_chars);
         if text.trim().is_empty() {
-            self.push_indented_wrapped_limited(
-                vec![DetailSegment::raw(empty_message.to_string())],
-                left_padding,
-                right_padding,
-                1,
-            );
+            let segments = vec![DetailSegment::raw(empty_message.to_string())];
+            self.push_prefixed_wrapped_limited(segments, options.prefix, options.right_padding, 1);
             return;
         }
 
         let blocks = markdown_blocks(&text);
         let original_width = self.width;
-        self.width = reserved_width(self.width, right_padding);
-        let indent = padding_prefix(left_padding);
+        self.width = reserved_width(self.width, options.right_padding);
         let mut emitted = 0;
         for block in blocks {
-            let mut prefix = indent.clone();
-            prefix.extend(quote_prefix(block.quote_depth));
-            if !self.push_wrapped_prefixed(
-                &block.segments,
-                prefix.as_slice(),
-                &mut emitted,
-                max_lines,
-            ) {
+            let mut line_prefix = options.prefix.clone();
+            line_prefix.extend(quote_prefix(block.quote_depth));
+            if block.gap_before
+                && !self.push_markdown_gap(line_prefix.as_slice(), &mut emitted, max_lines)
+            {
                 break;
+            }
+            match block.kind {
+                MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
+                    if !self.push_wrapped_prefixed(
+                        &block.segments,
+                        line_prefix.as_slice(),
+                        &mut emitted,
+                        max_lines,
+                    ) {
+                        break;
+                    }
+                }
+                MarkdownBlockKind::Code { .. } => {
+                    if !self.push_preformatted_prefixed(
+                        &block.segments,
+                        line_prefix.as_slice(),
+                        &mut emitted,
+                        max_lines,
+                    ) {
+                        break;
+                    }
+                }
             }
         }
         self.width = original_width;
+    }
+
+    fn push_markdown_gap(
+        &mut self,
+        prefix: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        if *emitted >= max_lines {
+            self.push_plain("...");
+            return false;
+        }
+        self.push_line(prefix.to_vec());
+        *emitted += 1;
+        true
     }
 
     fn push_wrapped_limited(&mut self, segments: Vec<DetailSegment>, max_lines: usize) {
@@ -3388,16 +3766,15 @@ impl DetailsBuilder {
         let _ = self.push_wrapped(&segments, &mut emitted, max_lines);
     }
 
-    fn push_indented_wrapped_limited(
+    fn push_prefixed_wrapped_limited(
         &mut self,
         segments: Vec<DetailSegment>,
-        left_padding: usize,
+        prefix: Vec<DetailSegment>,
         right_padding: usize,
         max_lines: usize,
     ) {
         let original_width = self.width;
         self.width = reserved_width(self.width, right_padding);
-        let prefix = padding_prefix(left_padding);
         let mut emitted = 0;
         if prefix.is_empty() {
             let _ = self.push_wrapped(&segments, &mut emitted, max_lines);
@@ -3520,6 +3897,43 @@ impl DetailsBuilder {
         } else {
             true
         }
+    }
+
+    fn push_preformatted_prefixed(
+        &mut self,
+        segments: &[DetailSegment],
+        prefix: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        let prefix_width: usize = prefix
+            .iter()
+            .map(|segment| display_width(&segment.text))
+            .sum();
+        let prefix = if prefix_width < self.width {
+            prefix
+        } else {
+            &[]
+        };
+        let prefix_width = if prefix.is_empty() { 0 } else { prefix_width };
+        let mut current = prefix.to_vec();
+        let mut column = prefix_width;
+
+        for segment in segments {
+            for ch in segment.text.chars() {
+                if column >= self.width {
+                    if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
+                        return false;
+                    }
+                    current = prefix.to_vec();
+                    column = prefix_width;
+                }
+                push_char_segment(&mut current, segment, ch);
+                column += display_width_char(ch);
+            }
+        }
+
+        self.flush_wrapped_line(&mut current, emitted, max_lines)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3705,12 +4119,15 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         builder.push_blank();
     }
 
-    builder.push_line(vec![DetailSegment::styled(
-        item.title.clone(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]);
+    builder.push_wrapped_limited(
+        vec![DetailSegment::styled(
+            item.title.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )],
+        3,
+    );
 
     builder.push_meta_line(vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
@@ -3780,6 +4197,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
 
     builder.push_blank();
     builder.push_heading("Description");
+    builder.push_blank();
     builder.push_markdown_block(
         item.body.as_deref().unwrap_or(""),
         "No description.",
@@ -3790,6 +4208,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
         builder.push_heading("Recent Comments");
+        builder.push_blank();
         match app.details.get(&item.id) {
             Some(DetailState::Loading) => {
                 builder.push_plain("loading comments...");
@@ -3836,12 +4255,15 @@ fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
 
     push_details_mode_tabs(&mut builder, DetailsMode::Diff);
     builder.push_blank();
-    builder.push_line(vec![DetailSegment::styled(
-        item.title.clone(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]);
+    builder.push_wrapped_limited(
+        vec![DetailSegment::styled(
+            item.title.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )],
+        3,
+    );
     builder.push_meta_line(vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
         (
@@ -3868,7 +4290,7 @@ fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
                 diff,
                 selected_file,
                 selected_line,
-                app.selected_diff_range_for(&item.id),
+                app.diff_mark_range_for(&item.id),
             );
         }
         Some(DiffState::Error(error)) => {
@@ -4149,13 +4571,6 @@ fn diff_review_target_from_range(
     {
         return Err("range must stay in one file".to_string());
     }
-    if targets[start..=end]
-        .iter()
-        .any(|target| target.side != first.side)
-    {
-        return Err("range must stay on one diff side".to_string());
-    }
-
     let mut target = last.clone();
     if start != end {
         target.start_line = Some(first.line);
@@ -4258,15 +4673,27 @@ fn push_comment(
             DetailAction::EditComment(index),
         ));
     }
-    builder.push_indented_wrapped_limited(header, COMMENT_LEFT_PADDING, COMMENT_RIGHT_PADDING, 2);
-    builder.push_markdown_block_indented(
+    let prefix = comment_line_prefix(selected);
+    builder.push_prefixed_wrapped_limited(
+        header,
+        prefix.clone(),
+        comment_right_padding(selected),
+        2,
+    );
+    builder.push_markdown_block_prefixed(
         &comment.body,
         "No comment body.",
         usize::MAX,
         usize::MAX,
-        COMMENT_LEFT_PADDING,
-        COMMENT_RIGHT_PADDING,
+        MarkdownRenderOptions {
+            prefix,
+            right_padding: comment_right_padding(selected),
+        },
     );
+    if selected {
+        push_comment_separator(builder, true);
+        add_comment_right_border(builder, start_line, builder.document.lines.len());
+    }
     builder.document.comments.push(CommentRegion {
         index,
         start_line,
@@ -4297,12 +4724,56 @@ fn review_comment_label(review: &crate::model::ReviewCommentPreview) -> String {
 fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool) {
     let width = builder
         .width
-        .saturating_sub(COMMENT_LEFT_PADDING + COMMENT_RIGHT_PADDING)
+        .saturating_sub(COMMENT_LEFT_PADDING + comment_right_padding(selected))
         .max(12);
+    let line = if selected { "━" } else { "─" };
     builder.push_line(vec![
-        DetailSegment::styled(" ".repeat(COMMENT_LEFT_PADDING), Style::default()),
-        DetailSegment::styled("─".repeat(width.min(72)), comment_separator_style(selected)),
+        comment_line_prefix(selected)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| DetailSegment::raw(" ".repeat(COMMENT_LEFT_PADDING))),
+        DetailSegment::styled(
+            line.repeat(if selected { width } else { width.min(72) }),
+            comment_separator_style(selected),
+        ),
     ]);
+}
+
+fn comment_line_prefix(selected: bool) -> Vec<DetailSegment> {
+    if selected {
+        vec![DetailSegment::styled("┃ ", comment_selected_rail_style())]
+    } else {
+        padding_prefix(COMMENT_LEFT_PADDING)
+    }
+}
+
+fn add_comment_right_border(builder: &mut DetailsBuilder, start_line: usize, end_line: usize) {
+    let border_column = comment_right_border_column(builder.width);
+    for line in builder
+        .document
+        .lines
+        .iter_mut()
+        .take(end_line)
+        .skip(start_line)
+    {
+        let width = display_width(&line.to_string());
+        if width < border_column {
+            line.spans
+                .push(Span::raw(" ".repeat(border_column - width)));
+        }
+        line.spans
+            .push(Span::styled("┃", comment_selected_rail_style()));
+    }
+}
+
+fn comment_right_border_column(width: usize) -> usize {
+    width
+        .saturating_sub(COMMENT_RIGHT_PADDING + 1)
+        .max(COMMENT_LEFT_PADDING)
+}
+
+fn comment_right_padding(selected: bool) -> usize {
+    COMMENT_RIGHT_PADDING + usize::from(selected)
 }
 
 fn action_hint_text(state: Option<&ActionHintState>) -> (String, Option<String>) {
@@ -4413,6 +4884,7 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
     let mut link: Option<String> = None;
     let mut code_block = String::new();
     let mut in_code_block = false;
+    let mut code_language = CodeLanguage::Other;
     let mut strong_depth = 0_u8;
     let mut emphasis_depth = 0_u8;
     let mut quote_depth = 0_u8;
@@ -4422,19 +4894,35 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
     for event in Parser::new_ext(text, options) {
         match event {
             MarkdownEvent::Start(Tag::Paragraph) => {}
-            MarkdownEvent::End(TagEnd::Paragraph) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth)
-            }
+            MarkdownEvent::End(TagEnd::Paragraph) => flush_markdown_block(
+                &mut blocks,
+                &mut current,
+                quote_depth,
+                MarkdownBlockKind::Text,
+            ),
             MarkdownEvent::Start(Tag::Heading { .. }) => {}
-            MarkdownEvent::End(TagEnd::Heading(_)) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth)
-            }
+            MarkdownEvent::End(TagEnd::Heading(_)) => flush_markdown_block(
+                &mut blocks,
+                &mut current,
+                quote_depth,
+                MarkdownBlockKind::Text,
+            ),
             MarkdownEvent::Start(Tag::BlockQuote(_)) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+                flush_markdown_block(
+                    &mut blocks,
+                    &mut current,
+                    quote_depth,
+                    MarkdownBlockKind::Text,
+                );
                 quote_depth = quote_depth.saturating_add(1);
             }
             MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+                flush_markdown_block(
+                    &mut blocks,
+                    &mut current,
+                    quote_depth,
+                    MarkdownBlockKind::Text,
+                );
                 quote_depth = quote_depth.saturating_sub(1);
             }
             MarkdownEvent::Start(Tag::Item) => {
@@ -4443,9 +4931,12 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                     Style::default().fg(Color::Gray),
                 ));
             }
-            MarkdownEvent::End(TagEnd::Item) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth)
-            }
+            MarkdownEvent::End(TagEnd::Item) => flush_markdown_block(
+                &mut blocks,
+                &mut current,
+                quote_depth,
+                MarkdownBlockKind::ListItem,
+            ),
             MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
                 link = Some(dest_url.to_string());
             }
@@ -4464,22 +4955,37 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
             MarkdownEvent::End(TagEnd::Emphasis) => {
                 emphasis_depth = emphasis_depth.saturating_sub(1);
             }
-            MarkdownEvent::Start(Tag::CodeBlock(_)) => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth);
+            MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
+                flush_markdown_block(
+                    &mut blocks,
+                    &mut current,
+                    quote_depth,
+                    MarkdownBlockKind::Text,
+                );
                 in_code_block = true;
+                code_language = CodeLanguage::from_code_block(&kind);
                 code_block.clear();
             }
             MarkdownEvent::End(TagEnd::CodeBlock) => {
-                for line in code_block.lines() {
-                    blocks.push(MarkdownBlock {
+                let mut lines = code_block.split('\n').collect::<Vec<_>>();
+                if lines.last() == Some(&"") {
+                    lines.pop();
+                }
+                if lines.is_empty() {
+                    lines.push("");
+                }
+                for line in lines {
+                    push_markdown_block(
+                        &mut blocks,
                         quote_depth,
-                        segments: vec![DetailSegment::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::LightGreen),
-                        )],
-                    });
+                        MarkdownBlockKind::Code {
+                            language: code_language,
+                        },
+                        highlight_code_line(line, code_language),
+                    );
                 }
                 in_code_block = false;
+                code_language = CodeLanguage::Other;
                 code_block.clear();
             }
             MarkdownEvent::Text(text) => {
@@ -4499,37 +5005,334 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 Style::default().fg(Color::LightGreen),
             )),
             MarkdownEvent::SoftBreak => current.push(DetailSegment::raw(" ")),
-            MarkdownEvent::HardBreak => {
-                flush_markdown_block(&mut blocks, &mut current, quote_depth)
-            }
-            MarkdownEvent::Rule => blocks.push(MarkdownBlock {
+            MarkdownEvent::HardBreak => flush_markdown_block(
+                &mut blocks,
+                &mut current,
                 quote_depth,
-                segments: vec![DetailSegment::styled(
+                MarkdownBlockKind::Text,
+            ),
+            MarkdownEvent::Rule => push_markdown_block(
+                &mut blocks,
+                quote_depth,
+                MarkdownBlockKind::Text,
+                vec![DetailSegment::styled(
                     "─".repeat(24),
                     Style::default().fg(Color::DarkGray),
                 )],
-            }),
+            ),
             MarkdownEvent::TaskListMarker(checked) => {
                 current.push(DetailSegment::raw(if checked { "[x] " } else { "[ ] " }));
             }
             _ => {}
         }
     }
-    flush_markdown_block(&mut blocks, &mut current, quote_depth);
+    flush_markdown_block(
+        &mut blocks,
+        &mut current,
+        quote_depth,
+        MarkdownBlockKind::Text,
+    );
     blocks
+}
+
+fn is_rust_code_info(info: &str) -> bool {
+    matches!(
+        info.split_whitespace().next().map(str::to_ascii_lowercase),
+        Some(language) if matches!(language.as_str(), "rust" | "rs")
+    )
+}
+
+fn is_plain_code_info(info: &str) -> bool {
+    matches!(
+        info.split_whitespace().next().map(str::to_ascii_lowercase),
+        Some(language) if matches!(
+            language.as_str(),
+            "plain" | "text" | "txt" | "log" | "console" | "output"
+        )
+    )
+}
+
+fn highlight_code_line(line: &str, language: CodeLanguage) -> Vec<DetailSegment> {
+    match language {
+        CodeLanguage::Rust => highlight_rust_code_line(line),
+        CodeLanguage::Plain => highlight_plain_code_line(line),
+        CodeLanguage::Other => vec![DetailSegment::styled(line.to_string(), code_plain_style())],
+    }
+}
+
+fn highlight_plain_code_line(line: &str) -> Vec<DetailSegment> {
+    let content_start = line
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_whitespace()).then_some(index))
+        .unwrap_or(line.len());
+    let (prefix, content) = line.split_at(content_start);
+    let mut segments = Vec::new();
+    push_highlighted_text(&mut segments, prefix, code_plain_style());
+    push_highlighted_text(&mut segments, content, plain_code_content_style(content));
+    segments
+}
+
+fn plain_code_content_style(content: &str) -> Style {
+    let lower = content.to_ascii_lowercase();
+    if lower.starts_with("error") || lower.contains(" failed") || lower.contains(": fail") {
+        log_error_style()
+    } else if lower.starts_with("warning") {
+        log_warning_style()
+    } else if lower.contains(" info ") || lower.contains(" info  ") {
+        log_info_style()
+    } else if content == "---" || content.starts_with("##[") || content.starts_with("[TIMING:") {
+        log_meta_style()
+    } else {
+        code_plain_style()
+    }
+}
+
+fn highlight_rust_code_line(line: &str) -> Vec<DetailSegment> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '/' && chars.get(index + 1) == Some(&'/') {
+            push_highlighted_text(
+                &mut segments,
+                &chars[index..].iter().collect::<String>(),
+                rust_comment_style(),
+            );
+            break;
+        }
+
+        if ch == '"' {
+            let end = quoted_end(&chars, index, '"');
+            push_highlighted_text(
+                &mut segments,
+                &chars[index..end].iter().collect::<String>(),
+                rust_string_style(),
+            );
+            index = end;
+            continue;
+        }
+
+        if ch == '\''
+            && let Some(end) = rust_char_literal_end(&chars, index)
+        {
+            push_highlighted_text(
+                &mut segments,
+                &chars[index..end].iter().collect::<String>(),
+                rust_string_style(),
+            );
+            index = end;
+            continue;
+        }
+
+        if is_rust_ident_start(ch) {
+            let start = index;
+            index += 1;
+            while chars
+                .get(index)
+                .is_some_and(|candidate| is_rust_ident_continue(*candidate))
+            {
+                index += 1;
+            }
+            let mut end = index;
+            let text = chars[start..index].iter().collect::<String>();
+            let style = if is_rust_keyword(&text) {
+                rust_keyword_style()
+            } else if is_rust_primitive_type(&text) {
+                rust_type_style()
+            } else if chars.get(index) == Some(&'!') {
+                end = index + 1;
+                rust_macro_style()
+            } else {
+                code_plain_style()
+            };
+            push_highlighted_text(
+                &mut segments,
+                &chars[start..end].iter().collect::<String>(),
+                style,
+            );
+            index = end;
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while chars.get(index).is_some_and(|candidate| {
+                candidate.is_ascii_alphanumeric() || matches!(candidate, '_' | '.')
+            }) {
+                index += 1;
+            }
+            push_highlighted_text(
+                &mut segments,
+                &chars[start..index].iter().collect::<String>(),
+                rust_number_style(),
+            );
+            continue;
+        }
+
+        push_highlighted_text(&mut segments, &ch.to_string(), code_plain_style());
+        index += 1;
+    }
+
+    segments
+}
+
+fn quoted_end(chars: &[char], start: usize, quote: char) -> usize {
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return index + 1;
+        }
+        index += 1;
+    }
+    chars.len()
+}
+
+fn rust_char_literal_end(chars: &[char], start: usize) -> Option<usize> {
+    let end = quoted_end(chars, start, '\'');
+    if end <= start + 1 || end > chars.len() {
+        return None;
+    }
+    let body_len = chars[start + 1..end - 1].len();
+    if (1..=6).contains(&body_len) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn is_rust_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_rust_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_rust_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "Self"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+    )
+}
+
+fn is_rust_primitive_type(text: &str) -> bool {
+    matches!(
+        text,
+        "bool"
+            | "char"
+            | "f32"
+            | "f64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+    )
+}
+
+fn push_highlighted_text(segments: &mut Vec<DetailSegment>, text: &str, style: Style) {
+    let template = DetailSegment::styled("", style);
+    push_text_segment(segments, &template, text);
 }
 
 fn flush_markdown_block(
     blocks: &mut Vec<MarkdownBlock>,
     current: &mut Vec<DetailSegment>,
     quote_depth: u8,
+    kind: MarkdownBlockKind,
 ) {
     if current.iter().any(|segment| !segment.text.is_empty()) {
-        blocks.push(MarkdownBlock {
-            quote_depth,
-            segments: std::mem::take(current),
-        });
+        push_markdown_block(blocks, quote_depth, kind, std::mem::take(current));
     }
+}
+
+fn push_markdown_block(
+    blocks: &mut Vec<MarkdownBlock>,
+    quote_depth: u8,
+    kind: MarkdownBlockKind,
+    segments: Vec<DetailSegment>,
+) {
+    let gap_before = markdown_gap_before(blocks.last(), quote_depth, kind);
+    blocks.push(MarkdownBlock {
+        quote_depth,
+        kind,
+        gap_before,
+        segments,
+    });
+}
+
+fn markdown_gap_before(
+    previous: Option<&MarkdownBlock>,
+    quote_depth: u8,
+    kind: MarkdownBlockKind,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if previous.quote_depth != quote_depth {
+        return false;
+    }
+    !matches!(
+        (previous.kind, kind),
+        (MarkdownBlockKind::ListItem, MarkdownBlockKind::ListItem)
+            | (
+                MarkdownBlockKind::Code { .. },
+                MarkdownBlockKind::Code { .. }
+            )
+    )
 }
 
 fn quote_prefix(depth: u8) -> Vec<DetailSegment> {
@@ -4678,6 +5481,54 @@ fn quote_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+fn code_plain_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn rust_keyword_style() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn rust_type_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+fn rust_string_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn rust_comment_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn rust_macro_style() -> Style {
+    Style::default().fg(Color::LightBlue)
+}
+
+fn rust_number_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn log_error_style() -> Style {
+    Style::default()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn log_warning_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+fn log_info_style() -> Style {
+    Style::default().fg(Color::LightBlue)
+}
+
+fn log_meta_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 fn diff_file_style() -> Style {
     Style::default()
         .fg(Color::Cyan)
@@ -4729,10 +5580,18 @@ fn comment_marker_style(selected: bool) -> Style {
 
 fn comment_separator_style(selected: bool) -> Style {
     if selected {
-        Style::default().fg(Color::LightMagenta)
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     }
+}
+
+fn comment_selected_rail_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn display_width(text: &str) -> usize {
@@ -5156,9 +6015,11 @@ impl AppState {
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
             diff_mark: HashMap::new(),
+            last_diff_click: None,
             diff_mode_state: HashMap::new(),
             action_hints: HashMap::new(),
             details_stale: HashSet::new(),
+            pending_details_load: None,
             notification_read_pending: HashSet::new(),
             selected_comment_index: 0,
             comment_dialog: None,
@@ -5319,41 +6180,32 @@ impl AppState {
                     (_, Some(error)) => format!("snapshot save failed: {error}"),
                 };
             }
-            AppMsg::DetailsLoaded {
-                item_id,
-                comments,
-                actions,
-            } => {
-                match comments {
-                    Ok(comments) => {
-                        self.details_stale.remove(&item_id);
-                        self.details
-                            .insert(item_id.clone(), DetailState::Loaded(comments));
-                        self.clamp_selected_comment();
-                    }
-                    Err(error) => {
-                        if self.setup_dialog.is_none() {
-                            self.setup_dialog = setup_dialog_from_error(&error);
-                        }
-                        self.details_stale.remove(&item_id);
-                        self.details
-                            .insert(item_id.clone(), DetailState::Error(error));
-                    }
+            AppMsg::CommentsLoaded { item_id, comments } => match comments {
+                Ok(comments) => {
+                    self.details_stale.remove(&item_id);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Loaded(comments));
+                    self.clamp_selected_comment();
                 }
-
-                if let Some(actions) = actions {
-                    match actions {
-                        Ok(actions) => {
-                            self.action_hints
-                                .insert(item_id, ActionHintState::Loaded(actions));
-                        }
-                        Err(error) => {
-                            self.action_hints
-                                .insert(item_id, ActionHintState::Error(error));
-                        }
+                Err(error) => {
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog_from_error(&error);
                     }
+                    self.details_stale.remove(&item_id);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Error(error));
                 }
-            }
+            },
+            AppMsg::ActionHintsLoaded { item_id, actions } => match actions {
+                Ok(actions) => {
+                    self.action_hints
+                        .insert(item_id, ActionHintState::Loaded(actions));
+                }
+                Err(error) => {
+                    self.action_hints
+                        .insert(item_id, ActionHintState::Error(error));
+                }
+            },
             AppMsg::DiffLoaded { item_id, diff } => match diff {
                 Ok(diff) => {
                     let file_count = diff.files.len();
@@ -5792,23 +6644,60 @@ impl AppState {
 
     fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
         let Some(item) = self.current_item().cloned() else {
+            self.pending_details_load = None;
             return;
         };
         if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+            self.pending_details_load = None;
             return;
         }
-        if !self.should_start_details_load(&item) {
+        if !self.details_load_needed(&item) {
+            self.pending_details_load = None;
+            return;
+        }
+        if !self.details_load_ready(&item.id) {
             return;
         }
 
-        if !self.details.contains_key(&item.id) {
-            self.details.insert(item.id.clone(), DetailState::Loading);
+        self.pending_details_load = None;
+        if self.start_comments_load_if_needed(&item) {
+            start_comments_load(item.clone(), tx.clone());
         }
-        if matches!(item.kind, ItemKind::PullRequest) && !self.action_hints.contains_key(&item.id) {
-            self.action_hints
-                .insert(item.id.clone(), ActionHintState::Loading);
+        if self.start_action_hints_load_if_needed(&item) {
+            start_action_hints_load(item, tx.clone());
         }
-        start_details_load(item, tx.clone());
+    }
+
+    fn details_load_needed(&self, item: &WorkItem) -> bool {
+        self.comments_load_needed(item) || self.action_hints_load_needed(item)
+    }
+
+    fn comments_load_needed(&self, item: &WorkItem) -> bool {
+        !self.details.contains_key(&item.id) || self.details_stale.contains(&item.id)
+    }
+
+    fn action_hints_load_needed(&self, item: &WorkItem) -> bool {
+        matches!(item.kind, ItemKind::PullRequest) && !self.action_hints.contains_key(&item.id)
+    }
+
+    fn details_load_ready(&mut self, item_id: &str) -> bool {
+        if self.focus == FocusTarget::Details {
+            self.pending_details_load = None;
+            return true;
+        }
+
+        let now = Instant::now();
+        match self.pending_details_load.as_ref() {
+            Some(pending) if pending.item_id == item_id && now >= pending.ready_at => true,
+            Some(pending) if pending.item_id == item_id => false,
+            _ => {
+                self.pending_details_load = Some(PendingDetailsLoad {
+                    item_id: item_id.to_string(),
+                    ready_at: now + DETAILS_LOAD_DEBOUNCE,
+                });
+                false
+            }
+        }
     }
 
     fn ensure_current_diff_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
@@ -5859,7 +6748,15 @@ impl AppState {
 
     fn selected_diff_range_for(&self, item_id: &str) -> Option<(usize, usize)> {
         let mark = self.diff_mark.get(item_id)?;
-        Some(ordered_range(mark.anchor, mark.focus))
+        if !mark.complete {
+            return None;
+        }
+        Some(mark.range())
+    }
+
+    fn diff_mark_range_for(&self, item_id: &str) -> Option<(usize, usize)> {
+        let mark = self.diff_mark.get(item_id)?;
+        Some(mark.range())
     }
 
     fn current_diff_review_targets(&self) -> Option<Vec<DiffReviewTarget>> {
@@ -5923,12 +6820,24 @@ impl AppState {
             })
     }
 
-    fn should_start_details_load(&mut self, item: &WorkItem) -> bool {
+    fn start_comments_load_if_needed(&mut self, item: &WorkItem) -> bool {
         let should_refresh = self.details_stale.remove(&item.id);
-        !self.details.contains_key(&item.id)
-            || should_refresh
-            || (matches!(item.kind, ItemKind::PullRequest)
-                && !self.action_hints.contains_key(&item.id))
+        if self.details.contains_key(&item.id) && !should_refresh {
+            return false;
+        }
+        if !self.details.contains_key(&item.id) {
+            self.details.insert(item.id.clone(), DetailState::Loading);
+        }
+        true
+    }
+
+    fn start_action_hints_load_if_needed(&mut self, item: &WorkItem) -> bool {
+        if !self.action_hints_load_needed(item) {
+            return false;
+        }
+        self.action_hints
+            .insert(item.id.clone(), ActionHintState::Loading);
+        true
     }
 
     fn switch_view(&mut self, view: impl Into<String>) {
@@ -6155,79 +7064,93 @@ impl AppState {
             self.status = "nothing to diff".to_string();
             return;
         };
-        let completing_mark = self
+        let file_index = self.selected_diff_file.get(&item_id).copied().unwrap_or(0);
+        let is_double_click = self.is_diff_double_click(&item_id, file_index, index);
+        let had_pending_mark = self
             .diff_mark
             .get(&item_id)
-            .map(|mark| !mark.complete)
-            .unwrap_or(false);
+            .is_some_and(|mark| mark.is_pending());
         self.select_diff_line(index, area);
-        let current = self
-            .selected_diff_line
-            .get(&item_id)
-            .copied()
-            .unwrap_or(index);
-        if completing_mark {
-            if let Some(mark) = self.diff_mark.get_mut(&item_id) {
-                mark.focus = current;
-                mark.complete = true;
-            }
+
+        if is_double_click {
+            self.end_diff_mark();
+        } else if had_pending_mark {
             self.update_diff_mark_status(&item_id);
         } else {
-            self.diff_mark.insert(
-                item_id.clone(),
-                DiffMarkState {
-                    anchor: current,
-                    focus: current,
-                    complete: false,
-                },
-            );
-            self.update_diff_mark_status(&item_id);
+            self.begin_diff_mark();
         }
     }
 
-    fn toggle_diff_mark(&mut self) {
-        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
-            self.status = "nothing to mark".to_string();
+    fn is_diff_double_click(
+        &mut self,
+        item_id: &str,
+        file_index: usize,
+        review_index: usize,
+    ) -> bool {
+        let now = Instant::now();
+        let is_double_click = self
+            .last_diff_click
+            .as_ref()
+            .is_some_and(|last| last.matches(item_id, file_index, review_index, now));
+        self.last_diff_click = Some(DiffClickState {
+            item_id: item_id.to_string(),
+            file_index,
+            review_index,
+            at: now,
+        });
+        is_double_click
+    }
+
+    fn begin_diff_mark(&mut self) {
+        let Some((item_id, targets)) = self.diff_review_context("nothing to mark") else {
             return;
+        };
+        let current = self.selected_diff_review_index(&item_id, targets.len());
+
+        self.diff_mark
+            .insert(item_id.clone(), DiffMarkState::pending(current));
+        self.update_diff_mark_status(&item_id);
+    }
+
+    fn end_diff_mark(&mut self) {
+        let Some((item_id, targets)) = self.diff_review_context("nothing to mark") else {
+            return;
+        };
+        let current = self.selected_diff_review_index(&item_id, targets.len());
+
+        let Some(mark) = self.diff_mark.get_mut(&item_id) else {
+            self.status = "press m to begin mark first".to_string();
+            return;
+        };
+        mark.complete_at(current);
+        self.update_diff_mark_status(&item_id);
+    }
+
+    fn diff_review_context(
+        &mut self,
+        missing_item_status: &'static str,
+    ) -> Option<(String, Vec<DiffReviewTarget>)> {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = missing_item_status.to_string();
+            return None;
         };
         let Some(targets) = self.current_diff_review_targets() else {
             self.status = "diff still loading".to_string();
-            return;
+            return None;
         };
         if targets.is_empty() {
             self.status = "no reviewable diff lines".to_string();
-            return;
+            return None;
         }
-        let current = self
-            .selected_diff_line
-            .get(&item_id)
+        Some((item_id, targets))
+    }
+
+    fn selected_diff_review_index(&self, item_id: &str, target_count: usize) -> usize {
+        self.selected_diff_line
+            .get(item_id)
             .copied()
             .unwrap_or(0)
-            .min(targets.len() - 1);
-
-        match self.diff_mark.get(&item_id).copied() {
-            Some(mark) if !mark.complete => {
-                self.diff_mark.insert(
-                    item_id.clone(),
-                    DiffMarkState {
-                        anchor: mark.anchor,
-                        focus: current,
-                        complete: true,
-                    },
-                );
-            }
-            _ => {
-                self.diff_mark.insert(
-                    item_id.clone(),
-                    DiffMarkState {
-                        anchor: current,
-                        focus: current,
-                        complete: false,
-                    },
-                );
-            }
-        }
-        self.update_diff_mark_status(&item_id);
+            .min(target_count.saturating_sub(1))
     }
 
     fn update_diff_mark_after_line_select(&mut self, selected: usize) {
@@ -6255,17 +7178,20 @@ impl AppState {
             self.status = "no reviewable diff lines".to_string();
             return;
         }
-        let (start, end) = ordered_range(mark.anchor, mark.focus);
+        let (start, end) = mark.range();
         match diff_review_target_from_range(&targets, start, end) {
-            Ok(target) if target.is_range() => {
-                let verb = if mark.complete { "selected" } else { "marking" };
-                self.status = format!("{verb} {}", target.location_label());
-            }
             Ok(target) => {
-                self.status = format!(
-                    "mark started at {}; move highlight or click another line, then press m/c",
-                    target.location_label()
-                );
+                if mark.complete {
+                    self.status = format!("selected {}", target.location_label());
+                } else if target.is_range() {
+                    self.status =
+                        format!("marking {}; press e to end mark", target.location_label());
+                } else {
+                    self.status = format!(
+                        "mark started at {}; move highlight, then press e",
+                        target.location_label()
+                    );
+                }
             }
             Err(error) => {
                 self.status = error;
@@ -6634,6 +7560,68 @@ impl AppState {
         self.selected_comment_index =
             move_bounded(self.selected_comment_index.min(len - 1), len, delta);
         self.status = format!("comment {} focused", self.selected_comment_index + 1);
+    }
+
+    fn move_comment_in_view(&mut self, delta: isize, area: Option<Rect>) {
+        let before = self.selected_comment_index;
+        self.move_comment(delta);
+        if before == self.selected_comment_index {
+            self.scroll_details_past_comment_edge(delta, area);
+        } else {
+            self.scroll_selected_comment_into_view(area);
+        }
+    }
+
+    fn scroll_details_past_comment_edge(&mut self, delta: isize, area: Option<Rect>) {
+        let amount = area
+            .map(|area| {
+                usize::from(block_inner(details_area_for(self, area)).height)
+                    .saturating_div(2)
+                    .max(3)
+            })
+            .unwrap_or(6)
+            .min(i16::MAX as usize) as i16;
+        let signed = if delta < 0 { -amount } else { amount };
+        self.scroll_details(signed);
+        if let Some(area) = area {
+            let details_area = details_area_for(self, area);
+            self.details_scroll = self
+                .details_scroll
+                .min(max_details_scroll(self, details_area));
+        }
+    }
+
+    fn scroll_selected_comment_into_view(&mut self, area: Option<Rect>) {
+        if self.details_mode != DetailsMode::Conversation {
+            return;
+        }
+        let Some(area) = area else {
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            return;
+        }
+        let document = build_details_document(self, inner.width);
+        let Some(region) = document.comment_region(self.selected_comment_index) else {
+            return;
+        };
+        let viewport_start = usize::from(self.details_scroll);
+        let viewport_height = usize::from(inner.height);
+        let viewport_end = viewport_start.saturating_add(viewport_height);
+        let focus_line = region.focus_line();
+        let lower_margin = viewport_start.saturating_add(1);
+        let upper_margin = viewport_end.saturating_sub(2);
+        if focus_line < lower_margin {
+            self.details_scroll = focus_line.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+        } else if focus_line >= upper_margin {
+            let next_scroll = focus_line.saturating_sub(viewport_height / 3);
+            self.details_scroll = next_scroll.min(usize::from(u16::MAX)) as u16;
+        }
+        self.details_scroll = self
+            .details_scroll
+            .min(max_details_scroll(self, details_area));
     }
 
     fn handle_detail_action(&mut self, action: DetailAction) {
@@ -7089,13 +8077,20 @@ impl AppState {
     }
 
     fn open_selected(&mut self) {
-        let Some(item) = self.current_item() else {
+        let Some(url) = self.selected_open_url() else {
             self.status = "nothing to open".to_string();
             return;
         };
 
-        let url = item.url.clone();
         self.open_url(&url);
+    }
+
+    fn selected_open_url(&self) -> Option<String> {
+        let item = self.current_item()?;
+        if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
+            return Some(pull_request_changes_url(item));
+        }
+        Some(item.url.clone())
     }
 
     fn open_url(&mut self, url: &str) {
@@ -7977,7 +8972,7 @@ deleted file mode 100644
         ));
         assert!(!handle_key_in_area(
             &mut app,
-            key(KeyCode::Char('m')),
+            key(KeyCode::Char('e')),
             &config,
             &store,
             &tx,
@@ -8006,7 +9001,7 @@ deleted file mode 100644
     }
 
     #[test]
-    fn mixed_side_diff_range_is_rejected_for_review_comment() {
+    fn mixed_side_diff_range_creates_review_comment_target() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -8033,7 +9028,7 @@ deleted file mode 100644
         for code in [
             KeyCode::Char('m'),
             KeyCode::Char('j'),
-            KeyCode::Char('m'),
+            KeyCode::Char('e'),
             KeyCode::Char('c'),
         ] {
             assert!(!handle_key_in_area(
@@ -8046,12 +9041,20 @@ deleted file mode 100644
             ));
         }
 
-        assert!(app.comment_dialog.is_none());
-        assert_eq!(app.status, "range must stay on one diff side");
+        assert!(matches!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(CommentDialogMode::Review { target })
+                if target.path == "src/lib.rs"
+                    && target.start_line == Some(1)
+                    && target.start_side == Some(DiffReviewSide::Left)
+                    && target.line == 1
+                    && target.side == DiffReviewSide::Right
+        ));
+        assert_eq!(app.status, "reviewing src/lib.rs:1L-1R");
     }
 
     #[test]
-    fn two_mouse_clicks_mark_diff_range() {
+    fn single_click_begins_and_double_click_ends_diff_range() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.show_diff();
         app.diffs.insert(
@@ -8104,6 +9107,28 @@ deleted file mode 100644
                 None,
             );
         }
+
+        let target = app.current_diff_review_target().expect("current line");
+        assert_eq!(target.start_line, None);
+        assert_eq!(target.line, 3);
+
+        handle_left_click(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 2,
+                row: inner.y + line_for(2),
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            MouseLayout {
+                view_tabs: page[0],
+                section_tabs: page[1],
+                table: body[0],
+                details: details_area,
+            },
+            None,
+            None,
+        );
 
         let target = app.current_diff_review_target().expect("review range");
         assert_eq!(target.start_line, Some(1));
@@ -8508,6 +9533,31 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn a_in_diff_file_list_opens_normal_comment_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_list();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('a')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(&CommentDialogMode::New)
+        );
+    }
+
+    #[test]
     fn setup_dialog_from_error_classifies_gh_setup_failures() {
         assert_eq!(
             setup_dialog_from_error("GitHub CLI `gh` is required but was not found."),
@@ -8868,7 +9918,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.details_stale.insert("1".to_string());
         let item = app.current_item().cloned().expect("selected item");
 
-        assert!(app.should_start_details_load(&item));
+        assert!(app.start_comments_load_if_needed(&item));
 
         assert!(
             matches!(
@@ -8878,6 +9928,57 @@ diff --git a/src/github.rs b/src/github.rs
             "stale refresh should keep old comments visible while the async reload runs"
         );
         assert!(!app.details_stale.contains("1"));
+    }
+
+    #[test]
+    fn pr_action_hints_can_load_without_reloading_cached_comments() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "cached comment", None)]),
+        );
+        let item = app.current_item().cloned().expect("selected item");
+
+        assert!(app.details_load_needed(&item));
+        assert!(!app.start_comments_load_if_needed(&item));
+        assert!(app.start_action_hints_load_if_needed(&item));
+
+        assert!(
+            matches!(
+                app.details.get("1"),
+                Some(DetailState::Loaded(comments)) if comments[0].body == "cached comment"
+            ),
+            "loading PR metadata should not hide already loaded comments"
+        );
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loading)
+        ));
+    }
+
+    #[test]
+    fn list_focused_details_load_is_debounced_but_details_focus_is_immediate() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_list();
+        let item_id = app.current_item().expect("item").id.clone();
+
+        assert!(app.details_load_needed(app.current_item().unwrap()));
+        assert!(!app.details_load_ready(&item_id));
+        assert!(app.pending_details_load.is_some());
+
+        app.pending_details_load
+            .as_mut()
+            .expect("pending load")
+            .ready_at = Instant::now() - Duration::from_millis(1);
+        assert!(app.details_load_ready(&item_id));
+
+        app.pending_details_load = Some(PendingDetailsLoad {
+            item_id: item_id.clone(),
+            ready_at: Instant::now() + Duration::from_secs(60),
+        });
+        app.focus_details();
+        assert!(app.details_load_ready(&item_id));
+        assert!(app.pending_details_load.is_none());
     }
 
     #[test]
@@ -9175,10 +10276,132 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m mark  c comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
         assert!(!diff.contains("R reply"));
+
+        app.focus_list();
+        let diff_list = footer_line(&app, &paths).to_string();
+        assert!(!diff_list.contains("m text-select"));
+    }
+
+    #[test]
+    fn conversation_details_n_and_p_focus_comments_and_keep_d_u_as_page_scroll() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first comment", None),
+                comment("bob", "second comment", None),
+                comment("carol", "third comment", None),
+            ]),
+        );
+        let area = Rect::new(0, 0, 100, 12);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let second = document.comment_region(1).expect("second comment");
+        assert!(
+            second.start_line >= usize::from(inner.height),
+            "small test viewport should start before the second comment"
+        );
+        app.details_scroll = second
+            .start_line
+            .saturating_sub(usize::from(inner.height).saturating_sub(1))
+            .min(usize::from(u16::MAX)) as u16;
+        assert!(
+            second.start_line < usize::from(app.details_scroll) + usize::from(inner.height),
+            "the separator is visible before jumping"
+        );
+        assert!(
+            second.focus_line() >= usize::from(app.details_scroll) + usize::from(inner.height),
+            "the actual comment header is still below the viewport before jumping"
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 1);
+        let scroll_start = usize::from(app.details_scroll);
+        let scroll_end = scroll_start + usize::from(inner.height);
+        assert!(
+            second.focus_line() >= scroll_start && second.focus_line() < scroll_end,
+            "n should scroll the focused comment header into view"
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('d')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 1);
+        assert!(usize::from(app.details_scroll) >= scroll_start);
+    }
+
+    #[test]
+    fn conversation_details_p_at_first_comment_scrolls_toward_metadata() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.body = Some(
+            (1..=24)
+                .map(|index| format!("description paragraph {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "first comment", None)]),
+        );
+        let area = Rect::new(0, 0, 100, 14);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let first = document.comment_region(0).expect("first comment");
+        app.details_scroll = first.focus_line().min(usize::from(u16::MAX)) as u16;
+        app.selected_comment_index = 0;
+        let before = app.details_scroll;
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+
+        assert_eq!(app.selected_comment_index, 0);
+        assert!(app.details_scroll < before);
     }
 
     #[test]
@@ -9376,6 +10599,19 @@ diff --git a/src/github.rs b/src/github.rs
             section_tab_label(&app, app.visible_sections()[0]),
             "Test (2/120)"
         );
+    }
+
+    #[test]
+    fn top_tab_highlights_use_high_contrast_blocks() {
+        let view = active_view_tab_style();
+        assert_eq!(view.fg, Some(Color::Black));
+        assert_eq!(view.bg, Some(Color::LightCyan));
+        assert!(view.add_modifier.contains(Modifier::BOLD));
+
+        let section = active_section_tab_style();
+        assert_eq!(section.fg, Some(Color::Black));
+        assert_eq!(section.bg, Some(Color::LightYellow));
+        assert!(section.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -9757,6 +10993,43 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn details_headings_have_body_gap() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "First comment", None)]),
+        );
+
+        let rendered = build_details_document(&app, 100)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let description_index = rendered
+            .iter()
+            .position(|line| line == "Description")
+            .expect("description heading");
+        assert_eq!(rendered.get(description_index + 1), Some(&String::new()));
+        assert_eq!(
+            rendered.get(description_index + 2),
+            Some(&"A body with useful context".to_string())
+        );
+
+        let comments_index = rendered
+            .iter()
+            .position(|line| line == "Recent Comments")
+            .expect("comments heading");
+        assert_eq!(rendered.get(comments_index + 1), Some(&String::new()));
+        assert!(
+            rendered
+                .get(comments_index + 2)
+                .is_some_and(|line| line.trim_start().starts_with('─')),
+            "comment separator should start after the heading gap: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn markdown_blockquotes_render_with_quote_marker_on_wrapped_lines() {
         let mut builder = DetailsBuilder::new(12);
         builder.push_markdown_block(
@@ -9815,6 +11088,116 @@ diff --git a/src/github.rs b/src/github.rs
             ]
         );
         assert!(rendered.iter().all(|line| !line.ends_with(' ')));
+    }
+
+    #[test]
+    fn markdown_preserves_block_spacing_without_splitting_lists_or_code() {
+        let mut builder = DetailsBuilder::new(72);
+        builder.push_markdown_block_indented(
+            "Feature gate: `#![feature(split_as_slice)]`\n\nThis is a tracking issue for:\n\n### Public API\n\n```rust\nlet a = [1,2,3];\nlet mut iter = a.split(|i| i == 2);\n```\n\n- [x] Implementation: #92287\n- [ ] Final comment period (FCP)",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let rendered = builder
+            .finish()
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "  Feature gate: #![feature(split_as_slice)]");
+        assert!(rendered[1].trim().is_empty());
+        assert_eq!(rendered[2], "  This is a tracking issue for:");
+        assert!(rendered[3].trim().is_empty());
+        assert_eq!(rendered[4], "  Public API");
+        assert!(rendered[5].trim().is_empty());
+        assert_eq!(rendered[6], "  let a = [1,2,3];");
+        assert_eq!(rendered[7], "  let mut iter = a.split(|i| i == 2);");
+        assert!(rendered[8].trim().is_empty());
+        assert_eq!(rendered[9], "  - [x] Implementation: #92287");
+        assert_eq!(rendered[10], "  - [ ] Final comment period (FCP)");
+    }
+
+    #[test]
+    fn fenced_rust_code_preserves_indentation_and_highlights() {
+        let mut builder = DetailsBuilder::new(64);
+        builder.push_markdown_block_indented(
+            "```rust\nfn places_alias<'tcx>(\n    tcx: TyCtxt<'tcx>,\n) -> bool {\n    return false; // conservative\n}\n```",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "  fn places_alias<'tcx>(");
+        assert_eq!(rendered[1], "      tcx: TyCtxt<'tcx>,");
+        assert_eq!(rendered[3], "      return false; // conservative");
+
+        let keyword = document.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "fn")
+            .expect("highlighted fn keyword");
+        assert_eq!(keyword.style.fg, Some(Color::LightMagenta));
+        assert!(keyword.style.add_modifier.contains(Modifier::BOLD));
+
+        let comment = document.lines[3]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "// conservative")
+            .expect("highlighted comment");
+        assert_eq!(comment.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn plain_fenced_code_preserves_log_indentation_and_highlights_failures() {
+        let mut builder = DetailsBuilder::new(88);
+        builder.push_markdown_block_indented(
+            "```plain\n---\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.62s\nerror[E0308]: mismatched types\n   --> /rust/deps/zerovec/src/yoke_impls.rs:164:19\n[2026-04-30T21:58:21.028Z INFO  opt_dist::timer] Section ended: FAIL\n```",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "  ---");
+        assert_eq!(
+            rendered[1],
+            "      Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.62s"
+        );
+        assert_eq!(rendered[2], "  error[E0308]: mismatched types");
+
+        let separator = document.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "---")
+            .expect("highlighted separator");
+        assert_eq!(separator.style.fg, Some(Color::DarkGray));
+
+        let error = document.lines[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "error[E0308]: mismatched types")
+            .expect("highlighted error");
+        assert_eq!(error.style.fg, Some(Color::LightRed));
+        assert!(error.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -9953,13 +11336,38 @@ diff --git a/src/github.rs b/src/github.rs
         let bob_line_index = document
             .lines
             .iter()
-            .position(|line| line.to_string().contains("▸ bob"))
+            .position(|line| line.to_string().contains("┃ ▸ bob"))
             .expect("selected comment header");
         let reply_column = document.lines[bob_line_index]
             .to_string()
             .find("reply")
             .expect("reply button") as u16;
 
+        let selected_border_count = document
+            .lines
+            .iter()
+            .filter(|line| line.to_string().contains("┃ ━"))
+            .count();
+        assert_eq!(selected_border_count, 2);
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("┃ Second comment"))
+        );
+        assert!(document.lines[bob_line_index].to_string().ends_with('┃'));
+        let selected_body_line = document
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("┃ Second comment"))
+            .expect("selected comment body");
+        assert!(selected_body_line.to_string().ends_with('┃'));
+        assert!(
+            document
+                .lines
+                .iter()
+                .all(|line| line.spans.iter().all(|span| span.style.bg.is_none()))
+        );
         assert_eq!(
             document.action_at(bob_line_index, reply_column),
             Some(DetailAction::ReplyComment(1))
@@ -10157,6 +11565,34 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             app.comment_dialog.map(|dialog| dialog.mode),
             Some(CommentDialogMode::New)
+        );
+    }
+
+    #[test]
+    fn open_url_targets_changes_page_in_diff_mode() {
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![work_item("8", "chenyukang/ghr", 8, "Add diff UI", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+        assert_eq!(
+            app.selected_open_url().as_deref(),
+            Some("https://github.com/chenyukang/ghr/pull/8")
+        );
+
+        app.show_diff();
+        assert_eq!(
+            app.selected_open_url().as_deref(),
+            Some("https://github.com/chenyukang/ghr/pull/8/changes")
         );
     }
 
@@ -10597,7 +12033,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn c_in_diff_details_opens_review_comment_dialog_and_a_is_unbound() {
+    fn c_in_diff_details_opens_review_comment_dialog_and_a_opens_normal_comment() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -10626,9 +12062,14 @@ diff --git a/src/github.rs b/src/github.rs
             &store,
             &tx
         ));
-        assert!(app.comment_dialog.is_none());
+        assert_eq!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(&CommentDialogMode::New)
+        );
         assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.details_mode, DetailsMode::Diff);
 
+        app.comment_dialog = None;
         assert!(!handle_key(
             &mut app,
             key(KeyCode::Char('c')),
@@ -11384,6 +12825,59 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn mouse_click_details_action_uses_current_rendered_rows() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_list();
+        app.selected_comment_index = 0;
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "First comment", None),
+                comment(
+                    "bob",
+                    "Second comment",
+                    Some("https://github.com/rust-lang/rust/pull/1#issuecomment-2"),
+                ),
+            ]),
+        );
+        let area = Rect::new(0, 0, 140, 36);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let bob_line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("bob"))
+            .expect("bob comment line");
+        let reply_column = document.lines[bob_line_index]
+            .to_string()
+            .find("reply")
+            .expect("reply action") as u16;
+        let row = inner.y + bob_line_index as u16 - app.details_scroll;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + reply_column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.selected_comment_index, 1);
+        assert!(matches!(
+            app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(CommentDialogMode::Reply {
+                comment_index: 1,
+                author,
+                ..
+            }) if author == "bob"
+        ));
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_diff_file_list_one_file_at_a_time() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.show_diff();
@@ -11511,6 +13005,105 @@ diff --git a/c.rs b/c.rs
         );
 
         assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_can_reach_last_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(
+                (1..=12)
+                    .map(|index| {
+                        comment(&format!("user{index}"), &format!("comment {index}"), None)
+                    })
+                    .collect(),
+            ),
+        );
+        let area = Rect::new(0, 0, 100, 16);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+
+        for _ in 0..80 {
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: inner.x + 2,
+                    row: inner.y + inner.height.saturating_sub(1),
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                area,
+            );
+        }
+
+        let max_scroll = max_details_scroll(&app, details_area_for(&app, area));
+        assert_eq!(app.details_scroll, max_scroll);
+        let document = build_details_document(&app, inner.width);
+        let last = document.comment_region(11).expect("last comment");
+        let viewport_start = usize::from(app.details_scroll);
+        let viewport_end = viewport_start + usize::from(inner.height);
+        assert!(
+            last.focus_line() >= viewport_start && last.focus_line() < viewport_end,
+            "last comment header should be visible at bottom: scroll={} height={} last={:?}",
+            app.details_scroll,
+            inner.height,
+            last
+        );
+    }
+
+    #[test]
+    fn event_batch_coalesces_excessive_details_wheel_events() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.body = Some(
+            (1..=120)
+                .map(|index| format!("paragraph {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.focus_details();
+        app.search_active = true;
+        let config = Config::default();
+        let paths = test_paths();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let area = Rect::new(0, 0, 100, 20);
+        let details = body_areas(body_area(area))[1];
+        let inner = block_inner(details);
+        let events = (0..100)
+            .map(|_| {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: inner.x + 2,
+                    row: inner.y + 2,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                })
+            })
+            .collect();
+
+        assert!(!handle_event_batch(
+            &mut app, events, area, &config, &paths, &store, &tx
+        ));
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert!(!app.search_active);
+        assert_eq!(
+            app.details_scroll,
+            (MAX_COALESCED_MOUSE_SCROLL_STEPS as u16) * MOUSE_DETAILS_SCROLL_LINES
+        );
     }
 
     #[test]

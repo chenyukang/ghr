@@ -1,15 +1,13 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use futures::future::{BoxFuture, FutureExt};
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Deserialize;
 use tokio::process::Command;
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::OnceCell;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
@@ -23,7 +21,7 @@ static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
 const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
-const SEARCH_REFRESH_CONCURRENCY: usize = 4;
+const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,18 +222,16 @@ struct PullRequestHeadRefRaw {
 
 pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
     let started = Instant::now();
-    let notifications = refresh_notification_sections(config);
-    let searches = async {
-        let viewer_login = match cached_viewer_login().await {
-            Ok(login) => Some(login),
-            Err(error) => {
-                warn!(error = %error, "failed to resolve @me for search filters");
-                None
-            }
-        };
-        refresh_search_sections(config, viewer_login.as_deref()).await
+    let viewer_login = match cached_viewer_login().await {
+        Ok(login) => Some(login),
+        Err(error) => {
+            warn!(error = %error, "failed to resolve @me for search filters");
+            None
+        }
     };
-    let (mut searches, mut notifications) = tokio::join!(searches, notifications);
+    let mut searches = refresh_search_sections(config, viewer_login.as_deref()).await;
+    pace_search_refresh().await;
+    let mut notifications = refresh_notification_sections(config).await;
     searches.append(&mut notifications);
     info!(
         sections = searches.len(),
@@ -280,24 +276,25 @@ pub async fn search_global(
     let excludes = config.exclude_repos.clone();
     let pr_per_page = config.defaults.pr_per_page;
     let issue_per_page = config.defaults.issue_per_page;
-    let (pull_requests, issues) = tokio::join!(
-        refresh_search_section(
-            view.clone(),
-            SectionKind::PullRequests,
-            pr_section,
-            pr_per_page,
-            1,
-            excludes.as_slice(),
-        ),
-        refresh_search_section(
-            view,
-            SectionKind::Issues,
-            issue_section,
-            issue_per_page,
-            1,
-            excludes.as_slice(),
-        )
-    );
+    let pull_requests = refresh_search_section(
+        view.clone(),
+        SectionKind::PullRequests,
+        pr_section,
+        pr_per_page,
+        1,
+        excludes.as_slice(),
+    )
+    .await;
+    pace_search_refresh().await;
+    let issues = refresh_search_section(
+        view,
+        SectionKind::Issues,
+        issue_section,
+        issue_per_page,
+        1,
+        excludes.as_slice(),
+    )
+    .await;
 
     vec![pull_requests, issues]
 }
@@ -306,73 +303,27 @@ async fn refresh_search_sections(
     config: &Config,
     viewer_login: Option<&str>,
 ) -> Vec<SectionSnapshot> {
-    let excludes = Arc::new(config.exclude_repos.clone());
-    let viewer_login = Arc::new(viewer_login.map(str::to_string));
-    let search_limiter = Arc::new(Semaphore::new(SEARCH_REFRESH_CONCURRENCY));
-    let mut tasks: FuturesUnordered<BoxFuture<'static, (usize, SectionSnapshot)>> =
-        FuturesUnordered::new();
-    let mut order = 0;
+    let excludes = config.exclude_repos.clone();
+    let mut jobs = Vec::new();
 
     for section in config.pr_sections.clone() {
-        let excludes = excludes.clone();
-        let viewer_login = viewer_login.clone();
-        let search_limiter = search_limiter.clone();
         let limit = section.limit.unwrap_or(config.defaults.pr_per_page);
-        let index = order;
-        order += 1;
-        tasks.push(
-            async move {
-                let _permit = search_limiter
-                    .acquire_owned()
-                    .await
-                    .expect("search refresh semaphore should stay open");
-                let section = resolve_me_section(section, viewer_login.as_ref().as_deref());
-                (
-                    index,
-                    refresh_search_section(
-                        builtin_view_key(SectionKind::PullRequests),
-                        SectionKind::PullRequests,
-                        section,
-                        limit,
-                        1,
-                        excludes.as_slice(),
-                    )
-                    .await,
-                )
-            }
-            .boxed(),
-        );
+        jobs.push(SearchRefreshJob {
+            view: builtin_view_key(SectionKind::PullRequests),
+            kind: SectionKind::PullRequests,
+            section: resolve_me_section(section, viewer_login),
+            limit,
+        });
     }
 
     for section in config.issue_sections.clone() {
-        let excludes = excludes.clone();
-        let viewer_login = viewer_login.clone();
-        let search_limiter = search_limiter.clone();
         let limit = section.limit.unwrap_or(config.defaults.issue_per_page);
-        let index = order;
-        order += 1;
-        tasks.push(
-            async move {
-                let _permit = search_limiter
-                    .acquire_owned()
-                    .await
-                    .expect("search refresh semaphore should stay open");
-                let section = resolve_me_section(section, viewer_login.as_ref().as_deref());
-                (
-                    index,
-                    refresh_search_section(
-                        builtin_view_key(SectionKind::Issues),
-                        SectionKind::Issues,
-                        section,
-                        limit,
-                        1,
-                        excludes.as_slice(),
-                    )
-                    .await,
-                )
-            }
-            .boxed(),
-        );
+        jobs.push(SearchRefreshJob {
+            view: builtin_view_key(SectionKind::Issues),
+            kind: SectionKind::Issues,
+            section: resolve_me_section(section, viewer_login),
+            limit,
+        });
     }
 
     for repo in config.repos.clone() {
@@ -383,8 +334,6 @@ async fn refresh_search_sections(
         let view = repo_view_key(&repo.name);
         let filters = repo_section_filters(&repo.repo);
         if repo.show_prs {
-            let excludes = excludes.clone();
-            let search_limiter = search_limiter.clone();
             let limit = config.defaults.pr_per_page;
             let section = SearchSection {
                 title: "Pull Requests".to_string(),
@@ -392,35 +341,15 @@ async fn refresh_search_sections(
                 queries: Vec::new(),
                 limit: None,
             };
-            let view = view.clone();
-            let index = order;
-            order += 1;
-            tasks.push(
-                async move {
-                    let _permit = search_limiter
-                        .acquire_owned()
-                        .await
-                        .expect("search refresh semaphore should stay open");
-                    (
-                        index,
-                        refresh_search_section(
-                            view,
-                            SectionKind::PullRequests,
-                            section,
-                            limit,
-                            1,
-                            excludes.as_slice(),
-                        )
-                        .await,
-                    )
-                }
-                .boxed(),
-            );
+            jobs.push(SearchRefreshJob {
+                view: view.clone(),
+                kind: SectionKind::PullRequests,
+                section,
+                limit,
+            });
         }
 
         if repo.show_issues {
-            let excludes = excludes.clone();
-            let search_limiter = search_limiter.clone();
             let limit = config.defaults.issue_per_page;
             let section = SearchSection {
                 title: "Issues".to_string(),
@@ -428,42 +357,44 @@ async fn refresh_search_sections(
                 queries: Vec::new(),
                 limit: None,
             };
-            let view = view.clone();
-            let index = order;
-            order += 1;
-            tasks.push(
-                async move {
-                    let _permit = search_limiter
-                        .acquire_owned()
-                        .await
-                        .expect("search refresh semaphore should stay open");
-                    (
-                        index,
-                        refresh_search_section(
-                            view,
-                            SectionKind::Issues,
-                            section,
-                            limit,
-                            1,
-                            excludes.as_slice(),
-                        )
-                        .await,
-                    )
-                }
-                .boxed(),
-            );
+            jobs.push(SearchRefreshJob {
+                view: view.clone(),
+                kind: SectionKind::Issues,
+                section,
+                limit,
+            });
         }
     }
 
     let mut sections = Vec::new();
-    while let Some(section) = tasks.next().await {
-        sections.push(section);
+    for job in jobs {
+        if !sections.is_empty() {
+            pace_search_refresh().await;
+        }
+        sections.push(
+            refresh_search_section(
+                job.view,
+                job.kind,
+                job.section,
+                job.limit,
+                1,
+                excludes.as_slice(),
+            )
+            .await,
+        );
     }
-    sections.sort_by_key(|(index, _)| *index);
     sections
-        .into_iter()
-        .map(|(_, section)| section)
-        .collect::<Vec<_>>()
+}
+
+struct SearchRefreshJob {
+    view: String,
+    kind: SectionKind,
+    section: SearchSection,
+    limit: usize,
+}
+
+async fn pace_search_refresh() {
+    sleep(SEARCH_REFRESH_SPACING).await;
 }
 
 pub async fn refresh_section_page(
@@ -571,18 +502,12 @@ async fn fetch_search_items(
         return fetch_search_page(kind, query, page, limit, exclude_repos).await;
     }
 
-    let exclude_repos = Arc::new(exclude_repos.to_vec());
-    let mut tasks = FuturesUnordered::new();
-    for query in queries {
-        let exclude_repos = exclude_repos.clone();
-        tasks.push(async move {
-            fetch_search_items_for_query(kind, query, limit, exclude_repos.as_slice()).await
-        });
-    }
-
     let mut deduped = HashMap::<String, WorkItem>::new();
-    while let Some(result) = tasks.next().await {
-        for item in result? {
+    for (index, query) in queries.into_iter().enumerate() {
+        if index > 0 {
+            pace_search_refresh().await;
+        }
+        for item in fetch_search_items_for_query(kind, query, limit, exclude_repos).await? {
             match deduped.get(&item.id) {
                 Some(existing) if existing.updated_at >= item.updated_at => {}
                 _ => {
@@ -788,52 +713,66 @@ pub async fn fetch_comments(
 }
 
 pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<CommentPreview>> {
+    let output = fetch_issue_comments_output(repository, number).await?;
+    let viewer_login = comment_viewer_login("comment ownership").await;
+    parse_issue_comments_output(&output, repository, number, viewer_login.as_deref())
+}
+
+async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
-    let output = run_gh_json(&[
+    run_gh_json(&[
         "api".to_string(),
         "--paginate".to_string(),
         "--slurp".to_string(),
         path,
     ])
-    .await?;
-    let viewer_login = match cached_viewer_login().await {
-        Ok(login) => Some(login),
-        Err(error) => {
-            warn!(error = %error, "failed to resolve current GitHub user for comment ownership");
-            None
-        }
-    };
-    parse_issue_comments_output(&output, repository, number, viewer_login.as_deref())
+    .await
 }
 
 pub async fn fetch_pull_request_comments(
     repository: &str,
     number: u64,
 ) -> Result<Vec<CommentPreview>> {
-    let mut comments = fetch_issue_comments(repository, number).await?;
+    let issue_comments = fetch_issue_comments_output(repository, number);
+    let review_comments = fetch_pull_request_review_comments_output(repository, number);
+    let viewer_login = comment_viewer_login("pull request comment ownership");
+    let (issue_output, review_output, viewer_login) =
+        tokio::join!(issue_comments, review_comments, viewer_login);
+    let viewer_login = viewer_login.as_deref();
+    let mut comments =
+        parse_issue_comments_output(&issue_output?, repository, number, viewer_login)?;
+    comments.append(&mut parse_pull_request_review_comments_output(
+        &review_output?,
+        repository,
+        number,
+        viewer_login,
+    )?);
+    comments.sort_by_key(|comment| comment.created_at);
+    Ok(comments)
+}
+
+async fn fetch_pull_request_review_comments_output(
+    repository: &str,
+    number: u64,
+) -> Result<String> {
     let path = format!("repos/{repository}/pulls/{number}/comments?per_page=100");
-    let output = run_gh_json(&[
+    run_gh_json(&[
         "api".to_string(),
         "--paginate".to_string(),
         "--slurp".to_string(),
         path,
     ])
-    .await?;
-    let viewer_login = match cached_viewer_login().await {
+    .await
+}
+
+async fn comment_viewer_login(context: &'static str) -> Option<String> {
+    match cached_viewer_login().await {
         Ok(login) => Some(login),
         Err(error) => {
-            warn!(error = %error, "failed to resolve current GitHub user for review comment ownership");
+            warn!(error = %error, "failed to resolve current GitHub user for {context}");
             None
         }
-    };
-    comments.append(&mut parse_pull_request_review_comments_output(
-        &output,
-        repository,
-        number,
-        viewer_login.as_deref(),
-    )?);
-    comments.sort_by_key(|comment| comment.created_at);
-    Ok(comments)
+    }
 }
 
 pub async fn fetch_pull_request_action_hints(repository: &str, number: u64) -> Result<ActionHints> {

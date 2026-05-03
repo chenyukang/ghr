@@ -1,6 +1,6 @@
 # ghr
 
-`ghr` is a fast terminal dashboard for GitHub work queues. It focuses on the things you need to scan often: pull requests, issues, notifications, descriptions, and recent comments.
+`ghr` is a fast terminal workspace for staying on top of GitHub. It brings pull requests, issues, notifications, repo tabs, conversations, checks, and diffs into one stateful TUI, so you can triage, review, comment, approve, merge, and jump back in without waiting on a fresh GitHub fetch.
 
 [![CI](https://github.com/chenyukang/ghr/actions/workflows/ci.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/ci.yml)
 [![Release](https://github.com/chenyukang/ghr/actions/workflows/release.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/release.yml)

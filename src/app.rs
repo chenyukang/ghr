@@ -15,7 +15,7 @@ use crossterm::terminal::{
 };
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -174,6 +174,12 @@ enum SetupDialog {
     AuthRequired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDialog {
+    Initializing,
+    Ready,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommentDialogMode {
     New,
@@ -301,6 +307,7 @@ struct AppState {
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
     setup_dialog: Option<SetupDialog>,
+    startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
     mouse_capture_enabled: bool,
     help_dialog: bool,
@@ -406,6 +413,7 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     let sections = merge_cached_sections(configured_sections(&config), cached);
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    app.show_startup_initializing();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     start_refresh(config.clone(), store.clone(), tx.clone());
@@ -631,6 +639,7 @@ fn mouse_scroll_step(kind: MouseEventKind) -> Option<i16> {
 fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<MouseWheelTarget> {
     if !app.mouse_capture_enabled
         || app.setup_dialog.is_some()
+        || app.startup_dialog.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.pr_action_dialog.is_some()
@@ -1018,6 +1027,21 @@ fn handle_key_in_area(
         return false;
     }
 
+    if let Some(dialog) = app.startup_dialog {
+        match (dialog, key.code) {
+            (StartupDialog::Initializing, _) => {}
+            (StartupDialog::Ready, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) => {
+                app.dismiss_startup_dialog()
+            }
+            (StartupDialog::Ready, KeyCode::Char('?')) => {
+                app.dismiss_startup_dialog();
+                app.show_help_dialog();
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     if app.message_dialog.is_some() {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
@@ -1325,6 +1349,9 @@ fn handle_mouse_with_sync(
     if app.setup_dialog.is_some() {
         return false;
     }
+    if let Some(dialog) = app.startup_dialog {
+        return handle_startup_dialog_mouse(app, dialog, mouse, area);
+    }
     if app.help_dialog {
         return false;
     }
@@ -1398,6 +1425,27 @@ fn handle_mouse_with_sync(
             handle_table_hover(app, mouse, layout.table, store, tx);
         }
         _ => {}
+    }
+
+    false
+}
+
+fn handle_startup_dialog_mouse(
+    app: &mut AppState,
+    dialog: StartupDialog,
+    mouse: MouseEvent,
+    area: Rect,
+) -> bool {
+    if !matches!(dialog, StartupDialog::Ready)
+        || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    {
+        return false;
+    }
+
+    let dialog_area = startup_dialog_area(dialog, area);
+    if rect_contains(startup_dialog_ok_area(dialog_area), mouse.column, mouse.row) {
+        app.dismiss_startup_dialog();
+        return true;
     }
 
     false
@@ -1778,6 +1826,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
 
     if let Some(dialog) = app.setup_dialog {
         draw_setup_dialog(frame, dialog, area);
+    } else if let Some(dialog) = app.startup_dialog {
+        draw_startup_dialog(frame, app, paths, dialog, area);
     } else if let Some(dialog) = &app.message_dialog {
         draw_message_dialog(frame, dialog, area);
     } else if app.help_dialog {
@@ -2629,6 +2679,172 @@ fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
         .last()
         .map(|span| span.content.as_ref() == " | ")
         .unwrap_or(false)
+}
+
+fn draw_startup_dialog(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    paths: &Paths,
+    dialog: StartupDialog,
+    area: Rect,
+) {
+    let elapsed_secs = app.last_refresh_request.elapsed().as_secs();
+    let (title, lines, show_ok) = startup_dialog_content(dialog, app, paths, elapsed_secs);
+    let dialog_area = startup_dialog_area(dialog, area);
+    let accent = match dialog {
+        StartupDialog::Initializing => Color::Cyan,
+        StartupDialog::Ready => Color::LightGreen,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(Color::Black))
+        .title(Span::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+
+    if show_ok {
+        let ok = Paragraph::new("[ OK ]").alignment(Alignment::Center).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_widget(ok, startup_dialog_ok_area(dialog_area));
+    }
+}
+
+fn startup_dialog_area(dialog: StartupDialog, area: Rect) -> Rect {
+    let height = match dialog {
+        StartupDialog::Initializing => 11,
+        StartupDialog::Ready => 13,
+    };
+    centered_rect(72, height, area)
+}
+
+fn startup_dialog_ok_area(dialog_area: Rect) -> Rect {
+    let width = 8.min(dialog_area.width.saturating_sub(4)).max(1);
+    let x = dialog_area.x + dialog_area.width.saturating_sub(width) / 2;
+    let y = dialog_area.y + dialog_area.height.saturating_sub(2);
+    Rect::new(x, y, width, 1)
+}
+
+fn startup_dialog_content(
+    dialog: StartupDialog,
+    app: &AppState,
+    paths: &Paths,
+    elapsed_secs: u64,
+) -> (&'static str, Vec<Line<'static>>, bool) {
+    match dialog {
+        StartupDialog::Initializing => (
+            "Initializing",
+            vec![
+                Line::from("ghr is preparing your GitHub workspace."),
+                Line::from(""),
+                startup_loading_line(elapsed_secs),
+                startup_progress_line(elapsed_secs),
+                Line::from(""),
+                key_value_line("config.toml", paths.config_path.display().to_string()),
+                key_value_line("database", paths.db_path.display().to_string()),
+                Line::from(""),
+                Line::from("Loading cache and refreshing remote data. Please wait..."),
+            ],
+            false,
+        ),
+        StartupDialog::Ready => (
+            "Ready",
+            vec![
+                Line::from("ghr is ready."),
+                Line::from(""),
+                key_value_line("loaded", startup_loaded_summary(app)),
+                key_value_line("config.toml", paths.config_path.display().to_string()),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(
+                        "?",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" anytime for the shortcut reference."),
+                ]),
+                Line::from("Click OK or press Enter/Esc to close this dialog."),
+            ],
+            true,
+        ),
+    }
+}
+
+fn startup_loading_line(elapsed_secs: u64) -> Line<'static> {
+    let dots = match elapsed_secs % 4 {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("Loading{dots:<3}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {elapsed_secs}s"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn startup_progress_line(elapsed_secs: u64) -> Line<'static> {
+    const WIDTH: usize = 28;
+    const FILL: usize = 9;
+
+    let span = WIDTH.saturating_sub(FILL).max(1);
+    let offset = (elapsed_secs as usize) % (span + 1);
+    let mut bar = String::with_capacity(WIDTH + 2);
+    bar.push('[');
+    for index in 0..WIDTH {
+        if index >= offset && index < offset + FILL {
+            bar.push('=');
+        } else {
+            bar.push(' ');
+        }
+    }
+    bar.push(']');
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(bar, Style::default().fg(Color::Cyan)),
+    ])
+}
+
+fn startup_loaded_summary(app: &AppState) -> String {
+    let section_count = app.sections.len();
+    let item_count = app
+        .sections
+        .iter()
+        .map(|section| section.items.len())
+        .sum::<usize>();
+    let error_count = app
+        .sections
+        .iter()
+        .filter(|section| section.error.is_some())
+        .count();
+    let mut summary = format!("{item_count} item(s) across {section_count} section(s)");
+    if error_count > 0 {
+        summary.push_str(&format!("; {error_count} refresh error(s)"));
+    }
+    summary
 }
 
 fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
@@ -6027,6 +6243,7 @@ impl AppState {
             pr_action_dialog: None,
             pr_action_running: false,
             setup_dialog: None,
+            startup_dialog: None,
             message_dialog: None,
             mouse_capture_enabled: true,
             help_dialog: false,
@@ -6135,6 +6352,11 @@ impl AppState {
         true
     }
 
+    fn show_startup_initializing(&mut self) {
+        self.startup_dialog = Some(StartupDialog::Initializing);
+        self.status = "initializing; refreshing from GitHub".to_string();
+    }
+
     fn handle_msg(&mut self, message: AppMsg) {
         match message {
             AppMsg::RefreshStarted => {
@@ -6173,6 +6395,13 @@ impl AppState {
                     self.selected_comment_index = 0;
                 }
                 self.refreshing = false;
+                if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
+                    self.startup_dialog = if setup_dialog.is_some() {
+                        None
+                    } else {
+                        Some(StartupDialog::Ready)
+                    };
+                }
                 self.setup_dialog = setup_dialog;
                 self.status = match (errors, save_error) {
                     (0, None) => "refresh complete".to_string(),
@@ -6452,6 +6681,11 @@ impl AppState {
     fn dismiss_setup_dialog(&mut self) {
         self.setup_dialog = None;
         self.status = "setup hint dismissed; cached data still available".to_string();
+    }
+
+    fn dismiss_startup_dialog(&mut self) {
+        self.startup_dialog = None;
+        self.status = "startup hint dismissed".to_string();
     }
 
     fn dismiss_message_dialog(&mut self) {
@@ -9578,6 +9812,7 @@ diff --git a/src/github.rs b/src/github.rs
         failed_section.items.clear();
         failed_section.error = Some("GitHub CLI `gh` is required but was not found.".to_string());
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_startup_initializing();
 
         app.handle_msg(AppMsg::RefreshFinished {
             sections: vec![failed_section],
@@ -9585,10 +9820,125 @@ diff --git a/src/github.rs b/src/github.rs
         });
 
         assert_eq!(app.setup_dialog, Some(SetupDialog::MissingGh));
+        assert_eq!(app.startup_dialog, None);
         assert_eq!(
             app.status,
             "GitHub CLI missing: install `gh`, then run `gh auth login`"
         );
+    }
+
+    #[test]
+    fn startup_refresh_finishes_with_ready_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let paths = test_paths();
+
+        assert_eq!(app.startup_dialog, None);
+        app.show_startup_initializing();
+        assert_eq!(app.startup_dialog, Some(StartupDialog::Initializing));
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert_eq!(app.startup_dialog, Some(StartupDialog::Ready));
+        assert_eq!(app.setup_dialog, None);
+        assert_eq!(app.status, "refresh complete");
+
+        let (_title, lines, show_ok) =
+            startup_dialog_content(StartupDialog::Ready, &app, &paths, 0);
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(show_ok);
+        assert!(text.contains("2 item(s) across 1 section(s)"));
+        assert!(text.contains("/tmp/ghr-test/config.toml"));
+        assert!(text.contains("? anytime"));
+    }
+
+    #[test]
+    fn startup_initializing_dialog_asks_user_to_wait() {
+        let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let paths = test_paths();
+        let (_title, lines, show_ok) =
+            startup_dialog_content(StartupDialog::Initializing, &app, &paths, 2);
+        let text = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!show_ok);
+        assert!(text.contains("Loading.."));
+        assert!(text.contains("["));
+        assert!(text.contains("Please wait"));
+        assert!(!text.contains("quit"));
+        assert!(!text.contains("Ctrl+C"));
+    }
+
+    #[test]
+    fn startup_initializing_q_does_not_quit() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.startup_dialog = Some(StartupDialog::Initializing);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('q')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.startup_dialog, Some(StartupDialog::Initializing));
+    }
+
+    #[test]
+    fn startup_ready_dialog_dismisses_before_regular_input() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.startup_dialog = Some(StartupDialog::Ready);
+        app.search_active = true;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.startup_dialog, None);
+        assert!(app.search_active);
+        assert_eq!(app.status, "startup hint dismissed");
+    }
+
+    #[test]
+    fn startup_ready_ok_click_dismisses_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 120, 40);
+        app.startup_dialog = Some(StartupDialog::Ready);
+        let ok_area = startup_dialog_ok_area(startup_dialog_area(StartupDialog::Ready, area));
+
+        assert!(handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: ok_area.x,
+                row: ok_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        ));
+
+        assert_eq!(app.startup_dialog, None);
+        assert_eq!(app.status, "startup hint dismissed");
     }
 
     #[test]

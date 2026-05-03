@@ -7,11 +7,11 @@
 
 **Conversation and triage view**
 
-![ghr conversation and triage screenshot](assets/screenshot.png)
+![ghr conversation and triage screenshot](assets/screenshot.webp)
 
 **Pull request diff review view**
 
-![ghr pull request diff review screenshot](assets/screenshot-diff.png)
+![ghr pull request diff review screenshot](assets/screenshot-diff.webp)
 
 ## Features
 

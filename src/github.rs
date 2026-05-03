@@ -197,6 +197,16 @@ struct PullRequestViewerReviewRaw {
     state: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PullRequestHeadRaw {
+    head: PullRequestHeadRefRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHeadRefRaw {
+    sha: String,
+}
+
 pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
     let started = Instant::now();
     let notifications = refresh_notification_sections(config);
@@ -830,6 +840,18 @@ query($owner: String!, $name: String!, $number: Int!) {
     Ok(pull_request_action_hints(&pr))
 }
 
+pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<String> {
+    let path = format!("repos/{repository}/pulls/{number}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.v3.diff".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to fetch diff for {repository}#{number}"))
+}
+
 pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/{number}/comments");
     run_gh_json(&[
@@ -841,6 +863,40 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
         format!("body={body}"),
     ])
     .await?;
+    Ok(())
+}
+
+pub async fn post_pull_request_review_comment(
+    repository: &str,
+    number: u64,
+    path: &str,
+    line: usize,
+    side: &str,
+    body: &str,
+) -> Result<()> {
+    let pr_path = format!("repos/{repository}/pulls/{number}");
+    let pr_output = run_gh_json(&["api".to_string(), pr_path]).await?;
+    let pr = serde_json::from_str::<PullRequestHeadRaw>(&pr_output)
+        .with_context(|| format!("failed to parse pull request head for {repository}#{number}"))?;
+    let comments_path = format!("repos/{repository}/pulls/{number}/comments");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        comments_path,
+        "-f".to_string(),
+        format!("body={body}"),
+        "-f".to_string(),
+        format!("commit_id={}", pr.head.sha),
+        "-f".to_string(),
+        format!("path={path}"),
+        "-F".to_string(),
+        format!("line={line}"),
+        "-f".to_string(),
+        format!("side={side}"),
+    ])
+    .await
+    .with_context(|| format!("failed to post review comment for {repository}#{number}"))?;
     Ok(())
 }
 

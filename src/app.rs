@@ -447,12 +447,12 @@ fn start_section_page_load(
         )
         .await;
         let mut save_error = None;
-        if section.error.is_none() {
-            if let Err(error) = store.save_section(&section) {
-                let message = error.to_string();
-                warn!(error = %message, "failed to save paged snapshot");
-                save_error = Some(message);
-            }
+        if section.error.is_none()
+            && let Err(error) = store.save_section(&section)
+        {
+            let message = error.to_string();
+            warn!(error = %message, "failed to save paged snapshot");
+            save_error = Some(message);
         }
         let _ = tx.send(AppMsg::SectionPageLoaded {
             section_key: request.section_key,
@@ -1008,19 +1008,18 @@ fn table_visible_range_label(
     end: usize,
     visible_len: usize,
 ) -> String {
-    if unfiltered {
-        if let (Some(total_count), Some(page_size)) =
+    if unfiltered
+        && let (Some(total_count), Some(page_size)) =
             (section.total_count, section_page_size_for_display(section))
-        {
-            let offset = section.page.saturating_sub(1).saturating_mul(page_size);
-            let global_start = offset.saturating_add(start).min(total_count);
-            let global_end = offset.saturating_add(end).min(total_count);
-            let mut label = format!(" | showing {global_start}-{global_end}/{total_count}");
-            if let Some(page_label) = section_page_label(section) {
-                label.push_str(&format!(" | page {page_label}"));
-            }
-            return label;
+    {
+        let offset = section.page.saturating_sub(1).saturating_mul(page_size);
+        let global_start = offset.saturating_add(start).min(total_count);
+        let global_end = offset.saturating_add(end).min(total_count);
+        let mut label = format!(" | showing {global_start}-{global_end}/{total_count}");
+        if let Some(page_label) = section_page_label(section) {
+            label.push_str(&format!(" | page {page_label}"));
         }
+        return label;
     }
 
     let mut label = format!(" | showing {start}-{end}/{visible_len}");
@@ -1319,7 +1318,7 @@ fn section_page_size_for_display(section: &SectionSnapshot) -> Option<usize> {
 }
 
 fn section_total_pages(total_count: usize, page_size: usize) -> (usize, bool) {
-    let accessible = total_count.min(SEARCH_RESULT_WINDOW).max(1);
+    let accessible = total_count.clamp(1, SEARCH_RESULT_WINDOW);
     let total_pages = accessible.div_ceil(page_size.max(1)).max(1);
     (total_pages, total_count > SEARCH_RESULT_WINDOW)
 }
@@ -1664,20 +1663,20 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
 fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
     match app.focus {
         FocusTarget::Ghr => {
-            push_footer_state(spans, "ghr", "tabs", Color::Cyan);
+            push_footer_context(spans, "ghr", "tabs");
             push_footer_pair(spans, "h/l", "switch", Color::Cyan);
             push_footer_pair(spans, "j/enter", "Sections", Color::Cyan);
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::Sections => {
-            push_footer_state(spans, "Sections", "tabs", Color::Cyan);
+            push_footer_context(spans, "Sections", "tabs");
             push_footer_pair(spans, "h/l", "switch", Color::Cyan);
             push_footer_pair(spans, "k", "ghr", Color::Cyan);
             push_footer_pair(spans, "j/enter", "List", Color::Cyan);
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::List => {
-            push_footer_state(spans, "List", "items", Color::Cyan);
+            push_footer_context(spans, "List", "items");
             push_footer_pair(spans, "j/k", "move", Color::Cyan);
             push_footer_pair(spans, "pg d/u", "page", Color::Cyan);
             push_footer_pair(spans, "[ ]", "results", Color::Cyan);
@@ -1688,7 +1687,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
             push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
         }
         FocusTarget::Details => {
-            push_footer_state(spans, "Details", "content", Color::Cyan);
+            push_footer_context(spans, "Details", "content");
             push_footer_pair(spans, "j/k", "scroll", Color::Cyan);
             push_footer_pair(spans, "pg d/u", "page", Color::Cyan);
             push_footer_pair(spans, "g", "top", Color::Cyan);
@@ -1740,6 +1739,24 @@ fn push_footer_state(
     ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(value.into(), Style::default().fg(value_color)));
+}
+
+fn push_footer_context(
+    spans: &mut Vec<Span<'static>>,
+    key: &'static str,
+    value: impl Into<String>,
+) {
+    if !spans.is_empty() && !footer_ends_with_separator(spans) {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        key,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(value.into(), Style::default().fg(Color::Gray)));
 }
 
 fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
@@ -2738,6 +2755,7 @@ impl DetailsBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_hard_wrapped_token(
         &mut self,
         token: &WrapToken,
@@ -3747,14 +3765,11 @@ impl AppState {
 
         self.clamp_positions();
 
-        if same_view_key(&self.active_view, &anchor.active_view) {
-            if let Some(section_key) = &anchor.section_key {
-                if let Some(position) =
-                    self.section_position_by_key(&anchor.active_view, section_key)
-                {
-                    self.set_current_section_position(position);
-                }
-            }
+        if same_view_key(&self.active_view, &anchor.active_view)
+            && let Some(section_key) = &anchor.section_key
+            && let Some(position) = self.section_position_by_key(&anchor.active_view, section_key)
+        {
+            self.set_current_section_position(position);
         }
 
         let restored = anchor.item_id.as_deref().is_some_and(|item_id| {
@@ -4649,9 +4664,7 @@ impl AppState {
     }
 
     fn prepare_comment_submit(&mut self) -> Option<PendingCommentSubmit> {
-        let Some(dialog) = self.comment_dialog.take() else {
-            return None;
-        };
+        let dialog = self.comment_dialog.take()?;
         let body = dialog.body.trim().to_string();
         if body.is_empty() {
             self.comment_dialog = Some(dialog);
@@ -5852,6 +5865,30 @@ mod tests {
         assert!(details.contains("n/p comment  a comment  R reply  e edit"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
+    }
+
+    #[test]
+    fn footer_context_label_uses_active_color() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let paths = test_paths();
+
+        app.focus_details();
+        let line = footer_line(&app, &paths);
+
+        let details = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "Details")
+            .expect("details context label");
+        assert_eq!(details.style.fg, Some(Color::Cyan));
+        assert!(details.style.add_modifier.contains(Modifier::BOLD));
+
+        let content = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "content")
+            .expect("details context value");
+        assert_eq!(content.style.fg, Some(Color::Gray));
     }
 
     #[test]

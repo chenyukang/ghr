@@ -724,10 +724,10 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if !tokens.iter().any(|token| token.starts_with("repo:")) {
-        if let Some(repo) = repo_scope.map(str::trim).filter(|repo| !repo.is_empty()) {
-            tokens.push(format!("repo:{repo}"));
-        }
+    if !tokens.iter().any(|token| token.starts_with("repo:"))
+        && let Some(repo) = repo_scope.map(str::trim).filter(|repo| !repo.is_empty())
+    {
+        tokens.push(format!("repo:{repo}"));
     }
     if !tokens.iter().any(|token| token.starts_with("archived:")) {
         tokens.push("archived:false".to_string());

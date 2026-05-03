@@ -2,6 +2,9 @@
 
 `ghr` is a fast terminal dashboard for GitHub work queues. It focuses on the things you need to scan often: pull requests, issues, notifications, descriptions, and recent comments.
 
+[![CI](https://github.com/chenyukang/ghr/actions/workflows/ci.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/ci.yml)
+[![Release](https://github.com/chenyukang/ghr/actions/workflows/release.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/release.yml)
+
 ![ghr dashboard screenshot](assets/screenshot.png)
 
 ## Features
@@ -49,7 +52,7 @@ ghr
 | `A` | Open an approve confirmation for the selected PR |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `r` | Refresh from GitHub |
-| `q` | Quit |
+| `q` / `Ctrl+C` | Quit |
 
 ## Default Sections
 
@@ -126,6 +129,19 @@ Use `[[repos]]` to add repository tabs to the top bar. Each configured repo show
 - `ghr.log`: log file
 
 The snapshot cache is intentionally local and disposable. Delete `~/.ghr/ghr.db` if you want to rebuild it from GitHub.
+
+## Release
+
+CI runs formatting, `cargo check`, strict `clippy`, tests on Linux and macOS, and `cargo package`.
+
+Publishing is automatic on version tags:
+
+```bash
+git tag v0.1.4
+git push origin v0.1.4
+```
+
+The release workflow verifies that the tag matches `Cargo.toml`, publishes `ghr-cli` to crates.io, and creates a GitHub release. Configure the repository environment `crates-io` with a `CARGO_REGISTRY_TOKEN` secret before pushing a release tag.
 
 ## Design Notes
 

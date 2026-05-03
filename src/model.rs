@@ -57,6 +57,17 @@ pub struct CommentPreview {
     pub url: Option<String>,
     #[serde(default)]
     pub is_mine: bool,
+    #[serde(default)]
+    pub review: Option<ReviewCommentPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCommentPreview {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub side: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -309,6 +320,35 @@ pub fn section_counts(section: &SectionSnapshot) -> (usize, usize) {
         .filter(|item| item.unread.unwrap_or(false))
         .count();
     (total, unread)
+}
+
+pub fn notification_section_requires_unread(section: &SectionSnapshot) -> bool {
+    matches!(section.kind, SectionKind::Notifications)
+        && section
+            .filters
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("is:unread"))
+}
+
+pub fn mark_notification_read_in_section(section: &mut SectionSnapshot, thread_id: &str) -> bool {
+    if !matches!(section.kind, SectionKind::Notifications) {
+        return false;
+    }
+
+    if notification_section_requires_unread(section) {
+        let previous_len = section.items.len();
+        section.items.retain(|item| item.id != thread_id);
+        return section.items.len() != previous_len;
+    }
+
+    let mut changed = false;
+    for item in &mut section.items {
+        if item.id == thread_id && item.unread.unwrap_or(false) {
+            item.unread = Some(false);
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(test)]

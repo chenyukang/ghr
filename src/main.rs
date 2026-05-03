@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     paths.ensure()?;
 
     let _log_guard = init_logging(&paths)?;
-    let config = Config::load_or_create(&paths.config_path)?;
+    let mut config = Config::load_or_create(&paths.config_path)?;
     let store = SnapshotStore::new(paths.db_path.clone());
     store.init()?;
 
@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
         println!("config ready: {}", paths.config_path.display());
         return Ok(());
     }
+
+    config = config.include_current_git_repo();
 
     if cli.refresh {
         let refreshed = refresh_dashboard(&config).await;

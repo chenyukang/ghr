@@ -5,7 +5,13 @@
 [![CI](https://github.com/chenyukang/ghr/actions/workflows/ci.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/ci.yml)
 [![Release](https://github.com/chenyukang/ghr/actions/workflows/release.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/release.yml)
 
-![ghr dashboard screenshot](assets/screenshot.png)
+**Conversation and triage view**
+
+![ghr conversation and triage screenshot](assets/screenshot.png)
+
+**Pull request diff review view**
+
+![ghr pull request diff review screenshot](assets/screenshot-diff.png)
 
 ## Features
 

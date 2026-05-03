@@ -168,7 +168,9 @@ struct IssueCommentRaw {
 #[derive(Debug, Deserialize)]
 struct PullRequestReviewCommentRaw {
     id: Option<u64>,
+    in_reply_to_id: Option<u64>,
     body: Option<String>,
+    diff_hunk: Option<String>,
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -176,7 +178,10 @@ struct PullRequestReviewCommentRaw {
     path: Option<String>,
     line: Option<u64>,
     original_line: Option<u64>,
+    start_line: Option<u64>,
+    original_start_line: Option<u64>,
     side: Option<String>,
+    start_side: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1115,6 +1120,7 @@ fn parse_issue_comments_output(
                 created_at: comment.created_at,
                 updated_at: comment.updated_at,
                 url: comment.html_url,
+                parent_id: None,
                 is_mine,
                 review: None,
             }
@@ -1151,11 +1157,17 @@ fn parse_pull_request_review_comments_output(
                 created_at: comment.created_at,
                 updated_at: comment.updated_at,
                 url: comment.html_url,
+                parent_id: comment.in_reply_to_id,
                 is_mine,
                 review: Some(ReviewCommentPreview {
                     path: comment.path.unwrap_or_else(|| "-".to_string()),
-                    line: comment.line.or(comment.original_line),
+                    line: comment.line,
+                    original_line: comment.original_line,
+                    start_line: comment.start_line,
+                    original_start_line: comment.original_start_line,
                     side: comment.side,
+                    start_side: comment.start_side,
+                    diff_hunk: comment.diff_hunk,
                 }),
             }
         })
@@ -2092,6 +2104,7 @@ mod tests {
           [
             {
               "id": 10,
+              "in_reply_to_id": 8,
               "body": "inline",
               "html_url": "https://github.com/owner/repo/pull/1#discussion_r10",
               "created_at": "2026-01-02T00:00:00Z",
@@ -2099,7 +2112,12 @@ mod tests {
               "user": { "login": "alice" },
               "path": "src/app.rs",
               "line": 57,
-              "side": "RIGHT"
+              "original_line": 50,
+              "start_line": 44,
+              "original_start_line": 42,
+              "side": "RIGHT",
+              "start_side": "RIGHT",
+              "diff_hunk": "@@ -55,6 +55,7 @@ fn main() {\n line 55\n+line 57\n line 58"
             }
           ]
         ]
@@ -2112,12 +2130,21 @@ mod tests {
         assert_eq!(comments.len(), 1);
         let comment = &comments[0];
         assert_eq!(comment.id, Some(10));
+        assert_eq!(comment.parent_id, Some(8));
         assert_eq!(comment.author, "alice");
         assert!(comment.is_mine);
         let review = comment.review.as_ref().expect("review metadata");
         assert_eq!(review.path, "src/app.rs");
         assert_eq!(review.line, Some(57));
+        assert_eq!(review.original_line, Some(50));
+        assert_eq!(review.start_line, Some(44));
+        assert_eq!(review.original_start_line, Some(42));
         assert_eq!(review.side.as_deref(), Some("RIGHT"));
+        assert_eq!(review.start_side.as_deref(), Some("RIGHT"));
+        assert_eq!(
+            review.diff_hunk.as_deref(),
+            Some("@@ -55,6 +55,7 @@ fn main() {\n line 55\n+line 57\n line 58")
+        );
     }
 
     #[test]

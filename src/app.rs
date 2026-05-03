@@ -271,6 +271,13 @@ const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
+const COMMENT_COLLAPSE_MIN_LINES: usize = 36;
+const COMMENT_COLLAPSE_MIN_CHARS: usize = 2_800;
+const COMMENT_COLLAPSED_PREVIEW_LINES: usize = 18;
+const COMMENT_COLLAPSED_PREVIEW_CHARS: usize = 1_600;
+const INLINE_COMMENT_CONTEXT_RADIUS: usize = 3;
+const INLINE_COMMENT_CONTEXT_MAX_LINES: usize = INLINE_COMMENT_CONTEXT_RADIUS * 2 + 1;
+const DIFF_INLINE_COMMENT_GUTTER_WIDTH: usize = 11;
 const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -294,6 +301,9 @@ struct AppState {
     global_search_active: bool,
     global_search_query: String,
     global_search_running: bool,
+    global_search_return_view: Option<String>,
+    global_search_scope: Option<String>,
+    global_search_started_at: Option<Instant>,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
@@ -309,6 +319,7 @@ struct AppState {
     pending_details_load: Option<PendingDetailsLoad>,
     notification_read_pending: HashSet<String>,
     selected_comment_index: usize,
+    expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
     pr_action_dialog: Option<PrActionDialog>,
@@ -1183,6 +1194,9 @@ fn handle_key_in_area(
         }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
+            KeyCode::Esc if app.is_global_search_results_view() => {
+                app.leave_global_search_results()
+            }
             KeyCode::Esc => {}
             KeyCode::Char('/') => app.start_search(),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -1281,6 +1295,9 @@ fn handle_key_in_area(
             KeyCode::Char('e') if app.details_mode == DetailsMode::Diff => app.end_diff_mark(),
             KeyCode::Char('n') => app.move_comment_in_view(1, area),
             KeyCode::Char('p') => app.move_comment_in_view(-1, area),
+            KeyCode::Enter if app.details_mode == DetailsMode::Conversation => {
+                app.toggle_selected_comment_expanded()
+            }
             KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
             KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
             KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
@@ -1904,6 +1921,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
+    } else if app.global_search_running {
+        draw_global_search_loading_dialog(frame, app, area);
     }
 }
 
@@ -2427,7 +2446,9 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
     if app.global_search_active {
         let scope = app
-            .current_repo_scope()
+            .global_search_scope
+            .clone()
+            .or_else(|| app.current_repo_scope())
             .map(|repo| format!(" in {repo}"))
             .unwrap_or_default();
         return Some((
@@ -2435,6 +2456,13 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
                 "Repo Search{scope}: S{}_  Enter search  Esc cancel",
                 app.global_search_query
             ),
+            Color::LightMagenta,
+        ));
+    }
+
+    if app.is_global_search_results_view() {
+        return Some((
+            format!("Search results: {}  Esc back", app.global_search_query),
             Color::LightMagenta,
         ));
     }
@@ -2668,6 +2696,9 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "g/G", "ends", Color::Cyan);
                 push_footer_pair(spans, "enter", "Details", Color::Cyan);
                 push_footer_pair(spans, "/", "filter", Color::Yellow);
+                if app.is_global_search_results_view() {
+                    push_footer_pair(spans, "esc", "back", Color::Cyan);
+                }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
@@ -2699,6 +2730,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
                 push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
+                push_footer_pair(spans, "enter", "expand", Color::Yellow);
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
@@ -3087,6 +3119,49 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let dialog_area = centered_rect(58, 9, area);
+    let elapsed_secs = app
+        .global_search_started_at
+        .map(|started| started.elapsed().as_secs())
+        .unwrap_or(0);
+    let lines = global_search_loading_content(app, elapsed_secs);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Searching",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn global_search_loading_content(app: &AppState, elapsed_secs: u64) -> Vec<Line<'static>> {
+    let scope = app
+        .global_search_scope
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| "GitHub".to_string());
+    vec![
+        Line::from("Searching pull requests and issues."),
+        Line::from(""),
+        startup_loading_line(elapsed_secs),
+        startup_progress_line(elapsed_secs),
+        Line::from(""),
+        key_value_line("query", app.global_search_query.clone()),
+        key_value_line("scope", scope),
+    ]
+}
+
 fn key_value_line(key: &'static str, value: String) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
@@ -3407,6 +3482,10 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "start list filtering or Details comment search"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line(
+            "Esc in Search results",
+            "return to the previous default list",
+        ),
         help_key_line("m", "toggle mouse text selection mode"),
         help_key_line("Esc", "leave details or clear search"),
         Line::from(""),
@@ -3448,6 +3527,10 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("/", "search loaded comments by keyword"),
         help_key_line("n / p in conversation", "focus next / previous comment"),
         help_key_line("n / p in diff", "page down / page up"),
+        help_key_line(
+            "Enter in conversation",
+            "expand or collapse a long focused comment",
+        ),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
         help_key_line("g / G", "scroll details to top / bottom"),
         help_key_line("v", "show PR diff"),
@@ -3612,6 +3695,20 @@ impl CommentRegion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommentDisplayEntry {
+    index: usize,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommentCollapseState {
+    long: bool,
+    collapsed: bool,
+    line_count: usize,
+    char_count: usize,
+}
+
 #[derive(Debug, Clone)]
 struct DiffLineRegion {
     line: usize,
@@ -3665,7 +3762,7 @@ enum DiffLineKind {
     Metadata,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DiffReviewSide {
     Left,
     Right,
@@ -3697,6 +3794,34 @@ struct DiffReviewTarget {
     preview: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiffInlineCommentKey {
+    path: String,
+    line: usize,
+    side: DiffReviewSide,
+}
+
+impl From<&DiffReviewTarget> for DiffInlineCommentKey {
+    fn from(target: &DiffReviewTarget) -> Self {
+        Self {
+            path: target.path.clone(),
+            line: target.line,
+            side: target.side,
+        }
+    }
+}
+
+struct DiffRenderContext<'a> {
+    item_id: &'a str,
+    comments: Option<&'a [CommentPreview]>,
+    expanded_comments: &'a HashSet<String>,
+    details_focused: bool,
+    selected_comment_index: usize,
+    selected_file: usize,
+    selected_line: usize,
+    selected_range: Option<(usize, usize)>,
+}
+
 impl DiffReviewTarget {
     fn location_label(&self) -> String {
         match (self.start_line, self.start_side) {
@@ -3725,6 +3850,7 @@ impl DiffReviewTarget {
 enum DetailAction {
     ReplyComment(usize),
     EditComment(usize),
+    ToggleCommentExpanded(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3785,7 +3911,19 @@ struct MarkdownBlock {
 enum MarkdownBlockKind {
     Text,
     ListItem,
+    TableRow,
     Code { language: CodeLanguage },
+}
+
+#[derive(Debug, Clone, Default)]
+struct MarkdownTable {
+    rows: Vec<MarkdownTableRow>,
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownTableRow {
+    cells: Vec<Vec<DetailSegment>>,
+    header: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3975,7 +4113,7 @@ impl DetailsBuilder {
                         return;
                     }
                 }
-                MarkdownBlockKind::Code { .. } => {
+                MarkdownBlockKind::Code { .. } | MarkdownBlockKind::TableRow => {
                     if !self.push_preformatted_prefixed(
                         &block.segments,
                         prefix.as_slice(),
@@ -4049,7 +4187,7 @@ impl DetailsBuilder {
                         break;
                     }
                 }
-                MarkdownBlockKind::Code { .. } => {
+                MarkdownBlockKind::Code { .. } | MarkdownBlockKind::TableRow => {
                     if !self.push_preformatted_prefixed(
                         &block.segments,
                         line_prefix.as_slice(),
@@ -4547,19 +4685,24 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
                     ));
                     builder.push_blank();
                 }
-                for (index, comment) in comments.iter().enumerate() {
-                    if index > 0 {
+                for (position, entry) in comment_display_entries(comments).iter().enumerate() {
+                    if position > 0 {
                         builder.push_blank();
                     }
+                    let index = entry.index;
+                    let comment = &comments[index];
                     let search_match = search_matches
                         .as_ref()
                         .is_some_and(|matches| matches.contains(&index));
+                    let collapse = app.comment_collapse_state(&item.id, index, comment);
                     push_comment(
                         &mut builder,
                         index,
                         comment,
                         app.focus == FocusTarget::Details && index == app.selected_comment_index,
                         search_match,
+                        entry.depth,
+                        collapse,
                     );
                 }
             }
@@ -4619,12 +4762,23 @@ fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
                 .get(selected_file)
                 .map(|file| app.selected_diff_line_index_for(&item.id, file))
                 .unwrap_or(0);
+            let inline_comments = match app.details.get(&item.id) {
+                Some(DetailState::Loaded(comments)) => Some(comments.as_slice()),
+                _ => None,
+            };
             push_diff(
                 &mut builder,
                 diff,
-                selected_file,
-                selected_line,
-                app.diff_mark_range_for(&item.id),
+                DiffRenderContext {
+                    item_id: &item.id,
+                    comments: inline_comments,
+                    expanded_comments: &app.expanded_comments,
+                    details_focused: app.focus == FocusTarget::Details,
+                    selected_comment_index: app.selected_comment_index,
+                    selected_file,
+                    selected_line,
+                    selected_range: app.diff_mark_range_for(&item.id),
+                },
             );
         }
         Some(DiffState::Error(error)) => {
@@ -4658,13 +4812,7 @@ fn push_details_mode_tabs(builder: &mut DetailsBuilder, active: DetailsMode) {
     ]);
 }
 
-fn push_diff(
-    builder: &mut DetailsBuilder,
-    diff: &PullRequestDiff,
-    selected_file: usize,
-    selected_line: usize,
-    selected_range: Option<(usize, usize)>,
-) {
+fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: DiffRenderContext<'_>) {
     builder.push_line(vec![
         DetailSegment::styled("Diff", heading_style()),
         DetailSegment::raw(format!("  files: {}  ", diff.files.len())),
@@ -4678,8 +4826,15 @@ fn push_diff(
         return;
     }
 
-    let selected_file = selected_file.min(diff.files.len().saturating_sub(1));
+    let selected_file = context
+        .selected_file
+        .min(diff.files.len().saturating_sub(1));
     let file = &diff.files[selected_file];
+    let inline_comment_map = context
+        .comments
+        .map(diff_inline_comment_map)
+        .unwrap_or_default();
+    let empty_entries: Vec<CommentDisplayEntry> = Vec::new();
 
     builder.push_line(vec![DetailSegment::styled(
         format!("file {}/{}", selected_file + 1, diff.files.len()),
@@ -4702,7 +4857,12 @@ fn push_diff(
             diff_hunk_style(),
         )]);
         for line in &hunk.lines {
-            let line_review_index = diff_review_target(file, line).map(|_| {
+            let target = diff_review_target(file, line);
+            let inline_entries = target
+                .as_ref()
+                .and_then(|target| inline_comment_map.get(&DiffInlineCommentKey::from(target)))
+                .unwrap_or(&empty_entries);
+            let line_review_index = target.as_ref().map(|_| {
                 let index = review_index;
                 review_index += 1;
                 index
@@ -4712,9 +4872,21 @@ fn push_diff(
                 line,
                 line_review_index,
                 line_review_index.is_some_and(|index| {
-                    index == selected_line || index_in_range(index, selected_range)
+                    index == context.selected_line || index_in_range(index, context.selected_range)
                 }),
+                inline_entries.len(),
             );
+            if let Some(comments) = context.comments {
+                push_diff_inline_comments(
+                    builder,
+                    context.item_id,
+                    comments,
+                    inline_entries,
+                    context.expanded_comments,
+                    context.details_focused,
+                    context.selected_comment_index,
+                );
+            }
         }
     }
 }
@@ -4743,6 +4915,7 @@ fn push_diff_line(
     line: &DiffLine,
     review_index: Option<usize>,
     selected: bool,
+    inline_comment_count: usize,
 ) {
     if let Some(review_index) = review_index {
         builder.mark_diff_line(review_index, selected);
@@ -4765,14 +4938,205 @@ fn push_diff_line(
     if selected {
         style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
     }
-    let prefix_width = display_width(&gutter) + display_width(marker) + 1;
+    let inline_comment_marker = if inline_comment_count > 0 {
+        Some(if inline_comment_count > 9 {
+            "●* "
+        } else {
+            "● "
+        })
+    } else {
+        None
+    };
+    let comment_marker_width = inline_comment_marker.map(display_width).unwrap_or(0);
+    let prefix_width = display_width(&gutter) + comment_marker_width + display_width(marker) + 1;
     let content_width = builder.width.saturating_sub(prefix_width).max(1);
-    builder.push_line(vec![
-        DetailSegment::styled(gutter, gutter_style),
+    let mut segments = vec![DetailSegment::styled(gutter, gutter_style)];
+    if let Some(marker) = inline_comment_marker {
+        segments.push(DetailSegment::styled(
+            marker,
+            diff_inline_comment_marker_style(),
+        ));
+    }
+    segments.extend([
         DetailSegment::styled(marker, style),
         DetailSegment::styled(" ", style),
         DetailSegment::styled(truncate_inline(&line.text, content_width), style),
     ]);
+    builder.push_line(segments);
+}
+
+fn push_diff_inline_comments(
+    builder: &mut DetailsBuilder,
+    item_id: &str,
+    comments: &[CommentPreview],
+    entries: &[CommentDisplayEntry],
+    expanded_comments: &HashSet<String>,
+    details_focused: bool,
+    selected_comment_index: usize,
+) {
+    for entry in entries {
+        let Some(comment) = comments.get(entry.index) else {
+            continue;
+        };
+        let selected = details_focused && entry.index == selected_comment_index;
+        let collapse = comment_collapse_state_for(item_id, entry.index, comment, expanded_comments);
+        push_diff_inline_comment(
+            builder,
+            entry.index,
+            comment,
+            selected,
+            entry.depth,
+            collapse,
+        );
+    }
+}
+
+fn push_diff_inline_comment(
+    builder: &mut DetailsBuilder,
+    index: usize,
+    comment: &CommentPreview,
+    selected: bool,
+    depth: usize,
+    collapse: CommentCollapseState,
+) {
+    let timestamp = comment
+        .updated_at
+        .as_ref()
+        .or(comment.created_at.as_ref())
+        .cloned();
+    let start_line = builder.document.lines.len();
+    push_diff_inline_comment_separator(builder, selected, depth);
+    let content_start_line = builder.document.lines.len();
+
+    let mut header = vec![
+        DetailSegment::styled(
+            if selected { "▸ " } else { "● " },
+            comment_marker_style(selected),
+        ),
+        DetailSegment::styled(comment.author.clone(), comment_author_style(selected)),
+        DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
+    ];
+    if let Some(url) = &comment.url {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::link("open", url.clone()));
+    }
+    header.push(DetailSegment::raw("  "));
+    header.push(DetailSegment::action(
+        "reply",
+        DetailAction::ReplyComment(index),
+    ));
+    if comment.is_mine && comment.id.is_some() {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            "edit",
+            DetailAction::EditComment(index),
+        ));
+    }
+    if collapse.long {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            if collapse.collapsed {
+                "▸ collapsed"
+            } else {
+                "▾ expanded"
+            },
+            DetailAction::ToggleCommentExpanded(index),
+        ));
+    }
+
+    let prefix = diff_inline_comment_prefix(selected, depth);
+    builder.push_prefixed_wrapped_limited(header, prefix.clone(), COMMENT_RIGHT_PADDING, 2);
+    let collapsed_body;
+    let body = if collapse.collapsed {
+        collapsed_body = collapsed_comment_body(&comment.body);
+        collapsed_body.as_str()
+    } else {
+        comment.body.as_str()
+    };
+    builder.push_markdown_block_prefixed(
+        body,
+        "No comment body.",
+        usize::MAX,
+        usize::MAX,
+        MarkdownRenderOptions {
+            prefix,
+            right_padding: COMMENT_RIGHT_PADDING,
+        },
+    );
+    if collapse.collapsed {
+        push_diff_inline_comment_expand_line(builder, index, selected, depth, collapse);
+    }
+    if selected {
+        add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
+        push_diff_inline_comment_separator(builder, true, depth);
+        add_comment_right_border(builder, start_line, builder.document.lines.len());
+    }
+    builder.document.comments.push(CommentRegion {
+        index,
+        start_line,
+        end_line: builder.document.lines.len(),
+    });
+}
+
+fn push_diff_inline_comment_separator(builder: &mut DetailsBuilder, selected: bool, depth: usize) {
+    let mut segments = diff_inline_comment_prefix(selected, depth);
+    let prefix_width = segments_width(&segments);
+    let width = builder
+        .width
+        .saturating_sub(prefix_width + COMMENT_RIGHT_PADDING)
+        .max(12);
+    let line = if selected { "━" } else { "─" };
+    segments.push(DetailSegment::styled(
+        line.repeat(width),
+        comment_separator_style(selected),
+    ));
+    builder.push_line(segments);
+}
+
+fn push_diff_inline_comment_expand_line(
+    builder: &mut DetailsBuilder,
+    index: usize,
+    selected: bool,
+    depth: usize,
+    collapse: CommentCollapseState,
+) {
+    builder.push_prefixed_wrapped_limited(
+        vec![
+            DetailSegment::styled("⋯ ", diff_metadata_style()),
+            DetailSegment::action(
+                "▸ show full comment",
+                DetailAction::ToggleCommentExpanded(index),
+            ),
+            DetailSegment::styled(
+                format!(
+                    " ({} lines, {} chars)",
+                    collapse.line_count, collapse.char_count
+                ),
+                diff_metadata_style(),
+            ),
+        ],
+        diff_inline_comment_prefix(selected, depth),
+        COMMENT_RIGHT_PADDING,
+        2,
+    );
+}
+
+fn diff_inline_comment_prefix(selected: bool, depth: usize) -> Vec<DetailSegment> {
+    let depth = depth.min(4);
+    let mut prefix = " ".repeat(DIFF_INLINE_COMMENT_GUTTER_WIDTH);
+    prefix.push_str(if selected { "┃ " } else { "│ " });
+    if depth > 0 {
+        prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
+        prefix.push_str("↳ ");
+    }
+    vec![DetailSegment::styled(
+        prefix,
+        if selected {
+            comment_selected_rail_style()
+        } else {
+            comment_thread_style()
+        },
+    )]
 }
 
 fn diff_tree_entries(diff: &PullRequestDiff) -> Vec<DiffTreeEntry> {
@@ -4939,6 +5303,74 @@ fn diff_review_path(file: &DiffFile, side: DiffReviewSide) -> String {
     }
 }
 
+fn diff_inline_comment_map(
+    comments: &[CommentPreview],
+) -> HashMap<DiffInlineCommentKey, Vec<CommentDisplayEntry>> {
+    let mut id_to_index = HashMap::new();
+    for (index, comment) in comments.iter().enumerate() {
+        if let Some(id) = comment.id {
+            id_to_index.insert(id, index);
+        }
+    }
+
+    let direct_keys = comments
+        .iter()
+        .map(diff_inline_comment_key_for_comment)
+        .collect::<Vec<_>>();
+    let mut index_keys = direct_keys.clone();
+    for (index, comment) in comments.iter().enumerate() {
+        if index_keys[index].is_some() {
+            continue;
+        }
+
+        let mut parent_id = comment.parent_id;
+        let mut seen = HashSet::new();
+        while let Some(id) = parent_id {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some(parent_index) = id_to_index.get(&id).copied() else {
+                break;
+            };
+            if let Some(key) = index_keys[parent_index]
+                .clone()
+                .or_else(|| direct_keys[parent_index].clone())
+            {
+                index_keys[index] = Some(key);
+                break;
+            }
+            parent_id = comments[parent_index].parent_id;
+        }
+    }
+
+    let mut map: HashMap<DiffInlineCommentKey, Vec<CommentDisplayEntry>> = HashMap::new();
+    for entry in comment_display_entries(comments) {
+        if let Some(key) = index_keys[entry.index].clone() {
+            map.entry(key).or_default().push(entry);
+        }
+    }
+    map
+}
+
+fn diff_inline_comment_key_for_comment(comment: &CommentPreview) -> Option<DiffInlineCommentKey> {
+    let review = comment.review.as_ref()?;
+    let line = usize::try_from(review_display_line(review)?).ok()?;
+    let side = diff_review_side_from_label(review_display_side(review)?)?;
+    Some(DiffInlineCommentKey {
+        path: review.path.clone(),
+        line,
+        side,
+    })
+}
+
+fn diff_review_side_from_label(label: &str) -> Option<DiffReviewSide> {
+    match label {
+        label if label.eq_ignore_ascii_case("LEFT") => Some(DiffReviewSide::Left),
+        label if label.eq_ignore_ascii_case("RIGHT") => Some(DiffReviewSide::Right),
+        _ => None,
+    }
+}
+
 fn diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
     let old = old_line
         .map(|line| format!("{line:>4}"))
@@ -4968,6 +5400,8 @@ fn push_comment(
     comment: &CommentPreview,
     selected: bool,
     search_match: bool,
+    depth: usize,
+    collapse: CommentCollapseState,
 ) {
     let timestamp = comment
         .updated_at
@@ -4975,7 +5409,7 @@ fn push_comment(
         .or(comment.created_at.as_ref())
         .cloned();
     let start_line = builder.document.lines.len();
-    push_comment_separator(builder, selected);
+    push_comment_separator(builder, selected, depth);
     let content_start_line = builder.document.lines.len();
 
     let mut header = vec![
@@ -5003,6 +5437,17 @@ fn push_comment(
             comment_search_match_style(),
         ));
     }
+    if collapse.long {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            if collapse.collapsed {
+                "▸ collapsed"
+            } else {
+                "▾ expanded"
+            },
+            DetailAction::ToggleCommentExpanded(index),
+        ));
+    }
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
         "reply",
@@ -5015,15 +5460,25 @@ fn push_comment(
             DetailAction::EditComment(index),
         ));
     }
-    let prefix = comment_line_prefix(selected);
+    let prefix = comment_line_prefix(selected, depth);
     builder.push_prefixed_wrapped_limited(
         header,
         prefix.clone(),
         comment_right_padding(selected),
         2,
     );
+    if selected && let Some(review) = &comment.review {
+        push_inline_review_context(builder, review, selected, depth);
+    }
+    let collapsed_body;
+    let body = if collapse.collapsed {
+        collapsed_body = collapsed_comment_body(&comment.body);
+        collapsed_body.as_str()
+    } else {
+        comment.body.as_str()
+    };
     builder.push_markdown_block_prefixed(
-        &comment.body,
+        body,
         "No comment body.",
         usize::MAX,
         usize::MAX,
@@ -5032,9 +5487,12 @@ fn push_comment(
             right_padding: comment_right_padding(selected),
         },
     );
+    if collapse.collapsed {
+        push_comment_expand_line(builder, index, selected, depth, collapse);
+    }
     if selected {
         add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
-        push_comment_separator(builder, true);
+        push_comment_separator(builder, true, depth);
         add_comment_right_border(builder, start_line, builder.document.lines.len());
     }
     builder.document.comments.push(CommentRegion {
@@ -5064,6 +5522,449 @@ fn add_selected_comment_text_weight(
     }
 }
 
+fn long_comment_metrics(comment: &CommentPreview) -> (usize, usize) {
+    let text = normalize_text(&comment.body);
+    let line_count = if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    };
+    (line_count, text.chars().count())
+}
+
+fn is_long_comment(comment: &CommentPreview) -> bool {
+    let (line_count, char_count) = long_comment_metrics(comment);
+    line_count > COMMENT_COLLAPSE_MIN_LINES || char_count > COMMENT_COLLAPSE_MIN_CHARS
+}
+
+fn comment_collapse_state_for(
+    item_id: &str,
+    index: usize,
+    comment: &CommentPreview,
+    expanded_comments: &HashSet<String>,
+) -> CommentCollapseState {
+    let (line_count, char_count) = long_comment_metrics(comment);
+    let long = line_count > COMMENT_COLLAPSE_MIN_LINES || char_count > COMMENT_COLLAPSE_MIN_CHARS;
+    let key = comment_expand_key(item_id, index, comment);
+    CommentCollapseState {
+        long,
+        collapsed: long && !expanded_comments.contains(&key),
+        line_count,
+        char_count,
+    }
+}
+
+fn comment_expand_key(item_id: &str, index: usize, comment: &CommentPreview) -> String {
+    match comment.id {
+        Some(id) => format!("{item_id}:comment:{id}"),
+        None => format!("{item_id}:comment-index:{index}"),
+    }
+}
+
+fn collapsed_comment_body(body: &str) -> String {
+    let text = normalize_text(body);
+    let mut output = String::new();
+    let mut chars = 0_usize;
+    for (index, line) in text.lines().enumerate() {
+        if index >= COMMENT_COLLAPSED_PREVIEW_LINES {
+            break;
+        }
+        let line_chars = line.chars().count();
+        if chars.saturating_add(line_chars) > COMMENT_COLLAPSED_PREVIEW_CHARS {
+            let remaining = COMMENT_COLLAPSED_PREVIEW_CHARS.saturating_sub(chars);
+            if remaining > 0 {
+                output.push_str(&line.chars().take(remaining).collect::<String>());
+            }
+            break;
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(line);
+        chars = chars.saturating_add(line_chars).saturating_add(1);
+    }
+    output
+}
+
+fn push_comment_expand_line(
+    builder: &mut DetailsBuilder,
+    index: usize,
+    selected: bool,
+    depth: usize,
+    collapse: CommentCollapseState,
+) {
+    let prefix = comment_line_prefix(selected, depth);
+    builder.push_prefixed_wrapped_limited(
+        vec![
+            DetailSegment::styled("⋯ ", diff_metadata_style()),
+            DetailSegment::action(
+                "▸ show full comment",
+                DetailAction::ToggleCommentExpanded(index),
+            ),
+            DetailSegment::styled(
+                format!(
+                    " ({} lines, {} chars)",
+                    collapse.line_count, collapse.char_count
+                ),
+                diff_metadata_style(),
+            ),
+        ],
+        prefix,
+        comment_right_padding(selected),
+        2,
+    );
+}
+
+fn push_inline_review_context(
+    builder: &mut DetailsBuilder,
+    review: &crate::model::ReviewCommentPreview,
+    selected: bool,
+    depth: usize,
+) {
+    let Some(raw_hunk) = review
+        .diff_hunk
+        .as_deref()
+        .filter(|hunk| !hunk.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(hunk) = parse_inline_diff_hunk(raw_hunk) else {
+        return;
+    };
+
+    let focus_span = inline_diff_focus_span(&hunk.lines, review);
+    let (start, end) = inline_diff_context_range(hunk.lines.len(), focus_span);
+    let prefix = comment_line_prefix(selected, depth);
+    let right_padding = comment_right_padding(selected);
+    let original_width = builder.width;
+    builder.width = reserved_width(builder.width, right_padding);
+
+    builder.push_prefixed_wrapped_limited(
+        vec![DetailSegment::styled(
+            truncate_inline(
+                &hunk.header,
+                builder.width.saturating_sub(segments_width(&prefix)),
+            ),
+            diff_hunk_style(),
+        )],
+        prefix.clone(),
+        0,
+        1,
+    );
+    if start > 0 {
+        push_inline_diff_ellipsis(builder, prefix.as_slice());
+    }
+    for (offset, line) in hunk.lines[start..end].iter().enumerate() {
+        let index = start + offset;
+        let focused = focus_span.is_some_and(|(start, end)| (start..=end).contains(&index));
+        push_inline_diff_line(builder, line, prefix.as_slice(), focused);
+    }
+    if end < hunk.lines.len() {
+        push_inline_diff_ellipsis(builder, prefix.as_slice());
+    }
+
+    builder.width = original_width;
+}
+
+fn parse_inline_diff_hunk(raw: &str) -> Option<DiffHunk> {
+    let mut hunk: Option<DiffHunk> = None;
+    let mut file = DiffFile {
+        old_path: "-".to_string(),
+        new_path: "-".to_string(),
+        metadata: Vec::new(),
+        hunks: Vec::new(),
+        additions: 0,
+        deletions: 0,
+    };
+    let mut old_line = 0_usize;
+    let mut new_line = 0_usize;
+
+    for raw_line in raw.replace('\r', "").lines() {
+        if raw_line.starts_with("@@ ") {
+            let (next_old, next_new) = parse_hunk_line_starts(raw_line);
+            old_line = next_old;
+            new_line = next_new;
+            hunk = Some(DiffHunk {
+                header: raw_line.to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(current_hunk) = hunk.as_mut() {
+            push_diff_hunk_line(
+                &mut file,
+                current_hunk,
+                raw_line,
+                &mut old_line,
+                &mut new_line,
+            );
+        }
+    }
+
+    hunk.filter(|hunk| !hunk.lines.is_empty())
+}
+
+type InlineDiffTarget<'a> = (usize, Option<&'a str>);
+type InlineDiffRangeTarget<'a> = (InlineDiffTarget<'a>, InlineDiffTarget<'a>);
+
+fn inline_diff_focus_span(
+    lines: &[DiffLine],
+    review: &crate::model::ReviewCommentPreview,
+) -> Option<(usize, usize)> {
+    inline_diff_focus_range_candidates(review)
+        .into_iter()
+        .find_map(|(start, end)| {
+            let start_index = find_inline_diff_line(lines, start.0, start.1)?;
+            let end_index = find_inline_diff_line(lines, end.0, end.1)?;
+            Some(if start_index <= end_index {
+                (start_index, end_index)
+            } else {
+                (end_index, start_index)
+            })
+        })
+        .or_else(|| inline_diff_focus_line(lines, review).map(|index| (index, index)))
+}
+
+fn inline_diff_focus_range_candidates(
+    review: &crate::model::ReviewCommentPreview,
+) -> Vec<InlineDiffRangeTarget<'_>> {
+    let mut candidates = Vec::new();
+    push_inline_diff_focus_range_candidate(
+        &mut candidates,
+        review.start_line,
+        review.line,
+        review.start_side.as_deref().or(review.side.as_deref()),
+        review.side.as_deref(),
+    );
+    push_inline_diff_focus_range_candidate(
+        &mut candidates,
+        review.original_start_line,
+        review.original_line,
+        review.start_side.as_deref().or(review.side.as_deref()),
+        review.side.as_deref(),
+    );
+    candidates
+}
+
+fn push_inline_diff_focus_range_candidate<'a>(
+    candidates: &mut Vec<InlineDiffRangeTarget<'a>>,
+    start: Option<u64>,
+    end: Option<u64>,
+    start_side: Option<&'a str>,
+    end_side: Option<&'a str>,
+) {
+    let Some(start) = start.and_then(|line| usize::try_from(line).ok()) else {
+        return;
+    };
+    let Some(end) = end.and_then(|line| usize::try_from(line).ok()) else {
+        return;
+    };
+    if candidates.iter().any(|(existing_start, existing_end)| {
+        *existing_start == (start, start_side) && *existing_end == (end, end_side)
+    }) {
+        return;
+    }
+    candidates.push(((start, start_side), (end, end_side)));
+}
+
+fn inline_diff_focus_line(
+    lines: &[DiffLine],
+    review: &crate::model::ReviewCommentPreview,
+) -> Option<usize> {
+    inline_diff_focus_candidates(review)
+        .into_iter()
+        .find_map(|(target, side)| find_inline_diff_line(lines, target, side))
+}
+
+fn inline_diff_focus_candidates(
+    review: &crate::model::ReviewCommentPreview,
+) -> Vec<(usize, Option<&str>)> {
+    let mut candidates = Vec::new();
+    push_inline_diff_focus_candidate(&mut candidates, review.line, review.side.as_deref());
+    push_inline_diff_focus_candidate(
+        &mut candidates,
+        review.original_line,
+        review.side.as_deref(),
+    );
+    push_inline_diff_focus_candidate(
+        &mut candidates,
+        review.start_line,
+        review.start_side.as_deref().or(review.side.as_deref()),
+    );
+    push_inline_diff_focus_candidate(
+        &mut candidates,
+        review.original_start_line,
+        review.start_side.as_deref().or(review.side.as_deref()),
+    );
+    candidates
+}
+
+fn push_inline_diff_focus_candidate<'a>(
+    candidates: &mut Vec<(usize, Option<&'a str>)>,
+    line: Option<u64>,
+    side: Option<&'a str>,
+) {
+    let Some(line) = line.and_then(|line| usize::try_from(line).ok()) else {
+        return;
+    };
+    if candidates
+        .iter()
+        .any(|(existing_line, existing_side)| *existing_line == line && *existing_side == side)
+    {
+        return;
+    }
+    candidates.push((line, side));
+}
+
+fn find_inline_diff_line(lines: &[DiffLine], target: usize, side: Option<&str>) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| diff_line_matches_side(line, target, side))
+}
+
+fn diff_line_matches_side(line: &DiffLine, target: usize, side: Option<&str>) -> bool {
+    match side.unwrap_or_default() {
+        side if side.eq_ignore_ascii_case("LEFT") => line.old_line == Some(target),
+        side if side.eq_ignore_ascii_case("RIGHT") => line.new_line == Some(target),
+        _ => line.new_line == Some(target) || line.old_line == Some(target),
+    }
+}
+
+fn review_display_line(review: &crate::model::ReviewCommentPreview) -> Option<u64> {
+    review.line.or(review.original_line)
+}
+
+fn review_display_start_line(review: &crate::model::ReviewCommentPreview) -> Option<u64> {
+    review.start_line.or(review.original_start_line)
+}
+
+fn review_display_side(review: &crate::model::ReviewCommentPreview) -> Option<&str> {
+    review.side.as_deref().or(review.start_side.as_deref())
+}
+
+fn review_line_label(review: &crate::model::ReviewCommentPreview) -> String {
+    let end = review_display_line(review);
+    let start = review_display_start_line(review);
+    match (start, end) {
+        (Some(start), Some(end)) if start != end => format!("{start}-{end}"),
+        (_, Some(end)) => end.to_string(),
+        (Some(start), None) => start.to_string(),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn inline_diff_context_range(len: usize, focus_span: Option<(usize, usize)>) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let Some((span_start, span_end)) = focus_span else {
+        return (0, len.min(INLINE_COMMENT_CONTEXT_MAX_LINES));
+    };
+
+    let span_start = span_start.min(len - 1);
+    let span_end = span_end.min(len - 1).max(span_start);
+    let span_len = span_end - span_start + 1;
+    let max_lines = span_len
+        .saturating_add(INLINE_COMMENT_CONTEXT_RADIUS)
+        .saturating_add(INLINE_COMMENT_CONTEXT_RADIUS)
+        .clamp(INLINE_COMMENT_CONTEXT_MAX_LINES, 18)
+        .min(len);
+    let mut start = span_start.saturating_sub(INLINE_COMMENT_CONTEXT_RADIUS);
+    let mut end = span_end
+        .saturating_add(INLINE_COMMENT_CONTEXT_RADIUS)
+        .saturating_add(1)
+        .min(len);
+
+    if end.saturating_sub(start) > max_lines {
+        if span_len >= max_lines {
+            start = span_start;
+            end = start.saturating_add(max_lines).min(len);
+        } else {
+            let extra = max_lines - span_len;
+            let before = extra / 2;
+            let after = extra - before;
+            start = span_start.saturating_sub(before);
+            end = span_end.saturating_add(after).saturating_add(1).min(len);
+            if end.saturating_sub(start) < max_lines {
+                start = start.saturating_sub(max_lines - (end - start));
+            }
+        }
+    }
+    if end.saturating_sub(start) < max_lines {
+        end = (start + max_lines).min(len);
+    }
+    (start, end)
+}
+
+fn push_inline_diff_ellipsis(builder: &mut DetailsBuilder, prefix: &[DetailSegment]) {
+    let mut segments = prefix.to_vec();
+    segments.push(DetailSegment::styled("      ⋮", diff_metadata_style()));
+    builder.push_line(segments);
+}
+
+fn push_inline_diff_line(
+    builder: &mut DetailsBuilder,
+    line: &DiffLine,
+    prefix: &[DetailSegment],
+    focused: bool,
+) {
+    let marker = match line.kind {
+        DiffLineKind::Context => " ",
+        DiffLineKind::Added => "+",
+        DiffLineKind::Removed => "-",
+        DiffLineKind::Metadata => "\\",
+    };
+    let mut style = match line.kind {
+        DiffLineKind::Context => diff_context_style(),
+        DiffLineKind::Added => diff_added_style(),
+        DiffLineKind::Removed => diff_removed_style(),
+        DiffLineKind::Metadata => diff_metadata_style(),
+    };
+    if focused {
+        style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    }
+    let gutter_style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        diff_gutter_style()
+    };
+    let focus_marker = if focused { ">" } else { " " };
+    let gutter = format!(
+        "{focus_marker}{}",
+        compact_diff_gutter(line.old_line, line.new_line)
+    );
+    let prefix_width = prefix
+        .iter()
+        .map(|segment| display_width(&segment.text))
+        .sum::<usize>();
+    let content_width = builder
+        .width
+        .saturating_sub(prefix_width + display_width(&gutter) + display_width(marker) + 1)
+        .max(1);
+    let mut segments = prefix.to_vec();
+    segments.push(DetailSegment::styled(gutter, gutter_style));
+    segments.push(DetailSegment::styled(marker, style));
+    segments.push(DetailSegment::styled(" ", style));
+    segments.push(DetailSegment::styled(
+        truncate_inline(&line.text, content_width),
+        style,
+    ));
+    builder.push_line(segments);
+}
+
+fn compact_diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
+    let old = old_line
+        .map(|line| format!("{line:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let new = new_line
+        .map(|line| format!("{line:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    format!("{old} {new} │ ")
+}
+
 fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {
     match app.details.get(&item.id) {
         Some(DetailState::Loaded(comments)) => Some(comments.len()),
@@ -5072,39 +5973,44 @@ fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {
 }
 
 fn review_comment_label(review: &crate::model::ReviewCommentPreview) -> String {
-    let line = review
-        .line
-        .map(|line| line.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let side = review
-        .side
-        .as_deref()
+    let line = review_line_label(review);
+    let side = review_display_side(review)
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "line".to_string());
     format!("inline {}:{line} {side}", review.path)
 }
 
-fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool) {
+fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool, depth: usize) {
+    let prefix = comment_line_prefix(selected, depth);
+    let prefix_width = segments_width(&prefix);
     let width = builder
         .width
-        .saturating_sub(COMMENT_LEFT_PADDING + comment_right_padding(selected))
+        .saturating_sub(prefix_width + comment_right_padding(selected))
         .max(12);
     let line = if selected { "━" } else { "─" };
-    builder.push_line(vec![
-        comment_line_prefix(selected)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| DetailSegment::raw(" ".repeat(COMMENT_LEFT_PADDING))),
-        DetailSegment::styled(
-            line.repeat(if selected { width } else { width.min(72) }),
-            comment_separator_style(selected),
-        ),
-    ]);
+    let mut segments = prefix;
+    segments.push(DetailSegment::styled(
+        line.repeat(width),
+        comment_separator_style(selected),
+    ));
+    builder.push_line(segments);
 }
 
-fn comment_line_prefix(selected: bool) -> Vec<DetailSegment> {
+fn comment_line_prefix(selected: bool, depth: usize) -> Vec<DetailSegment> {
+    let depth = depth.min(4);
     if selected {
-        vec![DetailSegment::styled("┃ ", comment_selected_rail_style())]
+        let mut prefix = "┃ ".to_string();
+        if depth > 0 {
+            prefix.push_str("  ");
+            prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
+            prefix.push_str("↳ ");
+        }
+        vec![DetailSegment::styled(prefix, comment_selected_rail_style())]
+    } else if depth > 0 {
+        let mut prefix = "    ".to_string();
+        prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
+        prefix.push_str("↳ ");
+        vec![DetailSegment::styled(prefix, comment_thread_style())]
     } else {
         padding_prefix(COMMENT_LEFT_PADDING)
     }
@@ -5251,25 +6157,79 @@ fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
     let mut strong_depth = 0_u8;
     let mut emphasis_depth = 0_u8;
     let mut quote_depth = 0_u8;
+    let mut table: Option<MarkdownTable> = None;
+    let mut table_row: Option<MarkdownTableRow> = None;
+    let mut in_table_head = false;
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
 
     for event in Parser::new_ext(text, options) {
         match event {
             MarkdownEvent::Start(Tag::Paragraph) => {}
-            MarkdownEvent::End(TagEnd::Paragraph) => flush_markdown_block(
+            MarkdownEvent::End(TagEnd::Paragraph) if table.is_none() => flush_markdown_block(
                 &mut blocks,
                 &mut current,
                 quote_depth,
                 MarkdownBlockKind::Text,
             ),
+            MarkdownEvent::End(TagEnd::Paragraph) => {}
             MarkdownEvent::Start(Tag::Heading { .. }) => {}
-            MarkdownEvent::End(TagEnd::Heading(_)) => flush_markdown_block(
+            MarkdownEvent::End(TagEnd::Heading(_)) if table.is_none() => flush_markdown_block(
                 &mut blocks,
                 &mut current,
                 quote_depth,
                 MarkdownBlockKind::Text,
             ),
+            MarkdownEvent::End(TagEnd::Heading(_)) => {}
+            MarkdownEvent::Start(Tag::Table(_)) => {
+                flush_markdown_block(
+                    &mut blocks,
+                    &mut current,
+                    quote_depth,
+                    MarkdownBlockKind::Text,
+                );
+                table = Some(MarkdownTable::default());
+            }
+            MarkdownEvent::End(TagEnd::Table) => {
+                flush_table_row(&mut table, &mut table_row);
+                if let Some(table) = table.take() {
+                    push_markdown_table(&mut blocks, quote_depth, table);
+                }
+                in_table_head = false;
+            }
+            MarkdownEvent::Start(Tag::TableHead) => {
+                in_table_head = true;
+                table_row = Some(MarkdownTableRow {
+                    cells: Vec::new(),
+                    header: true,
+                });
+            }
+            MarkdownEvent::End(TagEnd::TableHead) => {
+                flush_table_row(&mut table, &mut table_row);
+                in_table_head = false;
+            }
+            MarkdownEvent::Start(Tag::TableRow) => {
+                flush_table_row(&mut table, &mut table_row);
+                table_row = Some(MarkdownTableRow {
+                    cells: Vec::new(),
+                    header: in_table_head,
+                });
+            }
+            MarkdownEvent::End(TagEnd::TableRow) => {
+                flush_table_row(&mut table, &mut table_row);
+            }
+            MarkdownEvent::Start(Tag::TableCell) => {
+                if table.is_some() && table_row.is_none() {
+                    table_row = Some(MarkdownTableRow {
+                        cells: Vec::new(),
+                        header: in_table_head,
+                    });
+                }
+                current.clear();
+            }
+            MarkdownEvent::End(TagEnd::TableCell) => {
+                flush_table_cell(&mut table_row, &mut current);
+            }
             MarkdownEvent::Start(Tag::BlockQuote(_)) => {
                 flush_markdown_block(
                     &mut blocks,
@@ -5651,6 +6611,129 @@ fn push_highlighted_text(segments: &mut Vec<DetailSegment>, text: &str, style: S
     push_text_segment(segments, &template, text);
 }
 
+fn flush_table_cell(row: &mut Option<MarkdownTableRow>, current: &mut Vec<DetailSegment>) {
+    if let Some(row) = row.as_mut() {
+        row.cells.push(trim_table_cell(std::mem::take(current)));
+        return;
+    }
+    current.clear();
+}
+
+fn flush_table_row(table: &mut Option<MarkdownTable>, row: &mut Option<MarkdownTableRow>) {
+    let Some(row) = row.take() else {
+        return;
+    };
+    if row
+        .cells
+        .iter()
+        .any(|cell| cell.iter().any(|segment| !segment.text.is_empty()))
+        && let Some(table) = table.as_mut()
+    {
+        table.rows.push(row);
+    }
+}
+
+fn push_markdown_table(blocks: &mut Vec<MarkdownBlock>, quote_depth: u8, table: MarkdownTable) {
+    let column_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0);
+    if column_count == 0 {
+        return;
+    }
+
+    let mut widths = vec![0_usize; column_count];
+    for row in &table.rows {
+        for (index, cell) in row.cells.iter().enumerate() {
+            widths[index] = widths[index].max(segments_width(cell));
+        }
+    }
+
+    for row in table.rows {
+        let is_header = row.header;
+        push_markdown_block(
+            blocks,
+            quote_depth,
+            MarkdownBlockKind::TableRow,
+            table_row_segments(&row, &widths),
+        );
+        if is_header {
+            push_markdown_block(
+                blocks,
+                quote_depth,
+                MarkdownBlockKind::TableRow,
+                table_separator_segments(&widths),
+            );
+        }
+    }
+}
+
+fn table_row_segments(row: &MarkdownTableRow, widths: &[usize]) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for (index, width) in widths.iter().copied().enumerate() {
+        if index > 0 {
+            segments.push(DetailSegment::styled(" │ ", table_separator_style()));
+        }
+        let mut cell = row.cells.get(index).cloned().unwrap_or_default();
+        if row.header {
+            for segment in &mut cell {
+                segment.style = segment.style.add_modifier(Modifier::BOLD);
+            }
+        }
+        let cell_width = segments_width(&cell);
+        segments.extend(cell);
+        if width > cell_width {
+            segments.push(DetailSegment::raw(" ".repeat(width - cell_width)));
+        }
+    }
+    segments
+}
+
+fn table_separator_segments(widths: &[usize]) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for (index, width) in widths.iter().copied().enumerate() {
+        if index > 0 {
+            segments.push(DetailSegment::styled("─┼─", table_separator_style()));
+        }
+        segments.push(DetailSegment::styled(
+            "─".repeat(width.max(1)),
+            table_separator_style(),
+        ));
+    }
+    segments
+}
+
+fn trim_table_cell(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
+    while let Some(first) = segments.first_mut() {
+        let trimmed = first.text.trim_start().to_string();
+        if trimmed.is_empty() {
+            segments.remove(0);
+        } else {
+            first.text = trimmed;
+            break;
+        }
+    }
+    while let Some(last) = segments.last_mut() {
+        let trimmed = last.text.trim_end().to_string();
+        if trimmed.is_empty() {
+            segments.pop();
+        } else {
+            last.text = trimmed;
+            break;
+        }
+    }
+    segments
+}
+
+fn segments_width(segments: &[DetailSegment]) -> usize {
+    segments
+        .iter()
+        .map(|segment| display_width(&segment.text))
+        .sum()
+}
+
 fn flush_markdown_block(
     blocks: &mut Vec<MarkdownBlock>,
     current: &mut Vec<DetailSegment>,
@@ -5691,6 +6774,7 @@ fn markdown_gap_before(
     !matches!(
         (previous.kind, kind),
         (MarkdownBlockKind::ListItem, MarkdownBlockKind::ListItem)
+            | (MarkdownBlockKind::TableRow, MarkdownBlockKind::TableRow)
             | (
                 MarkdownBlockKind::Code { .. },
                 MarkdownBlockKind::Code { .. }
@@ -5728,9 +6812,74 @@ fn append_text_segments(
     for (part, url) in split_raw_urls(text) {
         match url {
             Some(url) => current.push(DetailSegment::link(part, url)),
-            None => current.push(DetailSegment::styled(part, style)),
+            None => append_mention_segments(current, &part, style),
         }
     }
+}
+
+fn append_mention_segments(current: &mut Vec<DetailSegment>, text: &str, style: Style) {
+    let mut rest = text;
+    while let Some(start) = find_github_mention_start(rest) {
+        if start > 0 {
+            current.push(DetailSegment::styled(rest[..start].to_string(), style));
+        }
+
+        let after_start = &rest[start + 1..];
+        let username_len = after_start
+            .char_indices()
+            .take_while(|(_, ch)| is_github_username_char(*ch))
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if username_len == 0 {
+            current.push(DetailSegment::styled("@", style));
+            rest = after_start;
+            continue;
+        }
+
+        let username = &after_start[..username_len];
+        current.push(DetailSegment::link(
+            format!("@{username}"),
+            github_profile_url(username),
+        ));
+        rest = &after_start[username_len..];
+    }
+
+    if !rest.is_empty() {
+        current.push(DetailSegment::styled(rest.to_string(), style));
+    }
+}
+
+fn find_github_mention_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    for (index, ch) in text.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+        if index > 0 {
+            let previous = text[..index].chars().next_back();
+            if previous.is_some_and(|ch| {
+                is_github_username_char(ch) || matches!(ch, '.' | '_' | '+' | '/')
+            }) {
+                continue;
+            }
+        }
+        let next_index = index + 1;
+        if next_index >= bytes.len() {
+            continue;
+        }
+        let Some(next) = text[next_index..].chars().next() else {
+            continue;
+        };
+        if next.is_ascii_alphanumeric() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn is_github_username_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-'
 }
 
 fn split_raw_urls(text: &str) -> Vec<(String, Option<String>)> {
@@ -5834,6 +6983,10 @@ fn link_style() -> Style {
         .add_modifier(Modifier::UNDERLINED)
 }
 
+fn table_separator_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 fn action_style() -> Style {
     Style::default()
         .fg(Color::LightMagenta)
@@ -5922,6 +7075,12 @@ fn diff_metadata_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+fn diff_inline_comment_marker_style() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn comment_author_style(selected: bool) -> Style {
     let style = if selected {
         Style::default().fg(Color::Yellow)
@@ -5961,6 +7120,10 @@ fn comment_selected_rail_style() -> Style {
     Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+fn comment_thread_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 fn display_width(text: &str) -> usize {
@@ -6317,6 +7480,12 @@ fn operation_error_body(error: &str) -> String {
     truncate_inline(message, 900)
 }
 
+fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
+    let mut values = values.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
 fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog {
     match mode {
         PendingCommentMode::Post => message_dialog(
@@ -6378,6 +7547,9 @@ impl AppState {
             global_search_active: false,
             global_search_query: String::new(),
             global_search_running: false,
+            global_search_return_view: None,
+            global_search_scope: None,
+            global_search_started_at: None,
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
@@ -6393,6 +7565,7 @@ impl AppState {
             pending_details_load: None,
             notification_read_pending: HashSet::new(),
             selected_comment_index: 0,
+            expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             posting_comment: false,
             pr_action_dialog: None,
@@ -6428,6 +7601,7 @@ impl AppState {
             details_mode: self.details_mode.as_state_str().to_string(),
             details_scroll: self.details_scroll,
             selected_comment_index: self.selected_comment_index,
+            expanded_comments: sorted_strings(&self.expanded_comments),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
         }
@@ -6861,6 +8035,8 @@ impl AppState {
                     .sum::<usize>();
                 self.replace_global_search_sections(sections);
                 self.global_search_running = false;
+                self.global_search_started_at = None;
+                self.global_search_scope = None;
                 self.global_search_active = false;
                 self.global_search_query = query.clone();
                 self.search_active = false;
@@ -7078,6 +8254,50 @@ impl AppState {
         self.sections
             .retain(|section| section_view_key(section) != search_view);
         self.sections.extend(sections);
+    }
+
+    fn is_global_search_results_view(&self) -> bool {
+        same_view_key(&self.active_view, &global_search_view_key())
+    }
+
+    fn leave_global_search_results(&mut self) {
+        if !self.is_global_search_results_view() {
+            return;
+        }
+
+        let search_view = global_search_view_key();
+        self.sections
+            .retain(|section| section_view_key(section) != search_view);
+        let return_view = self
+            .global_search_return_view
+            .take()
+            .filter(|view| self.section_view_exists(view))
+            .or_else(|| {
+                let builtin = builtin_view_key(SectionKind::PullRequests);
+                self.section_view_exists(&builtin).then_some(builtin)
+            })
+            .or_else(|| self.sections.first().map(section_view_key));
+        if let Some(view) = return_view {
+            self.active_view = view;
+        }
+        self.global_search_active = false;
+        self.global_search_query.clear();
+        self.search_active = false;
+        self.search_query.clear();
+        self.comment_search_active = false;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.focus = FocusTarget::List;
+        self.status = "search results cleared".to_string();
+        self.clamp_positions();
+    }
+
+    fn section_view_exists(&self, view: &str) -> bool {
+        self.sections
+            .iter()
+            .any(|section| same_view_key(&section_view_key(section), view))
     }
 
     fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
@@ -8006,17 +9226,25 @@ impl AppState {
     }
 
     fn move_comment(&mut self, delta: isize) {
-        let Some(len) = self.current_comments().map(Vec::len) else {
+        let Some(comments) = self.current_comments() else {
             self.status = "no comments".to_string();
             return;
         };
-        if len == 0 {
+        let order = comment_display_entries(comments)
+            .into_iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        if order.is_empty() {
             self.status = "no comments".to_string();
             return;
         }
-        self.selected_comment_index =
-            move_bounded(self.selected_comment_index.min(len - 1), len, delta);
-        self.status = format!("comment {} focused", self.selected_comment_index + 1);
+        let current_position = order
+            .iter()
+            .position(|index| *index == self.selected_comment_index)
+            .unwrap_or(0);
+        let next_position = move_bounded(current_position, order.len(), delta);
+        self.selected_comment_index = order[next_position];
+        self.status = format!("comment {} focused", next_position + 1);
     }
 
     fn move_comment_in_view(&mut self, delta: isize, area: Option<Rect>) {
@@ -8144,6 +9372,32 @@ impl AppState {
                 self.select_comment(index);
                 self.start_edit_selected_comment_dialog();
             }
+            DetailAction::ToggleCommentExpanded(index) => {
+                self.select_comment(index);
+                self.toggle_selected_comment_expanded();
+            }
+        }
+    }
+
+    fn toggle_selected_comment_expanded(&mut self) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        let Some(comment) = self.current_selected_comment().cloned() else {
+            self.status = "no comment selected".to_string();
+            return;
+        };
+        if !is_long_comment(&comment) {
+            self.status = "comment is already fully visible".to_string();
+            return;
+        }
+        let key = comment_expand_key(&item_id, self.selected_comment_index, &comment);
+        if self.expanded_comments.remove(&key) {
+            self.status = "comment collapsed".to_string();
+        } else {
+            self.expanded_comments.insert(key);
+            self.status = "comment expanded".to_string();
         }
     }
 
@@ -8494,8 +9748,12 @@ impl AppState {
     }
 
     fn start_global_search_input(&mut self) {
+        if !self.is_global_search_results_view() {
+            self.global_search_return_view = Some(self.active_view.clone());
+        }
         self.focus = FocusTarget::List;
         self.global_search_active = true;
+        self.global_search_scope = self.current_repo_scope();
         self.global_search_query.clear();
         self.search_active = false;
         self.comment_search_active = false;
@@ -8538,12 +9796,15 @@ impl AppState {
                     self.status = "search already running".to_string();
                     return;
                 }
+                let repo_scope = self.current_repo_scope();
                 self.global_search_active = false;
                 self.global_search_running = true;
+                self.global_search_started_at = Some(Instant::now());
+                self.global_search_scope = repo_scope.clone();
                 self.search_active = false;
                 self.search_query.clear();
                 self.comment_search_active = false;
-                self.status = match self.current_repo_scope() {
+                self.status = match repo_scope {
                     Some(repo) => format!("searching {repo} for '{query}'"),
                     None => format!("searching GitHub for '{query}'"),
                 };
@@ -8734,6 +9995,15 @@ impl AppState {
 
     fn current_selected_comment(&self) -> Option<&CommentPreview> {
         self.current_comments()?.get(self.selected_comment_index)
+    }
+
+    fn comment_collapse_state(
+        &self,
+        item_id: &str,
+        index: usize,
+        comment: &CommentPreview,
+    ) -> CommentCollapseState {
+        comment_collapse_state_for(item_id, index, comment, &self.expanded_comments)
     }
 
     fn current_section_position(&self) -> usize {
@@ -8994,14 +10264,82 @@ fn filtered_indices(section: &SectionSnapshot, query: &str) -> Vec<usize> {
 fn comment_search_matches(comments: &[CommentPreview], query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
-        return (0..comments.len()).collect();
+        return comment_display_entries(comments)
+            .into_iter()
+            .map(|entry| entry.index)
+            .collect();
     }
 
-    comments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, comment)| comment_matches_search(comment, query).then_some(index))
+    comment_display_entries(comments)
+        .into_iter()
+        .filter_map(|entry| {
+            comment_matches_search(&comments[entry.index], query).then_some(entry.index)
+        })
         .collect()
+}
+
+fn comment_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEntry> {
+    let mut id_to_index = HashMap::new();
+    for (index, comment) in comments.iter().enumerate() {
+        if let Some(id) = comment.id {
+            id_to_index.insert(id, index);
+        }
+    }
+
+    let mut children = vec![Vec::new(); comments.len()];
+    let mut roots = Vec::new();
+    for (index, comment) in comments.iter().enumerate() {
+        let parent_index = comment
+            .parent_id
+            .and_then(|parent_id| id_to_index.get(&parent_id).copied())
+            .filter(|parent_index| *parent_index != index)
+            .filter(|parent_index| {
+                comments[index].review.is_some() && comments[*parent_index].review.is_some()
+            });
+        if let Some(parent_index) = parent_index {
+            children[parent_index].push(index);
+        } else {
+            roots.push(index);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(comments.len());
+    let mut visited = vec![false; comments.len()];
+    for index in roots {
+        push_comment_display_entry(index, 0, &children, &mut visited, &mut entries);
+    }
+    for index in 0..comments.len() {
+        if !visited[index] {
+            push_comment_display_entry(index, 0, &children, &mut visited, &mut entries);
+        }
+    }
+    entries
+}
+
+fn push_comment_display_entry(
+    index: usize,
+    depth: usize,
+    children: &[Vec<usize>],
+    visited: &mut [bool],
+    entries: &mut Vec<CommentDisplayEntry>,
+) {
+    if index >= visited.len() || visited[index] {
+        return;
+    }
+    visited[index] = true;
+    entries.push(CommentDisplayEntry {
+        index,
+        depth: depth.min(4),
+    });
+    for child_index in &children[index] {
+        push_comment_display_entry(
+            *child_index,
+            depth.saturating_add(1),
+            children,
+            visited,
+            entries,
+        );
+    }
 }
 
 fn comment_matches_search(comment: &CommentPreview, query: &str) -> bool {
@@ -9020,6 +10358,9 @@ fn searchable_comment_text(comment: &CommentPreview) -> String {
         parts.push(review.path.clone());
         if let Some(line) = review.line {
             parts.push(line.to_string());
+        }
+        if let Some(diff_hunk) = &review.diff_hunk {
+            parts.push(diff_hunk.clone());
         }
     }
     parts.join(" ").to_lowercase()
@@ -9311,6 +10652,102 @@ deleted file mode 100644
                     preview: "context".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn diff_details_render_inline_review_comments_below_target_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let review = crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+        };
+        let mut parent = comment(
+            "alice",
+            "Please keep this inline.",
+            Some("https://github.com/rust-lang/rust/pull/1#discussion_r1"),
+        );
+        parent.id = Some(1);
+        parent.review = Some(review.clone());
+        let mut child = comment("bob", "Thread reply", None);
+        child.id = Some(2);
+        child.parent_id = Some(1);
+        child.review = Some(review);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![parent, child]));
+
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("│ ● + new")),
+            "target diff line should show an inline comment marker: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("alice") && line.contains("reply")),
+            "inline comment header should render under the diff line: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains('↳') && line.contains("bob")),
+            "review replies should stay nested in the inline thread: {rendered:?}"
+        );
+
+        let body_line = rendered
+            .iter()
+            .position(|line| line.contains("Please keep this inline."))
+            .expect("parent inline body");
+        assert_eq!(document.comment_at(body_line), Some(0));
+
+        let header_line = rendered
+            .iter()
+            .position(|line| line.contains("alice") && line.contains("reply"))
+            .expect("parent inline header");
+        let open_column =
+            display_width(&rendered[header_line][..rendered[header_line].find("open").unwrap()])
+                as u16;
+        let reply_column =
+            display_width(&rendered[header_line][..rendered[header_line].find("reply").unwrap()])
+                as u16;
+        assert_eq!(
+            document.link_at(header_line, open_column),
+            Some("https://github.com/rust-lang/rust/pull/1#discussion_r1".to_string())
+        );
+        assert_eq!(
+            document.action_at(header_line, reply_column),
+            Some(DetailAction::ReplyComment(0))
         );
     }
 
@@ -10435,6 +11872,7 @@ diff --git a/src/github.rs b/src/github.rs
             details_mode: "conversation".to_string(),
             details_scroll: 7,
             selected_comment_index: 2,
+            expanded_comments: Vec::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
         };
@@ -11080,7 +12518,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  c/a comment  R reply  e edit"));
+        assert!(details.contains("n/p comment  enter expand  c/a comment  R reply  e edit"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
 
@@ -11621,7 +13059,18 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(submitted, Some("fib".to_string()));
         assert!(!app.global_search_active);
         assert!(app.global_search_running);
+        assert!(app.global_search_started_at.is_some());
+        assert_eq!(app.global_search_scope.as_deref(), Some("rust-lang/rust"));
         assert_eq!(app.status, "searching rust-lang/rust for 'fib'");
+
+        let rendered = global_search_loading_content(&app, 1)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Searching pull requests and issues."));
+        assert!(rendered.contains("query: fib"));
+        assert!(rendered.contains("scope: rust-lang/rust"));
     }
 
     #[test]
@@ -11654,6 +13103,7 @@ diff --git a/src/github.rs b/src/github.rs
     fn global_search_finished_switches_to_search_tab() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.global_search_running = true;
+        app.global_search_started_at = Some(Instant::now());
         let mut pr_section = SectionSnapshot::empty_for_view(
             global_search_view_key(),
             SectionKind::PullRequests,
@@ -11697,6 +13147,55 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.global_search_running);
         assert!(app.search_query.is_empty());
         assert_eq!(app.status, "search complete: 2 result(s) for 'fiber'");
+        assert!(app.global_search_started_at.is_none());
+    }
+
+    #[test]
+    fn escape_on_search_results_returns_to_previous_list() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_global_search_input();
+        app.global_search_query = "fiber".to_string();
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_| {});
+
+        let mut pr_section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "fiber",
+        );
+        pr_section.items = vec![work_item(
+            "pr-1",
+            "nervosnetwork/fiber",
+            1,
+            "Fiber PR",
+            None,
+        )];
+        app.handle_msg(AppMsg::GlobalSearchFinished {
+            query: "fiber".to_string(),
+            sections: vec![pr_section],
+        });
+
+        assert_eq!(app.active_view, global_search_view_key());
+        assert!(app.view_tabs().iter().any(|view| view.label == "Search"));
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert!(!app.view_tabs().iter().any(|view| view.label == "Search"));
+        assert!(app.global_search_query.is_empty());
+        assert_eq!(
+            app.current_section().map(|section| section.title.as_str()),
+            Some("Test")
+        );
+        assert_eq!(app.status, "search results cleared");
     }
 
     #[test]
@@ -11878,6 +13377,45 @@ diff --git a/src/github.rs b/src/github.rs
             document.link_at(line_index, column),
             Some("https://example.com/issues/1".to_string())
         );
+    }
+
+    #[test]
+    fn markdown_tables_render_as_separated_rows() {
+        let mut builder = DetailsBuilder::new(100);
+        builder.push_markdown_block(
+            "| x | not const | const |\n| --- | ---- | --- |\n| not comptime | fn | const fn |\n| comptime | comptime fn | ??? |",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+        );
+        let rendered = builder
+            .finish()
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let joined = rendered.join("\n");
+
+        assert!(
+            rendered.iter().any(|line| line.contains("x")
+                && line.contains("│ not const")
+                && line.contains("│ const")),
+            "table header should keep visible column separators: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("not comptime")
+                && line.contains("│ fn")
+                && line.contains("│ const fn")),
+            "table row should keep visible column separators: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("comptime")
+                && line.contains("│ comptime fn")
+                && line.contains("│ ???")),
+            "table row should keep visible column separators: {rendered:?}"
+        );
+        assert!(!joined.contains("xnot constconst"));
+        assert!(!joined.contains("| ---"));
     }
 
     #[test]
@@ -12101,6 +13639,7 @@ diff --git a/src/github.rs b/src/github.rs
                     created_at: None,
                     updated_at: None,
                     url: None,
+                    parent_id: None,
                     is_mine: false,
                     review: None,
                 },
@@ -12113,6 +13652,7 @@ diff --git a/src/github.rs b/src/github.rs
                     url: Some(
                         "https://github.com/rust-lang/rust/pull/1#issuecomment-2".to_string(),
                     ),
+                    parent_id: None,
                     is_mine: false,
                     review: None,
                 },
@@ -12175,6 +13715,173 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn github_mentions_in_comments_are_clickable() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment(
+                "npmccallum",
+                "@clarfonthey Apologies. See email test@example.com and https://github.com/rust-lang/rust.",
+                None,
+            )]),
+        );
+
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let mention_line = rendered
+            .iter()
+            .position(|line| line.contains("@clarfonthey"))
+            .expect("mention line");
+        let mention_column = rendered[mention_line].find("@clarfonthey").unwrap() as u16;
+        let email_column = rendered[mention_line].find("@example").unwrap() as u16;
+        let github_column = rendered[mention_line].find("https://github.com").unwrap() as u16;
+
+        assert_eq!(
+            document.link_at(mention_line, mention_column),
+            Some("https://github.com/clarfonthey".to_string())
+        );
+        assert_eq!(document.link_at(mention_line, email_column), None);
+        assert_eq!(
+            document.link_at(mention_line, github_column),
+            Some("https://github.com/rust-lang/rust".to_string())
+        );
+    }
+
+    #[test]
+    fn review_replies_render_under_parent_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let review = crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(10),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+        };
+        let mut parent = comment("alice", "parent review", None);
+        parent.id = Some(1);
+        parent.review = Some(review.clone());
+        let mut standalone = comment("carol", "standalone comment", None);
+        standalone.id = Some(2);
+        let mut child = comment("bob", "child reply", None);
+        child.id = Some(3);
+        child.parent_id = Some(1);
+        child.review = Some(review);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![parent, standalone, child]),
+        );
+
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let parent_line = rendered
+            .iter()
+            .position(|line| line.contains("parent review"))
+            .expect("parent body");
+        let child_line = rendered
+            .iter()
+            .position(|line| line.contains("child reply"))
+            .expect("child body");
+        let standalone_line = rendered
+            .iter()
+            .position(|line| line.contains("standalone comment"))
+            .expect("standalone body");
+
+        assert!(parent_line < child_line);
+        assert!(child_line < standalone_line);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains('↳') && line.contains("bob")),
+            "child reply should show a nested connector: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with("    ↳ bob")),
+            "child reply should be indented away from parent comments: {rendered:?}"
+        );
+        assert_eq!(document.comment_at(child_line), Some(2));
+
+        app.focus_details();
+        app.selected_comment_index = 0;
+        app.move_comment(1);
+        assert_eq!(app.selected_comment_index, 2);
+        app.move_comment(1);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn long_comments_are_collapsed_until_toggled() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut long_comment = comment(
+            "rust-log-analyzer",
+            &(1..=45)
+                .map(|line| {
+                    if line == 45 {
+                        "final unique tail marker".to_string()
+                    } else {
+                        format!("line {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some("https://github.com/rust-lang/rust/pull/146097#issuecomment-3261964634"),
+        );
+        long_comment.id = Some(3_261_964_634);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![long_comment]));
+
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains("▸ collapsed"));
+        assert!(joined.contains("▸ show full comment"));
+        assert!(joined.contains("line 1"));
+        assert!(!joined.contains("final unique tail marker"));
+
+        let expand_line = rendered
+            .iter()
+            .position(|line| line.contains("show full comment"))
+            .expect("expand action line");
+        let expand_column = rendered[expand_line].find("show full comment").unwrap() as u16;
+        assert_eq!(
+            document.action_at(expand_line, expand_column),
+            Some(DetailAction::ToggleCommentExpanded(0))
+        );
+
+        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0));
+        let expanded = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(expanded.contains("▾ expanded"));
+        assert!(expanded.contains("final unique tail marker"));
+        assert!(!expanded.contains("show full comment"));
+        assert!(
+            app.ui_state()
+                .expanded_comments
+                .contains(&"1:comment:3261964634".to_string())
+        );
+    }
+
+    #[test]
     fn details_comments_show_inline_review_location() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let mut inline = own_comment(
@@ -12186,10 +13893,18 @@ diff --git a/src/github.rs b/src/github.rs
         inline.review = Some(crate::model::ReviewCommentPreview {
             path: "src/github.rs".to_string(),
             line: Some(876),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
             side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: Some(
+                "@@ -873,6 +873,7 @@ fn run_gh_json(args: &[String]) -> Result<String> {\n \n     let output = Command::new(\"gh\")\n         .env(\"GH_PROMPT_DISABLED\", \"1\")\n+       .env(\"GH_NO_UPDATE_NOTIFIER\", \"1\")\n         .args(args)\n         .output()\n         .await".to_string(),
+            ),
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+        app.focus_details();
 
         let rendered = build_details_document(&app, 120)
             .lines
@@ -12199,8 +13914,62 @@ diff --git a/src/github.rs b/src/github.rs
             .join("\n");
 
         assert!(rendered.contains("inline src/github.rs:876 right"));
+        assert!(rendered.contains("GH_NO_UPDATE_NOTIFIER"));
+        assert!(rendered.lines().any(|line| {
+            line.contains('>') && line.contains('+') && line.contains("GH_NO_UPDATE_NOTIFIER")
+        }));
         assert!(rendered.contains("This is a review comment?"));
         assert!(rendered.contains("comments: 1"));
+    }
+
+    #[test]
+    fn inline_review_context_can_fall_back_to_original_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut inline = comment(
+            "Copilot",
+            "This deployScript example omits capacity on the output Cell.",
+            Some("https://github.com/nervosnetwork/ckb-dev-skills/pull/2#discussion_r3014289695"),
+        );
+        let mut diff_hunk = "@@ -0,0 +1,240 @@\n".to_string();
+        for line in 1..=49 {
+            diff_hunk.push_str(&format!("+line {line}\n"));
+        }
+        diff_hunk.push_str("+outputsData: [ccc.bytesFrom(scriptBinary)],");
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "skill/deployment.md".to_string(),
+            line: Some(56),
+            original_line: Some(50),
+            start_line: Some(44),
+            original_start_line: Some(42),
+            side: Some("RIGHT".to_string()),
+            start_side: Some("RIGHT".to_string()),
+            diff_hunk: Some(diff_hunk),
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+        app.focus_details();
+
+        let rendered = build_details_document(&app, 140)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("inline skill/deployment.md:44-56 right"));
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains('+') && line.contains("line 42")),
+            "range comments should keep the selected range in view"
+        );
+        assert!(rendered.lines().any(|line| {
+            line.contains('>') && line.contains('+') && line.contains("outputsData")
+        }));
+        assert!(
+            !rendered.contains("+line 1"),
+            "context should not fall back to the start of the hunk"
+        );
     }
 
     #[test]
@@ -12862,7 +14631,12 @@ diff --git a/src/github.rs b/src/github.rs
         inline.review = Some(crate::model::ReviewCommentPreview {
             path: "src/github.rs".to_string(),
             line: Some(876),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
             side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -12891,7 +14665,12 @@ diff --git a/src/github.rs b/src/github.rs
         inline.review = Some(crate::model::ReviewCommentPreview {
             path: "src/github.rs".to_string(),
             line: Some(876),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
             side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -13376,6 +15155,7 @@ diff --git a/src/github.rs b/src/github.rs
                 created_at: None,
                 updated_at: None,
                 url: None,
+                parent_id: None,
                 is_mine: false,
                 review: None,
             }]),
@@ -14668,6 +16448,7 @@ diff --git a/c.rs b/c.rs
             created_at: None,
             updated_at: None,
             url: url.map(str::to_string),
+            parent_id: None,
             is_mine: false,
             review: None,
         }
@@ -14681,6 +16462,7 @@ diff --git a/c.rs b/c.rs
             created_at: None,
             updated_at: None,
             url: url.map(str::to_string),
+            parent_id: None,
             is_mine: true,
             review: None,
         }

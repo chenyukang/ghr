@@ -55,6 +55,8 @@ pub struct CommentPreview {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<u64>,
     #[serde(default)]
     pub is_mine: bool,
     #[serde(default)]
@@ -66,8 +68,18 @@ pub struct ReviewCommentPreview {
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_start_line: Option<u64>,
     #[serde(default)]
     pub side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_hunk: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

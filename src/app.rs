@@ -33,7 +33,7 @@ use crate::github::{
     edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
     fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_section_page, search_global,
+    refresh_dashboard_with_progress, refresh_section_page, search_global,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -48,6 +48,10 @@ enum AppMsg {
     RefreshStarted,
     RefreshFinished {
         sections: Vec<SectionSnapshot>,
+        save_error: Option<String>,
+    },
+    RefreshSectionLoaded {
+        section: SectionSnapshot,
         save_error: Option<String>,
     },
     CommentsLoaded {
@@ -410,10 +414,13 @@ struct SectionPageRequest {
 
 pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
     let cached = store.load_all()?;
+    let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
-    app.show_startup_initializing();
+    if show_startup_dialog {
+        app.show_startup_initializing();
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     start_refresh(config.clone(), store.clone(), tx.clone());
@@ -453,6 +460,10 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     terminal.show_cursor()?;
 
     result
+}
+
+fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool {
+    cached.is_empty()
 }
 
 async fn run_loop(
@@ -696,19 +707,23 @@ fn sync_mouse_capture(
 fn start_refresh(config: Config, store: SnapshotStore, tx: UnboundedSender<AppMsg>) {
     let _ = tx.send(AppMsg::RefreshStarted);
     tokio::spawn(async move {
-        let sections = refresh_dashboard(&config).await;
         let mut save_error = None;
-        for section in &sections {
-            if section.error.is_some() {
-                continue;
-            }
-            if let Err(error) = store.save_section(section) {
+        let sections = refresh_dashboard_with_progress(&config, |section| {
+            if save_error.is_none()
+                && section.error.is_none()
+                && let Err(error) = store.save_section(section)
+            {
                 let message = error.to_string();
                 warn!(error = %message, "failed to save refreshed snapshot");
                 save_error = Some(message);
-                break;
             }
-        }
+
+            let _ = tx.send(AppMsg::RefreshSectionLoaded {
+                section: section.clone(),
+                save_error: save_error.clone(),
+            });
+        })
+        .await;
         let _ = tx.send(AppMsg::RefreshFinished {
             sections,
             save_error,
@@ -2747,7 +2762,7 @@ fn startup_dialog_content(
         StartupDialog::Initializing => (
             "Initializing",
             vec![
-                Line::from("ghr is preparing your GitHub workspace."),
+                Line::from("ghr is preparing your GitHub workspace for the first time."),
                 Line::from(""),
                 startup_loading_line(elapsed_secs),
                 startup_progress_line(elapsed_secs),
@@ -2755,7 +2770,7 @@ fn startup_dialog_content(
                 key_value_line("config.toml", paths.config_path.display().to_string()),
                 key_value_line("database", paths.db_path.display().to_string()),
                 Line::from(""),
-                Line::from("Loading cache and refreshing remote data. Please wait..."),
+                Line::from("Loading cache and refreshing remote data. Please wait ..."),
             ],
             false,
         ),
@@ -6357,12 +6372,60 @@ impl AppState {
         self.status = "initializing; refreshing from GitHub".to_string();
     }
 
+    fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
+        let anchor = self.current_refresh_anchor();
+        let previous_details_scroll = self.details_scroll;
+        let previous_comment_index = self.selected_comment_index;
+        let title = section.title.clone();
+        let section_error = section.error.clone();
+        let setup_dialog = section_error.as_deref().and_then(setup_dialog_from_error);
+
+        let current = std::mem::take(&mut self.sections);
+        self.sections = merge_refreshed_sections(current, vec![section]);
+
+        let restored_item = self.restore_refresh_anchor(&anchor);
+        if restored_item {
+            self.details_scroll = previous_details_scroll;
+            self.selected_comment_index = previous_comment_index;
+            if let Some(item_id) = anchor.item_id {
+                self.details_stale.insert(item_id);
+            }
+            self.clamp_selected_comment();
+        } else {
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+        }
+
+        if self.setup_dialog.is_none() {
+            self.setup_dialog = setup_dialog;
+        }
+        if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
+            self.startup_dialog = if self.setup_dialog.is_some() {
+                None
+            } else {
+                Some(StartupDialog::Ready)
+            };
+        }
+
+        self.status = match (section_error.as_deref(), save_error) {
+            (None, None) => format!("loaded {title}; still refreshing"),
+            (Some(error), None) => refresh_error_status(1, Some(error)),
+            (_, Some(error)) => format!("snapshot save failed: {error}"),
+        };
+    }
+
     fn handle_msg(&mut self, message: AppMsg) {
         match message {
             AppMsg::RefreshStarted => {
                 self.refreshing = true;
                 self.last_refresh_request = Instant::now();
                 self.status = "refreshing from GitHub".to_string();
+            }
+            AppMsg::RefreshSectionLoaded {
+                section,
+                save_error,
+            } => {
+                self.apply_refreshed_section(section, save_error);
             }
             AppMsg::RefreshFinished {
                 sections,
@@ -9856,6 +9919,87 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("2 item(s) across 1 section(s)"));
         assert!(text.contains("/tmp/ghr-test/config.toml"));
         assert!(text.contains("? anytime"));
+    }
+
+    #[test]
+    fn startup_dialog_is_only_needed_without_cached_snapshots() {
+        assert!(should_show_startup_dialog(&HashMap::new()));
+
+        let cached = HashMap::from([("pull_requests:test".to_string(), test_section())]);
+        assert!(!should_show_startup_dialog(&cached));
+    }
+
+    #[test]
+    fn refresh_finished_does_not_open_ready_dialog_without_startup_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert_eq!(app.startup_dialog, None);
+        assert_eq!(app.status, "refresh complete");
+    }
+
+    #[test]
+    fn progressive_refresh_section_renders_before_full_refresh_finishes() {
+        let mut empty = test_section();
+        empty.items.clear();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![empty]);
+        app.show_startup_initializing();
+        app.refreshing = true;
+
+        app.handle_msg(AppMsg::RefreshSectionLoaded {
+            section: test_section(),
+            save_error: None,
+        });
+
+        assert_eq!(app.startup_dialog, Some(StartupDialog::Ready));
+        assert!(app.refreshing);
+        assert_eq!(app.sections[0].items.len(), 2);
+        assert_eq!(
+            app.current_item().map(|item| item.title.as_str()),
+            Some("Compiler diagnostics")
+        );
+        assert_eq!(app.status, "loaded Test; still refreshing");
+    }
+
+    #[test]
+    fn full_refresh_after_progress_does_not_reopen_ready_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_startup_initializing();
+
+        app.handle_msg(AppMsg::RefreshSectionLoaded {
+            section: test_section(),
+            save_error: None,
+        });
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert_eq!(app.startup_dialog, Some(StartupDialog::Ready));
+        assert_eq!(app.status, "refresh complete");
+    }
+
+    #[test]
+    fn dismissed_startup_ready_dialog_stays_closed_after_full_refresh() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_startup_initializing();
+
+        app.handle_msg(AppMsg::RefreshSectionLoaded {
+            section: test_section(),
+            save_error: None,
+        });
+        app.dismiss_startup_dialog();
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert_eq!(app.startup_dialog, None);
+        assert_eq!(app.status, "refresh complete");
     }
 
     #[test]

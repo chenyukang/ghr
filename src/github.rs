@@ -221,6 +221,16 @@ struct PullRequestHeadRefRaw {
 }
 
 pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
+    refresh_dashboard_with_progress(config, |_| {}).await
+}
+
+pub async fn refresh_dashboard_with_progress<F>(
+    config: &Config,
+    mut on_section: F,
+) -> Vec<SectionSnapshot>
+where
+    F: FnMut(&SectionSnapshot),
+{
     let started = Instant::now();
     let viewer_login = match cached_viewer_login().await {
         Ok(login) => Some(login),
@@ -229,9 +239,13 @@ pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
             None
         }
     };
-    let mut searches = refresh_search_sections(config, viewer_login.as_deref()).await;
+    let mut searches =
+        refresh_search_sections(config, viewer_login.as_deref(), &mut on_section).await;
     pace_search_refresh().await;
     let mut notifications = refresh_notification_sections(config).await;
+    for section in &notifications {
+        on_section(section);
+    }
     searches.append(&mut notifications);
     info!(
         sections = searches.len(),
@@ -302,6 +316,7 @@ pub async fn search_global(
 async fn refresh_search_sections(
     config: &Config,
     viewer_login: Option<&str>,
+    on_section: &mut impl FnMut(&SectionSnapshot),
 ) -> Vec<SectionSnapshot> {
     let excludes = config.exclude_repos.clone();
     let mut jobs = Vec::new();
@@ -371,17 +386,17 @@ async fn refresh_search_sections(
         if !sections.is_empty() {
             pace_search_refresh().await;
         }
-        sections.push(
-            refresh_search_section(
-                job.view,
-                job.kind,
-                job.section,
-                job.limit,
-                1,
-                excludes.as_slice(),
-            )
-            .await,
-        );
+        let section = refresh_search_section(
+            job.view,
+            job.kind,
+            job.section,
+            job.limit,
+            1,
+            excludes.as_slice(),
+        )
+        .await;
+        on_section(&section);
+        sections.push(section);
     }
     sections
 }

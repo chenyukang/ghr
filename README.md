@@ -192,4 +192,4 @@ The release workflow verifies that the tag matches `Cargo.toml`, publishes `ghr-
 
 ## Design Notes
 
-`ghr` is inspired by tools like `ghui` and `gh-dash`, but it is not a strict rewrite. The main goal is a responsive Rust TUI that opens instantly from cached state, then refreshes GitHub data in the background.
+`ghr` is inspired by tools like `gh-dash`, but it is not a strict rewrite. The main goal is a responsive Rust TUI that opens instantly from cached state, then refreshes GitHub data in the background.

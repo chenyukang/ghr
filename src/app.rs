@@ -16,7 +16,7 @@ use crossterm::terminal::{
 };
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -44,7 +44,32 @@ use crate::model::{
     section_counts, section_view_key,
 };
 use crate::snapshot::SnapshotStore;
-use crate::state::{DEFAULT_LIST_WIDTH_PERCENT, UiState, clamp_list_width_percent};
+use crate::state::UiState;
+
+mod diff;
+mod layout;
+mod search;
+mod status;
+mod text;
+
+use diff::{
+    DiffFile, DiffLine, DiffLineKind, PullRequestDiff, parse_inline_diff_hunk,
+    parse_pull_request_diff,
+};
+use layout::{
+    block_inner, body_areas_with_ratio, centered_rect, centered_rect_width,
+    centered_rect_with_size, details_area_for, page_areas, rect_contains,
+    split_percent_from_column, splitter_contains,
+};
+#[cfg(test)]
+use layout::{body_area, body_areas};
+use search::{filtered_indices, fuzzy_score};
+use status::{
+    comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
+    pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
+    pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
+};
+use text::{display_width, normalize_text, truncate_inline, truncate_text};
 
 enum AppMsg {
     RefreshStarted,
@@ -1961,83 +1986,6 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
 }
 
-#[cfg(test)]
-fn body_area(area: Rect) -> Rect {
-    page_areas(area)[2]
-}
-
-fn details_area_for(app: &AppState, area: Rect) -> Rect {
-    let chunks = page_areas(area);
-    if app.mouse_capture_enabled {
-        body_areas_with_ratio(chunks[2], app.list_width_percent)[1]
-    } else {
-        chunks[2]
-    }
-}
-
-fn page_areas(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(2),
-        ])
-        .split(area)
-}
-
-#[cfg(test)]
-fn body_areas(area: Rect) -> std::rc::Rc<[Rect]> {
-    body_areas_with_ratio(area, DEFAULT_LIST_WIDTH_PERCENT)
-}
-
-fn body_areas_with_ratio(area: Rect, list_width_percent: u16) -> std::rc::Rc<[Rect]> {
-    let list_width_percent = clamp_list_width_percent(list_width_percent);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(list_width_percent),
-            Constraint::Percentage(100 - list_width_percent),
-        ])
-        .split(area)
-}
-
-fn block_inner(area: Rect) -> Rect {
-    Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    }
-}
-
-fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
-    x >= area.x
-        && x < area.x.saturating_add(area.width)
-        && y >= area.y
-        && y < area.y.saturating_add(area.height)
-}
-
-fn splitter_contains(body: Rect, list: Rect, details: Rect, x: u16, y: u16) -> bool {
-    if !rect_contains(body, x, y) {
-        return false;
-    }
-
-    let list_border = list.x.saturating_add(list.width).saturating_sub(1);
-    x == list_border || x == details.x
-}
-
-fn split_percent_from_column(body: Rect, column: u16) -> u16 {
-    if body.width == 0 {
-        return DEFAULT_LIST_WIDTH_PERCENT;
-    }
-
-    let left_width = column.saturating_sub(body.x).min(body.width);
-    let percent = (u32::from(left_width) * 100 + u32::from(body.width) / 2) / u32::from(body.width);
-    clamp_list_width_percent(percent as u16)
-}
-
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let views = app.view_tabs();
     let titles = views
@@ -3647,24 +3595,6 @@ fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static>
     ])
 }
 
-fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
-    let width = centered_rect_width(width_percent, area);
-    let height = height.min(area.height);
-    centered_rect_with_size(width, height, area)
-}
-
-fn centered_rect_width(width_percent: u16, area: Rect) -> u16 {
-    let mut width = area.width.saturating_mul(width_percent).saturating_div(100);
-    width = width.max(48.min(area.width)).min(area.width);
-    width
-}
-
-fn centered_rect_with_size(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width, height)
-}
-
 #[derive(Debug, Clone)]
 struct DetailsDocument {
     lines: Vec<Line<'static>>,
@@ -3762,50 +3692,11 @@ struct DiffLineRegion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PullRequestDiff {
-    files: Vec<DiffFile>,
-    additions: usize,
-    deletions: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffFile {
-    old_path: String,
-    new_path: String,
-    metadata: Vec<String>,
-    hunks: Vec<DiffHunk>,
-    additions: usize,
-    deletions: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DiffTreeEntry {
     file_index: Option<usize>,
     label: String,
     stats: String,
     depth: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffHunk {
-    header: String,
-    lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffLine {
-    kind: DiffLineKind,
-    old_line: Option<usize>,
-    new_line: Option<usize>,
-    text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffLineKind {
-    Context,
-    Added,
-    Removed,
-    Metadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5712,45 +5603,6 @@ fn push_inline_review_context(
     builder.width = original_width;
 }
 
-fn parse_inline_diff_hunk(raw: &str) -> Option<DiffHunk> {
-    let mut hunk: Option<DiffHunk> = None;
-    let mut file = DiffFile {
-        old_path: "-".to_string(),
-        new_path: "-".to_string(),
-        metadata: Vec::new(),
-        hunks: Vec::new(),
-        additions: 0,
-        deletions: 0,
-    };
-    let mut old_line = 0_usize;
-    let mut new_line = 0_usize;
-
-    for raw_line in raw.replace('\r', "").lines() {
-        if raw_line.starts_with("@@ ") {
-            let (next_old, next_new) = parse_hunk_line_starts(raw_line);
-            old_line = next_old;
-            new_line = next_new;
-            hunk = Some(DiffHunk {
-                header: raw_line.to_string(),
-                lines: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(current_hunk) = hunk.as_mut() {
-            push_diff_hunk_line(
-                &mut file,
-                current_hunk,
-                raw_line,
-                &mut old_line,
-                &mut new_line,
-            );
-        }
-    }
-
-    hunk.filter(|hunk| !hunk.lines.is_empty())
-}
-
 type InlineDiffTarget<'a> = (usize, Option<&'a str>);
 type InlineDiffRangeTarget<'a> = (InlineDiffTarget<'a>, InlineDiffTarget<'a>);
 
@@ -7184,270 +7036,6 @@ fn comment_thread_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn display_width(text: &str) -> usize {
-    text.chars().count()
-}
-
-fn normalize_text(text: &str) -> String {
-    text.replace('\r', "")
-        .replace('\t', "    ")
-        .trim()
-        .to_string()
-}
-
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    truncated.push_str("\n...");
-    truncated
-}
-
-fn parse_pull_request_diff(raw: &str) -> std::result::Result<PullRequestDiff, String> {
-    let mut diff = PullRequestDiff {
-        files: Vec::new(),
-        additions: 0,
-        deletions: 0,
-    };
-    let mut file: Option<DiffFile> = None;
-    let mut hunk: Option<DiffHunk> = None;
-    let mut old_line = 0_usize;
-    let mut new_line = 0_usize;
-
-    for raw_line in raw.replace('\r', "").lines() {
-        if raw_line.starts_with("diff --git ") {
-            flush_diff_file(&mut diff, &mut file, &mut hunk);
-            let (old_path, new_path) = parse_diff_git_paths(raw_line);
-            file = Some(DiffFile {
-                old_path,
-                new_path,
-                metadata: Vec::new(),
-                hunks: Vec::new(),
-                additions: 0,
-                deletions: 0,
-            });
-            continue;
-        }
-
-        let Some(current_file) = file.as_mut() else {
-            continue;
-        };
-
-        if raw_line.starts_with("@@ ") {
-            flush_diff_hunk(current_file, &mut hunk);
-            let (next_old, next_new) = parse_hunk_line_starts(raw_line);
-            old_line = next_old;
-            new_line = next_new;
-            hunk = Some(DiffHunk {
-                header: raw_line.to_string(),
-                lines: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(current_hunk) = hunk.as_mut() {
-            push_diff_hunk_line(
-                current_file,
-                current_hunk,
-                raw_line,
-                &mut old_line,
-                &mut new_line,
-            );
-        } else if let Some(path) = raw_line.strip_prefix("--- ") {
-            current_file.old_path = normalize_diff_path(path.trim());
-        } else if let Some(path) = raw_line.strip_prefix("+++ ") {
-            current_file.new_path = normalize_diff_path(path.trim());
-        } else if !raw_line.trim().is_empty() {
-            current_file.metadata.push(raw_line.to_string());
-        }
-    }
-
-    flush_diff_file(&mut diff, &mut file, &mut hunk);
-    diff.additions = diff.files.iter().map(|file| file.additions).sum();
-    diff.deletions = diff.files.iter().map(|file| file.deletions).sum();
-    Ok(diff)
-}
-
-fn flush_diff_file(
-    diff: &mut PullRequestDiff,
-    file: &mut Option<DiffFile>,
-    hunk: &mut Option<DiffHunk>,
-) {
-    if let Some(current_file) = file.as_mut() {
-        flush_diff_hunk(current_file, hunk);
-    }
-    if let Some(current_file) = file.take() {
-        diff.files.push(current_file);
-    }
-}
-
-fn flush_diff_hunk(file: &mut DiffFile, hunk: &mut Option<DiffHunk>) {
-    if let Some(current_hunk) = hunk.take() {
-        file.hunks.push(current_hunk);
-    }
-}
-
-fn parse_diff_git_paths(line: &str) -> (String, String) {
-    let mut parts = line
-        .strip_prefix("diff --git ")
-        .unwrap_or_default()
-        .split_whitespace();
-    let old_path = parts
-        .next()
-        .map(normalize_diff_path)
-        .unwrap_or_else(|| "-".to_string());
-    let new_path = parts
-        .next()
-        .map(normalize_diff_path)
-        .unwrap_or_else(|| old_path.clone());
-    (old_path, new_path)
-}
-
-fn normalize_diff_path(path: &str) -> String {
-    let path = path.trim().trim_matches('"');
-    if path == "/dev/null" {
-        return path.to_string();
-    }
-    path.strip_prefix("a/")
-        .or_else(|| path.strip_prefix("b/"))
-        .unwrap_or(path)
-        .to_string()
-}
-
-fn parse_hunk_line_starts(header: &str) -> (usize, usize) {
-    let mut parts = header.split_whitespace();
-    let _marker = parts.next();
-    let old = parts.next().and_then(parse_diff_range).unwrap_or(0);
-    let new = parts.next().and_then(parse_diff_range).unwrap_or(0);
-    (old, new)
-}
-
-fn parse_diff_range(range: &str) -> Option<usize> {
-    let range = range.trim_start_matches(['-', '+']);
-    range
-        .split_once(',')
-        .map(|(start, _)| start)
-        .unwrap_or(range)
-        .parse()
-        .ok()
-}
-
-fn push_diff_hunk_line(
-    file: &mut DiffFile,
-    hunk: &mut DiffHunk,
-    raw_line: &str,
-    old_line: &mut usize,
-    new_line: &mut usize,
-) {
-    let line = if raw_line.starts_with('+') && !raw_line.starts_with("+++") {
-        file.additions += 1;
-        let line = DiffLine {
-            kind: DiffLineKind::Added,
-            old_line: None,
-            new_line: Some(*new_line),
-            text: raw_line[1..].to_string(),
-        };
-        *new_line = new_line.saturating_add(1);
-        line
-    } else if raw_line.starts_with('-') && !raw_line.starts_with("---") {
-        file.deletions += 1;
-        let line = DiffLine {
-            kind: DiffLineKind::Removed,
-            old_line: Some(*old_line),
-            new_line: None,
-            text: raw_line[1..].to_string(),
-        };
-        *old_line = old_line.saturating_add(1);
-        line
-    } else if let Some(text) = raw_line.strip_prefix(' ') {
-        let line = DiffLine {
-            kind: DiffLineKind::Context,
-            old_line: Some(*old_line),
-            new_line: Some(*new_line),
-            text: text.to_string(),
-        };
-        *old_line = old_line.saturating_add(1);
-        *new_line = new_line.saturating_add(1);
-        line
-    } else {
-        DiffLine {
-            kind: DiffLineKind::Metadata,
-            old_line: None,
-            new_line: None,
-            text: raw_line.trim_start_matches('\\').trim_start().to_string(),
-        }
-    };
-    hunk.lines.push(line);
-}
-
-fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
-    let Some(first_error) = first_error else {
-        return format!("refresh complete with {count} failed section(s)");
-    };
-
-    if first_error.contains("GitHub CLI `gh` is required") {
-        return "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string();
-    }
-
-    if first_error.contains("Run `gh auth login`") {
-        return "GitHub CLI auth required: run `gh auth login`".to_string();
-    }
-
-    if is_github_search_rate_limit(first_error) {
-        return format!(
-            "GitHub search rate limited; using cached data ({count} failed section(s))"
-        );
-    }
-
-    format!("refresh complete with {count} failed section(s)")
-}
-
-fn compact_error_label(error: &str) -> String {
-    if error.contains("GitHub CLI `gh` is required") {
-        return "GitHub CLI missing".to_string();
-    }
-
-    if error.contains("Run `gh auth login`") {
-        return "GitHub CLI auth required".to_string();
-    }
-
-    if is_github_search_rate_limit(error) {
-        return "GitHub search rate limited".to_string();
-    }
-
-    let summary = error
-        .split_once(" failed: ")
-        .map(|(_, message)| message)
-        .unwrap_or(error)
-        .trim();
-    truncate_inline(summary, 80)
-}
-
-fn is_github_search_rate_limit(error: &str) -> bool {
-    error
-        .to_ascii_lowercase()
-        .contains("api rate limit exceeded")
-}
-
-fn truncate_inline(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-
-    if max_chars <= 3 {
-        return "...".chars().take(max_chars).collect();
-    }
-
-    let mut truncated = text
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
 fn is_comment_submit_key(key: KeyEvent) -> bool {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return false;
@@ -7463,79 +7051,6 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
 
 fn is_diff_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'v'))
-}
-
-fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
-    if error.contains("GitHub CLI `gh` is required") {
-        return Some(SetupDialog::MissingGh);
-    }
-
-    if error.contains("Run `gh auth login`") {
-        return Some(SetupDialog::AuthRequired);
-    }
-
-    None
-}
-
-fn message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
-    MessageDialog {
-        title: title.into(),
-        body: body.into(),
-        auto_close_at: None,
-    }
-}
-
-fn success_message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
-    MessageDialog {
-        title: title.into(),
-        body: body.into(),
-        auto_close_at: Some(Instant::now() + SUCCESS_DIALOG_AUTO_CLOSE),
-    }
-}
-
-fn pr_action_success_title(action: PrAction) -> &'static str {
-    match action {
-        PrAction::Merge => "Pull Request Merged",
-        PrAction::Close => "Pull Request Closed",
-        PrAction::Approve => "Pull Request Approved",
-    }
-}
-
-fn pr_action_success_body(action: PrAction) -> &'static str {
-    match action {
-        PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
-        PrAction::Close => "GitHub accepted the close action. Refreshing details.",
-        PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
-    }
-}
-
-fn pr_action_error_title(action: PrAction) -> &'static str {
-    match action {
-        PrAction::Merge => "Merge Failed",
-        PrAction::Close => "Close Failed",
-        PrAction::Approve => "Approve Failed",
-    }
-}
-
-fn pr_action_error_status(action: PrAction) -> &'static str {
-    match action {
-        PrAction::Merge => "pull request merge failed",
-        PrAction::Close => "pull request close failed",
-        PrAction::Approve => "pull request approval failed",
-    }
-}
-
-fn pr_action_error_body(error: &str) -> String {
-    operation_error_body(error)
-}
-
-fn operation_error_body(error: &str) -> String {
-    let message = error
-        .split_once(" failed: ")
-        .map(|(_, message)| message)
-        .unwrap_or(error)
-        .trim();
-    truncate_inline(message, 900)
 }
 
 fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
@@ -7569,27 +7084,6 @@ fn details_snapshot_hash(item: &WorkItem) -> String {
 fn comments_snapshot_hash(comments: &[CommentPreview]) -> String {
     let bytes = serde_json::to_vec(comments).unwrap_or_default();
     format!("{:x}", md5::compute(bytes))
-}
-
-fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog {
-    match mode {
-        PendingCommentMode::Post => message_dialog(
-            "Posting Comment",
-            "Waiting for GitHub to accept the comment...",
-        ),
-        PendingCommentMode::ReviewReply { .. } => message_dialog(
-            "Posting Review Reply",
-            "Waiting for GitHub to accept the review reply...",
-        ),
-        PendingCommentMode::Edit { .. } => message_dialog(
-            "Updating Comment",
-            "Waiting for GitHub to accept the update...",
-        ),
-        PendingCommentMode::Review { .. } => message_dialog(
-            "Posting Review Comment",
-            "Waiting for GitHub to accept the review comment...",
-        ),
-    }
 }
 
 impl AppState {
@@ -10518,26 +10012,6 @@ impl AppState {
     }
 }
 
-fn filtered_indices(section: &SectionSnapshot, query: &str) -> Vec<usize> {
-    let query = query.trim();
-    if query.is_empty() {
-        return (0..section.items.len()).collect();
-    }
-
-    let mut scored = section
-        .items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| fuzzy_score_item(item, query).map(|score| (index, score)))
-        .collect::<Vec<_>>();
-    scored.sort_by(|(left_index, left_score), (right_index, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_index.cmp(right_index))
-    });
-    scored.into_iter().map(|(index, _)| index).collect()
-}
-
 fn comment_search_matches(comments: &[CommentPreview], query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
@@ -10641,87 +10115,6 @@ fn searchable_comment_text(comment: &CommentPreview) -> String {
         }
     }
     parts.join(" ").to_lowercase()
-}
-
-fn fuzzy_score_item(item: &WorkItem, query: &str) -> Option<i64> {
-    let haystack = searchable_text(item);
-    let mut total = 0;
-    for token in query.split_whitespace() {
-        total += fuzzy_score(token, &haystack)?;
-    }
-    Some(total)
-}
-
-fn searchable_text(item: &WorkItem) -> String {
-    let mut parts = vec![item.repo.clone(), item.title.clone(), item.url.clone()];
-    if let Some(number) = item.number {
-        parts.push(format!("#{number}"));
-        parts.push(number.to_string());
-    }
-    if let Some(author) = &item.author {
-        parts.push(author.clone());
-    }
-    if let Some(state) = &item.state {
-        parts.push(state.clone());
-    }
-    if let Some(reason) = &item.reason {
-        parts.push(reason.clone());
-    }
-    if let Some(extra) = &item.extra {
-        parts.push(extra.clone());
-    }
-    if let Some(body) = &item.body {
-        parts.push(body.clone());
-    }
-    parts.extend(item.labels.iter().cloned());
-    parts.join(" ").to_lowercase()
-}
-
-fn fuzzy_score(query: &str, haystack: &str) -> Option<i64> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return Some(0);
-    }
-    if let Some(index) = haystack.find(&query) {
-        return Some(10_000 - index as i64);
-    }
-
-    let mut score = 0;
-    let mut search_start = 0;
-    let mut previous_match = None;
-    for needle in query.chars() {
-        let mut matched = None;
-        for (offset, candidate) in haystack[search_start..].char_indices() {
-            if candidate == needle {
-                matched = Some(search_start + offset);
-                break;
-            }
-        }
-
-        let index = matched?;
-        score += 100;
-        if let Some(previous) = previous_match {
-            let gap = index.saturating_sub(previous + 1);
-            if gap > 32 {
-                return None;
-            }
-            if gap == 0 {
-                score += 30;
-            } else {
-                score -= gap.min(30) as i64;
-            }
-        } else {
-            score -= index.min(50) as i64;
-        }
-        if index == 0 || haystack[..index].ends_with([' ', '/', '#', '-', '_']) {
-            score += 20;
-        }
-
-        previous_match = Some(index);
-        search_start = index + needle.len_utf8();
-    }
-
-    Some(score)
 }
 
 fn move_bounded(current: usize, len: usize, delta: isize) -> usize {

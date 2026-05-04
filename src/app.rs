@@ -68,8 +68,9 @@ use layout::{body_area, body_areas};
 use search::{filtered_indices, fuzzy_score};
 use status::{
     comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
-    pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
-    pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
+    persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
+    pr_action_error_title, pr_action_success_body, pr_action_success_title, refresh_error_status,
+    setup_dialog_from_error, success_message_dialog,
 };
 use text::{display_width, normalize_text, truncate_inline, truncate_text};
 
@@ -279,7 +280,15 @@ struct PrCheckoutPlan {
 struct MessageDialog {
     title: String,
     body: String,
+    kind: MessageDialogKind,
     auto_close_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageDialogKind {
+    Info,
+    Success,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3431,11 +3440,7 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
         "Enter/Esc: close"
     };
     let text = format!("{}\n\n{footer}", dialog.body);
-    let accent = if dialog.auto_close_at.is_some() {
-        Color::LightGreen
-    } else {
-        Color::LightRed
-    };
+    let accent = message_dialog_accent(dialog);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
@@ -3451,6 +3456,14 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+}
+
+fn message_dialog_accent(dialog: &MessageDialog) -> Color {
+    match dialog.kind {
+        MessageDialogKind::Info => Color::Yellow,
+        MessageDialogKind::Success => Color::LightGreen,
+        MessageDialogKind::Error => Color::LightRed,
+    }
 }
 
 fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -8046,7 +8059,7 @@ impl AppState {
                 match result {
                     Ok(result) => {
                         self.status = "pull request checked out locally".to_string();
-                        self.message_dialog = Some(message_dialog(
+                        self.message_dialog = Some(persistent_success_message_dialog(
                             pr_action_success_title(PrAction::Checkout),
                             format!(
                                 "{}\n\n{}\n\n{}",
@@ -14971,6 +14984,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request merged; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Merged");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
     }
 
@@ -14993,6 +15008,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request approved; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Approved");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
     }
 
@@ -15017,6 +15034,8 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -15046,6 +15065,8 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(dialog.body.contains("Checkout runs from /tmp/rust."));
         assert!(dialog.body.contains("Switched to branch"));
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -15069,6 +15090,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(dialog.title, "Checkout Failed");
         assert!(dialog.body.contains("Checkout runs from /tmp."));
         assert!(dialog.body.contains("fatal: not a git repository"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -15099,6 +15122,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.message_dialog = Some(MessageDialog {
             title: "Comment Posted".to_string(),
             body: "ok".to_string(),
+            kind: MessageDialogKind::Success,
             auto_close_at: Some(deadline),
         });
 
@@ -15120,6 +15144,14 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("blocking dialog");
         assert_eq!(dialog.title, "Comment Failed");
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pending_message_dialog_is_not_error_colored() {
+        let dialog = comment_pending_dialog(&PendingCommentMode::Post);
+
+        assert_eq!(dialog.kind, MessageDialogKind::Info);
+        assert_ne!(message_dialog_accent(&dialog), Color::LightRed);
     }
 
     #[test]

@@ -39,10 +39,10 @@ review.
 | --- | --- | --- | --- | --- | --- |
 | Mark draft / ready for review | `codex/pr-draft-ready-actions` | Chandrasekhar | In review | [#15](https://github.com/chenyukang/ghr/pull/15) | Add PR lifecycle actions and refresh details afterward. |
 | Update branch | `codex/pr-update-branch` | Boyle | In review | [#18](https://github.com/chenyukang/ghr/pull/18) | Use GitHub branch update API/CLI where available. |
-| Enable / disable auto-merge | `codex/pr-auto-merge-actions` | Later wave | Todo | - | Requires merge method choice and repository capability checks. |
-| Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Later wave | Todo | - | Existing merge confirmation should expose method selection. |
-| Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Later wave | Todo | - | Existing approve and inline comment flows are a starting point. |
-| Rerun failed checks | `codex/pr-rerun-checks` | Later wave | Todo | - | Needs check-suite/job discovery and a safe rerun action. |
+| Enable / disable auto-merge | `codex/pr-auto-merge-actions` | Ramanujan | In progress | - | Requires merge method choice and repository capability checks. |
+| Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Newton | In progress | - | Existing merge confirmation should expose method selection. |
+| Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Kierkegaard | In progress | - | Existing approve and inline comment flows are a starting point. |
+| Rerun failed checks | `codex/pr-rerun-checks` | James | In progress | - | Needs check-suite/job discovery and a safe rerun action. |
 | Checkout PR locally | `codex/pr-checkout-local` | Cicero | In review | [#19](https://github.com/chenyukang/ghr/pull/19) | Should run a local checkout command with a clear confirmation/status. |
 
 ## Agent queue
@@ -58,3 +58,7 @@ review.
 | Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In review: [#21](https://github.com/chenyukang/ghr/pull/21) |
 | Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In review: [#18](https://github.com/chenyukang/ghr/pull/18) |
 | Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In review: [#19](https://github.com/chenyukang/ghr/pull/19) |
+| Ramanujan | Enable / disable auto-merge | `~/.codex/worktrees/ghr-pr-auto-merge-actions` | `codex/pr-auto-merge-actions` | In progress |
+| Newton | Merge method selection | `~/.codex/worktrees/ghr-pr-merge-methods` | `codex/pr-merge-methods` | In progress |
+| Kierkegaard | Full PR review submit flow | `~/.codex/worktrees/ghr-pr-review-submit-flow` | `codex/pr-review-submit-flow` | In progress |
+| James | Rerun failed checks | `~/.codex/worktrees/ghr-pr-rerun-checks` | `codex/pr-rerun-checks` | In progress |

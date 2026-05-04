@@ -40,10 +40,18 @@ pub struct WorkItem {
     pub url: String,
     pub updated_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<Milestone>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,
     pub extra: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub number: u64,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

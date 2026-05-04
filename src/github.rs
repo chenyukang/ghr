@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReviewCommentPreview, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key, repo_section_filters,
-    repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, Milestone, ReviewCommentPreview,
+    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
+    repo_section_filters, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -118,12 +118,25 @@ struct SearchApiIssueRaw {
     draft: Option<bool>,
     html_url: String,
     labels: Option<Vec<SearchLabelRaw>>,
+    milestone: Option<SearchMilestoneRaw>,
     number: u64,
     repository_url: String,
     state: Option<String>,
     title: String,
     updated_at: Option<DateTime<Utc>>,
     user: Option<SearchAuthorRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchMilestoneRaw {
+    number: u64,
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MilestoneRaw {
+    number: u64,
+    title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -951,6 +964,25 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+pub async fn fetch_open_milestones(repository: &str) -> Result<Vec<Milestone>> {
+    let output = run_gh_json(&open_milestones_args(repository)).await?;
+    parse_open_milestones_output(&output, repository)
+}
+
+pub async fn change_issue_milestone(
+    repository: &str,
+    issue_number: u64,
+    milestone: Option<u64>,
+) -> Result<()> {
+    run_gh_json(&change_issue_milestone_args(
+        repository,
+        issue_number,
+        milestone,
+    ))
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullRequestReviewCommentTarget<'a> {
     pub path: &'a str,
@@ -1680,6 +1712,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         url: item.url,
         updated_at: item.updated_at,
         labels,
+        milestone: None,
         comments: item.comments_count,
         unread: None,
         reason: None,
@@ -1716,6 +1749,10 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         url: item.html_url,
         updated_at: item.updated_at,
         labels,
+        milestone: item.milestone.map(|milestone| Milestone {
+            number: milestone.number,
+            title: milestone.title,
+        }),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -1724,6 +1761,47 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
             .filter(|is_draft| *is_draft)
             .map(|_| "draft".to_string()),
     }
+}
+
+fn open_milestones_args(repository: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        format!("repos/{repository}/milestones?state=open&per_page=100"),
+    ]
+}
+
+fn change_issue_milestone_args(
+    repository: &str,
+    issue_number: u64,
+    milestone: Option<u64>,
+) -> Vec<String> {
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{repository}/issues/{issue_number}"),
+        "-F".to_string(),
+    ];
+    args.push(match milestone {
+        Some(number) => format!("milestone={number}"),
+        None => "milestone=null".to_string(),
+    });
+    args
+}
+
+fn parse_open_milestones_output(output: &str, repository: &str) -> Result<Vec<Milestone>> {
+    let pages = serde_json::from_str::<Vec<Vec<MilestoneRaw>>>(output)
+        .with_context(|| format!("failed to parse milestones for {repository}"))?;
+    Ok(pages
+        .into_iter()
+        .flatten()
+        .map(|milestone| Milestone {
+            number: milestone.number,
+            title: milestone.title,
+        })
+        .collect())
 }
 
 fn repo_from_repository_url(url: &str) -> String {
@@ -1755,6 +1833,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         url,
         updated_at: notification.updated_at,
         labels: Vec::new(),
+        milestone: None,
         comments: None,
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
@@ -2014,6 +2093,10 @@ mod tests {
             labels: Some(vec![SearchLabelRaw {
                 name: "T-compiler".to_string(),
             }]),
+            milestone: Some(SearchMilestoneRaw {
+                number: 3,
+                title: "1.90".to_string(),
+            }),
             number: 1,
             repository_url: "https://api.github.com/repos/rust-lang/rust".to_string(),
             state: Some("open".to_string()),
@@ -2031,6 +2114,78 @@ mod tests {
         assert_eq!(mapped.author.as_deref(), Some("chenyukang"));
         assert_eq!(mapped.comments, Some(7));
         assert_eq!(mapped.labels, vec!["T-compiler"]);
+        assert_eq!(
+            mapped.milestone,
+            Some(Milestone {
+                number: 3,
+                title: "1.90".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn open_milestones_args_use_paginated_issue_metadata_api() {
+        assert_eq!(
+            open_milestones_args("owner/repo"),
+            vec![
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/owner/repo/milestones?state=open&per_page=100"
+            ]
+        );
+    }
+
+    #[test]
+    fn change_issue_milestone_args_patch_issue_metadata() {
+        assert_eq!(
+            change_issue_milestone_args("owner/repo", 42, Some(7)),
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/owner/repo/issues/42",
+                "-F",
+                "milestone=7"
+            ]
+        );
+        assert_eq!(
+            change_issue_milestone_args("owner/repo", 42, None),
+            vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/owner/repo/issues/42",
+                "-F",
+                "milestone=null"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_open_milestones_output_flattens_paginated_response() {
+        let output = r#"
+[
+  [{"number": 1, "title": "alpha"}],
+  [{"number": 2, "title": "beta"}]
+]
+"#;
+
+        let milestones = parse_open_milestones_output(output, "owner/repo").unwrap();
+
+        assert_eq!(
+            milestones,
+            vec![
+                Milestone {
+                    number: 1,
+                    title: "alpha".to_string(),
+                },
+                Milestone {
+                    number: 2,
+                    title: "beta".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -260,6 +260,7 @@ mod tests {
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
             updated_at: None,
             labels: Vec::new(),
+            assignees: Vec::new(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

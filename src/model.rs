@@ -40,6 +40,8 @@ pub struct WorkItem {
     pub url: String,
     pub updated_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,

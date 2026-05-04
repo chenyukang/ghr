@@ -30,12 +30,12 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    AssigneeAction, PullRequestReviewCommentTarget, approve_pull_request, close_pull_request,
+    edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, search_global, update_issue_assignees, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -110,6 +110,11 @@ enum AppMsg {
         item_id: String,
         action: PrAction,
         result: std::result::Result<(), String>,
+    },
+    AssigneesUpdated {
+        item_id: String,
+        action: AssigneeAction,
+        result: std::result::Result<WorkItem, String>,
     },
     NotificationReadFinished {
         thread_id: String,
@@ -255,6 +260,57 @@ struct PrActionDialog {
     action: PrAction,
 }
 
+#[derive(Debug, Clone)]
+struct AssigneeDialog {
+    item: WorkItem,
+    action: AssigneeAction,
+    input: String,
+}
+
+fn assignee_action_label(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "assign",
+        AssigneeAction::Unassign => "unassign",
+    }
+}
+
+fn assignee_action_success_title(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "Assignee Added",
+        AssigneeAction::Unassign => "Assignee Removed",
+    }
+}
+
+fn assignee_action_success_body(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "GitHub added the assignee and refreshed the item.",
+        AssigneeAction::Unassign => "GitHub removed the assignee and refreshed the item.",
+    }
+}
+
+fn assignee_action_error_title(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "Assign Failed",
+        AssigneeAction::Unassign => "Unassign Failed",
+    }
+}
+
+fn parse_assignee_input(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut assignees = Vec::new();
+    for raw in input.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+        let login = raw.trim().trim_start_matches('@').trim();
+        if login.is_empty() {
+            continue;
+        }
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            assignees.push(login.to_string());
+        }
+    }
+    assignees
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialog {
     title: String,
@@ -354,6 +410,8 @@ struct AppState {
     posting_comment: bool,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
+    assignee_dialog: Option<AssigneeDialog>,
+    assignee_action_running: bool,
     setup_dialog: Option<SetupDialog>,
     startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
@@ -743,6 +801,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.pr_action_dialog.is_some()
+        || app.assignee_dialog.is_some()
     {
         return None;
     }
@@ -1110,6 +1169,30 @@ fn start_pr_action(
     });
 }
 
+fn start_assignee_update(
+    item: WorkItem,
+    action: AssigneeAction,
+    assignees: Vec<String>,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                update_issue_assignees(&item.repo, number, item.kind, action, &assignees)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::AssigneesUpdated {
+            item_id,
+            action,
+            result,
+        });
+    });
+}
+
 #[cfg(test)]
 fn handle_key(
     app: &mut AppState,
@@ -1175,6 +1258,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.assignee_dialog.is_some() {
+        app.handle_assignee_dialog_key(key, tx);
+        return false;
+    }
+
     if app.comment_search_active {
         app.handle_comment_search_key(key, area);
         return false;
@@ -1226,6 +1314,8 @@ fn handle_key_in_area(
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
         KeyCode::Char('S') => app.start_global_search_input(),
+        KeyCode::Char('+') => app.start_assignee_dialog(AssigneeAction::Assign),
+        KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
         KeyCode::Tab => app.move_focused_tab_group(1),
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
@@ -1979,6 +2069,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_help_dialog(frame, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
+    } else if let Some(dialog) = &app.assignee_dialog {
+        draw_assignee_dialog(frame, dialog, app.assignee_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
@@ -2679,6 +2771,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
@@ -2693,6 +2786,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             }
         }
@@ -2717,6 +2811,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
@@ -2724,6 +2819,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(spans, "enter", "expand", Color::Yellow);
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
@@ -3068,6 +3164,61 @@ fn draw_pr_action_dialog(
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
             },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(68, 13, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let action = assignee_action_label(dialog.action);
+    let current = if dialog.item.assignees.is_empty() {
+        "-".to_string()
+    } else {
+        dialog.item.assignees.join(", ")
+    };
+    let status = if running {
+        "working...".to_string()
+    } else {
+        format!("Enter: {action} assignee(s)    Esc: cancel")
+    };
+    let lines = vec![
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("item", number),
+        key_value_line("current", current),
+        Line::from(""),
+        key_value_line("login(s)", format!("{}_", dialog.input)),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            status,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    ];
+    let title = match dialog.action {
+        AssigneeAction::Assign => "Assign Assignee",
+        AssigneeAction::Unassign => "Unassign Assignee",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3506,6 +3657,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
+        help_key_line("+ / -", "assign or unassign issue and PR assignees"),
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
@@ -3515,6 +3667,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
         help_key_line("a", "add a normal PR comment"),
+        help_key_line("+ / -", "assign or unassign PR assignees"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
@@ -3536,6 +3689,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("c in diff", "add review comment on selected diff line"),
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
+        help_key_line("+ / -", "assign or unassign issue and PR assignees"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("S", "search PRs and issues in the current repo"),
@@ -3547,6 +3701,10 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_heading("Pull Request Confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
         help_key_line("Esc", "cancel PR action"),
+        Line::from(""),
+        help_heading("Assignee Editor"),
+        help_key_line("Enter", "assign or unassign typed login(s)"),
+        help_key_line("Esc", "cancel assignee action"),
         Line::from(""),
         help_heading("Repo Search"),
         help_key_line("S", "open search input"),
@@ -3788,6 +3946,8 @@ enum DetailAction {
     ReplyComment(usize),
     EditComment(usize),
     ToggleCommentExpanded(usize),
+    AssignAssignee,
+    UnassignAssignee,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4578,6 +4738,11 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
     builder.push_link_value("url", &item.url);
 
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        builder.push_blank();
+        builder.push_meta_line(vec![("assignees", assignee_detail_segments(item))]);
+    }
+
     if !item.labels.is_empty() {
         builder.push_blank();
         builder.push_key_value("labels", item.labels.join(", "));
@@ -4747,6 +4912,34 @@ fn push_details_mode_tabs(builder: &mut DetailsBuilder, active: DetailsMode) {
         DetailSegment::styled(" | ", Style::default().fg(Color::DarkGray)),
         tab("Diff", DetailsMode::Diff),
     ]);
+}
+
+fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    if item.assignees.is_empty() {
+        segments.push(DetailSegment::raw("-"));
+    } else {
+        for (index, assignee) in item.assignees.iter().enumerate() {
+            if index > 0 {
+                segments.push(DetailSegment::raw(", "));
+            }
+            segments.push(DetailSegment::link(
+                assignee.clone(),
+                github_profile_url(assignee),
+            ));
+        }
+    }
+    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::action(
+        "+ assign",
+        DetailAction::AssignAssignee,
+    ));
+    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::action(
+        "- unassign",
+        DetailAction::UnassignAssignee,
+    ));
+    segments
 }
 
 fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: DiffRenderContext<'_>) {
@@ -7170,6 +7363,8 @@ impl AppState {
             posting_comment: false,
             pr_action_dialog: None,
             pr_action_running: false,
+            assignee_dialog: None,
+            assignee_action_running: false,
             setup_dialog: None,
             startup_dialog: None,
             message_dialog: None,
@@ -7618,6 +7813,46 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::AssigneesUpdated {
+                item_id,
+                action,
+                result,
+            } => {
+                self.assignee_action_running = false;
+                self.assignee_dialog = None;
+                match result {
+                    Ok(updated_item) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.replace_item(&item_id, updated_item);
+                        self.status = match action {
+                            AssigneeAction::Assign => "assignee added".to_string(),
+                            AssigneeAction::Unassign => "assignee removed".to_string(),
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            assignee_action_success_title(action),
+                            assignee_action_success_body(action),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                assignee_action_error_title(action),
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = match action {
+                            AssigneeAction::Assign => "assign failed".to_string(),
+                            AssigneeAction::Unassign => "unassign failed".to_string(),
+                        };
+                    }
+                }
+            }
             AppMsg::NotificationReadFinished { thread_id, result } => {
                 self.notification_read_pending.remove(&thread_id);
                 match result {
@@ -7765,6 +8000,16 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                }
+            }
+        }
+    }
+
+    fn replace_item(&mut self, item_id: &str, updated_item: WorkItem) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id == item_id {
+                    *item = updated_item.clone();
                 }
             }
         }
@@ -9044,6 +9289,8 @@ impl AppState {
                 self.select_comment(index);
                 self.toggle_selected_comment_expanded();
             }
+            DetailAction::AssignAssignee => self.start_assignee_dialog(AssigneeAction::Assign),
+            DetailAction::UnassignAssignee => self.start_assignee_dialog(AssigneeAction::Unassign),
         }
     }
 
@@ -9142,6 +9389,92 @@ impl AppState {
         submit(item, action);
     }
 
+    fn start_assignee_dialog(&mut self, action: AssigneeAction) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+            self.status = "selected item cannot have assignees".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.assignee_dialog = Some(AssigneeDialog {
+            item,
+            action,
+            input: String::new(),
+        });
+        self.assignee_action_running = false;
+        self.status = match action {
+            AssigneeAction::Assign => "enter assignee to add".to_string(),
+            AssigneeAction::Unassign => "enter assignee to remove".to_string(),
+        };
+    }
+
+    fn handle_assignee_dialog_key(&mut self, key: KeyEvent, tx: &UnboundedSender<AppMsg>) {
+        let tx = tx.clone();
+        self.handle_assignee_dialog_key_with_submit(key, move |item, action, assignees| {
+            start_assignee_update(item, action, assignees, tx.clone());
+        });
+    }
+
+    fn handle_assignee_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, AssigneeAction, Vec<String>),
+    {
+        if self.assignee_action_running {
+            self.status = "assignee action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.assignee_dialog = None;
+                self.status = "assignee action cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                self.submit_assignee_action(&mut submit);
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.assignee_dialog {
+                    dialog.input.pop();
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.assignee_dialog {
+                    dialog.input.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_assignee_action<F>(&mut self, submit: &mut F)
+    where
+        F: FnMut(WorkItem, AssigneeAction, Vec<String>),
+    {
+        let Some(dialog) = &self.assignee_dialog else {
+            return;
+        };
+        let assignees = parse_assignee_input(&dialog.input);
+        if assignees.is_empty() {
+            self.status = "assignee login is empty".to_string();
+            return;
+        }
+        let item = dialog.item.clone();
+        let action = dialog.action;
+        self.assignee_action_running = true;
+        self.status = match action {
+            AssigneeAction::Assign => "assigning assignee".to_string(),
+            AssigneeAction::Unassign => "removing assignee".to_string(),
+        };
+        submit(item, action, assignees);
+    }
+
     fn start_new_comment_dialog(&mut self) {
         if !self.current_item_supports_comments() {
             self.status = "selected item cannot be commented on".to_string();
@@ -9152,6 +9485,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -9177,6 +9511,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -9213,6 +9548,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -9256,6 +9592,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -12261,6 +12598,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
+        assert!(text.contains("+/- assign"));
         assert!(text.contains("M/C/A pr action"));
         assert!(
             text.contains(
@@ -12290,7 +12628,8 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  enter expand  c/a comment  R reply  e edit"));
+        assert!(details.contains("n/p comment  enter expand  c/a comment  +/- assign"));
+        assert!(details.contains("R reply  e edit"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
 
@@ -12298,7 +12637,8 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  +/- assign"));
+        assert!(diff.contains("M/C/A pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -13910,6 +14250,143 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(dialog.body.contains("> @alice wrote:"));
         assert!(dialog.body.contains("> Quoted body"));
+    }
+
+    #[test]
+    fn assignee_actions_are_rendered_in_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
+
+        let document = build_details_document(&app, 100);
+        let assignee_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("assignees: alice"))
+            .expect("assignee row");
+        let assign_column = document.lines[assignee_line]
+            .to_string()
+            .find("+ assign")
+            .expect("assign action") as u16;
+        let unassign_column = document.lines[assignee_line]
+            .to_string()
+            .find("- unassign")
+            .expect("unassign action") as u16;
+
+        assert_eq!(
+            document.action_at(assignee_line, assign_column),
+            Some(DetailAction::AssignAssignee)
+        );
+        assert_eq!(
+            document.action_at(assignee_line, unassign_column),
+            Some(DetailAction::UnassignAssignee)
+        );
+    }
+
+    #[test]
+    fn plus_and_minus_open_assignee_dialogs() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('+')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(
+            app.assignee_dialog.as_ref().map(|dialog| dialog.action),
+            Some(AssigneeAction::Assign)
+        );
+        assert_eq!(app.status, "enter assignee to add");
+
+        app.assignee_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('-')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(
+            app.assignee_dialog.as_ref().map(|dialog| dialog.action),
+            Some(AssigneeAction::Unassign)
+        );
+        assert_eq!(app.status, "enter assignee to remove");
+    }
+
+    #[test]
+    fn assignee_dialog_enter_submits_parsed_logins() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign);
+        app.assignee_dialog.as_mut().unwrap().input = "@alice, bob alice".to_string();
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert!(app.assignee_action_running);
+        assert_eq!(app.status, "assigning assignee");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_update_success_refreshes_item_state() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign);
+        app.assignee_action_running = true;
+        let mut updated = app.current_item().cloned().expect("item");
+        updated.assignees = vec!["alice".to_string()];
+
+        app.handle_msg(AppMsg::AssigneesUpdated {
+            item_id: "1".to_string(),
+            action: AssigneeAction::Assign,
+            result: Ok(updated),
+        });
+
+        assert!(!app.assignee_action_running);
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(app.current_item().unwrap().assignees, vec!["alice"]);
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "assignee added");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| dialog.title.as_str()),
+            Some("Assignee Added")
+        );
+    }
+
+    #[test]
+    fn assignee_update_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Unassign);
+        app.assignee_action_running = true;
+
+        app.handle_msg(AppMsg::AssigneesUpdated {
+            item_id: "1".to_string(),
+            action: AssigneeAction::Unassign,
+            result: Err("gh api repos/owner/repo/issues/1/assignees failed: HTTP 422".to_string()),
+        });
+
+        assert!(!app.assignee_action_running);
+        assert_eq!(app.status, "unassign failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Unassign Failed");
+        assert_eq!(dialog.body, "HTTP 422");
     }
 
     #[test]
@@ -16452,6 +16929,7 @@ diff --git a/d.rs b/d.rs
             url: format!("https://github.com/{repo}/pull/{number}"),
             updated_at: None,
             labels: vec!["T-compiler".to_string()],
+            assignees: Vec::new(),
             comments: Some(0),
             unread: None,
             reason: None,
@@ -16472,6 +16950,7 @@ diff --git a/d.rs b/d.rs
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
             updated_at: None,
             labels: Vec::new(),
+            assignees: Vec::new(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

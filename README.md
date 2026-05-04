@@ -70,6 +70,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |
 | `a` | Add a normal issue or PR comment |
+| `+` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment when it is yours; in diff mode, end a review range |

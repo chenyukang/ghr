@@ -202,6 +202,21 @@ struct PullRequestCheckRaw {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PullRequestAutoMergeStatusRaw {
+    auto_merge_request: Option<serde_json::Value>,
+    is_draft: Option<bool>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryMergeMethodsRaw {
+    allow_merge_commit: Option<bool>,
+    allow_rebase_merge: Option<bool>,
+    allow_squash_merge: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PullRequestActionGraphQlRaw {
     data: PullRequestActionDataRaw,
 }
@@ -220,6 +235,7 @@ struct PullRequestActionRepositoryRaw {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestActionRaw {
+    auto_merge_request: Option<serde_json::Value>,
     is_draft: Option<bool>,
     merge_state_status: Option<String>,
     review_decision: Option<String>,
@@ -871,6 +887,9 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       state
+      autoMergeRequest {
+        enabledAt
+      }
       isDraft
       mergeStateStatus
       reviewDecision
@@ -1057,16 +1076,19 @@ pub async fn edit_pull_request_review_comment(
 
 pub async fn merge_pull_request(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_can_merge(repository, number).await?;
-    run_gh_json(&[
+    run_gh_json(&merge_pull_request_args(repository, number)).await?;
+    Ok(())
+}
+
+fn merge_pull_request_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
         "pr".to_string(),
         "merge".to_string(),
         number.to_string(),
         "--repo".to_string(),
         repository.to_string(),
         "--merge".to_string(),
-    ])
-    .await?;
-    Ok(())
+    ]
 }
 
 async fn ensure_pull_request_can_merge(repository: &str, number: u64) -> Result<()> {
@@ -1098,6 +1120,172 @@ pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
     ])
     .await?;
     Ok(())
+}
+
+pub async fn enable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
+    ensure_pull_request_auto_merge_can_enable(repository, number).await?;
+    let method = auto_merge_method_flag(repository).await?;
+    run_gh_json(&enable_pull_request_auto_merge_args(
+        repository, number, method,
+    ))
+    .await?;
+    Ok(())
+}
+
+fn enable_pull_request_auto_merge_args(
+    repository: &str,
+    number: u64,
+    method: &'static str,
+) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        method.to_string(),
+        "--auto".to_string(),
+    ]
+}
+
+async fn auto_merge_method_flag(repository: &str) -> Result<&'static str> {
+    let output = run_gh_json(&repository_merge_methods_args(repository)).await?;
+    let methods = serde_json::from_str::<RepositoryMergeMethodsRaw>(&output)
+        .with_context(|| format!("failed to parse merge methods for {repository}"))?;
+    repository_merge_method_flag(repository, &methods)
+}
+
+fn repository_merge_methods_args(repository: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        format!("repos/{repository}"),
+        "--jq".to_string(),
+        "{allow_merge_commit,allow_squash_merge,allow_rebase_merge}".to_string(),
+    ]
+}
+
+fn repository_merge_method_flag(
+    repository: &str,
+    methods: &RepositoryMergeMethodsRaw,
+) -> Result<&'static str> {
+    if methods.allow_merge_commit.unwrap_or(false) {
+        Ok("--merge")
+    } else if methods.allow_squash_merge.unwrap_or(false) {
+        Ok("--squash")
+    } else if methods.allow_rebase_merge.unwrap_or(false) {
+        Ok("--rebase")
+    } else {
+        bail!(
+            "cannot enable auto-merge for {repository}: repository does not allow merge, squash, or rebase merges"
+        );
+    }
+}
+
+pub async fn disable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
+    ensure_pull_request_auto_merge_can_disable(repository, number).await?;
+    run_gh_json(&disable_pull_request_auto_merge_args(repository, number)).await?;
+    Ok(())
+}
+
+fn disable_pull_request_auto_merge_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        "--disable-auto".to_string(),
+    ]
+}
+
+async fn ensure_pull_request_auto_merge_can_enable(repository: &str, number: u64) -> Result<()> {
+    let status = fetch_pull_request_auto_merge_status(repository, number).await?;
+    if let Some(message) = pull_request_auto_merge_enable_blocker(repository, number, &status) {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+async fn ensure_pull_request_auto_merge_can_disable(repository: &str, number: u64) -> Result<()> {
+    let status = fetch_pull_request_auto_merge_status(repository, number).await?;
+    if let Some(message) = pull_request_auto_merge_disable_blocker(repository, number, &status) {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+async fn fetch_pull_request_auto_merge_status(
+    repository: &str,
+    number: u64,
+) -> Result<PullRequestAutoMergeStatusRaw> {
+    let output = run_gh_json(&pull_request_auto_merge_status_args(repository, number)).await?;
+    serde_json::from_str::<PullRequestAutoMergeStatusRaw>(&output)
+        .with_context(|| format!("failed to parse auto-merge status for {repository}#{number}"))
+}
+
+fn pull_request_auto_merge_status_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "view".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        "--json".to_string(),
+        "state,isDraft,autoMergeRequest".to_string(),
+    ]
+}
+
+fn pull_request_auto_merge_enable_blocker(
+    repository: &str,
+    number: u64,
+    status: &PullRequestAutoMergeStatusRaw,
+) -> Option<String> {
+    if let Some(message) =
+        pull_request_auto_merge_open_blocker(repository, number, status, "enable")
+    {
+        return Some(message);
+    }
+    if status.is_draft.unwrap_or(false) {
+        return Some(format!(
+            "cannot enable auto-merge for {repository}#{number}: pull request is a draft"
+        ));
+    }
+    if status.auto_merge_request.is_some() {
+        return Some(format!(
+            "auto-merge is already enabled for {repository}#{number}"
+        ));
+    }
+    None
+}
+
+fn pull_request_auto_merge_disable_blocker(
+    repository: &str,
+    number: u64,
+    status: &PullRequestAutoMergeStatusRaw,
+) -> Option<String> {
+    if let Some(message) =
+        pull_request_auto_merge_open_blocker(repository, number, status, "disable")
+    {
+        return Some(message);
+    }
+    if status.auto_merge_request.is_none() {
+        return Some(format!(
+            "auto-merge is already disabled for {repository}#{number}"
+        ));
+    }
+    None
+}
+
+fn pull_request_auto_merge_open_blocker(
+    repository: &str,
+    number: u64,
+    status: &PullRequestAutoMergeStatusRaw,
+    action: &str,
+) -> Option<String> {
+    let state = status.state.as_deref().unwrap_or("UNKNOWN");
+    (!state.eq_ignore_ascii_case("OPEN")).then(|| {
+        format!("cannot {action} auto-merge for {repository}#{number}: pull request is {state}")
+    })
 }
 
 pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
@@ -1477,11 +1665,16 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         .as_deref()
         .is_none_or(|state| state.eq_ignore_ascii_case("OPEN"));
     let draft = pr.is_draft.unwrap_or(false);
+    let auto_merge_enabled = pr.auto_merge_request.is_some();
     let did_author = pr.viewer_did_author.unwrap_or(false);
     let latest_review = pr
         .viewer_latest_review
         .as_ref()
         .and_then(|review| review.state.as_deref());
+
+    if open && auto_merge_enabled {
+        labels.push("Auto-merge on".to_string());
+    }
 
     if open
         && !draft
@@ -1495,7 +1688,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
 
     if blockers.is_empty() && can_merge {
         labels.push("Mergeable".to_string());
-    } else if open && !draft && can_auto_merge {
+    } else if open && !draft && can_auto_merge && !auto_merge_enabled {
         labels.push("Auto-mergeable".to_string());
     }
 
@@ -2233,6 +2426,117 @@ mod tests {
     }
 
     #[test]
+    fn auto_merge_commands_use_non_interactive_gh_pr_merge_flags() {
+        assert_eq!(
+            enable_pull_request_auto_merge_args("owner/repo", 42, "--merge"),
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "owner/repo",
+                "--merge",
+                "--auto"
+            ]
+        );
+        assert_eq!(
+            disable_pull_request_auto_merge_args("owner/repo", 42),
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "owner/repo",
+                "--disable-auto"
+            ]
+        );
+        assert_eq!(
+            pull_request_auto_merge_status_args("owner/repo", 42),
+            vec![
+                "pr",
+                "view",
+                "42",
+                "--repo",
+                "owner/repo",
+                "--json",
+                "state,isDraft,autoMergeRequest"
+            ]
+        );
+        assert_eq!(
+            repository_merge_methods_args("owner/repo"),
+            vec![
+                "api",
+                "repos/owner/repo",
+                "--jq",
+                "{allow_merge_commit,allow_squash_merge,allow_rebase_merge}"
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_merge_method_uses_allowed_repo_merge_policy() {
+        let merge = RepositoryMergeMethodsRaw {
+            allow_merge_commit: Some(true),
+            allow_squash_merge: Some(true),
+            allow_rebase_merge: Some(true),
+        };
+        assert_eq!(
+            repository_merge_method_flag("owner/repo", &merge).expect("merge allowed"),
+            "--merge"
+        );
+
+        let squash = RepositoryMergeMethodsRaw {
+            allow_merge_commit: Some(false),
+            allow_squash_merge: Some(true),
+            allow_rebase_merge: Some(true),
+        };
+        assert_eq!(
+            repository_merge_method_flag("owner/repo", &squash).expect("squash allowed"),
+            "--squash"
+        );
+
+        let none = RepositoryMergeMethodsRaw {
+            allow_merge_commit: Some(false),
+            allow_squash_merge: Some(false),
+            allow_rebase_merge: Some(false),
+        };
+        let error = repository_merge_method_flag("owner/repo", &none)
+            .expect_err("no merge methods should be rejected")
+            .to_string();
+        assert!(error.contains("repository does not allow merge"));
+    }
+
+    #[test]
+    fn auto_merge_preflight_rejects_closed_and_already_matching_state() {
+        let closed = PullRequestAutoMergeStatusRaw {
+            auto_merge_request: None,
+            is_draft: Some(false),
+            state: Some("MERGED".to_string()),
+        };
+        let error = pull_request_auto_merge_enable_blocker("owner/repo", 42, &closed)
+            .expect("merged PR should be rejected");
+        assert!(error.contains("pull request is MERGED"));
+
+        let enabled = PullRequestAutoMergeStatusRaw {
+            auto_merge_request: Some(serde_json::json!({ "enabledAt": "2026-05-04T00:00:00Z" })),
+            is_draft: Some(false),
+            state: Some("OPEN".to_string()),
+        };
+        let error = pull_request_auto_merge_enable_blocker("owner/repo", 42, &enabled)
+            .expect("already enabled PR should be rejected");
+        assert_eq!(error, "auto-merge is already enabled for owner/repo#42");
+
+        let disabled = PullRequestAutoMergeStatusRaw {
+            auto_merge_request: None,
+            is_draft: Some(false),
+            state: Some("OPEN".to_string()),
+        };
+        let error = pull_request_auto_merge_disable_blocker("owner/repo", 42, &disabled)
+            .expect("already disabled PR should be rejected");
+        assert_eq!(error, "auto-merge is already disabled for owner/repo#42");
+    }
+
+    #[test]
     fn merge_blocker_message_explains_review_and_checks() {
         let status = PullRequestMergeStatusRaw {
             is_draft: Some(false),
@@ -2279,6 +2583,7 @@ mod tests {
     #[test]
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            auto_merge_request: None,
             is_draft: Some(false),
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: Some("REVIEW_REQUIRED".to_string()),
@@ -2330,6 +2635,7 @@ mod tests {
     #[test]
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            auto_merge_request: None,
             is_draft: Some(false),
             merge_state_status: Some("CLEAN".to_string()),
             review_decision: Some("APPROVED".to_string()),

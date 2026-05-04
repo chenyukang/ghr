@@ -77,6 +77,8 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `M` | Open a merge confirmation for the selected PR |
 | `C` | Open a close confirmation for the selected PR |
 | `A` | Open an approve confirmation for the selected PR |
+| `E` | Open an enable auto-merge confirmation for the selected PR |
+| `D` | Open a disable auto-merge confirmation for the selected PR |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `r` | Refresh from GitHub |

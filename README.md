@@ -23,7 +23,7 @@
 - Fuzzy filtering in every loaded list with `/`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
-- Comment, reply, edit, merge, close, and approve flows from inside the TUI.
+- Comment, reply, edit, merge, close, approve, and draft / ready-for-review flows from inside the TUI.
 - Unread notification handling with local cache updates and GitHub read-state sync.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
@@ -77,6 +77,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `M` | Open a merge confirmation for the selected PR |
 | `C` | Open a close confirmation for the selected PR |
 | `A` | Open an approve confirmation for the selected PR |
+| `D` | Toggle the selected open PR between draft and ready for review |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `r` | Refresh from GitHub |

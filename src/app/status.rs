@@ -84,6 +84,8 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Pull Request Merged",
         PrAction::Close => "Pull Request Closed",
         PrAction::Approve => "Pull Request Approved",
+        PrAction::ConvertToDraft => "Pull Request Converted to Draft",
+        PrAction::MarkReadyForReview => "Pull Request Ready for Review",
     }
 }
 
@@ -92,6 +94,12 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
+        PrAction::ConvertToDraft => {
+            "GitHub converted the pull request to draft. Refreshing details."
+        }
+        PrAction::MarkReadyForReview => {
+            "GitHub marked the pull request ready for review. Refreshing details."
+        }
     }
 }
 
@@ -100,6 +108,8 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Merge Failed",
         PrAction::Close => "Close Failed",
         PrAction::Approve => "Approve Failed",
+        PrAction::ConvertToDraft => "Convert to Draft Failed",
+        PrAction::MarkReadyForReview => "Ready for Review Failed",
     }
 }
 
@@ -108,6 +118,8 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Merge => "pull request merge failed",
         PrAction::Close => "pull request close failed",
         PrAction::Approve => "pull request approval failed",
+        PrAction::ConvertToDraft => "pull request draft conversion failed",
+        PrAction::MarkReadyForReview => "pull request ready-for-review failed",
     }
 }
 

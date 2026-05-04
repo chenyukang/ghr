@@ -1113,6 +1113,30 @@ pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+pub async fn convert_pull_request_to_draft(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&pull_request_ready_args(repository, number, true)).await?;
+    Ok(())
+}
+
+pub async fn mark_pull_request_ready_for_review(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&pull_request_ready_args(repository, number, false)).await?;
+    Ok(())
+}
+
+fn pull_request_ready_args(repository: &str, number: u64, undo: bool) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "ready".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ];
+    if undo {
+        args.push("--undo".to_string());
+    }
+    args
+}
+
 fn parse_issue_comments_output(
     output: &str,
     repository: &str,
@@ -1972,6 +1996,18 @@ mod tests {
         assert_eq!(search_command_limit(50), 50);
         assert_eq!(search_command_limit(101), 101);
         assert_eq!(search_command_limit(5_000), 1_000);
+    }
+
+    #[test]
+    fn pull_request_ready_args_toggle_ready_and_draft() {
+        assert_eq!(
+            pull_request_ready_args("owner/repo", 42, false),
+            vec!["pr", "ready", "42", "--repo", "owner/repo"]
+        );
+        assert_eq!(
+            pull_request_ready_args("owner/repo", 42, true),
+            vec!["pr", "ready", "42", "--repo", "owner/repo", "--undo"]
+        );
     }
 
     #[test]

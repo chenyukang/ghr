@@ -29,7 +29,7 @@ review.
 | Assign / unassign assignees | `codex/assignee-actions` | Harvey | In review | [#17](https://github.com/chenyukang/ghr/pull/17) | Support issues and PRs through GitHub issue assignee APIs. |
 | Request / remove reviewers, including re-request review | `codex/reviewer-actions` | Huygens | In review | [#16](https://github.com/chenyukang/ghr/pull/16) | PR-only reviewer management; user reviewers only. |
 | Close / reopen issue and PR reopen | `codex/state-actions` | Russell | In review | [#14](https://github.com/chenyukang/ghr/pull/14) | Existing PR close flow expanded to issue close/reopen and PR reopen. |
-| Edit title / body | `codex/edit-title-body` | Nietzsche | In progress | - | Needs a focused editor flow for current issue/PR metadata. |
+| Edit title / body | `codex/edit-title-body` | Nietzsche | In review | [#20](https://github.com/chenyukang/ghr/pull/20) | Uses existing editor dialog: `E`, then `t` or `b`, then `Ctrl+Enter`. |
 | Change milestone | `codex/milestone-actions` | Hegel | In progress | - | Needs milestone list/prefix selection plus clear/remove. |
 | Quick state/search filters in TUI | `codex/search-filter-shortcuts` | Hooke | In progress | - | open/closed/merged/draft/all plus assignee/author/label filters. |
 
@@ -53,7 +53,7 @@ review.
 | Huygens | Request / remove / re-request reviewers | `~/.codex/worktrees/ghr-reviewer-actions` | `codex/reviewer-actions` | In review: [#16](https://github.com/chenyukang/ghr/pull/16) |
 | Russell | Close / reopen issue and PR reopen | `~/.codex/worktrees/ghr-state-actions` | `codex/state-actions` | In review: [#14](https://github.com/chenyukang/ghr/pull/14) |
 | Chandrasekhar | Mark draft / ready for review | `~/.codex/worktrees/ghr-pr-draft-ready-actions` | `codex/pr-draft-ready-actions` | In review: [#15](https://github.com/chenyukang/ghr/pull/15) |
-| Nietzsche | Edit title / body | `~/.codex/worktrees/ghr-edit-title-body` | `codex/edit-title-body` | In progress |
+| Nietzsche | Edit title / body | `~/.codex/worktrees/ghr-edit-title-body` | `codex/edit-title-body` | In review: [#20](https://github.com/chenyukang/ghr/pull/20) |
 | Hegel | Change milestone | `~/.codex/worktrees/ghr-milestone-actions` | `codex/milestone-actions` | In progress |
 | Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In progress |
 | Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In review: [#18](https://github.com/chenyukang/ghr/pull/18) |

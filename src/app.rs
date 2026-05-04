@@ -315,6 +315,7 @@ const COMMENT_DIALOG_MIN_EDITOR_HEIGHT: u16 = 4;
 const COMMENT_DIALOG_EDITOR_PADDING_LINES: u16 = 1;
 const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
+const PR_ACTION_REMOTE_BRANCH_LINE: u16 = 6;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
 const COMMENT_COLLAPSE_MIN_LINES: usize = 36;
@@ -1761,7 +1762,12 @@ fn handle_mouse_with_sync(
     if app.message_dialog.is_some() {
         return false;
     }
-    if app.pr_action_dialog.is_some() {
+    if let Some(dialog) = &app.pr_action_dialog {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(url) = pr_action_dialog_link_at(dialog, area, mouse.column, mouse.row)
+        {
+            app.open_url(&url);
+        }
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
@@ -3286,12 +3292,7 @@ fn draw_pr_action_dialog(
     running: bool,
     area: Rect,
 ) {
-    let dialog_height = if dialog.action == PrAction::Checkout {
-        14
-    } else {
-        12
-    };
-    let dialog_area = centered_rect(66, dialog_height, area);
+    let dialog_area = pr_action_dialog_area(dialog, area);
     let number = dialog
         .item
         .number
@@ -3333,14 +3334,11 @@ fn draw_pr_action_dialog(
             Line::from("")
         },
         if dialog.action == PrAction::Checkout {
-            key_value_line(
-                "remote branch",
+            remote_branch_line(
                 dialog
                     .checkout
                     .as_ref()
-                    .and_then(|checkout| checkout.branch.as_ref())
-                    .map(pull_request_branch_label)
-                    .unwrap_or_else(|| "unavailable".to_string()),
+                    .and_then(|checkout| checkout.branch.as_ref()),
             )
         } else {
             Line::from("")
@@ -3375,6 +3373,54 @@ fn draw_pr_action_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+}
+
+fn pr_action_dialog_area(dialog: &PrActionDialog, area: Rect) -> Rect {
+    let dialog_height = if dialog.action == PrAction::Checkout {
+        14
+    } else {
+        12
+    };
+    centered_rect(66, dialog_height, area)
+}
+
+fn remote_branch_line(branch: Option<&PullRequestBranch>) -> Line<'static> {
+    let Some(branch) = branch else {
+        return key_value_line("remote branch", "unavailable".to_string());
+    };
+    Line::from(vec![
+        Span::styled("remote branch: ", Style::default().fg(Color::Gray)),
+        Span::styled(pull_request_branch_label(branch), link_style()),
+    ])
+}
+
+fn pr_action_dialog_link_at(
+    dialog: &PrActionDialog,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    if dialog.action != PrAction::Checkout {
+        return None;
+    }
+    let branch = dialog
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.branch.as_ref())?;
+    let dialog_area = pr_action_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+    let content_row = row.saturating_sub(inner.y);
+    if content_row != PR_ACTION_REMOTE_BRANCH_LINE {
+        return None;
+    }
+    let label = pull_request_branch_label(branch);
+    let start = display_width("remote branch: ") as u16;
+    let end = start.saturating_add(display_width(&label) as u16);
+    let clicked = column.saturating_sub(inner.x);
+    (clicked >= start && clicked < end).then(|| pull_request_branch_url(branch))
 }
 
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
@@ -4285,13 +4331,16 @@ impl DetailsBuilder {
     }
 
     fn push_key_value(&mut self, key: &str, value: impl Into<String>) {
-        self.push_wrapped_limited(
-            vec![
-                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
-                DetailSegment::raw(value.into()),
-            ],
-            1,
-        );
+        self.push_styled_key_value(key, vec![DetailSegment::raw(value.into())]);
+    }
+
+    fn push_styled_key_value(&mut self, key: &str, value: Vec<DetailSegment>) {
+        let mut segments = vec![DetailSegment::styled(
+            format!("{key}: "),
+            Style::default().fg(Color::Gray),
+        )];
+        segments.extend(value);
+        self.push_wrapped_limited(segments, 1);
     }
 
     fn push_link_value(&mut self, key: &str, url: &str) {
@@ -4847,6 +4896,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     ]);
 
     let mut secondary_meta = Vec::new();
+    let mut action_meta = Vec::new();
     let mut action_note = None;
     if let Some(author) = useful_meta_value(item.author.as_deref()) {
         secondary_meta.push((
@@ -4864,13 +4914,13 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         secondary_meta.push(("reason", vec![DetailSegment::raw(reason.to_string())]));
     }
     if matches!(item.kind, ItemKind::PullRequest) {
-        let (action_text, note) = action_hint_text(app.action_hints.get(&item.id));
+        let (action_segments, note) = action_hint_segments(app.action_hints.get(&item.id));
         secondary_meta.push((
             "branch",
             branch_hint_segments(app.action_hints.get(&item.id)),
         ));
-        secondary_meta.push(("action", vec![DetailSegment::raw(action_text)]));
-        secondary_meta.push((
+        action_meta.push(("action", action_segments));
+        action_meta.push((
             "checks",
             check_hint_segments(app.action_hints.get(&item.id)),
         ));
@@ -4879,8 +4929,11 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     if !secondary_meta.is_empty() {
         builder.push_meta_line(secondary_meta);
     }
+    if !action_meta.is_empty() {
+        builder.push_meta_line(action_meta);
+    }
     if let Some(note) = action_note {
-        builder.push_key_value("action note", note);
+        builder.push_styled_key_value("action note", action_note_segments(&note));
     }
     builder.push_link_value("url", &item.url);
 
@@ -6249,22 +6302,61 @@ fn comment_right_padding(selected: bool) -> usize {
     COMMENT_RIGHT_PADDING + usize::from(selected)
 }
 
-fn action_hint_text(state: Option<&ActionHintState>) -> (String, Option<String>) {
+fn action_hint_segments(state: Option<&ActionHintState>) -> (Vec<DetailSegment>, Option<String>) {
     match state {
         Some(ActionHintState::Loaded(hints)) => {
-            let text = if hints.labels.is_empty() {
-                "-".to_string()
+            let segments = if hints.labels.is_empty() {
+                vec![DetailSegment::raw("-")]
             } else {
-                hints.labels.join(", ")
+                action_label_segments(&hints.labels)
             };
-            (text, hints.note.clone())
+            (segments, hints.note.clone())
         }
-        Some(ActionHintState::Loading) | None => ("loading...".to_string(), None),
+        Some(ActionHintState::Loading) | None => (vec![DetailSegment::raw("loading...")], None),
         Some(ActionHintState::Error(error)) => (
-            "unavailable".to_string(),
+            vec![DetailSegment::raw("unavailable")],
             Some(format!("Failed to load action hints: {error}")),
         ),
     }
+}
+
+fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for label in labels {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw(", "));
+        }
+        let style = if label == "Mergeable" {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default()
+        };
+        segments.push(DetailSegment::styled(label, style));
+    }
+    segments
+}
+
+fn action_note_segments(note: &str) -> Vec<DetailSegment> {
+    const CONFLICTS: &str = "merge conflicts must be resolved";
+    let mut segments = Vec::new();
+    let mut rest = note;
+    while let Some(index) = rest.find(CONFLICTS) {
+        if index > 0 {
+            segments.push(DetailSegment::raw(rest[..index].to_string()));
+        }
+        segments.push(DetailSegment::styled(
+            CONFLICTS,
+            log_error_style().add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[index + CONFLICTS.len()..];
+    }
+    if !rest.is_empty() {
+        segments.push(DetailSegment::raw(rest.to_string()));
+    }
+    if segments.is_empty() {
+        segments.push(DetailSegment::raw(note.to_string()));
+    }
+    segments
 }
 
 fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
@@ -6281,6 +6373,13 @@ fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
 
 fn pull_request_branch_label(branch: &PullRequestBranch) -> String {
     format!("{}:{}", branch.repository, branch.branch)
+}
+
+fn pull_request_branch_url(branch: &PullRequestBranch) -> String {
+    format!(
+        "https://github.com/{}/tree/{}",
+        branch.repository, branch.branch
+    )
 }
 
 fn check_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
@@ -13485,12 +13584,12 @@ diff --git a/src/github.rs b/src/github.rs
             }),
         );
 
-        let rendered = build_details_document(&app, 120)
+        let lines = build_details_document(&app, 120)
             .lines
             .iter()
             .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("action: Approvable, Mergeable"));
         assert!(rendered.contains("checks:"));
@@ -13499,6 +13598,18 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains("1 pending"));
         assert!(rendered.contains("branch: chenyukang/ghr:feature/checks"));
         assert!(rendered.contains("action note: Merge blocked: checks pending"));
+        let branch_line = lines
+            .iter()
+            .position(|line| line.contains("branch: chenyukang/ghr:feature/checks"))
+            .expect("branch line");
+        let action_line = lines
+            .iter()
+            .position(|line| line.contains("action: Approvable, Mergeable"))
+            .expect("action line");
+        assert!(
+            action_line > branch_line,
+            "action/checks should start on a new line"
+        );
     }
 
     #[test]
@@ -13518,6 +13629,45 @@ diff --git a/src/github.rs b/src/github.rs
             .expect("failed check segment");
         assert_eq!(failed.style.fg, Some(Color::LightRed));
         assert!(failed.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn mergeable_action_label_is_rendered_green() {
+        let segments = action_label_segments(&["Approvable".to_string(), "Mergeable".to_string()]);
+
+        let approvable = segments
+            .iter()
+            .find(|segment| segment.text == "Approvable")
+            .expect("approvable segment");
+        assert_eq!(approvable.style, Style::default());
+
+        let mergeable = segments
+            .iter()
+            .find(|segment| segment.text == "Mergeable")
+            .expect("mergeable segment");
+        assert_eq!(mergeable.style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn merge_conflict_action_note_is_rendered_red() {
+        let segments =
+            action_note_segments("Merge blocked: draft; merge conflicts must be resolved");
+
+        let conflict = segments
+            .iter()
+            .find(|segment| segment.text == "merge conflicts must be resolved")
+            .expect("conflict segment");
+        assert_eq!(conflict.style.fg, Some(Color::LightRed));
+        assert!(conflict.style.add_modifier.contains(Modifier::BOLD));
+
+        let rendered = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            "Merge blocked: draft; merge conflicts must be resolved"
+        );
     }
 
     #[test]
@@ -14625,6 +14775,42 @@ diff --git a/src/github.rs b/src/github.rs
             Some("chenyukang/ghr:codex/pr-checkout-local")
         );
         assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn checkout_confirmation_remote_branch_is_clickable() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let config = checkout_test_config();
+        app.action_hints.insert(
+            "checkout-pr".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                note: None,
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "codex/pr-checkout-local".to_string(),
+                }),
+            }),
+        );
+        app.start_pr_checkout_dialog(&config);
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        let area = Rect::new(0, 0, 120, 40);
+        let inner = block_inner(pr_action_dialog_area(dialog, area));
+        let branch_column = inner
+            .x
+            .saturating_add(display_width("remote branch: ") as u16)
+            .saturating_add(1);
+        let branch_row = inner.y.saturating_add(PR_ACTION_REMOTE_BRANCH_LINE);
+
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column, branch_row).as_deref(),
+            Some("https://github.com/chenyukang/ghr/tree/codex/pr-checkout-local")
+        );
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column.saturating_sub(2), branch_row),
+            None
+        );
     }
 
     #[test]

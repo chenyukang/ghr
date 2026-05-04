@@ -35,14 +35,15 @@ use crate::github::{
     CommentFetchResult, MergeMethod, PullRequestReviewCommentTarget, PullRequestReviewEvent,
     add_issue_comment_reaction, add_issue_label, add_issue_reaction,
     add_pull_request_review_comment_reaction, approve_pull_request, close_pull_request,
-    create_issue, create_pending_pull_request_review, discard_pending_pull_request_review,
-    edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
-    fetch_pull_request_action_hints, fetch_pull_request_diff, fetch_repository_labels,
-    mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
-    rerun_failed_pull_request_checks, search_global, submit_pending_pull_request_review,
-    submit_pull_request_review, with_background_github_priority,
+    create_issue, create_pending_pull_request_review, disable_pull_request_auto_merge,
+    discard_pending_pull_request_review, edit_issue_comment, edit_pull_request_review_comment,
+    enable_pull_request_auto_merge, fetch_comments, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, fetch_repository_labels, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, remove_issue_label, rerun_failed_pull_request_checks, search_global,
+    submit_pending_pull_request_review, submit_pull_request_review,
+    with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, PullRequestBranch,
@@ -474,6 +475,8 @@ enum PrAction {
     Close,
     #[allow(dead_code)]
     Approve,
+    EnableAutoMerge,
+    DisableAutoMerge,
     Checkout,
     RerunFailedChecks,
 }
@@ -1529,6 +1532,12 @@ fn start_pr_action(
                 PrAction::Approve => approve_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::EnableAutoMerge => enable_pull_request_auto_merge(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
+                PrAction::DisableAutoMerge => disable_pull_request_auto_merge(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
                 PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
                 PrAction::RerunFailedChecks => rerun_failed_pull_request_checks(&item.repo, number)
                     .await
@@ -1994,6 +2003,8 @@ fn handle_key_in_area(
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
             KeyCode::Char('D') => app.discard_pending_review(tx),
+            KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+            KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
@@ -2022,6 +2033,8 @@ fn handle_key_in_area(
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
             KeyCode::Char('D') => app.discard_pending_review(tx),
+            KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+            KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
                 app.start_add_label_dialog(Some(tx))
@@ -2171,6 +2184,8 @@ fn handle_diff_file_list_key(
         KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
         KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
         KeyCode::Char('D') => app.discard_pending_review(tx),
+        KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+        KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
         KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
         KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
         KeyCode::Enter => app.focus_details(),
@@ -3475,7 +3490,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -3490,7 +3505,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -3515,7 +3530,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -3525,7 +3540,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3832,6 +3847,8 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "merge",
         PrAction::Close => "close",
         PrAction::Approve => "approve",
+        PrAction::EnableAutoMerge => "enable auto-merge for",
+        PrAction::DisableAutoMerge => "disable auto-merge for",
         PrAction::Checkout => "checkout",
         PrAction::RerunFailedChecks => "rerun failed checks for",
     };
@@ -3839,6 +3856,8 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "Merge this pull request on GitHub?",
         PrAction::Close => "Close this pull request on GitHub?",
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::EnableAutoMerge => "Enable auto-merge for this pull request on GitHub?",
+        PrAction::DisableAutoMerge => "Disable auto-merge for this pull request on GitHub?",
         PrAction::Checkout => "Checkout this pull request locally?",
         PrAction::RerunFailedChecks => "Rerun failed GitHub Actions jobs for this pull request?",
     };
@@ -3908,6 +3927,8 @@ fn draw_pr_action_dialog(
                 PrAction::Merge => "Merge Pull Request",
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::EnableAutoMerge => "Enable Auto-Merge",
+                PrAction::DisableAutoMerge => "Disable Auto-Merge",
                 PrAction::Checkout => "Checkout Pull Request Locally",
                 PrAction::RerunFailedChecks => "Rerun Failed Checks",
             },
@@ -5070,6 +5091,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
         help_key_line("D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
@@ -5086,6 +5109,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
         help_key_line("D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
@@ -5120,6 +5145,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
         help_key_line("D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
@@ -9735,6 +9762,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
+                        self.action_hints.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
                         self.status = match action {
                             PrAction::Merge => format!(
@@ -9743,6 +9771,12 @@ impl AppState {
                             ),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
+                            PrAction::EnableAutoMerge => {
+                                "pull request auto-merge enabled; refreshing".to_string()
+                            }
+                            PrAction::DisableAutoMerge => {
+                                "pull request auto-merge disabled; refreshing".to_string()
+                            }
                             PrAction::Checkout => "pull request checked out locally".to_string(),
                             PrAction::RerunFailedChecks => {
                                 "failed checks rerun; refreshing".to_string()
@@ -9961,6 +9995,8 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                    PrAction::EnableAutoMerge => {}
+                    PrAction::DisableAutoMerge => {}
                     PrAction::Checkout => {}
                     PrAction::RerunFailedChecks => {}
                 }
@@ -11546,6 +11582,8 @@ impl AppState {
             PrAction::Merge => "confirm pull request merge (method: merge)".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
+            PrAction::EnableAutoMerge => "confirm pull request auto-merge enable".to_string(),
+            PrAction::DisableAutoMerge => "confirm pull request auto-merge disable".to_string(),
             PrAction::Checkout => "confirm local pull request checkout".to_string(),
             PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
         };
@@ -11715,6 +11753,8 @@ impl AppState {
             ),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
+            PrAction::EnableAutoMerge => "enabling pull request auto-merge".to_string(),
+            PrAction::DisableAutoMerge => "disabling pull request auto-merge".to_string(),
             PrAction::Checkout => "checking out pull request locally".to_string(),
             PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
         };
@@ -15546,6 +15586,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("open PR merge confirmation"));
         assert!(text.contains("open PR close confirmation"));
         assert!(text.contains("choose merge, squash, or rebase merge method"));
+        assert!(text.contains("open PR enable auto-merge confirmation"));
+        assert!(text.contains("open PR disable auto-merge confirmation"));
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
@@ -15659,7 +15701,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
         assert!(text.contains("s/A/D review"));
-        assert!(text.contains("M/C/F/X pr action"));
+        assert!(text.contains("M/C/E/O/F/X pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -15692,7 +15734,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/F/X pr action"));
+        assert!(!ghr.contains("M/C/E/O/F/X pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -15711,7 +15753,7 @@ diff --git a/src/github.rs b/src/github.rs
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
         assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
-        assert!(diff.contains("M/C/F/X pr action"));
+        assert!(diff.contains("M/C/E/O/F/X pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -18267,6 +18309,66 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_e_key_opens_enable_auto_merge_confirmation_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("enable dialog");
+        assert_eq!(dialog.action, PrAction::EnableAutoMerge);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request auto-merge enable");
+    }
+
+    #[test]
+    fn capital_o_key_opens_disable_auto_merge_confirmation_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('O')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("disable dialog");
+        assert_eq!(dialog.action, PrAction::DisableAutoMerge);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request auto-merge disable");
+    }
+
+    #[test]
+    fn auto_merge_action_dialog_prompt_is_clear() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::EnableAutoMerge);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Enable auto-merge for this pull request on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, enable auto-merge for PR"));
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -18645,6 +18747,40 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn auto_merge_action_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -18692,6 +18828,61 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(dialog.kind, MessageDialogKind::Success);
         assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn auto_merge_action_finished_refreshes_details_and_action_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Auto-mergeable".to_string()],
+                checks: None,
+                note: None,
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::EnableAutoMerge);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::EnableAutoMerge,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert!(!app.action_hints.contains_key("1"));
+        assert_eq!(app.status, "pull request auto-merge enabled; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Auto-Merge Enabled");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn auto_merge_action_failure_reports_action_specific_status() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::DisableAutoMerge);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::DisableAutoMerge,
+            merge_method: None,
+            result: Err("auto-merge is already disabled for owner/repo#1".to_string()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request auto-merge disable failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Disable Auto-Merge Failed");
+        assert!(dialog.body.contains("auto-merge is already disabled"));
+        assert!(dialog.auto_close_at.is_none());
     }
 
     #[test]
@@ -19093,6 +19284,32 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(matches!(
             app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
             Some(PrAction::Merge)
+        ));
+
+        app.pr_action_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::EnableAutoMerge)
+        ));
+
+        app.pr_action_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('O')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::DisableAutoMerge)
         ));
     }
 

@@ -86,6 +86,8 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `s` | Submit a PR review summary as comment, request changes, or approve |
 | `A` | Approve through the PR review summary flow |
 | `D` | Discard a pending PR review created in this session |
+| `E` | Open an enable auto-merge confirmation for the selected PR |
+| `O` | Open a disable auto-merge confirmation for the selected PR |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `Ctrl+Enter` in issue dialog | Create the issue |

@@ -107,6 +107,8 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Pull Request Merged",
         PrAction::Close => "Pull Request Closed",
         PrAction::Approve => "Pull Request Approved",
+        PrAction::EnableAutoMerge => "Auto-Merge Enabled",
+        PrAction::DisableAutoMerge => "Auto-Merge Disabled",
         PrAction::Checkout => "Pull Request Checked Out",
         PrAction::RerunFailedChecks => "Failed Checks Rerun",
     }
@@ -117,6 +119,8 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
+        PrAction::EnableAutoMerge => "GitHub enabled auto-merge. Refreshing details.",
+        PrAction::DisableAutoMerge => "GitHub disabled auto-merge. Refreshing details.",
         PrAction::Checkout => "GitHub CLI checked out the pull request locally.",
         PrAction::RerunFailedChecks => {
             "GitHub accepted the failed-check rerun request. Refreshing details."
@@ -129,6 +133,8 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Merge Failed",
         PrAction::Close => "Close Failed",
         PrAction::Approve => "Approve Failed",
+        PrAction::EnableAutoMerge => "Enable Auto-Merge Failed",
+        PrAction::DisableAutoMerge => "Disable Auto-Merge Failed",
         PrAction::Checkout => "Checkout Failed",
         PrAction::RerunFailedChecks => "Rerun Failed",
     }
@@ -139,6 +145,8 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Merge => "pull request merge failed",
         PrAction::Close => "pull request close failed",
         PrAction::Approve => "pull request approval failed",
+        PrAction::EnableAutoMerge => "pull request auto-merge enable failed",
+        PrAction::DisableAutoMerge => "pull request auto-merge disable failed",
         PrAction::Checkout => "pull request checkout failed",
         PrAction::RerunFailedChecks => "failed check rerun failed",
     }

@@ -30,12 +30,12 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    PullRequestReviewCommentTarget, add_issue_label, approve_pull_request, close_pull_request,
+    create_issue, edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, remove_issue_label, search_global, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -105,6 +105,14 @@ enum AppMsg {
     ReviewCommentPosted {
         item_id: String,
         result: std::result::Result<(), String>,
+    },
+    LabelUpdated {
+        item_id: String,
+        action: LabelAction,
+        result: std::result::Result<(), String>,
+    },
+    IssueCreated {
+        result: std::result::Result<WorkItem, String>,
     },
     PrActionFinished {
         item_id: String,
@@ -242,6 +250,68 @@ struct PendingCommentSubmit {
     mode: PendingCommentMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LabelDialogMode {
+    Add,
+    Remove { label: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LabelDialog {
+    mode: LabelDialogMode,
+    input: String,
+}
+
+struct PendingLabelUpdate {
+    item: WorkItem,
+    action: LabelAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LabelAction {
+    Add(String),
+    Remove(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueDialogField {
+    Repo,
+    Title,
+    Labels,
+    Body,
+}
+
+impl IssueDialogField {
+    fn next(self, delta: isize) -> Self {
+        const FIELDS: [IssueDialogField; 4] = [
+            IssueDialogField::Repo,
+            IssueDialogField::Title,
+            IssueDialogField::Labels,
+            IssueDialogField::Body,
+        ];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        let next = move_wrapping(index, FIELDS.len(), delta);
+        FIELDS[next]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueDialog {
+    repo: String,
+    title: String,
+    labels: String,
+    body: String,
+    field: IssueDialogField,
+    body_scroll: u16,
+}
+
+struct PendingIssueCreate {
+    repo: String,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrAction {
     Merge,
@@ -352,6 +422,10 @@ struct AppState {
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
+    label_dialog: Option<LabelDialog>,
+    label_updating: bool,
+    issue_dialog: Option<IssueDialog>,
+    issue_creating: bool,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
     setup_dialog: Option<SetupDialog>,
@@ -743,6 +817,8 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.pr_action_dialog.is_some()
+        || app.label_dialog.is_some()
+        || app.issue_dialog.is_some()
     {
         return None;
     }
@@ -1057,6 +1133,42 @@ fn start_review_comment_submit(
     });
 }
 
+fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match (item.number, &action) {
+            (Some(number), LabelAction::Add(label)) => add_issue_label(&item.repo, number, label)
+                .await
+                .map_err(|error| error.to_string()),
+            (Some(number), LabelAction::Remove(label)) => {
+                remove_issue_label(&item.repo, number, label)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            (None, _) => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::LabelUpdated {
+            item_id,
+            action,
+            result,
+        });
+    });
+}
+
+fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = create_issue(
+            &pending.repo,
+            &pending.title,
+            &pending.body,
+            &pending.labels,
+        )
+        .await
+        .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::IssueCreated { result });
+    });
+}
+
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
@@ -1167,6 +1279,16 @@ fn handle_key_in_area(
 
     if app.comment_dialog.is_some() {
         app.handle_comment_dialog_key(key, tx, area);
+        return false;
+    }
+
+    if app.label_dialog.is_some() {
+        app.handle_label_dialog_key(key, tx);
+        return false;
+    }
+
+    if app.issue_dialog.is_some() {
+        app.handle_issue_dialog_key(key, tx, area);
         return false;
     }
 
@@ -1288,6 +1410,8 @@ fn handle_key_in_area(
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
+            KeyCode::Char('L') => app.start_add_label_dialog(),
+            KeyCode::Char('N') => app.start_new_issue_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
                 app.mark_current_notification_read(store, tx);
@@ -1308,6 +1432,10 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
+                app.start_add_label_dialog()
+            }
+            KeyCode::Char('N') => app.start_new_issue_dialog(),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1501,6 +1629,12 @@ fn handle_mouse_with_sync(
     if app.pr_action_dialog.is_some() {
         return false;
     }
+    if app.label_dialog.is_some() {
+        return false;
+    }
+    if app.issue_dialog.is_some() {
+        return false;
+    }
     if let Some(dialog) = &app.comment_dialog {
         let dialog_area = comment_dialog_area(dialog, area);
         if rect_contains(dialog_area, mouse.column, mouse.row) {
@@ -1643,21 +1777,26 @@ fn handle_left_click(
     app.comment_search_active = false;
     app.global_search_active = false;
 
+    if let Some(action) = document.action_at(line_index, column) {
+        app.handle_detail_action(action);
+        return;
+    }
+    let clicked_comment = document.comment_at(line_index);
+    if let Some(url) = document.link_at(line_index, column) {
+        if let Some(comment_index) = clicked_comment {
+            app.select_comment(comment_index);
+        }
+        app.open_url(&url);
+        return;
+    }
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)
     {
         app.handle_diff_line_click(diff_line, None);
         return;
     }
-    if let Some(comment_index) = document.comment_at(line_index) {
+    if let Some(comment_index) = clicked_comment {
         app.select_comment(comment_index);
-    }
-    if let Some(action) = document.action_at(line_index, column) {
-        app.handle_detail_action(action);
-        return;
-    }
-    if let Some(url) = document.link_at(line_index, column) {
-        app.open_url(&url);
     }
 }
 
@@ -1979,6 +2118,10 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_help_dialog(frame, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
+    } else if let Some(dialog) = &app.label_dialog {
+        draw_label_dialog(frame, dialog, app.label_updating, area);
+    } else if let Some(dialog) = &app.issue_dialog {
+        draw_issue_dialog(frame, dialog, app.issue_creating, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
@@ -2570,6 +2713,21 @@ fn section_repo_scope(section: &SectionSnapshot) -> Option<String> {
         .find_map(repo_token_value)
 }
 
+fn created_issue_matches_section(
+    section: &SectionSnapshot,
+    item: &WorkItem,
+    active_view: &str,
+) -> bool {
+    if section.kind != SectionKind::Issues {
+        return false;
+    }
+
+    match section_repo_scope(section) {
+        Some(repo) => repo == item.repo,
+        None => same_view_key(&section_view_key(section), active_view),
+    }
+}
+
 fn repo_token_value(token: &str) -> Option<String> {
     token
         .strip_prefix("repo:")
@@ -3081,6 +3239,253 @@ fn draw_pr_action_dialog(
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(66, 9, area);
+    let (title, lines, accent, cursor) = match &dialog.mode {
+        LabelDialogMode::Add => {
+            let status = if running {
+                "working...".to_string()
+            } else {
+                "Enter: add label    Esc: cancel".to_string()
+            };
+            let input = if dialog.input.is_empty() {
+                " ".to_string()
+            } else {
+                dialog.input.clone()
+            };
+            (
+                "Add Label",
+                vec![
+                    Line::from("Label name"),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(input, Style::default().fg(Color::Cyan))]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        status,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )]),
+                ],
+                Color::LightMagenta,
+                Some(dialog.input.chars().count() as u16),
+            )
+        }
+        LabelDialogMode::Remove { label } => {
+            let status = if running {
+                "working...".to_string()
+            } else {
+                "y/Enter: remove label    Esc: cancel".to_string()
+            };
+            (
+                "Remove Label",
+                vec![
+                    Line::from("Remove this label from the selected item?"),
+                    Line::from(""),
+                    key_value_line("label", label.clone()),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        status,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )]),
+                ],
+                Color::Yellow,
+                None,
+            )
+        }
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    if let Some(column) = cursor {
+        let inner = block_inner(dialog_area);
+        frame.set_cursor_position(Position::new(
+            inner
+                .x
+                .saturating_add(column)
+                .min(inner.right().saturating_sub(1)),
+            inner.y.saturating_add(2),
+        ));
+    }
+}
+
+fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool, area: Rect) {
+    let dialog_area = issue_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = issue_dialog_body_editor_height(dialog_area);
+    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let scroll = dialog.body_scroll.min(max_scroll);
+    let mut lines = vec![
+        issue_dialog_field_label("Repo", IssueDialogField::Repo, dialog.field),
+        issue_dialog_input_line(&dialog.repo, editor_width),
+        issue_dialog_field_label("Title", IssueDialogField::Title, dialog.field),
+        issue_dialog_input_line(&dialog.title, editor_width),
+        issue_dialog_field_label("Labels", IssueDialogField::Labels, dialog.field),
+        issue_dialog_input_line(&dialog.labels, editor_width),
+        issue_dialog_field_label("Body", IssueDialogField::Body, dialog.field),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(7 + editor_height) {
+        lines.push(Line::from(""));
+    }
+    let status = if running {
+        "working..."
+    } else {
+        "Tab: field  Ctrl+Enter: create  Enter: newline/next  Esc: cancel"
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        status,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "New Issue",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    if let Some(position) =
+        issue_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn issue_dialog_area(area: Rect) -> Rect {
+    centered_rect(78, 22, area)
+}
+
+fn issue_dialog_body_editor_height(dialog_area: Rect) -> u16 {
+    let inner = block_inner(dialog_area);
+    inner.height.saturating_sub(9).max(1)
+}
+
+fn issue_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = issue_dialog_area(area);
+        let inner = block_inner(dialog_area);
+        return (
+            inner.width.max(1),
+            issue_dialog_body_editor_height(dialog_area),
+        );
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+fn issue_dialog_field_label(
+    label: &'static str,
+    field: IssueDialogField,
+    current: IssueDialogField,
+) -> Line<'static> {
+    let style = if field == current {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(Span::styled(label, style))
+}
+
+fn issue_dialog_input_line(value: &str, width: u16) -> Line<'static> {
+    let text = if value.is_empty() {
+        " ".to_string()
+    } else {
+        truncate_inline(value, usize::from(width.max(1)))
+    };
+    Line::from(Span::styled(text, Style::default().fg(Color::White)))
+}
+
+fn issue_dialog_cursor_position(
+    dialog: &IssueDialog,
+    scroll: u16,
+    dialog_area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(dialog_area);
+    let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    match dialog.field {
+        IssueDialogField::Repo => Some(Position::new(
+            clamp_x(inner.x.saturating_add(dialog.repo.chars().count() as u16)),
+            inner.y.saturating_add(1),
+        )),
+        IssueDialogField::Title => Some(Position::new(
+            clamp_x(inner.x.saturating_add(dialog.title.chars().count() as u16)),
+            inner.y.saturating_add(3),
+        )),
+        IssueDialogField::Labels => Some(Position::new(
+            clamp_x(inner.x.saturating_add(dialog.labels.chars().count() as u16)),
+            inner.y.saturating_add(5),
+        )),
+        IssueDialogField::Body => {
+            let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
+            let visible_end = scroll.saturating_add(editor_height.max(1));
+            if line < scroll || line >= visible_end {
+                return None;
+            }
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(column)),
+                inner.y.saturating_add(7).saturating_add(line - scroll),
+            ))
+        }
+    }
+}
+
+fn parse_issue_labels(input: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for label in input
+        .split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        if !labels.iter().any(|existing| existing == label) {
+            labels.push(label.to_string());
+        }
+    }
+    labels
+}
+
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
     let dialog_area = centered_rect(78, 14, area);
     let footer = if dialog.auto_close_at.is_some() {
@@ -3506,6 +3911,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
+        help_key_line("L", "add a label to the selected issue or PR"),
+        help_key_line("N", "create an issue in the current repo"),
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
@@ -3538,6 +3945,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
+        help_key_line("L", "add a label to the selected issue or PR"),
+        help_key_line("N", "create an issue in the current repo"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
@@ -3559,6 +3968,17 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Backspace", "delete previous character"),
         help_key_line("PgDown/PgUp or mouse wheel", "scroll long drafts"),
         help_key_line("Esc", "cancel editing"),
+        Line::from(""),
+        help_heading("Label Dialog"),
+        help_key_line("Enter", "add label or confirm removal"),
+        help_key_line("Backspace", "delete previous character while adding"),
+        help_key_line("Esc", "cancel label update"),
+        Line::from(""),
+        help_heading("Issue Dialog"),
+        help_key_line("Tab / Shift+Tab", "switch issue fields"),
+        help_key_line("Enter", "move to next field or insert a body newline"),
+        help_key_line("Ctrl+Enter", "create issue"),
+        help_key_line("Esc", "cancel issue creation"),
         Line::from(""),
         help_heading("Mouse"),
         help_key_line(
@@ -3788,6 +4208,8 @@ enum DetailAction {
     ReplyComment(usize),
     EditComment(usize),
     ToggleCommentExpanded(usize),
+    AddLabel,
+    RemoveLabel(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3821,6 +4243,15 @@ impl DetailSegment {
         Self {
             text: text.into(),
             style: link_style(),
+            link: Some(url.into()),
+            action: None,
+        }
+    }
+
+    fn styled_link(text: impl Into<String>, url: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
             link: Some(url.into()),
             action: None,
         }
@@ -4578,9 +5009,9 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
     builder.push_link_value("url", &item.url);
 
-    if !item.labels.is_empty() {
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
-        builder.push_key_value("labels", item.labels.join(", "));
+        push_label_controls(&mut builder, &item.labels);
     }
 
     if let Some(extra) = &item.extra {
@@ -4653,6 +5084,34 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
 
     builder.finish()
+}
+
+fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
+    let mut segments = vec![DetailSegment::styled(
+        "labels: ",
+        Style::default().fg(Color::Gray),
+    )];
+    if labels.is_empty() {
+        segments.push(DetailSegment::styled(
+            "none",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for (index, label) in labels.iter().enumerate() {
+            if index > 0 {
+                segments.push(DetailSegment::raw("  "));
+            }
+            segments.push(DetailSegment::styled(label.clone(), label_style()));
+            segments.push(DetailSegment::raw(" "));
+            segments.push(DetailSegment::action(
+                "remove",
+                DetailAction::RemoveLabel(label.clone()),
+            ));
+        }
+    }
+    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::action("add label", DetailAction::AddLabel));
+    builder.push_wrapped_limited(segments, 3);
 }
 
 fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
@@ -4950,7 +5409,7 @@ fn push_diff_inline_comment(
             if selected { "▸ " } else { "● " },
             comment_marker_style(selected),
         ),
-        DetailSegment::styled(comment.author.clone(), comment_author_style(selected)),
+        comment_author_link_segment(&comment.author, selected),
         DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
     ];
     if let Some(url) = &comment.url {
@@ -5331,6 +5790,14 @@ fn github_profile_url(author: &str) -> String {
     format!("https://github.com/{author}")
 }
 
+fn comment_author_link_segment(author: &str, selected: bool) -> DetailSegment {
+    DetailSegment::styled_link(
+        author.to_string(),
+        github_profile_url(author),
+        comment_author_style(selected).add_modifier(Modifier::UNDERLINED),
+    )
+}
+
 fn push_comment(
     builder: &mut DetailsBuilder,
     index: usize,
@@ -5354,7 +5821,7 @@ fn push_comment(
             if selected { "▸ " } else { "  " },
             comment_marker_style(selected),
         ),
-        DetailSegment::styled(comment.author.clone(), comment_author_style(selected)),
+        comment_author_link_segment(&comment.author, selected),
         DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
     ];
     if let Some(url) = &comment.url {
@@ -6903,6 +7370,12 @@ fn action_style() -> Style {
         .add_modifier(Modifier::UNDERLINED)
 }
 
+fn label_style() -> Style {
+    Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn quote_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
@@ -7168,6 +7641,10 @@ impl AppState {
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             posting_comment: false,
+            label_dialog: None,
+            label_updating: false,
+            issue_dialog: None,
+            issue_creating: false,
             pr_action_dialog: None,
             pr_action_running: false,
             setup_dialog: None,
@@ -7580,6 +8057,79 @@ impl AppState {
                     self.status = "review comment failed".to_string();
                 }
             },
+            AppMsg::LabelUpdated {
+                item_id,
+                action,
+                result,
+            } => {
+                self.label_updating = false;
+                self.label_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.apply_label_update_local(&item_id, &action);
+                        self.status = match action {
+                            LabelAction::Add(label) => format!("label added: {label}"),
+                            LabelAction::Remove(label) => format!("label removed: {label}"),
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            "Labels Updated",
+                            "GitHub accepted the label update.",
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Label Update Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "label update failed".to_string();
+                    }
+                }
+            }
+            AppMsg::IssueCreated { result } => {
+                self.issue_creating = false;
+                self.issue_dialog = None;
+                match result {
+                    Ok(item) => {
+                        let number = item
+                            .number
+                            .map(|number| format!("#{number}"))
+                            .unwrap_or_else(|| item.id.clone());
+                        let inserted = self.insert_created_issue(item.clone());
+                        self.status = if inserted {
+                            format!("issue created: {number}")
+                        } else {
+                            format!("issue created: {number}; refresh to show it in a list")
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            "Issue Created",
+                            format!("Created {number}: {}", item.title),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Issue Create Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "issue create failed".to_string();
+                    }
+                }
+            }
             AppMsg::PrActionFinished {
                 item_id,
                 action,
@@ -7693,6 +8243,7 @@ impl AppState {
                 self.details_scroll = 0;
                 self.selected_comment_index = 0;
                 self.comment_dialog = None;
+                self.label_dialog = None;
                 self.pr_action_dialog = None;
                 self.clamp_positions();
                 self.status = if errors == 0 {
@@ -7770,6 +8321,65 @@ impl AppState {
         }
     }
 
+    fn apply_label_update_local(&mut self, item_id: &str, action: &LabelAction) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                match action {
+                    LabelAction::Add(label) => {
+                        if !item.labels.iter().any(|existing| existing == label) {
+                            item.labels.push(label.clone());
+                        }
+                    }
+                    LabelAction::Remove(label) => {
+                        item.labels.retain(|existing| existing != label);
+                    }
+                }
+            }
+        }
+    }
+
+    fn insert_created_issue(&mut self, item: WorkItem) -> bool {
+        let active_view = self.active_view.clone();
+        let item_id = item.id.clone();
+        let mut target = None;
+        let mut inserted = false;
+
+        for section in &mut self.sections {
+            if !created_issue_matches_section(section, &item, &active_view) {
+                continue;
+            }
+
+            section.items.retain(|existing| existing.id != item_id);
+            section.items.insert(0, item.clone());
+            section.total_count = section.total_count.map(|count| count.saturating_add(1));
+            let view = section_view_key(section);
+            let key = section.key.clone();
+            if target.is_none() || same_view_key(&view, &active_view) {
+                target = Some((view, key));
+            }
+            inserted = true;
+        }
+
+        if let Some((view, section_key)) = target {
+            self.active_view = view.clone();
+            if let Some(section_position) = self.section_position_by_key(&view, &section_key) {
+                self.set_current_section_position(section_position);
+            }
+            self.set_current_selected_position(0);
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+            self.focus = FocusTarget::Details;
+            self.details
+                .insert(item_id, DetailState::Loaded(Vec::new()));
+        }
+
+        self.clamp_positions();
+        inserted
+    }
+
     fn mark_current_notification_read(
         &mut self,
         store: &SnapshotStore,
@@ -7838,6 +8448,8 @@ impl AppState {
                 self.details_scroll = 0;
                 self.selected_comment_index = 0;
                 self.comment_dialog = None;
+                self.label_dialog = None;
+                self.issue_dialog = None;
                 self.pr_action_dialog = None;
             }
         } else {
@@ -9044,6 +9656,8 @@ impl AppState {
                 self.select_comment(index);
                 self.toggle_selected_comment_expanded();
             }
+            DetailAction::AddLabel => self.start_add_label_dialog(),
+            DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
         }
     }
 
@@ -9081,6 +9695,9 @@ impl AppState {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
         self.pr_action_running = false;
         self.status = match action {
@@ -9152,6 +9769,8 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -9177,6 +9796,8 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -9213,6 +9834,8 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -9256,6 +9879,8 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -9299,6 +9924,330 @@ impl AppState {
                 start_review_comment_submit(submit.item, target, submit.body, tx.clone());
             }
         });
+    }
+
+    fn start_add_label_dialog(&mut self) {
+        if !self.current_item_supports_labels() {
+            self.status = "labels are available for issues and pull requests".to_string();
+            return;
+        }
+        self.label_dialog = Some(LabelDialog {
+            mode: LabelDialogMode::Add,
+            input: String::new(),
+        });
+        self.label_updating = false;
+        self.comment_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.focus = FocusTarget::Details;
+        self.status = "label input mode".to_string();
+    }
+
+    fn start_remove_label_dialog(&mut self, label: String) {
+        if !self.current_item_supports_labels() {
+            self.status = "labels are available for issues and pull requests".to_string();
+            return;
+        }
+        self.label_dialog = Some(LabelDialog {
+            mode: LabelDialogMode::Remove { label },
+            input: String::new(),
+        });
+        self.label_updating = false;
+        self.comment_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.focus = FocusTarget::Details;
+        self.status = "confirm label removal".to_string();
+    }
+
+    fn handle_label_dialog_key(&mut self, key: KeyEvent, tx: &UnboundedSender<AppMsg>) {
+        self.handle_label_dialog_key_with_submit(key, |pending| {
+            start_label_update(pending.item, pending.action, tx.clone());
+        });
+    }
+
+    fn handle_label_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(PendingLabelUpdate),
+    {
+        if self.label_updating {
+            return;
+        }
+
+        let Some(mode) = self.label_dialog.as_ref().map(|dialog| dialog.mode.clone()) else {
+            return;
+        };
+
+        match mode {
+            LabelDialogMode::Add => match key.code {
+                KeyCode::Esc => {
+                    self.label_dialog = None;
+                    self.status = "label update cancelled".to_string();
+                }
+                KeyCode::Enter => {
+                    if let Some(pending) = self.prepare_label_add() {
+                        submit(pending);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(dialog) = &mut self.label_dialog {
+                        dialog.input.pop();
+                    }
+                }
+                KeyCode::Char(value) => {
+                    if let Some(dialog) = &mut self.label_dialog {
+                        dialog.input.push(value);
+                    }
+                }
+                _ => {}
+            },
+            LabelDialogMode::Remove { label } => match key.code {
+                KeyCode::Esc => {
+                    self.label_dialog = None;
+                    self.status = "label update cancelled".to_string();
+                }
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(pending) = self.prepare_label_remove(label) {
+                        submit(pending);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn prepare_label_add(&mut self) -> Option<PendingLabelUpdate> {
+        let dialog = self.label_dialog.take()?;
+        let label = dialog.input.trim().to_string();
+        if label.is_empty() {
+            self.label_dialog = Some(dialog);
+            self.status = "label is empty".to_string();
+            return None;
+        }
+        self.prepare_label_update(LabelAction::Add(label), Some(dialog))
+    }
+
+    fn prepare_label_remove(&mut self, label: String) -> Option<PendingLabelUpdate> {
+        self.label_dialog = None;
+        self.prepare_label_update(LabelAction::Remove(label), None)
+    }
+
+    fn prepare_label_update(
+        &mut self,
+        action: LabelAction,
+        restore_dialog: Option<LabelDialog>,
+    ) -> Option<PendingLabelUpdate> {
+        let Some(item) = self.current_item().cloned() else {
+            self.label_dialog = restore_dialog;
+            self.status = "nothing selected".to_string();
+            return None;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            self.label_dialog = restore_dialog;
+            self.status = "labels are available for issues and pull requests".to_string();
+            return None;
+        }
+        self.label_updating = true;
+        self.status = match &action {
+            LabelAction::Add(label) => format!("adding label {label}"),
+            LabelAction::Remove(label) => format!("removing label {label}"),
+        };
+        self.message_dialog = Some(message_dialog("Updating Labels", "Waiting for GitHub..."));
+        Some(PendingLabelUpdate { item, action })
+    }
+
+    fn start_new_issue_dialog(&mut self) {
+        let Some(repo) = self.current_repo_scope() else {
+            self.status = "select an item or repo before creating an issue".to_string();
+            return;
+        };
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.issue_dialog = Some(IssueDialog {
+            repo,
+            title: String::new(),
+            labels: String::new(),
+            body: String::new(),
+            field: IssueDialogField::Title,
+            body_scroll: 0,
+        });
+        self.issue_creating = false;
+        self.status = "new issue".to_string();
+    }
+
+    fn handle_issue_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        self.handle_issue_dialog_key_with_submit(key, area, |pending| {
+            start_issue_create(pending, tx.clone());
+        });
+    }
+
+    fn handle_issue_dialog_key_with_submit<F>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+    ) where
+        F: FnMut(PendingIssueCreate),
+    {
+        if self.issue_creating {
+            return;
+        }
+
+        if is_comment_submit_key(key) {
+            if let Some(pending) = self.prepare_issue_create() {
+                submit(pending);
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.issue_dialog = None;
+                self.status = "issue creation cancelled".to_string();
+            }
+            KeyCode::Tab => self.move_issue_dialog_field(1),
+            KeyCode::BackTab => self.move_issue_dialog_field(-1),
+            KeyCode::PageDown => self.scroll_issue_dialog_body(6, area),
+            KeyCode::PageUp => self.scroll_issue_dialog_body(-6, area),
+            KeyCode::Enter => {
+                if self
+                    .issue_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.field == IssueDialogField::Body)
+                {
+                    if let Some(dialog) = &mut self.issue_dialog {
+                        dialog.body.push('\n');
+                    }
+                    self.scroll_issue_dialog_to_cursor_in_area(area);
+                } else {
+                    self.move_issue_dialog_field(1);
+                }
+            }
+            KeyCode::Backspace => {
+                self.pop_issue_dialog_char();
+                self.scroll_issue_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Char(value) => {
+                self.push_issue_dialog_char(value);
+                self.scroll_issue_dialog_to_cursor_in_area(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_issue_dialog_field(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.issue_dialog {
+            dialog.field = dialog.field.next(delta);
+            self.status = match dialog.field {
+                IssueDialogField::Repo => "editing issue repo".to_string(),
+                IssueDialogField::Title => "editing issue title".to_string(),
+                IssueDialogField::Labels => "editing issue labels".to_string(),
+                IssueDialogField::Body => "editing issue body".to_string(),
+            };
+        }
+    }
+
+    fn push_issue_dialog_char(&mut self, value: char) {
+        let Some(dialog) = &mut self.issue_dialog else {
+            return;
+        };
+        match dialog.field {
+            IssueDialogField::Repo => dialog.repo.push(value),
+            IssueDialogField::Title => dialog.title.push(value),
+            IssueDialogField::Labels => dialog.labels.push(value),
+            IssueDialogField::Body => dialog.body.push(value),
+        }
+    }
+
+    fn pop_issue_dialog_char(&mut self) {
+        let Some(dialog) = &mut self.issue_dialog else {
+            return;
+        };
+        match dialog.field {
+            IssueDialogField::Repo => {
+                dialog.repo.pop();
+            }
+            IssueDialogField::Title => {
+                dialog.title.pop();
+            }
+            IssueDialogField::Labels => {
+                dialog.labels.pop();
+            }
+            IssueDialogField::Body => {
+                dialog.body.pop();
+            }
+        }
+    }
+
+    fn scroll_issue_dialog_body(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.issue_dialog else {
+            return;
+        };
+        let (width, height) = issue_dialog_body_editor_size(area);
+        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        if delta < 0 {
+            dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.body_scroll = dialog.body_scroll.saturating_add(delta as u16);
+        }
+        dialog.body_scroll = dialog.body_scroll.min(max_scroll);
+    }
+
+    fn scroll_issue_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.issue_dialog {
+            if dialog.field != IssueDialogField::Body {
+                return;
+            }
+            let (width, height) = issue_dialog_body_editor_size(area);
+            dialog.body_scroll =
+                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.body_scroll);
+        }
+    }
+
+    fn prepare_issue_create(&mut self) -> Option<PendingIssueCreate> {
+        let dialog = self.issue_dialog.take()?;
+        let repo = dialog.repo.trim().to_string();
+        let title = dialog.title.trim().to_string();
+        let body = dialog.body.trim().to_string();
+        let labels = parse_issue_labels(&dialog.labels);
+
+        if !repo.contains('/') {
+            self.issue_dialog = Some(dialog);
+            self.status = "repo must be owner/name".to_string();
+            return None;
+        }
+        if title.is_empty() {
+            self.issue_dialog = Some(dialog);
+            self.status = "issue title is empty".to_string();
+            return None;
+        }
+
+        self.issue_creating = true;
+        self.status = format!("creating issue in {repo}");
+        self.message_dialog = Some(message_dialog("Creating Issue", "Waiting for GitHub..."));
+        Some(PendingIssueCreate {
+            repo,
+            title,
+            body,
+            labels,
+        })
     }
 
     fn handle_comment_dialog_key_with_submit<F>(
@@ -9427,6 +10376,8 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.pr_action_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
@@ -9496,6 +10447,8 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
         self.pr_action_dialog = None;
         self.status = "search mode".to_string();
         self.clamp_positions();
@@ -9543,6 +10496,7 @@ impl AppState {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_dialog = None;
+        self.label_dialog = None;
         self.pr_action_dialog = None;
     }
 
@@ -9609,7 +10563,12 @@ impl AppState {
     }
 
     fn open_url(&mut self, url: &str) {
-        match open::that(url) {
+        #[cfg(not(test))]
+        let result: std::io::Result<()> = open::that(url);
+        #[cfg(test)]
+        let result: std::io::Result<()> = Ok(());
+
+        match result {
             Ok(_) => {
                 self.status = format!("opened {url}");
             }
@@ -9650,6 +10609,15 @@ impl AppState {
     }
 
     fn current_item_supports_comments(&self) -> bool {
+        self.current_item()
+            .map(|item| {
+                matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
+                    && item.number.is_some()
+            })
+            .unwrap_or(false)
+    }
+
+    fn current_item_supports_labels(&self) -> bool {
         self.current_item()
             .map(|item| {
                 matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
@@ -10394,6 +11362,8 @@ deleted file mode 100644
                 .any(|line| line.contains('↳') && line.contains("bob")),
             "review replies should stay nested in the inline thread: {rendered:?}"
         );
+        assert_document_link_for_text(&document, "alice", "https://github.com/alice");
+        assert_document_link_for_text(&document, "bob", "https://github.com/bob");
 
         let body_line = rendered
             .iter()
@@ -10419,6 +11389,77 @@ deleted file mode 100644
             document.action_at(header_line, reply_column),
             Some(DetailAction::ReplyComment(0))
         );
+    }
+
+    #[test]
+    fn mouse_clicking_inline_comment_author_opens_profile() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let mut comment = comment(
+            "cuviper",
+            "I just meant stable vs. this nightly.",
+            Some("https://github.com/rust-lang/rust/pull/1#discussion_r1"),
+        );
+        comment.id = Some(1);
+        comment.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+        let area = Rect::new(0, 0, 140, 30);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let author_line = document
+            .lines
+            .iter()
+            .position(|line| {
+                let rendered = line.to_string();
+                rendered.contains("cuviper") && rendered.contains("reply")
+            })
+            .expect("inline comment author line");
+        let rendered = document.lines[author_line].to_string();
+        let author_column =
+            display_width(&rendered[..rendered.find("cuviper").expect("author column")]) as u16;
+        let author_row = inner.y + author_line as u16 - app.details_scroll;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + author_column,
+                row: author_row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.status, "opened https://github.com/cuviper");
     }
 
     #[test]
@@ -13022,6 +14063,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains("state: open"));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
+        assert!(rendered.contains("labels: T-compiler remove  add label"));
         assert!(!rendered.contains("reason: -"));
 
         let author_line = lines
@@ -13033,6 +14075,66 @@ diff --git a/src/github.rs b/src/github.rs
             document.link_at(author_line, author_column),
             Some("https://github.com/chenyukang".to_string())
         );
+        assert_document_action_for_text(
+            &document,
+            "remove",
+            DetailAction::RemoveLabel("T-compiler".to_string()),
+        );
+    }
+
+    #[test]
+    fn issue_details_meta_links_author() {
+        let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Issues, vec![section]);
+        let document = build_details_document(&app, 120);
+
+        assert_document_link_for_text(&document, "alice", "https://github.com/alice");
+        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
+    }
+
+    #[test]
+    fn issue_details_show_empty_labels_as_actionable() {
+        let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        item.labels.clear();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Issues, vec![section]);
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("labels: none  add label"));
+        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
     }
 
     #[test]
@@ -13510,6 +14612,40 @@ diff --git a/src/github.rs b/src/github.rs
             document.link_at(line_index, column),
             Some("https://example.com/one".to_string())
         );
+    }
+
+    #[test]
+    fn pr_and_issue_detail_comment_authors_are_clickable() {
+        let mut pr_app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        pr_app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "PR comment", None)]),
+        );
+        let pr_document = build_details_document(&pr_app, 120);
+        assert_document_link_for_text(&pr_document, "alice", "https://github.com/alice");
+
+        let mut issue = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("bob"));
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        let issue_section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: String::new(),
+            items: vec![issue],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut issue_app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        issue_app.details.insert(
+            "issue-1".to_string(),
+            DetailState::Loaded(vec![comment("carol", "Issue comment", None)]),
+        );
+        let issue_document = build_details_document(&issue_app, 120);
+        assert_document_link_for_text(&issue_document, "carol", "https://github.com/carol");
     }
 
     #[test]
@@ -14055,6 +15191,149 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             app.selected_open_url().as_deref(),
             Some("https://github.com/chenyukang/ghr/pull/8/changes")
+        );
+    }
+
+    #[test]
+    fn label_dialog_submits_add_label() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_add_label_dialog();
+
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Char('b')), |_| {});
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Char('u')), |_| {});
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Char('g')), |_| {});
+
+        let mut pending = None;
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Enter), |update| {
+            pending = Some(update);
+        });
+        let pending = pending.expect("pending label update");
+
+        assert!(app.label_updating);
+        assert!(app.label_dialog.is_none());
+        assert_eq!(pending.item.id, "1");
+        assert_eq!(pending.action, LabelAction::Add("bug".to_string()));
+    }
+
+    #[test]
+    fn issue_label_input_parses_comma_separated_labels() {
+        assert_eq!(
+            parse_issue_labels("bug, needs review, bug, , T-compiler"),
+            vec!["bug", "needs review", "T-compiler"]
+        );
+    }
+
+    #[test]
+    fn issue_dialog_submits_metadata() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_new_issue_dialog();
+
+        for ch in "Crash in parser".chars() {
+            app.handle_issue_dialog_key_with_submit(key(KeyCode::Char(ch)), None, |_| {});
+        }
+        app.handle_issue_dialog_key_with_submit(key(KeyCode::Tab), None, |_| {});
+        for ch in "bug, T-compiler".chars() {
+            app.handle_issue_dialog_key_with_submit(key(KeyCode::Char(ch)), None, |_| {});
+        }
+        app.handle_issue_dialog_key_with_submit(key(KeyCode::Tab), None, |_| {});
+        for ch in "Steps to reproduce".chars() {
+            app.handle_issue_dialog_key_with_submit(key(KeyCode::Char(ch)), None, |_| {});
+        }
+
+        let mut pending = None;
+        app.handle_issue_dialog_key_with_submit(ctrl_key(KeyCode::Enter), None, |issue| {
+            pending = Some(issue);
+        });
+        let pending = pending.expect("pending issue create");
+
+        assert!(app.issue_creating);
+        assert!(app.issue_dialog.is_none());
+        assert_eq!(pending.repo, "rust-lang/rust");
+        assert_eq!(pending.title, "Crash in parser");
+        assert_eq!(pending.body, "Steps to reproduce");
+        assert_eq!(pending.labels, vec!["bug", "T-compiler"]);
+    }
+
+    #[test]
+    fn created_issue_is_inserted_into_matching_repo_issue_section() {
+        let pr_section = SectionSnapshot {
+            key: "repo:Fiber:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:nervosnetwork/fiber is:open archived:false".to_string(),
+            items: vec![work_item("pr-1", "nervosnetwork/fiber", 10, "A PR", None)],
+            total_count: Some(1),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let issue_section = SectionSnapshot {
+            key: "repo:Fiber:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:nervosnetwork/fiber is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![pr_section, issue_section]);
+        app.active_view = "repo:Fiber".to_string();
+        app.clamp_positions();
+
+        let mut issue = work_item(
+            "nervosnetwork/fiber#42",
+            "nervosnetwork/fiber",
+            42,
+            "New issue",
+            Some("chenyukang"),
+        );
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/nervosnetwork/fiber/issues/42".to_string();
+        issue.labels = vec!["bug".to_string()];
+
+        assert!(app.insert_created_issue(issue));
+        assert_eq!(app.active_view, "repo:Fiber");
+        assert_eq!(
+            app.current_section().map(|section| section.key.as_str()),
+            Some("repo:Fiber:issues:Issues")
+        );
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("nervosnetwork/fiber#42")
+        );
+        assert_eq!(app.focus, FocusTarget::Details);
+    }
+
+    #[test]
+    fn remove_label_action_opens_confirmation_and_updates_local_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_detail_action(DetailAction::RemoveLabel("T-compiler".to_string()));
+        assert_eq!(
+            app.label_dialog.as_ref().map(|dialog| &dialog.mode),
+            Some(&LabelDialogMode::Remove {
+                label: "T-compiler".to_string()
+            })
+        );
+
+        let mut pending = None;
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Enter), |update| {
+            pending = Some(update);
+        });
+        let pending = pending.expect("pending label update");
+        assert_eq!(
+            pending.action,
+            LabelAction::Remove("T-compiler".to_string())
+        );
+
+        app.apply_label_update_local("1", &pending.action);
+        assert_eq!(
+            app.current_item().map(|item| item.labels.as_slice()),
+            Some(&[][..])
         );
     }
 
@@ -16409,6 +17688,46 @@ diff --git a/d.rs b/d.rs
         let details_area = details_area_for(app, area);
         let inner = block_inner(details_area);
         build_details_document(app, inner.width).selected_diff_line
+    }
+
+    fn assert_document_link_for_text(document: &DetailsDocument, text: &str, expected_url: &str) {
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let line_index = rendered
+            .iter()
+            .position(|line| line.contains(text))
+            .expect("link text line");
+        let column = display_width(
+            &rendered[line_index][..rendered[line_index].find(text).expect("link text column")],
+        ) as u16;
+        assert_eq!(
+            document.link_at(line_index, column).as_deref(),
+            Some(expected_url)
+        );
+    }
+
+    fn assert_document_action_for_text(
+        document: &DetailsDocument,
+        text: &str,
+        expected_action: DetailAction,
+    ) {
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let line_index = rendered
+            .iter()
+            .position(|line| line.contains(text))
+            .expect("action text line");
+        let column = rendered[line_index].find(text).expect("action text column") as u16;
+        assert_eq!(
+            document.action_at(line_index, column),
+            Some(expected_action)
+        );
     }
 
     fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {

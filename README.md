@@ -66,6 +66,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `[` / `]` | Load previous/next GitHub result page, or switch diff files in diff mode |
 | `/` | Fuzzy filter the current list |
 | `S` | Search matching PRs and issues in the current repo |
+| `N` | In issues list, create a new issue in the current repo |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |

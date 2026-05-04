@@ -344,7 +344,7 @@ pub fn configured_sections(config: &Config) -> Vec<SectionSnapshot> {
 }
 
 pub fn repo_section_filters(repo: &str) -> String {
-    format!("repo:{repo} is:open archived:false sort:updated-desc")
+    format!("repo:{repo} is:open archived:false sort:created-desc")
 }
 
 pub fn merge_cached_sections(
@@ -480,7 +480,7 @@ mod tests {
         assert!(repo_sections[0].key.starts_with("repo:fiber:"));
         assert_eq!(
             repo_sections[0].filters,
-            "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc"
+            "repo:nervosnetwork/fiber is:open archived:false sort:created-desc"
         );
     }
 

@@ -221,13 +221,13 @@ impl Default for Config {
             pr_sections: vec![
                 SearchSection {
                     title: "My Pull Requests".to_string(),
-                    filters: "is:open author:@me archived:false sort:updated-desc".to_string(),
+                    filters: "is:open author:@me archived:false sort:created-desc".to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
                 SearchSection {
                     title: "Assigned to Me".to_string(),
-                    filters: "is:open assignee:@me archived:false sort:updated-desc".to_string(),
+                    filters: "is:open assignee:@me archived:false sort:created-desc".to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
@@ -235,9 +235,9 @@ impl Default for Config {
                     title: "All Requests".to_string(),
                     filters: String::new(),
                     queries: vec![
-                        "author:@me archived:false sort:updated-desc".to_string(),
-                        "involves:@me -author:@me archived:false sort:updated-desc".to_string(),
-                        "reviewed-by:@me -author:@me archived:false sort:updated-desc".to_string(),
+                        "author:@me archived:false sort:created-desc".to_string(),
+                        "involves:@me -author:@me archived:false sort:created-desc".to_string(),
+                        "reviewed-by:@me -author:@me archived:false sort:created-desc".to_string(),
                     ],
                     limit: None,
                 },
@@ -245,19 +245,19 @@ impl Default for Config {
             issue_sections: vec![
                 SearchSection {
                     title: "Assigned to Me".to_string(),
-                    filters: "is:open assignee:@me archived:false sort:updated-desc".to_string(),
+                    filters: "is:open assignee:@me archived:false sort:created-desc".to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
                 SearchSection {
                     title: "Mentioned".to_string(),
-                    filters: "is:open mentions:@me archived:false sort:updated-desc".to_string(),
+                    filters: "is:open mentions:@me archived:false sort:created-desc".to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
                 SearchSection {
                     title: "Involved".to_string(),
-                    filters: "is:open involves:@me archived:false sort:updated-desc".to_string(),
+                    filters: "is:open involves:@me archived:false sort:created-desc".to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
@@ -450,8 +450,8 @@ mod tests {
             title: "All Requests".to_string(),
             filters: String::new(),
             queries: vec![
-                "author:@me sort:updated-desc".to_string(),
-                "reviewed-by:@me sort:updated-desc".to_string(),
+                "author:@me sort:created-desc".to_string(),
+                "reviewed-by:@me sort:created-desc".to_string(),
             ],
             limit: None,
         };
@@ -459,13 +459,13 @@ mod tests {
         assert_eq!(
             section.search_filters(),
             vec![
-                "author:@me sort:updated-desc".to_string(),
-                "reviewed-by:@me sort:updated-desc".to_string()
+                "author:@me sort:created-desc".to_string(),
+                "reviewed-by:@me sort:created-desc".to_string()
             ]
         );
         assert_eq!(
             section.display_filters(),
-            "author:@me sort:updated-desc | reviewed-by:@me sort:updated-desc"
+            "author:@me sort:created-desc | reviewed-by:@me sort:created-desc"
         );
     }
 
@@ -492,11 +492,11 @@ mod tests {
 
             [[pr_sections]]
             title = "Assigned to Me"
-            filters = "is:open assignee:@me archived:false sort:updated-desc"
+            filters = "is:open assignee:@me archived:false sort:created-desc"
 
             [[issue_sections]]
             title = "Assigned to Me"
-            filters = "is:open assignee:@me archived:false sort:updated-desc"
+            filters = "is:open assignee:@me archived:false sort:created-desc"
 
             [[notification_sections]]
             title = "Unread"

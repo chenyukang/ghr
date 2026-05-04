@@ -178,14 +178,14 @@ include_read_notifications = true
 
 [[pr_sections]]
 title = "My Pull Requests"
-filters = "is:open author:@me archived:false sort:updated-desc"
+filters = "is:open author:@me archived:false sort:created-desc"
 
 [[pr_sections]]
 title = "All Requests"
 queries = [
-  "author:@me archived:false sort:updated-desc",
-  "involves:@me -author:@me archived:false sort:updated-desc",
-  "reviewed-by:@me -author:@me archived:false sort:updated-desc",
+  "author:@me archived:false sort:created-desc",
+  "involves:@me -author:@me archived:false sort:created-desc",
+  "reviewed-by:@me -author:@me archived:false sort:created-desc",
 ]
 
 exclude_repos = ["some-org/archive-*"]

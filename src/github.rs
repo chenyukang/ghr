@@ -100,6 +100,11 @@ struct SearchLabelRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct RepositoryLabelRaw {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRepositoryRaw {
     name_with_owner: String,
@@ -951,6 +956,24 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
+    let path = format!("repos/{repository}/labels");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+        "-f".to_string(),
+        "per_page=100".to_string(),
+    ])
+    .await
+    .with_context(|| format!("failed to fetch labels for {repository}"))?;
+    parse_repository_labels_output(&output)
+        .with_context(|| format!("failed to parse labels for {repository}"))
+}
+
 pub async fn add_issue_label(repository: &str, number: u64, label: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/{number}/labels");
     run_gh_json(&[
@@ -1793,6 +1816,20 @@ fn repo_from_repository_url(url: &str) -> String {
         .to_string()
 }
 
+fn parse_repository_labels_output(output: &str) -> Result<Vec<String>> {
+    let pages = serde_json::from_str::<Vec<Vec<RepositoryLabelRaw>>>(output)
+        .context("failed to parse paginated repository labels")?;
+    let mut labels = pages
+        .into_iter()
+        .flatten()
+        .map(|label| label.name.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    labels.sort_by_key(|label| label.to_ascii_lowercase());
+    labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(labels)
+}
+
 fn percent_encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -2110,6 +2147,19 @@ mod tests {
         assert_eq!(
             percent_encode_path_segment("needs review/triage"),
             "needs%20review%2Ftriage"
+        );
+    }
+
+    #[test]
+    fn paginated_repository_labels_are_sorted_and_deduped() {
+        let output = r#"[
+          [{"name": "bug"}, {"name": "T-compiler"}],
+          [{"name": "enhancement"}, {"name": "Bug"}]
+        ]"#;
+
+        assert_eq!(
+            parse_repository_labels_output(output).unwrap(),
+            vec!["bug", "enhancement", "T-compiler"]
         );
     }
 

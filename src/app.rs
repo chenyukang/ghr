@@ -32,10 +32,11 @@ use crate::dirs::Paths;
 use crate::github::{
     PullRequestReviewCommentTarget, add_issue_label, approve_pull_request, close_pull_request,
     create_issue, edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
-    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
-    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
-    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
-    refresh_section_page, remove_issue_label, search_global, with_background_github_priority,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, fetch_repository_labels,
+    mark_notification_thread_read, merge_pull_request, post_issue_comment,
+    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
+    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label, search_global,
+    with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -110,6 +111,10 @@ enum AppMsg {
         item_id: String,
         action: LabelAction,
         result: std::result::Result<(), String>,
+    },
+    LabelSuggestionsLoaded {
+        repo: String,
+        result: std::result::Result<Vec<String>, String>,
     },
     IssueCreated {
         result: std::result::Result<WorkItem, String>,
@@ -252,7 +257,7 @@ struct PendingCommentSubmit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LabelDialogMode {
-    Add,
+    Add { repo: String },
     Remove { label: String },
 }
 
@@ -260,6 +265,11 @@ enum LabelDialogMode {
 struct LabelDialog {
     mode: LabelDialogMode,
     input: String,
+    existing_labels: Vec<String>,
+    suggestions: Vec<String>,
+    suggestions_loading: bool,
+    suggestions_error: Option<String>,
+    selected_suggestion: usize,
 }
 
 struct PendingLabelUpdate {
@@ -377,6 +387,7 @@ const DIFF_INLINE_COMMENT_GUTTER_WIDTH: usize = 11;
 const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
+const LABEL_SUGGESTION_LIMIT: usize = 6;
 
 struct AppState {
     active_view: String,
@@ -1155,6 +1166,15 @@ fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<A
     });
 }
 
+fn start_label_suggestions_load(repo: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = fetch_repository_labels(&repo)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::LabelSuggestionsLoaded { repo, result });
+    });
+}
+
 fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let result = create_issue(
@@ -1410,7 +1430,7 @@ fn handle_key_in_area(
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
-            KeyCode::Char('L') => app.start_add_label_dialog(),
+            KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
             KeyCode::Char('N') => app.start_new_issue_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1433,7 +1453,7 @@ fn handle_key_in_area(
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
-                app.start_add_label_dialog()
+                app.start_add_label_dialog(Some(tx))
             }
             KeyCode::Char('N') => app.start_new_issue_dialog(),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
@@ -1778,7 +1798,7 @@ fn handle_left_click(
     app.global_search_active = false;
 
     if let Some(action) = document.action_at(line_index, column) {
-        app.handle_detail_action(action);
+        app.handle_detail_action(action, tx);
         return;
     }
     let clicked_comment = document.comment_at(line_index);
@@ -3240,33 +3260,97 @@ fn draw_pr_action_dialog(
 }
 
 fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool, area: Rect) {
-    let dialog_area = centered_rect(66, 9, area);
+    let dialog_area = if matches!(dialog.mode, LabelDialogMode::Add { .. }) {
+        centered_rect(74, 16, area)
+    } else {
+        centered_rect(66, 9, area)
+    };
     let (title, lines, accent, cursor) = match &dialog.mode {
-        LabelDialogMode::Add => {
+        LabelDialogMode::Add { repo } => {
             let status = if running {
                 "working...".to_string()
             } else {
-                "Enter: add label    Esc: cancel".to_string()
+                "Up/Down: choose    Enter: add    Esc: cancel".to_string()
             };
             let input = if dialog.input.is_empty() {
                 " ".to_string()
             } else {
                 dialog.input.clone()
             };
-            (
-                "Add Label",
-                vec![
-                    Line::from("Label name"),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(input, Style::default().fg(Color::Cyan))]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        status,
+            let matches = label_dialog_suggestion_matches(dialog);
+            let mut lines = vec![
+                key_value_line("repo", repo.clone()),
+                Line::from("Label prefix"),
+                Line::from(vec![Span::styled(input, Style::default().fg(Color::Cyan))]),
+                Line::from(""),
+            ];
+            if dialog.suggestions_loading {
+                lines.push(Line::from(vec![Span::styled(
+                    "Suggestions: loading...",
+                    Style::default().fg(Color::Gray),
+                )]));
+            } else if let Some(error) = &dialog.suggestions_error {
+                lines.push(Line::from(vec![Span::styled(
+                    "Suggestions unavailable",
+                    Style::default()
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(vec![Span::styled(
+                    truncate_text(error, 68),
+                    Style::default().fg(Color::Gray),
+                )]));
+            } else if matches.is_empty() {
+                let message = if dialog.input.trim().is_empty() {
+                    "No labels available for this repo."
+                } else {
+                    "No prefix matches. Enter adds the typed label."
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    message,
+                    Style::default().fg(Color::Gray),
+                )]));
+            } else {
+                lines.push(Line::from(vec![Span::styled(
+                    "Suggestions",
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                let start =
+                    label_suggestion_window_start(matches.len(), dialog.selected_suggestion);
+                for (index, label) in matches
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(LABEL_SUGGESTION_LIMIT)
+                {
+                    let selected = index == dialog.selected_suggestion;
+                    let style = if selected {
                         Style::default()
                             .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )]),
-                ],
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(if selected { "> " } else { "  " }, style),
+                        Span::styled(label.clone(), style),
+                    ]));
+                }
+            }
+            while lines.len() < 12 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                status,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            (
+                "Add Label",
+                lines,
                 Color::LightMagenta,
                 Some(dialog.input.chars().count() as u16),
             )
@@ -3484,6 +3568,66 @@ fn parse_issue_labels(input: &str) -> Vec<String> {
         }
     }
     labels
+}
+
+fn label_dialog_suggestion_matches(dialog: &LabelDialog) -> Vec<String> {
+    if !matches!(dialog.mode, LabelDialogMode::Add { .. }) {
+        return Vec::new();
+    }
+    let query = dialog.input.trim().to_ascii_lowercase();
+    dialog
+        .suggestions
+        .iter()
+        .filter(|label| {
+            !dialog
+                .existing_labels
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(label))
+        })
+        .filter(|label| query.is_empty() || label.to_ascii_lowercase().starts_with(&query))
+        .cloned()
+        .collect()
+}
+
+fn selected_label_for_add(dialog: &LabelDialog) -> String {
+    let input = dialog.input.trim();
+    let matches = label_dialog_suggestion_matches(dialog);
+    if !input.is_empty()
+        && let Some(exact) = dialog
+            .suggestions
+            .iter()
+            .find(|label| label.eq_ignore_ascii_case(input))
+    {
+        return exact.clone();
+    }
+    if matches.is_empty() {
+        input.to_string()
+    } else {
+        matches
+            .get(dialog.selected_suggestion.min(matches.len() - 1))
+            .cloned()
+            .unwrap_or_else(|| input.to_string())
+    }
+}
+
+fn clamp_label_dialog_selection(dialog: &mut LabelDialog) {
+    let count = label_dialog_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_suggestion = 0;
+    } else {
+        dialog.selected_suggestion = dialog.selected_suggestion.min(count - 1);
+    }
+}
+
+fn label_suggestion_window_start(total: usize, selected: usize) -> usize {
+    if total <= LABEL_SUGGESTION_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(LABEL_SUGGESTION_LIMIT)
+            .min(total.saturating_sub(LABEL_SUGGESTION_LIMIT))
+    }
 }
 
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
@@ -3970,8 +4114,9 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Esc", "cancel editing"),
         Line::from(""),
         help_heading("Label Dialog"),
-        help_key_line("Enter", "add label or confirm removal"),
-        help_key_line("Backspace", "delete previous character while adding"),
+        help_key_line("Up/Down or Tab", "choose a matching repo label"),
+        help_key_line("Enter", "add selected label or confirm removal"),
+        help_key_line("Backspace", "delete previous character while filtering"),
         help_key_line("Esc", "cancel label update"),
         Line::from(""),
         help_heading("Issue Dialog"),
@@ -8093,6 +8238,32 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::LabelSuggestionsLoaded { repo, result } => {
+                let Some(dialog) = &mut self.label_dialog else {
+                    return;
+                };
+                let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode else {
+                    return;
+                };
+                if dialog_repo != &repo {
+                    return;
+                }
+                dialog.suggestions_loading = false;
+                match result {
+                    Ok(labels) => {
+                        dialog.suggestions = labels;
+                        dialog.suggestions_error = None;
+                        clamp_label_dialog_selection(dialog);
+                        self.status = "label suggestions loaded".to_string();
+                    }
+                    Err(error) => {
+                        dialog.suggestions.clear();
+                        dialog.suggestions_error = Some(error);
+                        dialog.selected_suggestion = 0;
+                        self.status = "label suggestions unavailable".to_string();
+                    }
+                }
+            }
             AppMsg::IssueCreated { result } => {
                 self.issue_creating = false;
                 self.issue_dialog = None;
@@ -9642,7 +9813,7 @@ impl AppState {
             .min(max_details_scroll(self, details_area));
     }
 
-    fn handle_detail_action(&mut self, action: DetailAction) {
+    fn handle_detail_action(&mut self, action: DetailAction, tx: Option<&UnboundedSender<AppMsg>>) {
         match action {
             DetailAction::ReplyComment(index) => {
                 self.select_comment(index);
@@ -9656,7 +9827,7 @@ impl AppState {
                 self.select_comment(index);
                 self.toggle_selected_comment_expanded();
             }
-            DetailAction::AddLabel => self.start_add_label_dialog(),
+            DetailAction::AddLabel => self.start_add_label_dialog(tx),
             DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
         }
     }
@@ -9926,14 +10097,25 @@ impl AppState {
         });
     }
 
-    fn start_add_label_dialog(&mut self) {
-        if !self.current_item_supports_labels() {
+    fn start_add_label_dialog(&mut self, tx: Option<&UnboundedSender<AppMsg>>) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
             self.status = "labels are available for issues and pull requests".to_string();
             return;
-        }
+        };
+        let repo = item.repo.clone();
+        let suggestions_loading = tx.is_some();
         self.label_dialog = Some(LabelDialog {
-            mode: LabelDialogMode::Add,
+            mode: LabelDialogMode::Add { repo: repo.clone() },
             input: String::new(),
+            existing_labels: item.labels,
+            suggestions: Vec::new(),
+            suggestions_loading,
+            suggestions_error: None,
+            selected_suggestion: 0,
         });
         self.label_updating = false;
         self.comment_dialog = None;
@@ -9943,7 +10125,14 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.focus = FocusTarget::Details;
-        self.status = "label input mode".to_string();
+        if let Some(tx) = tx {
+            start_label_suggestions_load(repo, tx.clone());
+        }
+        self.status = if suggestions_loading {
+            "loading label suggestions".to_string()
+        } else {
+            "label input mode".to_string()
+        };
     }
 
     fn start_remove_label_dialog(&mut self, label: String) {
@@ -9954,6 +10143,11 @@ impl AppState {
         self.label_dialog = Some(LabelDialog {
             mode: LabelDialogMode::Remove { label },
             input: String::new(),
+            existing_labels: Vec::new(),
+            suggestions: Vec::new(),
+            suggestions_loading: false,
+            suggestions_error: None,
+            selected_suggestion: 0,
         });
         self.label_updating = false;
         self.comment_dialog = None;
@@ -9985,7 +10179,7 @@ impl AppState {
         };
 
         match mode {
-            LabelDialogMode::Add => match key.code {
+            LabelDialogMode::Add { .. } => match key.code {
                 KeyCode::Esc => {
                     self.label_dialog = None;
                     self.status = "label update cancelled".to_string();
@@ -9995,14 +10189,20 @@ impl AppState {
                         submit(pending);
                     }
                 }
+                KeyCode::Down | KeyCode::Tab => self.move_label_suggestion(1),
+                KeyCode::Up | KeyCode::BackTab => self.move_label_suggestion(-1),
                 KeyCode::Backspace => {
                     if let Some(dialog) = &mut self.label_dialog {
                         dialog.input.pop();
+                        dialog.selected_suggestion = 0;
+                        clamp_label_dialog_selection(dialog);
                     }
                 }
                 KeyCode::Char(value) => {
                     if let Some(dialog) = &mut self.label_dialog {
                         dialog.input.push(value);
+                        dialog.selected_suggestion = 0;
+                        clamp_label_dialog_selection(dialog);
                     }
                 }
                 _ => {}
@@ -10024,13 +10224,30 @@ impl AppState {
 
     fn prepare_label_add(&mut self) -> Option<PendingLabelUpdate> {
         let dialog = self.label_dialog.take()?;
-        let label = dialog.input.trim().to_string();
+        let label = selected_label_for_add(&dialog);
         if label.is_empty() {
             self.label_dialog = Some(dialog);
             self.status = "label is empty".to_string();
             return None;
         }
         self.prepare_label_update(LabelAction::Add(label), Some(dialog))
+    }
+
+    fn move_label_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.label_dialog else {
+            return;
+        };
+        let count = label_dialog_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no label suggestions match".to_string();
+            return;
+        }
+        dialog.selected_suggestion = move_wrapping(dialog.selected_suggestion, count, delta);
+        let label = label_dialog_suggestion_matches(dialog)
+            .get(dialog.selected_suggestion)
+            .cloned()
+            .unwrap_or_else(|| dialog.input.trim().to_string());
+        self.status = format!("selected label suggestion: {label}");
     }
 
     fn prepare_label_remove(&mut self, label: String) -> Option<PendingLabelUpdate> {
@@ -14797,7 +15014,7 @@ diff --git a/src/github.rs b/src/github.rs
             Some(DetailAction::ToggleCommentExpanded(0))
         );
 
-        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0));
+        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0), None);
         let expanded = build_details_document(&app, 120)
             .lines
             .iter()
@@ -15010,7 +15227,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::EditComment(0));
+        app.handle_detail_action(DetailAction::EditComment(0), None);
 
         let dialog = app.comment_dialog.expect("edit dialog");
         assert_eq!(
@@ -15033,7 +15250,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![comment("alice", "Quoted body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::ReplyComment(0));
+        app.handle_detail_action(DetailAction::ReplyComment(0), None);
 
         let dialog = app.comment_dialog.expect("reply dialog");
         assert_eq!(
@@ -15197,7 +15414,7 @@ diff --git a/src/github.rs b/src/github.rs
     #[test]
     fn label_dialog_submits_add_label() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.start_add_label_dialog();
+        app.start_add_label_dialog(None);
 
         app.handle_label_dialog_key_with_submit(key(KeyCode::Char('b')), |_| {});
         app.handle_label_dialog_key_with_submit(key(KeyCode::Char('u')), |_| {});
@@ -15213,6 +15430,34 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(app.label_dialog.is_none());
         assert_eq!(pending.item.id, "1");
         assert_eq!(pending.action, LabelAction::Add("bug".to_string()));
+    }
+
+    #[test]
+    fn label_dialog_prefix_matches_repo_labels() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_add_label_dialog(None);
+        let dialog = app.label_dialog.as_mut().expect("label dialog");
+        dialog.suggestions = vec![
+            "bug".to_string(),
+            "good first issue".to_string(),
+            "T-compiler".to_string(),
+        ];
+
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Char('g')), |_| {});
+        assert_eq!(
+            label_dialog_suggestion_matches(app.label_dialog.as_ref().unwrap()),
+            vec!["good first issue"]
+        );
+
+        let mut pending = None;
+        app.handle_label_dialog_key_with_submit(key(KeyCode::Enter), |update| {
+            pending = Some(update);
+        });
+        let pending = pending.expect("pending label update");
+        assert_eq!(
+            pending.action,
+            LabelAction::Add("good first issue".to_string())
+        );
     }
 
     #[test]
@@ -15312,7 +15557,7 @@ diff --git a/src/github.rs b/src/github.rs
     fn remove_label_action_opens_confirmation_and_updates_local_item() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
-        app.handle_detail_action(DetailAction::RemoveLabel("T-compiler".to_string()));
+        app.handle_detail_action(DetailAction::RemoveLabel("T-compiler".to_string()), None);
         assert_eq!(
             app.label_dialog.as_ref().map(|dialog| &dialog.mode),
             Some(&LabelDialogMode::Remove {

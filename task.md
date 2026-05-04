@@ -31,7 +31,7 @@ review.
 | Close / reopen issue and PR reopen | `codex/state-actions` | Russell | In review | [#14](https://github.com/chenyukang/ghr/pull/14) | Existing PR close flow expanded to issue close/reopen and PR reopen. |
 | Edit title / body | `codex/edit-title-body` | Nietzsche | In review | [#20](https://github.com/chenyukang/ghr/pull/20) | Uses existing editor dialog: `E`, then `t` or `b`, then `Ctrl+Enter`. |
 | Change milestone | `codex/milestone-actions` | Hegel | In review | [#22](https://github.com/chenyukang/ghr/pull/22) | Prefix milestone selection plus clear/remove; current milestone display depends on fetched metadata. |
-| Quick state/search filters in TUI | `codex/search-filter-shortcuts` | Hooke | In progress | - | open/closed/merged/draft/all plus assignee/author/label filters. |
+| Quick state/search filters in TUI | `codex/search-filter-shortcuts` | Hooke | In review | [#21](https://github.com/chenyukang/ghr/pull/21) | open/closed/merged/draft/all plus assignee/author/label filters; labels with spaces are not grouped. |
 
 ## PR-only backlog
 
@@ -55,6 +55,6 @@ review.
 | Chandrasekhar | Mark draft / ready for review | `~/.codex/worktrees/ghr-pr-draft-ready-actions` | `codex/pr-draft-ready-actions` | In review: [#15](https://github.com/chenyukang/ghr/pull/15) |
 | Nietzsche | Edit title / body | `~/.codex/worktrees/ghr-edit-title-body` | `codex/edit-title-body` | In review: [#20](https://github.com/chenyukang/ghr/pull/20) |
 | Hegel | Change milestone | `~/.codex/worktrees/ghr-milestone-actions` | `codex/milestone-actions` | In review: [#22](https://github.com/chenyukang/ghr/pull/22) |
-| Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In progress |
+| Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In review: [#21](https://github.com/chenyukang/ghr/pull/21) |
 | Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In review: [#18](https://github.com/chenyukang/ghr/pull/18) |
 | Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In review: [#19](https://github.com/chenyukang/ghr/pull/19) |

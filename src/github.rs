@@ -1272,6 +1272,56 @@ pub struct PullRequestReviewCommentTarget<'a> {
     pub start_side: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestReviewEvent {
+    Comment,
+    RequestChanges,
+    Approve,
+}
+
+impl PullRequestReviewEvent {
+    pub fn as_api_value(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::RequestChanges => "REQUEST_CHANGES",
+            Self::Approve => "APPROVE",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::RequestChanges => "request changes",
+            Self::Approve => "approve",
+        }
+    }
+
+    pub fn success_label(self) -> &'static str {
+        match self {
+            Self::Comment => "review comment submitted",
+            Self::RequestChanges => "changes requested",
+            Self::Approve => "pull request approved",
+        }
+    }
+
+    pub fn requires_body(self) -> bool {
+        matches!(self, Self::Comment | Self::RequestChanges)
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Comment => Self::RequestChanges,
+            Self::RequestChanges => Self::Approve,
+            Self::Approve => Self::Comment,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewRaw {
+    id: u64,
+}
+
 pub async fn post_pull_request_review_comment(
     repository: &str,
     number: u64,
@@ -1312,6 +1362,120 @@ pub async fn post_pull_request_review_comment(
         .await
         .with_context(|| format!("failed to post review comment for {repository}#{number}"))?;
     Ok(())
+}
+
+pub async fn create_pending_pull_request_review(
+    repository: &str,
+    number: u64,
+    body: &str,
+) -> Result<u64> {
+    let args = create_pull_request_review_args(repository, number, None, body);
+    let output = run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to create pending review for {repository}#{number}"))?;
+    let review = serde_json::from_str::<PullRequestReviewRaw>(&output)
+        .with_context(|| format!("failed to parse pending review for {repository}#{number}"))?;
+    Ok(review.id)
+}
+
+pub async fn submit_pull_request_review(
+    repository: &str,
+    number: u64,
+    event: PullRequestReviewEvent,
+    body: &str,
+) -> Result<()> {
+    let args = create_pull_request_review_args(repository, number, Some(event), body);
+    run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to submit review for {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn submit_pending_pull_request_review(
+    repository: &str,
+    number: u64,
+    review_id: u64,
+    event: PullRequestReviewEvent,
+    body: &str,
+) -> Result<()> {
+    let args = submit_pending_pull_request_review_args(repository, number, review_id, event, body);
+    run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to submit pending review for {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn discard_pending_pull_request_review(
+    repository: &str,
+    number: u64,
+    review_id: u64,
+) -> Result<()> {
+    let args = discard_pending_pull_request_review_args(repository, number, review_id);
+    run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to discard pending review for {repository}#{number}"))?;
+    Ok(())
+}
+
+fn create_pull_request_review_args(
+    repository: &str,
+    number: u64,
+    event: Option<PullRequestReviewEvent>,
+    body: &str,
+) -> Vec<String> {
+    let path = format!("repos/{repository}/pulls/{number}/reviews");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+    ];
+    if let Some(event) = event {
+        args.push("-f".to_string());
+        args.push(format!("event={}", event.as_api_value()));
+    }
+    push_review_body_arg(&mut args, body);
+    args
+}
+
+fn submit_pending_pull_request_review_args(
+    repository: &str,
+    number: u64,
+    review_id: u64,
+    event: PullRequestReviewEvent,
+    body: &str,
+) -> Vec<String> {
+    let path = format!("repos/{repository}/pulls/{number}/reviews/{review_id}/events");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("event={}", event.as_api_value()),
+    ];
+    push_review_body_arg(&mut args, body);
+    args
+}
+
+fn discard_pending_pull_request_review_args(
+    repository: &str,
+    number: u64,
+    review_id: u64,
+) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "DELETE".to_string(),
+        format!("repos/{repository}/pulls/{number}/reviews/{review_id}"),
+    ]
+}
+
+fn push_review_body_arg(args: &mut Vec<String>, body: &str) {
+    if !body.trim().is_empty() {
+        args.push("-f".to_string());
+        args.push(format!("body={}", body.trim()));
+    }
 }
 
 pub async fn post_pull_request_review_reply(
@@ -1460,16 +1624,7 @@ pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
 }
 
 pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&[
-        "pr".to_string(),
-        "review".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--approve".to_string(),
-    ])
-    .await?;
-    Ok(())
+    submit_pull_request_review(repository, number, PullRequestReviewEvent::Approve, "").await
 }
 
 fn parse_issue_comments_output(
@@ -3198,5 +3353,84 @@ mod tests {
         let message = gh_failure_message(&["search".to_string(), "issues".to_string()], "HTTP 500");
 
         assert_eq!(message, "gh search issues failed: HTTP 500");
+    }
+
+    #[test]
+    fn review_submit_args_include_event_and_body() {
+        let args = create_pull_request_review_args(
+            "owner/repo",
+            42,
+            Some(PullRequestReviewEvent::RequestChanges),
+            "please fix",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/pulls/42/reviews",
+                "-f",
+                "event=REQUEST_CHANGES",
+                "-f",
+                "body=please fix",
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_review_create_args_omit_event() {
+        let args = create_pull_request_review_args("owner/repo", 42, None, "draft notes");
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/pulls/42/reviews",
+                "-f",
+                "body=draft notes",
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_review_submit_args_target_events_endpoint() {
+        let args = submit_pending_pull_request_review_args(
+            "owner/repo",
+            42,
+            77,
+            PullRequestReviewEvent::Approve,
+            "",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/pulls/42/reviews/77/events",
+                "-f",
+                "event=APPROVE",
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_review_discard_args_target_review_endpoint() {
+        let args = discard_pending_pull_request_review_args("owner/repo", 42, 77);
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "-X",
+                "DELETE",
+                "repos/owner/repo/pulls/42/reviews/77",
+            ]
+        );
     }
 }

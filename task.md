@@ -28,7 +28,7 @@ review.
 | --- | --- | --- | --- | --- | --- |
 | Assign / unassign assignees | `codex/assignee-actions` | Harvey | In progress | - | Support issues and PRs through GitHub issue assignee APIs. |
 | Request / remove reviewers, including re-request review | `codex/reviewer-actions` | Huygens | In progress | - | PR-only review request management. |
-| Close / reopen issue and PR reopen | `codex/state-actions` | Russell | In progress | - | Existing PR close flow should expand to issue close/reopen and PR reopen. |
+| Close / reopen issue and PR reopen | `codex/state-actions` | Russell | In review | [#14](https://github.com/chenyukang/ghr/pull/14) | Existing PR close flow expanded to issue close/reopen and PR reopen. |
 | Edit title / body | `codex/edit-title-body` | Later wave | Todo | - | Needs a focused editor flow for current issue/PR metadata. |
 | Change milestone | `codex/milestone-actions` | Later wave | Todo | - | Needs milestone list/prefix selection plus clear/remove. |
 | Quick state/search filters in TUI | `codex/search-filter-shortcuts` | Later wave | Todo | - | open/closed/merged/draft/all plus assignee/author/label filters. |
@@ -37,7 +37,7 @@ review.
 
 | Feature | Branch | Owner | Status | PR | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Mark draft / ready for review | `codex/pr-draft-ready-actions` | Chandrasekhar | In progress | - | Add PR lifecycle actions and refresh details afterward. |
+| Mark draft / ready for review | `codex/pr-draft-ready-actions` | Chandrasekhar | In review | [#15](https://github.com/chenyukang/ghr/pull/15) | Add PR lifecycle actions and refresh details afterward. |
 | Update branch | `codex/pr-update-branch` | Later wave | Todo | - | Use GitHub branch update API/CLI where available. |
 | Enable / disable auto-merge | `codex/pr-auto-merge-actions` | Later wave | Todo | - | Requires merge method choice and repository capability checks. |
 | Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Later wave | Todo | - | Existing merge confirmation should expose method selection. |
@@ -51,5 +51,5 @@ review.
 | --- | --- | --- | --- | --- |
 | Harvey | Assign / unassign assignees | `~/.codex/worktrees/ghr-assignee-actions` | `codex/assignee-actions` | In progress |
 | Huygens | Request / remove / re-request reviewers | `~/.codex/worktrees/ghr-reviewer-actions` | `codex/reviewer-actions` | In progress |
-| Russell | Close / reopen issue and PR reopen | `~/.codex/worktrees/ghr-state-actions` | `codex/state-actions` | In progress |
-| Chandrasekhar | Mark draft / ready for review | `~/.codex/worktrees/ghr-pr-draft-ready-actions` | `codex/pr-draft-ready-actions` | In progress |
+| Russell | Close / reopen issue and PR reopen | `~/.codex/worktrees/ghr-state-actions` | `codex/state-actions` | In review: [#14](https://github.com/chenyukang/ghr/pull/14) |
+| Chandrasekhar | Mark draft / ready for review | `~/.codex/worktrees/ghr-pr-draft-ready-actions` | `codex/pr-draft-ready-actions` | In review: [#15](https://github.com/chenyukang/ghr/pull/15) |

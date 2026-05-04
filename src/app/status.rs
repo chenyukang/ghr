@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use super::{
-    MessageDialog, MessageDialogKind, PendingCommentMode, PrAction, SUCCESS_DIALOG_AUTO_CLOSE,
-    SetupDialog, text::truncate_inline,
+    MessageDialog, MessageDialogKind, PendingCommentMode, PrAction, ReviewerAction,
+    SUCCESS_DIALOG_AUTO_CLOSE, SetupDialog, text::truncate_inline,
 };
 
 pub(super) fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
@@ -158,6 +158,34 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
 
 pub(super) fn pr_action_error_body(error: &str) -> String {
     operation_error_body(error)
+}
+
+pub(super) fn reviewer_action_success_title(action: ReviewerAction) -> &'static str {
+    match action {
+        ReviewerAction::Request => "Reviewers Requested",
+        ReviewerAction::Remove => "Review Requests Removed",
+    }
+}
+
+pub(super) fn reviewer_action_success_body(action: ReviewerAction) -> &'static str {
+    match action {
+        ReviewerAction::Request => "GitHub accepted the review request. Refreshing details.",
+        ReviewerAction::Remove => "GitHub removed the requested reviewers. Refreshing details.",
+    }
+}
+
+pub(super) fn reviewer_action_error_title(action: ReviewerAction) -> &'static str {
+    match action {
+        ReviewerAction::Request => "Reviewer Request Failed",
+        ReviewerAction::Remove => "Reviewer Removal Failed",
+    }
+}
+
+pub(super) fn reviewer_action_error_status(action: ReviewerAction) -> &'static str {
+    match action {
+        ReviewerAction::Request => "reviewer request failed",
+        ReviewerAction::Remove => "reviewer removal failed",
+    }
 }
 
 pub(super) fn operation_error_body(error: &str) -> String {

@@ -92,8 +92,11 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `D` | Discard a pending PR review created in this session |
 | `E` | Open an enable auto-merge confirmation for the selected PR |
 | `O` | Open a disable auto-merge confirmation for the selected PR |
+| `P` | Request or re-request PR reviewers with comma-separated logins |
+| `Y` | Remove pending PR review requests with comma-separated logins |
 | `t` | Change or clear the selected issue/PR milestone |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
+| `Enter` in Reviewer Action | Submit the reviewer login list |
 | `Ctrl+Enter` | Send or update a comment/title/body from the editor dialog |
 | `Ctrl+Enter` in issue dialog | Create the issue |
 | `r` | Refresh from GitHub |

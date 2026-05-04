@@ -250,11 +250,14 @@ enum PrAction {
     RerunFailedChecks,
 }
 
+type PrActionDialogSummary = Vec<(&'static str, String)>;
+type PrActionDialogSummaryError = (&'static str, String, String);
+
 #[derive(Debug, Clone)]
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
-    summary: Vec<(&'static str, String)>,
+    summary: PrActionDialogSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9150,7 +9153,7 @@ impl AppState {
         &self,
         item: &WorkItem,
         action: PrAction,
-    ) -> Result<Vec<(&'static str, String)>, (&'static str, String, String)> {
+    ) -> Result<PrActionDialogSummary, PrActionDialogSummaryError> {
         if action != PrAction::RerunFailedChecks {
             return Ok(Vec::new());
         }

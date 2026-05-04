@@ -76,7 +76,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |
 | `a` | Add a normal issue or PR comment |
 | `L` | Add a label to the selected issue or PR; type a prefix and choose from repo labels |
-| `N` | Create an issue in the current repo; edit repo, title, labels, and body |
+| `N` | In a PR list, create a PR from the repo `local_dir` current branch; in an issue list, create an issue |
 | `+` | Add a reaction to the selected issue, PR, or focused comment |
 | `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |

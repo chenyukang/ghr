@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1370,6 +1371,58 @@ pub async fn create_issue(
     Ok(search_api_item_to_work_item(SectionKind::Issues, raw))
 }
 
+pub async fn create_pull_request(
+    repository: &str,
+    local_dir: &Path,
+    head: &str,
+    title: &str,
+    body: &str,
+) -> Result<WorkItem> {
+    let args = create_pull_request_args(repository, head, title, body);
+    let output = run_gh_text_in_dir(&args, local_dir)
+        .await
+        .with_context(|| format!("failed to create pull request in {repository}"))?;
+    let number = pull_request_number_from_create_output(&output)
+        .ok_or_else(|| anyhow!("gh pr create did not return a pull request URL"))?;
+    let issue_path = format!("repos/{repository}/issues/{number}");
+    let issue_output = run_gh_json(&["api".to_string(), issue_path])
+        .await
+        .with_context(|| format!("failed to fetch created pull request {repository}#{number}"))?;
+    let raw = serde_json::from_str::<SearchApiIssueRaw>(&issue_output)
+        .with_context(|| format!("failed to parse created pull request {repository}#{number}"))?;
+    Ok(search_api_item_to_work_item(SectionKind::PullRequests, raw))
+}
+
+fn create_pull_request_args(repository: &str, head: &str, title: &str, body: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        "--head".to_string(),
+        head.to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        body.to_string(),
+    ]
+}
+
+fn pull_request_number_from_create_output(output: &str) -> Option<u64> {
+    output.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | '(' | ',' | '.'));
+        let marker = "/pull/";
+        let start = token.find(marker)?.saturating_add(marker.len());
+        let number = token[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        (!number.is_empty())
+            .then(|| number.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
 pub async fn fetch_open_milestones(repository: &str) -> Result<Vec<Milestone>> {
     let output = run_gh_json(&open_milestones_args(repository)).await?;
     parse_open_milestones_output(&output, repository)
@@ -2402,6 +2455,36 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
                 anyhow!("{}", gh_missing_message(args))
             } else {
                 anyhow!("failed to run gh {}: {error}", args.join(" "))
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        bail!("{}", gh_failure_message(args, &message));
+    }
+
+    String::from_utf8(output.stdout).context("gh output was not UTF-8")
+}
+
+async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
+    let _guard = UserGhRequestGuard::new();
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                anyhow!("{}", gh_missing_message(args))
+            } else {
+                anyhow!(
+                    "failed to run gh {} in {}: {error}",
+                    args.join(" "),
+                    directory.display()
+                )
             }
         })?;
 
@@ -4379,6 +4462,39 @@ mod tests {
                 "--repo".to_string(),
                 "owner/repo".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn create_pull_request_args_use_repo_head_title_and_body() {
+        assert_eq!(
+            create_pull_request_args("owner/repo", "feature/new-pr", "Add feature", "Body text"),
+            vec![
+                "pr".to_string(),
+                "create".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+                "--head".to_string(),
+                "feature/new-pr".to_string(),
+                "--title".to_string(),
+                "Add feature".to_string(),
+                "--body".to_string(),
+                "Body text".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_request_number_parses_from_create_output_url() {
+        assert_eq!(
+            pull_request_number_from_create_output("https://github.com/owner/repo/pull/42\n"),
+            Some(42)
+        );
+        assert_eq!(
+            pull_request_number_from_create_output(
+                "created https://github.com/owner/repo/pull/77."
+            ),
+            Some(77)
         );
     }
 

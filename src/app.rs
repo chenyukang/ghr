@@ -41,7 +41,7 @@ use crate::github::{
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
     approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
     convert_pull_request_to_draft, create_issue, create_milestone,
-    create_pending_pull_request_review, disable_pull_request_auto_merge,
+    create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
     fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
@@ -148,6 +148,9 @@ enum AppMsg {
         result: std::result::Result<Vec<String>, String>,
     },
     IssueCreated {
+        result: std::result::Result<WorkItem, String>,
+    },
+    PullRequestCreated {
         result: std::result::Result<WorkItem, String>,
     },
     ReviewDraftCreated {
@@ -519,6 +522,40 @@ struct PendingIssueCreate {
     title: String,
     body: String,
     labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrCreateField {
+    Title,
+    Body,
+}
+
+impl PrCreateField {
+    fn next(self, delta: isize) -> Self {
+        const FIELDS: [PrCreateField; 2] = [PrCreateField::Title, PrCreateField::Body];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        let next = move_wrapping(index, FIELDS.len(), delta);
+        FIELDS[next]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCreateDialog {
+    repo: String,
+    local_dir: PathBuf,
+    branch: String,
+    title: String,
+    body: String,
+    field: PrCreateField,
+    body_scroll: u16,
+}
+
+struct PendingPrCreate {
+    repo: String,
+    local_dir: PathBuf,
+    branch: String,
+    title: String,
+    body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,6 +1106,8 @@ struct AppState {
     label_updating: bool,
     issue_dialog: Option<IssueDialog>,
     issue_creating: bool,
+    pr_create_dialog: Option<PrCreateDialog>,
+    pr_creating: bool,
     review_submit_dialog: Option<ReviewSubmitDialog>,
     review_submit_running: bool,
     pending_reviews: HashMap<String, PendingReviewState>,
@@ -1697,6 +1736,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.pr_action_dialog.is_some()
         || app.label_dialog.is_some()
         || app.issue_dialog.is_some()
+        || app.pr_create_dialog.is_some()
         || app.milestone_dialog.is_some()
         || app.assignee_dialog.is_some()
         || app.reviewer_dialog.is_some()
@@ -2332,6 +2372,21 @@ fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) 
     });
 }
 
+fn start_pr_create(pending: PendingPrCreate, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = create_pull_request(
+            &pending.repo,
+            &pending.local_dir,
+            &pending.branch,
+            &pending.title,
+            &pending.body,
+        )
+        .await
+        .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::PullRequestCreated { result });
+    });
+}
+
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
@@ -2639,6 +2694,35 @@ fn ensure_directory_tracks_repo(
     };
     Err(format!(
         "{} does not track {repository}; found {remote_list}.",
+        directory.display()
+    ))
+}
+
+fn current_git_branch_for_directory(directory: &Path) -> std::result::Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to inspect current git branch in {}: {error}",
+                directory.display()
+            )
+        })?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() && !branch.is_empty() {
+        return Ok(branch);
+    }
+
+    let detail = command_output_text(&output.stdout, &output.stderr);
+    let detail = if detail.is_empty() {
+        "detached HEAD or no branch is checked out".to_string()
+    } else {
+        detail
+    };
+    Err(format!(
+        "cannot create PR from {}: {detail}",
         directory.display()
     ))
 }
@@ -2967,6 +3051,11 @@ fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.pr_create_dialog.is_some() {
+        app.handle_pr_create_dialog_key(key, tx, area);
+        return false;
+    }
+
     if app.reaction_dialog.is_some() {
         app.handle_reaction_dialog_key(key, tx);
         return false;
@@ -3142,7 +3231,7 @@ fn handle_key_in_area_mut(
             KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Char('L') => app.start_add_label_dialog_with_store(Some(store), Some(tx)),
-            KeyCode::Char('N') => app.start_new_issue_dialog(),
+            KeyCode::Char('N') => app.start_new_issue_or_pull_request_dialog(config),
             _ if is_assignee_assign_key(key) => {
                 app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
             }
@@ -3181,7 +3270,7 @@ fn handle_key_in_area_mut(
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
                 app.start_add_label_dialog_with_store(Some(store), Some(tx))
             }
-            KeyCode::Char('N') => app.start_new_issue_dialog(),
+            KeyCode::Char('N') => app.start_new_issue_or_pull_request_dialog(config),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
             _ if is_assignee_assign_key(key) => {
@@ -3438,6 +3527,9 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.issue_dialog.is_some() {
+        return false;
+    }
+    if app.pr_create_dialog.is_some() {
         return false;
     }
     if app.reaction_dialog.is_some() {
@@ -3948,6 +4040,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_label_dialog(frame, dialog, app.label_updating, area);
     } else if let Some(dialog) = &app.issue_dialog {
         draw_issue_dialog(frame, dialog, app.issue_creating, area);
+    } else if let Some(dialog) = &app.pr_create_dialog {
+        draw_pr_create_dialog(frame, dialog, app.pr_creating, area);
     } else if let Some(dialog) = &app.reaction_dialog {
         draw_reaction_dialog(frame, dialog, app.posting_reaction, area);
     } else if let Some(dialog) = &app.review_submit_dialog {
@@ -4749,6 +4843,21 @@ fn created_issue_matches_section(
 
     match section_repo_scope(section) {
         Some(repo) => repo == item.repo,
+        None => same_view_key(&section_view_key(section), active_view),
+    }
+}
+
+fn created_pull_request_matches_section(
+    section: &SectionSnapshot,
+    item: &WorkItem,
+    active_view: &str,
+) -> bool {
+    if section.kind != SectionKind::PullRequests {
+        return false;
+    }
+
+    match section_repo_scope(section) {
+        Some(repo) => repo.eq_ignore_ascii_case(&item.repo),
         None => same_view_key(&section_view_key(section), active_view),
     }
 }
@@ -6118,11 +6227,95 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     }
 }
 
+fn draw_pr_create_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &PrCreateDialog,
+    running: bool,
+    area: Rect,
+) {
+    let dialog_area = pr_create_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = pr_create_dialog_body_editor_height(dialog_area);
+    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let scroll = dialog.body_scroll.min(max_scroll);
+    let mut lines = vec![
+        key_value_line("repo", dialog.repo.clone()),
+        key_value_line("local dir", dialog.local_dir.display().to_string()),
+        key_value_line("branch", dialog.branch.clone()),
+        issue_dialog_separator_line(editor_width),
+        pr_create_dialog_field_input_line(
+            "Title",
+            &dialog.title,
+            PrCreateField::Title,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        pr_create_dialog_field_label("Body", PrCreateField::Body, dialog.field),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(7 + editor_height) {
+        lines.push(Line::from(""));
+    }
+    let status = if running {
+        "working..."
+    } else {
+        "Tab: field  Ctrl+Enter: create PR  Enter: newline/next  Esc: cancel"
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        status,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "New Pull Request",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    if let Some(position) =
+        pr_create_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
 fn issue_dialog_area(area: Rect) -> Rect {
     centered_rect(78, 22, area)
 }
 
+fn pr_create_dialog_area(area: Rect) -> Rect {
+    centered_rect(78, 20, area)
+}
+
 fn issue_dialog_body_editor_height(dialog_area: Rect) -> u16 {
+    let inner = block_inner(dialog_area);
+    inner.height.saturating_sub(9).max(1)
+}
+
+fn pr_create_dialog_body_editor_height(dialog_area: Rect) -> u16 {
     let inner = block_inner(dialog_area);
     inner.height.saturating_sub(9).max(1)
 }
@@ -6134,6 +6327,22 @@ fn issue_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
         return (
             inner.width.max(1),
             issue_dialog_body_editor_height(dialog_area),
+        );
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+fn pr_create_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = pr_create_dialog_area(area);
+        let inner = block_inner(dialog_area);
+        return (
+            inner.width.max(1),
+            pr_create_dialog_body_editor_height(dialog_area),
         );
     }
 
@@ -6162,6 +6371,25 @@ fn issue_dialog_field_input_line(
     ])
 }
 
+fn pr_create_dialog_field_input_line(
+    label: &'static str,
+    value: &str,
+    field: PrCreateField,
+    current: PrCreateField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
+    Line::from(vec![
+        Span::styled(prefix, pr_create_dialog_field_label_style(field, current)),
+        Span::styled(
+            issue_dialog_input_text(value, value_width),
+            Style::default().fg(Color::White),
+        ),
+    ])
+}
+
 fn issue_dialog_field_label(
     label: &'static str,
     field: IssueDialogField,
@@ -6173,7 +6401,28 @@ fn issue_dialog_field_label(
     ))
 }
 
+fn pr_create_dialog_field_label(
+    label: &'static str,
+    field: PrCreateField,
+    current: PrCreateField,
+) -> Line<'static> {
+    Line::from(Span::styled(
+        issue_dialog_field_label_text(label),
+        pr_create_dialog_field_label_style(field, current),
+    ))
+}
+
 fn issue_dialog_field_label_style(field: IssueDialogField, current: IssueDialogField) -> Style {
+    if field == current {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn pr_create_dialog_field_label_style(field: PrCreateField, current: PrCreateField) -> Style {
     if field == current {
         Style::default()
             .fg(Color::Cyan)
@@ -6249,6 +6498,41 @@ fn issue_dialog_cursor_position(
             ))
         }
         IssueDialogField::Body => {
+            let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
+            let visible_end = scroll.saturating_add(editor_height.max(1));
+            if line < scroll || line >= visible_end {
+                return None;
+            }
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(column)),
+                inner.y.saturating_add(7).saturating_add(line - scroll),
+            ))
+        }
+    }
+}
+
+fn pr_create_dialog_cursor_position(
+    dialog: &PrCreateDialog,
+    scroll: u16,
+    dialog_area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(dialog_area);
+    let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    let title_prefix_width =
+        display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
+    match dialog.field {
+        PrCreateField::Title => Some(Position::new(
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(title_prefix_width)
+                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
+            ),
+            inner.y.saturating_add(4),
+        )),
+        PrCreateField::Body => {
             let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
             let visible_end = scroll.saturating_add(editor_height.max(1));
             if line < scroll || line >= visible_end {
@@ -7224,10 +7508,10 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             palette_key(KeyCode::Char('t')),
         ),
         palette_command(
-            "Create Issue",
+            "Create Issue / PR",
             "N",
-            "Issue",
-            "Create an issue in the current repo",
+            "Issue/PR",
+            "Create an issue, or create a PR from local_dir in PR lists",
             palette_key(KeyCode::Char('N')),
         ),
         palette_command(
@@ -8251,7 +8535,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
-        help_key_line("N", "create an issue in the current repo"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
         help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         Line::from(""),
         help_heading("Diff Files"),
@@ -8295,7 +8579,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("+", "add a reaction to the visible focused comment or item"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("L", "add a label to the selected issue or PR"),
-        help_key_line("N", "create an issue in the current repo"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
         help_key_line("T", "edit selected issue or PR title/body"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
@@ -12326,6 +12610,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.comment_dialog.is_some()
         || app.label_dialog.is_some()
         || app.issue_dialog.is_some()
+        || app.pr_create_dialog.is_some()
         || app.review_submit_dialog.is_some()
         || app.item_edit_dialog.is_some()
         || app.milestone_dialog.is_some()
@@ -12487,6 +12772,8 @@ impl AppState {
             label_updating: false,
             issue_dialog: None,
             issue_creating: false,
+            pr_create_dialog: None,
+            pr_creating: false,
             review_submit_dialog: None,
             review_submit_running: false,
             pending_reviews: HashMap::new(),
@@ -13178,6 +13465,43 @@ impl AppState {
                             self.message_dialog = None;
                         }
                         self.status = "issue create failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PullRequestCreated { result } => {
+                self.pr_creating = false;
+                self.pr_create_dialog = None;
+                match result {
+                    Ok(item) => {
+                        let number = item
+                            .number
+                            .map(|number| format!("#{number}"))
+                            .unwrap_or_else(|| item.id.clone());
+                        let inserted = self.insert_created_pull_request(item.clone());
+                        self.status = if inserted {
+                            format!("pull request created: {number}")
+                        } else {
+                            format!("pull request created: {number}; refresh to show it in a list")
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pull Request Created",
+                            format!("Created {number}: {}", item.title),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pull Request Create Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pull request create failed".to_string();
                     }
                 }
             }
@@ -14291,6 +14615,45 @@ impl AppState {
 
         for section in &mut self.sections {
             if !created_issue_matches_section(section, &item, &active_view) {
+                continue;
+            }
+
+            section.items.retain(|existing| existing.id != item_id);
+            section.items.insert(0, item.clone());
+            section.total_count = section.total_count.map(|count| count.saturating_add(1));
+            let view = section_view_key(section);
+            let key = section.key.clone();
+            if target.is_none() || same_view_key(&view, &active_view) {
+                target = Some((view, key));
+            }
+            inserted = true;
+        }
+
+        if let Some((view, section_key)) = target {
+            self.active_view = view.clone();
+            if let Some(section_position) = self.section_position_by_key(&view, &section_key) {
+                self.set_current_section_position(section_position);
+            }
+            self.set_current_selected_position(0);
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+            self.focus = FocusTarget::Details;
+            self.details
+                .insert(item_id, DetailState::Loaded(Vec::new()));
+        }
+
+        self.clamp_positions();
+        inserted
+    }
+
+    fn insert_created_pull_request(&mut self, item: WorkItem) -> bool {
+        let active_view = self.active_view.clone();
+        let item_id = item.id.clone();
+        let mut target = None;
+        let mut inserted = false;
+
+        for section in &mut self.sections {
+            if !created_pull_request_matches_section(section, &item, &active_view) {
                 continue;
             }
 
@@ -17312,6 +17675,7 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.pr_create_dialog = None;
         self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.issue_dialog = Some(IssueDialog {
@@ -17324,6 +17688,68 @@ impl AppState {
         });
         self.issue_creating = false;
         self.status = "new issue".to_string();
+    }
+
+    fn start_new_issue_or_pull_request_dialog(&mut self, config: &Config) {
+        if self
+            .current_section()
+            .is_some_and(|section| section.kind == SectionKind::PullRequests)
+        {
+            self.start_new_pull_request_dialog(config);
+        } else {
+            self.start_new_issue_dialog();
+        }
+    }
+
+    fn start_new_pull_request_dialog(&mut self, config: &Config) {
+        let Some(repo) = self.current_repo_scope() else {
+            self.status = "select a repo before creating a pull request".to_string();
+            return;
+        };
+        let Some(local_dir) = configured_local_dir_for_repo(config, &repo) else {
+            self.status =
+                format!("repo {repo} has no local_dir; set [[repos]].local_dir to create a PR");
+            return;
+        };
+        if let Err(error) = ensure_directory_tracks_repo(&local_dir, &repo) {
+            self.status = format!("local_dir cannot create PR: {error}");
+            return;
+        }
+        let branch = match current_git_branch_for_directory(&local_dir) {
+            Ok(branch) => branch,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_create_dialog = None;
+        self.reaction_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
+        self.pr_create_dialog = Some(PrCreateDialog {
+            repo,
+            local_dir,
+            branch,
+            title: String::new(),
+            body: String::new(),
+            field: PrCreateField::Title,
+            body_scroll: 0,
+        });
+        self.pr_creating = false;
+        self.status = "new pull request".to_string();
     }
 
     fn handle_issue_dialog_key(
@@ -17486,6 +17912,156 @@ impl AppState {
             title,
             body,
             labels,
+        })
+    }
+
+    fn handle_pr_create_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        self.handle_pr_create_dialog_key_with_submit(key, area, |pending| {
+            start_pr_create(pending, tx.clone());
+        });
+    }
+
+    fn handle_pr_create_dialog_key_with_submit<F>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+    ) where
+        F: FnMut(PendingPrCreate),
+    {
+        if self.pr_creating {
+            return;
+        }
+
+        if is_comment_submit_key(key) {
+            if let Some(pending) = self.prepare_pr_create() {
+                submit(pending);
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pr_create_dialog = None;
+                self.status = "pull request creation cancelled".to_string();
+            }
+            KeyCode::Tab => self.move_pr_create_dialog_field(1),
+            KeyCode::BackTab => self.move_pr_create_dialog_field(-1),
+            KeyCode::PageDown => self.scroll_pr_create_dialog_body(6, area),
+            KeyCode::PageUp => self.scroll_pr_create_dialog_body(-6, area),
+            KeyCode::Enter => {
+                if self
+                    .pr_create_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.field == PrCreateField::Body)
+                {
+                    if let Some(dialog) = &mut self.pr_create_dialog {
+                        dialog.body.push('\n');
+                    }
+                    self.scroll_pr_create_dialog_to_cursor_in_area(area);
+                } else {
+                    self.move_pr_create_dialog_field(1);
+                }
+            }
+            KeyCode::Backspace => {
+                self.pop_pr_create_dialog_char();
+                self.scroll_pr_create_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Char(value) => {
+                self.push_pr_create_dialog_char(value);
+                self.scroll_pr_create_dialog_to_cursor_in_area(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_pr_create_dialog_field(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.pr_create_dialog {
+            dialog.field = dialog.field.next(delta);
+            self.status = match dialog.field {
+                PrCreateField::Title => "editing pull request title".to_string(),
+                PrCreateField::Body => "editing pull request body".to_string(),
+            };
+        }
+    }
+
+    fn push_pr_create_dialog_char(&mut self, value: char) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        match dialog.field {
+            PrCreateField::Title => dialog.title.push(value),
+            PrCreateField::Body => dialog.body.push(value),
+        }
+    }
+
+    fn pop_pr_create_dialog_char(&mut self) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        match dialog.field {
+            PrCreateField::Title => {
+                dialog.title.pop();
+            }
+            PrCreateField::Body => {
+                dialog.body.pop();
+            }
+        }
+    }
+
+    fn scroll_pr_create_dialog_body(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        let (width, height) = pr_create_dialog_body_editor_size(area);
+        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        if delta < 0 {
+            dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.body_scroll = dialog.body_scroll.saturating_add(delta as u16);
+        }
+        dialog.body_scroll = dialog.body_scroll.min(max_scroll);
+    }
+
+    fn scroll_pr_create_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.pr_create_dialog {
+            if dialog.field != PrCreateField::Body {
+                return;
+            }
+            let (width, height) = pr_create_dialog_body_editor_size(area);
+            dialog.body_scroll =
+                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.body_scroll);
+        }
+    }
+
+    fn prepare_pr_create(&mut self) -> Option<PendingPrCreate> {
+        let dialog = self.pr_create_dialog.take()?;
+        let title = dialog.title.trim().to_string();
+        let body = dialog.body.trim().to_string();
+
+        if title.is_empty() {
+            self.pr_create_dialog = Some(dialog);
+            self.status = "pull request title is empty".to_string();
+            return None;
+        }
+
+        self.pr_creating = true;
+        self.status = format!("creating pull request from {}", dialog.branch);
+        self.message_dialog = Some(message_dialog(
+            "Creating Pull Request",
+            "Waiting for GitHub...",
+        ));
+        Some(PendingPrCreate {
+            repo: dialog.repo,
+            local_dir: dialog.local_dir,
+            branch: dialog.branch,
+            title,
+            body,
         })
     }
 
@@ -18559,6 +19135,9 @@ fn mark_item_ready_for_review(item: &mut WorkItem) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CHECKOUT_TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn fuzzy_score_matches_ordered_subsequence() {
@@ -20911,7 +21490,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(
             commands
                 .iter()
-                .any(|command| command.title == "Create Issue")
+                .any(|command| command.title == "Create Issue / PR")
         );
         assert!(
             commands
@@ -24321,6 +24900,121 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(pending.title, "Crash in parser");
         assert_eq!(pending.body, "Steps to reproduce");
         assert_eq!(pending.labels, vec!["bug", "T-compiler"]);
+    }
+
+    #[test]
+    fn capital_n_in_pr_repo_with_local_dir_opens_pr_create_dialog() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/new-pr");
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        app.start_new_issue_or_pull_request_dialog(&config);
+        let dialog = app.pr_create_dialog.as_ref().expect("pr create dialog");
+
+        assert!(app.issue_dialog.is_none());
+        assert_eq!(dialog.repo, "chenyukang/ghr");
+        assert_eq!(dialog.local_dir, local_dir);
+        assert_eq!(dialog.branch, "feature/new-pr");
+        assert_eq!(dialog.field, PrCreateField::Title);
+        assert_eq!(app.status, "new pull request");
+    }
+
+    #[test]
+    fn capital_n_in_pr_repo_without_local_dir_shows_hint() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+
+        app.start_new_issue_or_pull_request_dialog(&Config::default());
+
+        assert!(app.pr_create_dialog.is_none());
+        assert!(app.issue_dialog.is_none());
+        assert!(app.status.contains("has no local_dir"));
+    }
+
+    #[test]
+    fn capital_n_in_issue_section_still_opens_issue_dialog() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+
+        app.start_new_issue_or_pull_request_dialog(&Config::default());
+
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(
+            app.issue_dialog.as_ref().map(|dialog| dialog.repo.as_str()),
+            Some("chenyukang/ghr")
+        );
+    }
+
+    #[test]
+    fn pr_create_dialog_submits_title_body_and_branch() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.pr_create_dialog = Some(PrCreateDialog {
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: local_dir.clone(),
+            branch: "feature/pr-body".to_string(),
+            title: "Add PR creation".to_string(),
+            body: "Created from the TUI".to_string(),
+            field: PrCreateField::Body,
+            body_scroll: 0,
+        });
+
+        let pending = app.prepare_pr_create().expect("pending pr create");
+
+        assert!(app.pr_creating);
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(pending.repo, "chenyukang/ghr");
+        assert_eq!(pending.local_dir, local_dir);
+        assert_eq!(pending.branch, "feature/pr-body");
+        assert_eq!(pending.title, "Add PR creation");
+        assert_eq!(pending.body, "Created from the TUI");
     }
 
     #[test]
@@ -28860,8 +29554,11 @@ diff --git a/d.rs b/d.rs
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("ghr-checkout-test-{}-{unique}", std::process::id()));
+        let counter = CHECKOUT_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ghr-checkout-test-{}-{unique}-{counter}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create checkout test dir");
 
         let init = Command::new("git")
@@ -28893,6 +29590,22 @@ diff --git a/d.rs b/d.rs
             command_output_text(&remote.stdout, &remote.stderr)
         );
 
+        dir
+    }
+
+    fn checkout_test_repo_dir_on_branch(branch: &str) -> PathBuf {
+        let dir = checkout_test_repo_dir();
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["checkout", "-q", "-b", branch])
+            .output()
+            .expect("run git checkout -b");
+        assert!(
+            checkout.status.success(),
+            "git checkout -b failed: {}",
+            command_output_text(&checkout.stdout, &checkout.stderr)
+        );
         dir
     }
 

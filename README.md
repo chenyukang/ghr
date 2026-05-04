@@ -54,6 +54,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+L` | Open the command palette and fuzzy search every shortcut |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Move within the focused tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |

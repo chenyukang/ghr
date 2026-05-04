@@ -423,6 +423,34 @@ struct PrActionDialog {
     action: PrAction,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PaletteCommand {
+    title: &'static str,
+    keys: &'static str,
+    scope: &'static str,
+    detail: &'static str,
+    action: PaletteAction,
+}
+
+#[derive(Debug, Clone)]
+enum PaletteAction {
+    Key(KeyEvent),
+    Quit,
+    ShowHelp,
+    ShowCommandPalette,
+    Refresh,
+    SearchCurrentRepo,
+    ToggleMouseCapture,
+    OpenSelected,
+    ShowDiff,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialog {
     title: String,
@@ -499,6 +527,7 @@ struct AppState {
     global_search_return_view: Option<String>,
     global_search_scope: Option<String>,
     global_search_started_at: Option<Instant>,
+    command_palette: Option<CommandPalette>,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
@@ -915,6 +944,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
     if !app.mouse_capture_enabled
         || app.setup_dialog.is_some()
         || app.startup_dialog.is_some()
+        || app.command_palette.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.pr_action_dialog.is_some()
@@ -1427,6 +1457,15 @@ fn handle_key_in_area(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.command_palette.is_some() {
+        return app.handle_command_palette_key(key, config, store, tx, area);
+    }
+
+    if is_command_palette_key(key) {
+        app.show_command_palette();
         return false;
     }
 
@@ -2293,6 +2332,10 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
         draw_global_search_loading_dialog(frame, app, area);
+    }
+
+    if let Some(palette) = &app.command_palette {
+        draw_command_palette(frame, palette, area);
     }
 }
 
@@ -3351,6 +3394,141 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn draw_command_palette(frame: &mut Frame<'_>, palette: &CommandPalette, area: Rect) {
+    let commands = command_palette_commands();
+    let matches = command_palette_filtered_indices(&commands, &palette.query);
+    let dialog_area = command_palette_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(3));
+    let selected = palette.selected.min(matches.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, matches.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(command_palette_input_line(&palette.query, width));
+    lines.push(Line::from(""));
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No commands found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, command_index) in matches.iter().enumerate().skip(start).take(result_height)
+        {
+            let command = &commands[*command_index];
+            lines.push(command_palette_result_line(
+                command,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter: run    Esc: close    Up/Down: select",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Command Palette",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+
+    let cursor_column =
+        display_width(&palette.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn command_palette_area(area: Rect) -> Rect {
+    let width = centered_rect_width(76, area).max(24).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 18.min(max_height).max(3);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height).min(2);
+    Rect::new(x, y, width, height)
+}
+
+fn command_palette_visible_start(selected: usize, len: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    selected.saturating_add(1).saturating_sub(height)
+}
+
+fn command_palette_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type to search commands",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+    ])
+}
+
+fn command_palette_result_line(
+    command: &PaletteCommand,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = format!(
+        "{marker}{:<34} {:<16} {}",
+        command.title, command.keys, command.scope
+    );
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let detail_style = if selected {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    Line::from(vec![
+        Span::styled(truncate_inline(&text, width), style),
+        Span::styled(
+            truncate_inline(
+                &format!("  {}", command.detail),
+                width.saturating_sub(display_width(&text)),
+            ),
+            detail_style,
+        ),
+    ])
+}
+
 fn draw_pr_action_dialog(
     frame: &mut Frame<'_>,
     dialog: &PrActionDialog,
@@ -4012,6 +4190,477 @@ fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
         .min(area.height.saturating_sub(2).max(1))
 }
 
+fn command_palette_commands() -> Vec<PaletteCommand> {
+    let mut commands = vec![
+        palette_command(
+            "Show Command Palette",
+            "Ctrl+L",
+            "General",
+            "Open this searchable command list",
+            PaletteAction::ShowCommandPalette,
+        ),
+        palette_command(
+            "Show Help",
+            "?",
+            "General",
+            "Open the full shortcut reference",
+            PaletteAction::ShowHelp,
+        ),
+        palette_command(
+            "Close or Cancel",
+            "Esc",
+            "General",
+            "Close the active dialog, search, or details focus",
+            palette_key(KeyCode::Esc),
+        ),
+        palette_command(
+            "Confirm or Open",
+            "Enter",
+            "General",
+            "Run the active confirmation or open the selected item area",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Quit ghr",
+            "q / Ctrl+C",
+            "General",
+            "Save UI state and quit",
+            PaletteAction::Quit,
+        ),
+        palette_command(
+            "Refresh",
+            "r",
+            "General",
+            "Refresh dashboard data from GitHub",
+            PaletteAction::Refresh,
+        ),
+        palette_command(
+            "Search Current Repo",
+            "S",
+            "General",
+            "Search matching PRs and issues in the current repo",
+            PaletteAction::SearchCurrentRepo,
+        ),
+        palette_command(
+            "Toggle Mouse Text Selection",
+            "m",
+            "General",
+            "Switch between TUI mouse controls and terminal text selection",
+            PaletteAction::ToggleMouseCapture,
+        ),
+        palette_command(
+            "Open Selected in Browser",
+            "o",
+            "General",
+            "Open the selected item or PR changes page",
+            PaletteAction::OpenSelected,
+        ),
+        palette_command(
+            "Show Pull Request Diff",
+            "v",
+            "General",
+            "Open PR diff mode",
+            PaletteAction::ShowDiff,
+        ),
+        palette_command(
+            "Leave Diff Mode",
+            "q",
+            "Diff",
+            "Return to the state before opening diff",
+            palette_key(KeyCode::Char('q')),
+        ),
+        palette_command(
+            "Focus ghr Tabs",
+            "1",
+            "Focus",
+            "Focus the top ghr tab group",
+            palette_key(KeyCode::Char('1')),
+        ),
+        palette_command(
+            "Focus Sections",
+            "2",
+            "Focus",
+            "Focus the section tab group",
+            palette_key(KeyCode::Char('2')),
+        ),
+        palette_command(
+            "Focus List",
+            "3",
+            "Focus",
+            "Focus the item list or changed-file list",
+            palette_key(KeyCode::Char('3')),
+        ),
+        palette_command(
+            "Focus Details",
+            "4 / Enter",
+            "Focus",
+            "Focus Details from the list",
+            palette_key(KeyCode::Char('4')),
+        ),
+        palette_command(
+            "Next Focused Tab Group",
+            "Tab",
+            "Tabs",
+            "Move within the focused tab group",
+            palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Previous Focused Tab Group",
+            "Shift+Tab",
+            "Tabs",
+            "Move backward within the focused tab group",
+            palette_key(KeyCode::BackTab),
+        ),
+        palette_command(
+            "Move Tab Right",
+            "l / Right / ]",
+            "Tabs",
+            "Move right in ghr or Sections",
+            palette_key(KeyCode::Char('l')),
+        ),
+        palette_command(
+            "Move Tab Left",
+            "h / Left / [",
+            "Tabs",
+            "Move left in ghr or Sections",
+            palette_key(KeyCode::Char('h')),
+        ),
+        palette_command(
+            "Search Current List",
+            "/",
+            "List",
+            "Fuzzy filter the current list",
+            palette_key(KeyCode::Char('/')),
+        ),
+        palette_command(
+            "Move Selection Down",
+            "j / Down",
+            "List",
+            "Move list selection or diff cursor down",
+            palette_key(KeyCode::Char('j')),
+        ),
+        palette_command(
+            "Move Selection Up",
+            "k / Up",
+            "List",
+            "Move list selection or diff cursor up",
+            palette_key(KeyCode::Char('k')),
+        ),
+        palette_command(
+            "Page Down",
+            "PgDown / d",
+            "List/Details",
+            "Move by a visible page",
+            palette_key(KeyCode::PageDown),
+        ),
+        palette_command(
+            "Page Up",
+            "PgUp / u",
+            "List/Details",
+            "Move up by a visible page",
+            palette_key(KeyCode::PageUp),
+        ),
+        palette_command(
+            "Jump to First",
+            "g",
+            "List/Details",
+            "Jump to top or first item",
+            palette_key(KeyCode::Char('g')),
+        ),
+        palette_command(
+            "Jump to Last",
+            "G",
+            "List/Details",
+            "Jump to bottom or last item",
+            palette_key(KeyCode::Char('G')),
+        ),
+        palette_command(
+            "Load Previous Result Page",
+            "[",
+            "List",
+            "Load previous GitHub result page",
+            palette_key(KeyCode::Char('[')),
+        ),
+        palette_command(
+            "Load Next Result Page",
+            "]",
+            "List",
+            "Load next GitHub result page",
+            palette_key(KeyCode::Char(']')),
+        ),
+        palette_command(
+            "Open PR Merge Confirmation",
+            "M",
+            "Pull Request",
+            "Confirm merging the selected PR",
+            palette_key(KeyCode::Char('M')),
+        ),
+        palette_command(
+            "Open PR Close Confirmation",
+            "C",
+            "Pull Request",
+            "Confirm closing the selected PR",
+            palette_key(KeyCode::Char('C')),
+        ),
+        palette_command(
+            "Open PR Approve Confirmation",
+            "A",
+            "Pull Request",
+            "Confirm approving the selected PR",
+            palette_key(KeyCode::Char('A')),
+        ),
+        palette_command(
+            "Add Comment",
+            "a / c",
+            "Issue/PR",
+            "Add a normal issue or PR comment",
+            palette_key(KeyCode::Char('a')),
+        ),
+        palette_command(
+            "Add Label",
+            "L",
+            "Issue/PR",
+            "Add a label to the selected issue or PR",
+            palette_key(KeyCode::Char('L')),
+        ),
+        palette_command(
+            "Create Issue",
+            "N",
+            "Issue",
+            "Create an issue in the current repo",
+            palette_key(KeyCode::Char('N')),
+        ),
+        palette_command(
+            "Add Reaction",
+            "+",
+            "Issue/PR",
+            "Add a reaction to the selected item or focused comment",
+            palette_key(KeyCode::Char('+')),
+        ),
+        palette_command(
+            "Search Details Comments",
+            "/",
+            "Details",
+            "Search loaded comments by keyword",
+            palette_key(KeyCode::Char('/')),
+        ),
+        palette_command(
+            "Next Comment",
+            "n",
+            "Details",
+            "Focus next visible comment",
+            palette_key(KeyCode::Char('n')),
+        ),
+        palette_command(
+            "Previous Comment",
+            "p",
+            "Details",
+            "Focus previous visible comment",
+            palette_key(KeyCode::Char('p')),
+        ),
+        palette_command(
+            "Reply to Focused Comment",
+            "R",
+            "Details",
+            "Quote reply to the focused comment",
+            palette_key(KeyCode::Char('R')),
+        ),
+        palette_command(
+            "Edit Focused Comment",
+            "e",
+            "Details",
+            "Edit the focused comment when it is yours",
+            palette_key(KeyCode::Char('e')),
+        ),
+        palette_command(
+            "Previous Diff File",
+            "[",
+            "Diff",
+            "Jump to previous changed file",
+            palette_key(KeyCode::Char('[')),
+        ),
+        palette_command(
+            "Next Diff File",
+            "]",
+            "Diff",
+            "Jump to next changed file",
+            palette_key(KeyCode::Char(']')),
+        ),
+        palette_command(
+            "Begin Review Range",
+            "m",
+            "Diff",
+            "Begin a review range at the selected diff line",
+            palette_key(KeyCode::Char('m')),
+        ),
+        palette_command(
+            "End Review Range",
+            "e",
+            "Diff",
+            "End the current review range",
+            palette_key(KeyCode::Char('e')),
+        ),
+        palette_command(
+            "Add Inline Review Comment",
+            "c",
+            "Diff",
+            "Add a review comment on the selected diff line or range",
+            palette_key(KeyCode::Char('c')),
+        ),
+        palette_command(
+            "Confirm PR Action",
+            "y / Enter",
+            "Dialog",
+            "Run the active PR confirmation",
+            palette_key(KeyCode::Char('y')),
+        ),
+        palette_command(
+            "Submit Comment",
+            "Ctrl+Enter",
+            "Comment Editor",
+            "Send or update the current comment",
+            palette_ctrl_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Insert Comment Newline",
+            "Enter",
+            "Comment Editor",
+            "Insert a newline in the comment editor",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Delete Previous Character",
+            "Backspace",
+            "Editor",
+            "Delete the previous character while editing or filtering",
+            palette_key(KeyCode::Backspace),
+        ),
+        palette_command(
+            "Choose Next Suggestion",
+            "Down / Tab",
+            "Label/Reaction",
+            "Move to the next label or reaction suggestion",
+            palette_key(KeyCode::Down),
+        ),
+        palette_command(
+            "Choose Previous Suggestion",
+            "Up / Shift+Tab",
+            "Label/Reaction",
+            "Move to the previous label or reaction suggestion",
+            palette_key(KeyCode::Up),
+        ),
+        palette_command(
+            "Confirm Label or Reaction",
+            "Enter",
+            "Label/Reaction",
+            "Confirm the selected label or reaction",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Next Issue Field",
+            "Tab",
+            "Issue Dialog",
+            "Move to the next issue field",
+            palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Previous Issue Field",
+            "Shift+Tab",
+            "Issue Dialog",
+            "Move to the previous issue field",
+            palette_key(KeyCode::BackTab),
+        ),
+        palette_command(
+            "Create Issue from Dialog",
+            "Ctrl+Enter",
+            "Issue Dialog",
+            "Create the issue from the issue dialog",
+            palette_ctrl_key(KeyCode::Enter),
+        ),
+    ];
+
+    for (index, reaction) in ReactionContent::ALL.iter().copied().enumerate() {
+        let key = char::from_digit((index + 1) as u32, 10).unwrap_or('1');
+        let keys = match index {
+            0 => "1",
+            1 => "2",
+            2 => "3",
+            3 => "4",
+            4 => "5",
+            5 => "6",
+            6 => "7",
+            _ => "8",
+        };
+        commands.push(palette_command(
+            reaction.label(),
+            keys,
+            "Reaction Dialog",
+            "Choose and add this reaction",
+            palette_key(KeyCode::Char(key)),
+        ));
+    }
+
+    commands
+}
+
+fn palette_command(
+    title: &'static str,
+    keys: &'static str,
+    scope: &'static str,
+    detail: &'static str,
+    action: PaletteAction,
+) -> PaletteCommand {
+    PaletteCommand {
+        title,
+        keys,
+        scope,
+        detail,
+        action,
+    }
+}
+
+fn palette_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn palette_ctrl_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+}
+
+fn command_palette_filtered_indices(commands: &[PaletteCommand], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..commands.len()).collect();
+    }
+
+    let mut scored = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            command_palette_score(command, query).map(|score| (index, score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    scored.into_iter().map(|(index, _)| index).collect()
+}
+
+fn command_palette_score(command: &PaletteCommand, query: &str) -> Option<i64> {
+    let haystack = format!(
+        "{} {} {} {}",
+        command.title, command.keys, command.scope, command.detail
+    )
+    .to_lowercase();
+    let mut total = 0;
+    for token in query.split_whitespace() {
+        total += fuzzy_score(token, &haystack)?;
+    }
+    Some(total)
+}
+
 fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
     let title = match &dialog.mode {
         CommentDialogMode::New => "New Comment".to_string(),
@@ -4309,6 +4958,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
     vec![
         help_heading("General"),
         help_key_line("? / Esc / Enter / q", "close this help"),
+        help_key_line("Ctrl+L", "open the command palette"),
         help_key_line("q", "quit ghr outside help"),
         help_key_line("q in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
@@ -8061,6 +8711,11 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'c'))
 }
 
+fn is_command_palette_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'l'))
+}
+
 fn is_diff_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'v'))
 }
@@ -8164,6 +8819,7 @@ impl AppState {
             global_search_return_view: None,
             global_search_scope: None,
             global_search_started_at: None,
+            command_palette: None,
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
@@ -8923,6 +9579,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.command_palette = None;
         self.reaction_dialog = None;
         self.status = "help".to_string();
     }
@@ -8930,6 +9587,134 @@ impl AppState {
     fn dismiss_help_dialog(&mut self) {
         self.help_dialog = false;
         self.status = "help dismissed".to_string();
+    }
+
+    fn show_command_palette(&mut self) {
+        self.command_palette = Some(CommandPalette::default());
+        self.status = "command palette".to_string();
+    }
+
+    fn dismiss_command_palette(&mut self) {
+        self.command_palette = None;
+        self.status = "command palette dismissed".to_string();
+    }
+
+    fn handle_command_palette_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.dismiss_command_palette();
+                false
+            }
+            KeyCode::Enter => self.submit_command_palette_selection(config, store, tx, area),
+            KeyCode::Down | KeyCode::Tab => {
+                self.move_command_palette_selection(1);
+                false
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.move_command_palette_selection(-1);
+                false
+            }
+            KeyCode::PageDown => {
+                self.move_command_palette_selection(8);
+                false
+            }
+            KeyCode::PageUp => {
+                self.move_command_palette_selection(-8);
+                false
+            }
+            KeyCode::Backspace => {
+                if let Some(palette) = &mut self.command_palette {
+                    palette.query.pop();
+                    palette.selected = 0;
+                }
+                false
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(palette) = &mut self.command_palette {
+                    palette.query.push(value);
+                    palette.selected = 0;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn move_command_palette_selection(&mut self, delta: isize) {
+        let Some(palette) = &mut self.command_palette else {
+            return;
+        };
+        let commands = command_palette_commands();
+        let len = command_palette_filtered_indices(&commands, &palette.query).len();
+        palette.selected = move_wrapping(palette.selected, len, delta);
+    }
+
+    fn submit_command_palette_selection(
+        &mut self,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) -> bool {
+        let Some(command) = self.selected_command_palette_command() else {
+            self.status = "no matching command".to_string();
+            return false;
+        };
+
+        self.command_palette = None;
+        match command.action {
+            PaletteAction::Key(key) => handle_key_in_area(self, key, config, store, tx, area),
+            PaletteAction::Quit => true,
+            PaletteAction::ShowHelp => {
+                self.show_help_dialog();
+                false
+            }
+            PaletteAction::ShowCommandPalette => {
+                self.show_command_palette();
+                false
+            }
+            PaletteAction::Refresh => {
+                trigger_refresh(self, config, store, tx);
+                false
+            }
+            PaletteAction::SearchCurrentRepo => {
+                self.start_global_search_input();
+                false
+            }
+            PaletteAction::ToggleMouseCapture => {
+                self.toggle_mouse_capture();
+                false
+            }
+            PaletteAction::OpenSelected => {
+                self.open_selected();
+                false
+            }
+            PaletteAction::ShowDiff => {
+                self.show_diff();
+                false
+            }
+        }
+    }
+
+    fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
+        let palette = self.command_palette.as_ref()?;
+        let commands = command_palette_commands();
+        let matches = command_palette_filtered_indices(&commands, &palette.query);
+        let selected = palette.selected.min(matches.len().saturating_sub(1));
+        matches
+            .get(selected)
+            .and_then(|index| commands.get(*index))
+            .cloned()
     }
 
     fn mark_item_after_pr_action(&mut self, item_id: &str, action: PrAction) {
@@ -14079,6 +14864,7 @@ diff --git a/src/github.rs b/src/github.rs
             .join("\n");
 
         assert!(text.contains("Tab / Shift+Tab"));
+        assert!(text.contains("Ctrl+L"));
         assert!(text.contains("Ctrl+Enter"));
         assert!(text.contains("R"));
         assert!(text.contains("edit focused comment"));
@@ -14088,6 +14874,165 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
+    }
+
+    #[test]
+    fn ctrl_l_opens_command_palette() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            ctrl_key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.command_palette, Some(CommandPalette::default()));
+        assert_eq!(app.status, "command palette");
+    }
+
+    #[test]
+    fn command_palette_opens_over_comment_editor_without_editing_draft() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+
+        assert!(!handle_key(
+            &mut app,
+            ctrl_key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft")
+        );
+    }
+
+    #[test]
+    fn command_palette_lists_and_fuzzy_filters_shortcuts() {
+        let commands = command_palette_commands();
+        assert!(commands.iter().any(|command| command.keys == "Ctrl+L"));
+        assert!(commands.iter().any(|command| command.keys == "Ctrl+Enter"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Open PR Merge Confirmation")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Create Issue")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.scope == "Reaction Dialog")
+        );
+
+        let merge_matches = command_palette_filtered_indices(&commands, "merge");
+        assert_eq!(
+            commands[merge_matches[0]].title,
+            "Open PR Merge Confirmation"
+        );
+
+        let issue_matches = command_palette_filtered_indices(&commands, "ctrl enter issue");
+        assert!(
+            issue_matches
+                .iter()
+                .any(|index| commands[*index].title == "Create Issue from Dialog")
+        );
+    }
+
+    #[test]
+    fn command_palette_enter_dispatches_selected_shortcut() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "help".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(app.help_dialog);
+        assert_eq!(app.status, "help");
+    }
+
+    #[test]
+    fn command_palette_global_command_works_over_comment_editor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+        app.command_palette = Some(CommandPalette {
+            query: "help".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(app.help_dialog);
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft")
+        );
+    }
+
+    #[test]
+    fn command_palette_escape_dismisses_without_dispatching() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "merge".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(!app.help_dialog);
+        assert_eq!(app.status, "command palette dismissed");
     }
 
     #[test]

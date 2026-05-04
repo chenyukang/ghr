@@ -38,7 +38,7 @@ review.
 | Feature | Branch | Owner | Status | PR | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Mark draft / ready for review | `codex/pr-draft-ready-actions` | Chandrasekhar | In review | [#15](https://github.com/chenyukang/ghr/pull/15) | Add PR lifecycle actions and refresh details afterward. |
-| Update branch | `codex/pr-update-branch` | Boyle | In progress | - | Use GitHub branch update API/CLI where available. |
+| Update branch | `codex/pr-update-branch` | Boyle | In review | [#18](https://github.com/chenyukang/ghr/pull/18) | Use GitHub branch update API/CLI where available. |
 | Enable / disable auto-merge | `codex/pr-auto-merge-actions` | Later wave | Todo | - | Requires merge method choice and repository capability checks. |
 | Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Later wave | Todo | - | Existing merge confirmation should expose method selection. |
 | Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Later wave | Todo | - | Existing approve and inline comment flows are a starting point. |
@@ -56,5 +56,5 @@ review.
 | Nietzsche | Edit title / body | `~/.codex/worktrees/ghr-edit-title-body` | `codex/edit-title-body` | In progress |
 | Hegel | Change milestone | `~/.codex/worktrees/ghr-milestone-actions` | `codex/milestone-actions` | In progress |
 | Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In progress |
-| Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In progress |
+| Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In review: [#18](https://github.com/chenyukang/ghr/pull/18) |
 | Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In progress |

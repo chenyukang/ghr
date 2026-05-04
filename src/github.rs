@@ -616,11 +616,25 @@ pub async fn refresh_section_page(
             None
         }
     };
+    let queries = filters
+        .split(" | ")
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let section = resolve_me_section(
         SearchSection {
             title,
-            filters,
-            queries: Vec::new(),
+            filters: if queries.len() > 1 {
+                String::new()
+            } else {
+                filters
+            },
+            queries: if queries.len() > 1 {
+                queries
+            } else {
+                Vec::new()
+            },
             limit: Some(page_size),
         },
         viewer_login.as_deref(),

@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReviewCommentPreview, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key, repo_section_filters,
-    repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, ReviewCommentPreview,
+    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
+    repo_section_filters, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -26,6 +26,11 @@ const SEARCH_API_MAX_RESULTS: usize = 1000;
 const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
+
+pub struct CommentFetchResult {
+    pub item_reactions: ReactionSummary,
+    pub comments: Vec<CommentPreview>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GhRequestPriority {
@@ -124,11 +129,46 @@ struct SearchApiIssueRaw {
     html_url: String,
     labels: Option<Vec<SearchLabelRaw>>,
     number: u64,
+    reactions: Option<ReactionSummaryRaw>,
     repository_url: String,
     state: Option<String>,
     title: String,
     updated_at: Option<DateTime<Utc>>,
     user: Option<SearchAuthorRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueDetailsRaw {
+    reactions: Option<ReactionSummaryRaw>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReactionSummaryRaw {
+    #[serde(rename = "+1")]
+    plus_one: Option<u64>,
+    #[serde(rename = "-1")]
+    minus_one: Option<u64>,
+    laugh: Option<u64>,
+    hooray: Option<u64>,
+    confused: Option<u64>,
+    heart: Option<u64>,
+    rocket: Option<u64>,
+    eyes: Option<u64>,
+}
+
+impl From<ReactionSummaryRaw> for ReactionSummary {
+    fn from(raw: ReactionSummaryRaw) -> Self {
+        Self {
+            plus_one: raw.plus_one.unwrap_or(0),
+            minus_one: raw.minus_one.unwrap_or(0),
+            laugh: raw.laugh.unwrap_or(0),
+            hooray: raw.hooray.unwrap_or(0),
+            confused: raw.confused.unwrap_or(0),
+            heart: raw.heart.unwrap_or(0),
+            rocket: raw.rocket.unwrap_or(0),
+            eyes: raw.eyes.unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,6 +207,7 @@ struct IssueCommentRaw {
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    reactions: Option<ReactionSummaryRaw>,
     user: Option<SearchAuthorRaw>,
 }
 
@@ -179,6 +220,7 @@ struct PullRequestReviewCommentRaw {
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    reactions: Option<ReactionSummaryRaw>,
     user: Option<SearchAuthorRaw>,
     path: Option<String>,
     line: Option<u64>,
@@ -798,24 +840,51 @@ pub async fn fetch_comments(
     repository: &str,
     number: u64,
     kind: ItemKind,
-) -> Result<Vec<CommentPreview>> {
+) -> Result<CommentFetchResult> {
     match kind {
         ItemKind::PullRequest => fetch_pull_request_comments(repository, number).await,
         ItemKind::Issue => fetch_issue_comments(repository, number).await,
-        ItemKind::Notification => Ok(Vec::new()),
+        ItemKind::Notification => Ok(CommentFetchResult {
+            item_reactions: ReactionSummary::default(),
+            comments: Vec::new(),
+        }),
     }
 }
 
-pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Vec<CommentPreview>> {
-    let output = fetch_issue_comments_output(repository, number).await?;
-    let viewer_login = comment_viewer_login("comment ownership").await;
-    parse_issue_comments_output(&output, repository, number, viewer_login.as_deref())
+pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<CommentFetchResult> {
+    let issue_output = fetch_issue_details_output(repository, number);
+    let comments_output = fetch_issue_comments_output(repository, number);
+    let viewer_login = comment_viewer_login("comment ownership");
+    let (issue_output, comments_output, viewer_login) =
+        tokio::join!(issue_output, comments_output, viewer_login);
+    Ok(CommentFetchResult {
+        item_reactions: parse_issue_details_output(&issue_output?, repository, number)?,
+        comments: parse_issue_comments_output(
+            &comments_output?,
+            repository,
+            number,
+            viewer_login.as_deref(),
+        )?,
+    })
+}
+
+async fn fetch_issue_details_output(repository: &str, number: u64) -> Result<String> {
+    let path = format!("repos/{repository}/issues/{number}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
+        path,
+    ])
+    .await
 }
 
 async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
     run_gh_json(&[
         "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
         "--paginate".to_string(),
         "--slurp".to_string(),
         path,
@@ -826,12 +895,13 @@ async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<St
 pub async fn fetch_pull_request_comments(
     repository: &str,
     number: u64,
-) -> Result<Vec<CommentPreview>> {
+) -> Result<CommentFetchResult> {
+    let issue_details = fetch_issue_details_output(repository, number);
     let issue_comments = fetch_issue_comments_output(repository, number);
     let review_comments = fetch_pull_request_review_comments_output(repository, number);
     let viewer_login = comment_viewer_login("pull request comment ownership");
-    let (issue_output, review_output, viewer_login) =
-        tokio::join!(issue_comments, review_comments, viewer_login);
+    let (issue_details, issue_output, review_output, viewer_login) =
+        tokio::join!(issue_details, issue_comments, review_comments, viewer_login);
     let viewer_login = viewer_login.as_deref();
     let mut comments =
         parse_issue_comments_output(&issue_output?, repository, number, viewer_login)?;
@@ -842,7 +912,10 @@ pub async fn fetch_pull_request_comments(
         viewer_login,
     )?);
     comments.sort_by_key(|comment| comment.created_at);
-    Ok(comments)
+    Ok(CommentFetchResult {
+        item_reactions: parse_issue_details_output(&issue_details?, repository, number)?,
+        comments,
+    })
 }
 
 async fn fetch_pull_request_review_comments_output(
@@ -852,6 +925,8 @@ async fn fetch_pull_request_review_comments_output(
     let path = format!("repos/{repository}/pulls/{number}/comments?per_page=100");
     run_gh_json(&[
         "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
         "--paginate".to_string(),
         "--slurp".to_string(),
         path,
@@ -1104,6 +1179,50 @@ pub async fn post_pull_request_review_reply(
     Ok(())
 }
 
+pub async fn add_issue_reaction(repository: &str, number: u64, content: &str) -> Result<()> {
+    let path = format!("repos/{repository}/issues/{number}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to {repository}#{number}"))
+}
+
+pub async fn add_issue_comment_reaction(
+    repository: &str,
+    comment_id: u64,
+    content: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/issues/comments/{comment_id}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to issue comment {comment_id}"))
+}
+
+pub async fn add_pull_request_review_comment_reaction(
+    repository: &str,
+    comment_id: u64,
+    content: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/pulls/comments/{comment_id}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to review comment {comment_id}"))
+}
+
+async fn post_reaction(path: String, content: &str) -> Result<()> {
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("content={content}"),
+    ])
+    .await?;
+    Ok(())
+}
+
 pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/comments/{comment_id}");
     run_gh_json(&[
@@ -1223,6 +1342,10 @@ fn parse_issue_comments_output(
                 url: comment.html_url,
                 parent_id: None,
                 is_mine,
+                reactions: comment
+                    .reactions
+                    .map(ReactionSummary::from)
+                    .unwrap_or_default(),
                 review: None,
             }
         })
@@ -1230,6 +1353,19 @@ fn parse_issue_comments_output(
 
     comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn parse_issue_details_output(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<ReactionSummary> {
+    let issue = serde_json::from_str::<IssueDetailsRaw>(output)
+        .with_context(|| format!("failed to parse issue details for {repository}#{number}"))?;
+    Ok(issue
+        .reactions
+        .map(ReactionSummary::from)
+        .unwrap_or_default())
 }
 
 fn parse_pull_request_review_comments_output(
@@ -1260,6 +1396,10 @@ fn parse_pull_request_review_comments_output(
                 url: comment.html_url,
                 parent_id: comment.in_reply_to_id,
                 is_mine,
+                reactions: comment
+                    .reactions
+                    .map(ReactionSummary::from)
+                    .unwrap_or_default(),
                 review: Some(ReviewCommentPreview {
                     path: comment.path.unwrap_or_else(|| "-".to_string()),
                     line: comment.line,
@@ -1762,6 +1902,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         url: item.url,
         updated_at: item.updated_at,
         labels,
+        reactions: ReactionSummary::default(),
         comments: item.comments_count,
         unread: None,
         reason: None,
@@ -1798,6 +1939,10 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         url: item.html_url,
         updated_at: item.updated_at,
         labels,
+        reactions: item
+            .reactions
+            .map(ReactionSummary::from)
+            .unwrap_or_default(),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -1863,6 +2008,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         url,
         updated_at: notification.updated_at,
         labels: Vec::new(),
+        reactions: ReactionSummary::default(),
         comments: None,
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
@@ -2123,6 +2269,7 @@ mod tests {
                 name: "T-compiler".to_string(),
             }]),
             number: 1,
+            reactions: None,
             repository_url: "https://api.github.com/repos/rust-lang/rust".to_string(),
             state: Some("open".to_string()),
             title: "ICE".to_string(),
@@ -2161,6 +2308,28 @@ mod tests {
             parse_repository_labels_output(output).unwrap(),
             vec!["bug", "enhancement", "T-compiler"]
         );
+    }
+
+    #[test]
+    fn issue_details_and_comments_parse_reactions() {
+        let issue = r#"{"reactions": {"+1": 0, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 1, "rocket": 0, "eyes": 0}}"#;
+        let reactions = parse_issue_details_output(issue, "owner/repo", 1).unwrap();
+        assert_eq!(reactions.heart, 1);
+
+        let output = r##"[
+          [{
+            "id": 1,
+            "body": "reacted",
+            "html_url": "https://github.com/owner/repo/issues/1#issuecomment-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "reactions": {"+1": 2, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 0, "rocket": 1, "eyes": 0},
+            "user": { "login": "alice" }
+          }]
+        ]"##;
+        let comments = parse_issue_comments_output(output, "owner/repo", 1, None).unwrap();
+        assert_eq!(comments[0].reactions.plus_one, 2);
+        assert_eq!(comments[0].reactions.rocket, 1);
     }
 
     #[test]

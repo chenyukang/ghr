@@ -1,5 +1,11 @@
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 pub(super) fn display_width(text: &str) -> usize {
-    text.chars().count()
+    UnicodeWidthStr::width(text)
+}
+
+pub(super) fn display_width_char(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(super) fn normalize_text(text: &str) -> String {

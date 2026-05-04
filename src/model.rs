@@ -40,10 +40,45 @@ pub struct WorkItem {
     pub url: String,
     pub updated_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub reactions: ReactionSummary,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,
     pub extra: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionSummary {
+    #[serde(default)]
+    pub plus_one: u64,
+    #[serde(default)]
+    pub minus_one: u64,
+    #[serde(default)]
+    pub laugh: u64,
+    #[serde(default)]
+    pub hooray: u64,
+    #[serde(default)]
+    pub confused: u64,
+    #[serde(default)]
+    pub heart: u64,
+    #[serde(default)]
+    pub rocket: u64,
+    #[serde(default)]
+    pub eyes: u64,
+}
+
+impl ReactionSummary {
+    pub fn is_empty(&self) -> bool {
+        self.plus_one == 0
+            && self.minus_one == 0
+            && self.laugh == 0
+            && self.hooray == 0
+            && self.confused == 0
+            && self.heart == 0
+            && self.rocket == 0
+            && self.eyes == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +94,8 @@ pub struct CommentPreview {
     pub parent_id: Option<u64>,
     #[serde(default)]
     pub is_mine: bool,
+    #[serde(default)]
+    pub reactions: ReactionSummary,
     #[serde(default)]
     pub review: Option<ReviewCommentPreview>,
 }

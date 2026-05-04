@@ -77,6 +77,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment when it is yours; in diff mode, end a review range |
+| `T` | Edit the selected issue or PR title/body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close confirmation for the selected PR |
@@ -91,7 +92,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `O` | Open a disable auto-merge confirmation for the selected PR |
 | `t` | Change or clear the selected issue/PR milestone |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
-| `Ctrl+Enter` | Send or update a comment from the comment dialog |
+| `Ctrl+Enter` | Send or update a comment/title/body from the editor dialog |
 | `Ctrl+Enter` in issue dialog | Create the issue |
 | `r` | Refresh from GitHub |
 | `q` / `Ctrl+C` | Save UI state and quit |

@@ -183,6 +183,13 @@ pub(super) fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog
             "Posting Review Comment",
             "Waiting for GitHub to accept the review comment...",
         ),
+        PendingCommentMode::ItemMetadata { field } => message_dialog(
+            format!("Updating {}", field.title()),
+            format!(
+                "Waiting for GitHub to accept the {} update...",
+                field.label()
+            ),
+        ),
     }
 }
 

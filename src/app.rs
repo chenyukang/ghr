@@ -120,6 +120,10 @@ enum AppMsg {
         section: SectionSnapshot,
         save_error: Option<String>,
     },
+    FilterSectionLoaded {
+        section_key: String,
+        section: SectionSnapshot,
+    },
     GlobalSearchFinished {
         query: String,
         sections: Vec<SectionSnapshot>,
@@ -312,6 +316,8 @@ struct AppState {
     active_view: String,
     sections: Vec<SectionSnapshot>,
     section_index: HashMap<String, usize>,
+    base_section_filters: HashMap<String, String>,
+    quick_filters: HashMap<String, QuickFilter>,
     selected_index: HashMap<String, usize>,
     list_scroll_offset: HashMap<String, usize>,
     focus: FocusTarget,
@@ -330,6 +336,8 @@ struct AppState {
     global_search_return_view: Option<String>,
     global_search_scope: Option<String>,
     global_search_started_at: Option<Instant>,
+    filter_input_active: bool,
+    filter_input_query: String,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
@@ -460,6 +468,210 @@ struct SectionPageRequest {
     page_size: usize,
     total_pages: usize,
     total_is_capped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickFilterState {
+    Open,
+    Closed,
+    Merged,
+    Draft,
+    All,
+}
+
+impl QuickFilterState {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            "merged" => Some(Self::Merged),
+            "draft" => Some(Self::Draft),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn display(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+            Self::Draft => "draft",
+            Self::All => "all",
+        }
+    }
+
+    fn query_token(self) -> Option<&'static str> {
+        match self {
+            Self::Open => Some("is:open"),
+            Self::Closed => Some("is:closed"),
+            Self::Merged => Some("is:merged"),
+            Self::Draft => Some("is:draft"),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QuickFilter {
+    state: Option<QuickFilterState>,
+    assignee: Option<String>,
+    author: Option<String>,
+    labels: Vec<String>,
+}
+
+impl QuickFilter {
+    fn parse(input: &str) -> std::result::Result<Option<Self>, String> {
+        let input = input.trim();
+        if input.is_empty() || matches!(input, "clear" | "reset") {
+            return Ok(None);
+        }
+
+        let mut filter = Self::default();
+        for token in input.split_whitespace() {
+            if let Some(state) = QuickFilterState::parse(token) {
+                filter.state = Some(state);
+                continue;
+            }
+            if let Some(value) = token
+                .strip_prefix("state:")
+                .or_else(|| token.strip_prefix("is:"))
+            {
+                filter.state = Some(
+                    QuickFilterState::parse(value)
+                        .ok_or_else(|| format!("unknown state filter: {value}"))?,
+                );
+                continue;
+            }
+            if let Some(value) = token.strip_prefix("assignee:") {
+                filter.assignee = Some(non_empty_filter_value("assignee", value)?);
+                continue;
+            }
+            if let Some(value) = token.strip_prefix("author:") {
+                filter.author = Some(non_empty_filter_value("author", value)?);
+                continue;
+            }
+            if let Some(value) = token
+                .strip_prefix("label:")
+                .or_else(|| token.strip_prefix("labels:"))
+            {
+                for label in comma_separated_filter_values("label", value)? {
+                    if !filter.labels.contains(&label) {
+                        filter.labels.push(label);
+                    }
+                }
+                continue;
+            }
+
+            return Err(format!("unknown filter token: {token}"));
+        }
+
+        Ok(Some(filter))
+    }
+
+    fn display(&self) -> String {
+        let mut tokens = Vec::new();
+        if let Some(state) = self.state {
+            tokens.push(format!("state:{}", state.display()));
+        }
+        if let Some(assignee) = &self.assignee {
+            tokens.push(format!("assignee:{assignee}"));
+        }
+        if let Some(author) = &self.author {
+            tokens.push(format!("author:{author}"));
+        }
+        tokens.extend(self.labels.iter().map(|label| format!("label:{label}")));
+        tokens.join(" ")
+    }
+}
+
+fn non_empty_filter_value(name: &str, value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("{name} filter is empty"))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn comma_separated_filter_values(
+    name: &str,
+    value: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err(format!("{name} filter is empty"))
+    } else {
+        Ok(values)
+    }
+}
+
+fn quick_filter_query(base_filters: &str, filter: &QuickFilter) -> String {
+    if base_filters.contains(" | ") {
+        return base_filters
+            .split(" | ")
+            .map(|filters| quick_filter_query(filters, filter))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+
+    let base_tokens = base_filters
+        .split_whitespace()
+        .filter(|token| !quick_filter_replaces_token(token, filter))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let overlay_tokens = quick_filter_tokens(filter);
+    insert_tokens_before_sort(base_tokens, overlay_tokens).join(" ")
+}
+
+fn quick_filter_replaces_token(token: &str, filter: &QuickFilter) -> bool {
+    (filter.state.is_some() && is_state_filter_token(token))
+        || (filter.assignee.is_some() && token.starts_with("assignee:"))
+        || (filter.author.is_some() && token.starts_with("author:"))
+        || (!filter.labels.is_empty()
+            && (token.starts_with("label:") || token.starts_with("labels:")))
+}
+
+fn quick_filter_tokens(filter: &QuickFilter) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Some(token) = filter.state.and_then(QuickFilterState::query_token) {
+        tokens.push(token.to_string());
+    }
+    if let Some(assignee) = &filter.assignee {
+        tokens.push(format!("assignee:{assignee}"));
+    }
+    if let Some(author) = &filter.author {
+        tokens.push(format!("author:{author}"));
+    }
+    tokens.extend(filter.labels.iter().map(|label| format!("label:{label}")));
+    tokens
+}
+
+fn insert_tokens_before_sort(
+    mut base_tokens: Vec<String>,
+    overlay_tokens: Vec<String>,
+) -> Vec<String> {
+    if overlay_tokens.is_empty() {
+        return base_tokens;
+    }
+    let sort_index = base_tokens
+        .iter()
+        .position(|token| token.starts_with("sort:"))
+        .unwrap_or(base_tokens.len());
+    base_tokens.splice(sort_index..sort_index, overlay_tokens);
+    base_tokens
+}
+
+fn is_state_filter_token(token: &str) -> bool {
+    matches!(
+        token,
+        "is:open" | "is:closed" | "is:merged" | "is:draft" | "draft:true" | "draft:false"
+    ) || token.starts_with("state:")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,6 +1098,75 @@ fn start_section_page_load(
     });
 }
 
+fn start_filtered_section_load(
+    app: &mut AppState,
+    config: &Config,
+    tx: &UnboundedSender<AppMsg>,
+    filter: Option<QuickFilter>,
+) {
+    if app.refreshing {
+        app.status = "refresh already running".to_string();
+        return;
+    }
+
+    let Some(section) = app.current_section() else {
+        app.status = "no section selected".to_string();
+        return;
+    };
+    if !matches!(
+        section.kind,
+        SectionKind::PullRequests | SectionKind::Issues
+    ) {
+        app.status = "quick filters are available for PR and issue sections".to_string();
+        return;
+    }
+
+    let section_key = section.key.clone();
+    let view = section_view_key(section);
+    let kind = section.kind;
+    let title = section.title.clone();
+    let base_filters = app.base_filters_for_section(section);
+    let page_size = section_page_size(section, config);
+    let effective_filters = match &filter {
+        Some(filter) => quick_filter_query(&base_filters, filter),
+        None => base_filters.clone(),
+    };
+    let status_filter = filter.as_ref().map(QuickFilter::display);
+
+    match filter {
+        Some(filter) => {
+            app.quick_filters.insert(section_key.clone(), filter);
+        }
+        None => {
+            app.quick_filters.remove(&section_key);
+        }
+    }
+
+    app.refreshing = true;
+    app.last_refresh_request = Instant::now();
+    app.set_current_selected_position(0);
+    app.clear_current_list_scroll_offset();
+    app.details_scroll = 0;
+    app.selected_comment_index = 0;
+    app.comment_dialog = None;
+    app.pr_action_dialog = None;
+    app.status = match status_filter {
+        Some(filter) if !filter.is_empty() => format!("applying filter {filter}"),
+        _ => "clearing quick filter".to_string(),
+    };
+
+    let config = config.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let section =
+            refresh_section_page(view, kind, title, effective_filters, 1, page_size, &config).await;
+        let _ = tx.send(AppMsg::FilterSectionLoaded {
+            section_key,
+            section,
+        });
+    });
+}
+
 fn start_global_search(
     query: String,
     repo_scope: Option<String>,
@@ -1180,6 +1461,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.filter_input_active {
+        app.handle_filter_input_key(key, config, tx);
+        return false;
+    }
+
     if app.global_search_active {
         app.handle_global_search_key(key, config, tx);
         return false;
@@ -1226,6 +1512,7 @@ fn handle_key_in_area(
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
         KeyCode::Char('S') => app.start_global_search_input(),
+        KeyCode::Char('f') => app.start_filter_input(),
         KeyCode::Tab => app.move_focused_tab_group(1),
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
@@ -1612,6 +1899,7 @@ fn handle_left_click(
         app.search_active = false;
         app.comment_search_active = false;
         app.global_search_active = false;
+        app.filter_input_active = false;
         app.status = "ghr focused".to_string();
         return;
     }
@@ -1642,6 +1930,7 @@ fn handle_left_click(
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
 
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)
@@ -1666,6 +1955,7 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
 
     let max_scroll = max_details_scroll(app, area);
     if max_scroll == 0 {
@@ -1686,6 +1976,7 @@ fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
     if app.details_mode == DetailsMode::Diff {
         app.move_diff_file(delta);
     } else {
@@ -2089,17 +2380,21 @@ fn active_section_tab_style() -> Style {
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
     let (_, unread) = section_counts(section);
     let count_label = section_count_label(section);
+    let title = app
+        .quick_filter_label_for_section(section)
+        .map(|filter| format!("{} [{filter}]", section.title))
+        .unwrap_or_else(|| section.title.clone());
     if !app.search_query.is_empty() {
         format!(
             "{} ({}/{})",
-            section.title,
+            title,
             app.filtered_indices(section).len(),
             section.items.len()
         )
     } else if unread > 0 {
-        format!("{} ({count_label}/{unread})", section.title)
+        format!("{title} ({count_label}/{unread})")
     } else {
-        format!("{} ({count_label})", section.title)
+        format!("{title} ({count_label})")
     }
 }
 
@@ -2219,6 +2514,9 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             app.search_query
         )
     };
+    if let Some(filter) = app.quick_filter_label_for_section(section) {
+        title.push_str(&format!(" | filter: {filter}"));
+    }
     if let Some(error) = &section.error {
         title.push_str(&format!(" - error: {}", compact_error_label(error)));
     };
@@ -2433,6 +2731,16 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
+    if app.filter_input_active {
+        return Some((
+            format!(
+                "Filter: f{}_  Enter apply  empty/clear resets  Esc cancel",
+                app.filter_input_query
+            ),
+            Color::LightCyan,
+        ));
+    }
+
     if app.global_search_active {
         let scope = app
             .global_search_scope
@@ -2596,6 +2904,8 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
         Some(format!("repo-search: S{}_", app.global_search_query))
     } else if app.global_search_running {
         Some("repo search running".to_string())
+    } else if app.filter_input_active {
+        Some(format!("filter: f{}_", app.filter_input_query))
     } else if app.search_active {
         Some(format!("local-search: /{}_", app.search_query))
     } else if app.search_query.is_empty() {
@@ -2603,6 +2913,7 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     } else {
         Some(format!("local-search: /{}", app.search_query))
     };
+    let active_filter = app.current_filter_label();
     let (mouse, text_selection_state) = footer_mouse_shortcut(app);
 
     let mut spans = Vec::new();
@@ -2612,6 +2923,7 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     push_footer_pair(&mut spans, "1-4", "focus", Color::Cyan);
     push_footer_pair(&mut spans, "?", "help", Color::Yellow);
     push_footer_pair(&mut spans, "S", "repo", Color::Yellow);
+    push_footer_pair(&mut spans, "f", "filter", Color::LightCyan);
     push_footer_pair(&mut spans, "r", "refresh", Color::Yellow);
     push_footer_pair(&mut spans, "o", "open", Color::Yellow);
     if let Some(mouse) = mouse {
@@ -2628,6 +2940,9 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     push_footer_state(&mut spans, "focus", focus, Color::Cyan);
     if let Some(search) = search {
         push_footer_state(&mut spans, "search", search, Color::Yellow);
+    }
+    if let Some(active_filter) = active_filter {
+        push_footer_state(&mut spans, "filter", active_filter, Color::LightCyan);
     }
     if let Some(text_selection_state) = text_selection_state {
         push_footer_state(&mut spans, "mode", text_selection_state, Color::LightBlue);
@@ -3476,6 +3791,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("f", "filter current PR/issue section"),
         help_key_line(
             "Esc in Search results",
             "return to the previous default list",
@@ -3501,6 +3817,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("f", "filter with state:closed label:bug author:alice"),
         help_key_line("v", "show pull request diff"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
@@ -3552,6 +3869,15 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("S", "open search input"),
         help_key_line("Enter", "run gh search prs and gh search issues"),
         help_key_line("Esc", "cancel global search input"),
+        Line::from(""),
+        help_heading("Section Filters"),
+        help_key_line("f", "open filter input for current PR/issue section"),
+        help_key_line("state:open/closed/merged/draft/all", "set state filter"),
+        help_key_line(
+            "assignee:user author:user label:name",
+            "set search qualifiers",
+        ),
+        help_key_line("empty or clear", "clear the current section filter"),
         Line::from(""),
         help_heading("Comment Editor"),
         help_key_line("Enter", "insert newline"),
@@ -7124,10 +7450,16 @@ impl AppState {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let base_section_filters = sections
+            .iter()
+            .map(|section| (section.key.clone(), section.filters.clone()))
+            .collect::<HashMap<_, _>>();
         let mut state = Self {
             active_view,
             sections,
             section_index: ui_state.section_index.clone(),
+            base_section_filters,
+            quick_filters: HashMap::new(),
             selected_index: ui_state.selected_index.clone(),
             list_scroll_offset: HashMap::new(),
             focus: FocusTarget::List,
@@ -7146,6 +7478,8 @@ impl AppState {
             global_search_return_view: None,
             global_search_scope: None,
             global_search_started_at: None,
+            filter_input_active: false,
+            filter_input_query: String::new(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
@@ -7331,6 +7665,18 @@ impl AppState {
         let title = section.title.clone();
         let section_error = section.error.clone();
         let setup_dialog = section_error.as_deref().and_then(setup_dialog_from_error);
+        self.remember_base_filters(&section);
+        if self.quick_filters.contains_key(&section.key) {
+            if self.setup_dialog.is_none() {
+                self.setup_dialog = setup_dialog;
+            }
+            self.status = match (section_error.as_deref(), save_error) {
+                (None, None) => format!("loaded {title}; quick filter still active"),
+                (Some(error), None) => refresh_error_status(1, Some(error)),
+                (_, Some(error)) => format!("snapshot save failed: {error}"),
+            };
+            return;
+        }
 
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
@@ -7395,6 +7741,13 @@ impl AppState {
                     .find_map(|section| section.error.as_deref())
                     .map(str::to_string);
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
+                for section in &sections {
+                    self.remember_base_filters(section);
+                }
+                let sections = sections
+                    .into_iter()
+                    .filter(|section| !self.quick_filters.contains_key(&section.key))
+                    .collect::<Vec<_>>();
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 let restored_item = self.restore_refresh_anchor(&anchor);
@@ -7663,6 +8016,28 @@ impl AppState {
                     (_, Some(error)) => format!("snapshot save failed: {error}"),
                 };
             }
+            AppMsg::FilterSectionLoaded {
+                section_key,
+                section,
+            } => {
+                let error = section.error.clone();
+                let filter_label = self
+                    .quick_filters
+                    .get(&section_key)
+                    .map(QuickFilter::display);
+                if self.setup_dialog.is_none() {
+                    self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
+                }
+                self.replace_section_page(&section_key, section);
+                self.refreshing = false;
+                self.status = match (error.as_deref(), filter_label) {
+                    (None, Some(filter)) if !filter.is_empty() => {
+                        format!("filter applied: {filter}")
+                    }
+                    (None, _) => "filter cleared".to_string(),
+                    (Some(error), _) => refresh_error_status(1, Some(error)),
+                };
+            }
             AppMsg::GlobalSearchFinished { query, sections } => {
                 let errors = sections
                     .iter()
@@ -7686,6 +8061,7 @@ impl AppState {
                 self.global_search_scope = None;
                 self.global_search_active = false;
                 self.global_search_query = query.clone();
+                self.filter_input_active = false;
                 self.search_active = false;
                 self.search_query.clear();
                 self.active_view = global_search_view_key();
@@ -7747,6 +8123,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.status = "help".to_string();
     }
 
@@ -7887,7 +8264,7 @@ impl AppState {
             view: section_view_key(section),
             kind: section.kind,
             title: section.title.clone(),
-            filters: section.filters.clone(),
+            filters: self.effective_filters_for_section(section),
             page: next_page,
             page_size,
             total_pages,
@@ -7895,10 +8272,52 @@ impl AppState {
         })
     }
 
+    fn base_filters_for_section(&self, section: &SectionSnapshot) -> String {
+        self.base_section_filters
+            .get(&section.key)
+            .cloned()
+            .unwrap_or_else(|| section.filters.clone())
+    }
+
+    fn remember_base_filters(&mut self, section: &SectionSnapshot) {
+        if section.error.is_none() {
+            self.base_section_filters
+                .insert(section.key.clone(), section.filters.clone());
+        }
+    }
+
+    fn effective_filters_for_section(&self, section: &SectionSnapshot) -> String {
+        let base_filters = self.base_filters_for_section(section);
+        self.quick_filters
+            .get(&section.key)
+            .map(|filter| quick_filter_query(&base_filters, filter))
+            .unwrap_or(base_filters)
+    }
+
+    fn current_filter_label(&self) -> Option<String> {
+        self.current_section()
+            .and_then(|section| self.quick_filter_label_for_section(section))
+    }
+
+    fn quick_filter_label_for_section(&self, section: &SectionSnapshot) -> Option<String> {
+        self.quick_filters
+            .get(&section.key)
+            .map(QuickFilter::display)
+            .filter(|label| !label.is_empty())
+    }
+
     fn replace_global_search_sections(&mut self, sections: Vec<SectionSnapshot>) {
         let search_view = global_search_view_key();
         self.sections
             .retain(|section| section_view_key(section) != search_view);
+        self.base_section_filters
+            .retain(|key, _| !key.starts_with("search:"));
+        self.quick_filters
+            .retain(|key, _| !key.starts_with("search:"));
+        for section in &sections {
+            self.base_section_filters
+                .insert(section.key.clone(), section.filters.clone());
+        }
         self.sections.extend(sections);
     }
 
@@ -9081,6 +9500,7 @@ impl AppState {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
         self.pr_action_running = false;
         self.status = match action {
@@ -9151,6 +9571,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
@@ -9176,6 +9597,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
@@ -9212,6 +9634,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
@@ -9255,6 +9678,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
@@ -9426,12 +9850,75 @@ impl AppState {
         self.global_search_query.clear();
         self.search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
         };
+    }
+
+    fn start_filter_input(&mut self) {
+        let Some(section) = self.current_section() else {
+            self.status = "no section selected".to_string();
+            return;
+        };
+        let section_key = section.key.clone();
+        let section_kind = section.kind;
+        if !matches!(
+            section_kind,
+            SectionKind::PullRequests | SectionKind::Issues
+        ) {
+            self.status = "quick filters are available for PR and issue sections".to_string();
+            return;
+        }
+
+        self.save_current_conversation_details_state();
+        self.focus = FocusTarget::List;
+        self.filter_input_active = true;
+        self.filter_input_query = self
+            .quick_filters
+            .get(&section_key)
+            .map(QuickFilter::display)
+            .unwrap_or_default();
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.status = "filter mode: state:closed label:bug author:alice".to_string();
+    }
+
+    fn handle_filter_input_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter_input_active = false;
+                self.status = "filter cancelled".to_string();
+            }
+            KeyCode::Enter => match QuickFilter::parse(&self.filter_input_query) {
+                Ok(filter) => {
+                    self.filter_input_active = false;
+                    self.filter_input_query.clear();
+                    start_filtered_section_load(self, config, tx, filter);
+                }
+                Err(message) => {
+                    self.status = message;
+                }
+            },
+            KeyCode::Backspace => {
+                self.filter_input_query.pop();
+            }
+            KeyCode::Char(value) => {
+                self.filter_input_query.push(value);
+            }
+            _ => {}
+        }
     }
 
     fn handle_global_search_key(
@@ -9473,6 +9960,7 @@ impl AppState {
                 self.search_active = false;
                 self.search_query.clear();
                 self.comment_search_active = false;
+                self.filter_input_active = false;
                 self.status = match repo_scope {
                     Some(repo) => format!("searching {repo} for '{query}'"),
                     None => format!("searching GitHub for '{query}'"),
@@ -9495,6 +9983,7 @@ impl AppState {
         self.search_active = true;
         self.global_search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.status = "search mode".to_string();
@@ -9505,6 +9994,7 @@ impl AppState {
         self.save_current_conversation_details_state();
         self.search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.search_query.clear();
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
@@ -9542,6 +10032,7 @@ impl AppState {
         self.comment_search_active = true;
         self.search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
     }
@@ -11399,6 +11890,32 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn refresh_finished_does_not_overwrite_active_quick_filter_rows() {
+        let mut filtered = test_section();
+        filtered.items.truncate(1);
+        filtered.filters = "repo:owner/repo archived:false is:closed sort:updated-desc".to_string();
+        let mut refreshed = test_section();
+        refreshed.filters = "repo:owner/repo is:open archived:false sort:updated-desc".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![filtered]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed").unwrap().expect("filter"),
+        );
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![refreshed],
+            save_error: None,
+        });
+
+        assert_eq!(app.sections[0].items.len(), 1);
+        assert_eq!(
+            app.base_section_filters.get("pull_requests:test"),
+            Some(&"repo:owner/repo is:open archived:false sort:updated-desc".to_string())
+        );
+        assert_eq!(app.status, "refresh complete");
+    }
+
+    #[test]
     fn progressive_refresh_section_renders_before_full_refresh_finishes() {
         let mut empty = test_section();
         empty.items.clear();
@@ -12262,11 +12779,9 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
         assert!(text.contains("M/C/A pr action"));
-        assert!(
-            text.contains(
-                "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
-            )
-        );
+        assert!(text.contains(
+            "| 1-4 focus  ? help  S repo  f filter  r refresh  o open  m text-select  q quit |"
+        ));
         assert!(text.contains("| focus List  refresh idle  state list focused"));
         assert!(!text.contains("1 ghr  2 Sections  3 list  4 Details"));
         assert!(!text.contains("n/p comment"));
@@ -12614,6 +13129,106 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn quick_filter_query_replaces_state_and_adds_qualifiers_before_sort() {
+        let filter =
+            QuickFilter::parse("state:closed label:bug author:alice assignee:bob").unwrap();
+        let filter = filter.expect("filter");
+
+        assert_eq!(
+            quick_filter_query(
+                "repo:owner/repo is:open author:me label:old archived:false sort:updated-desc",
+                &filter,
+            ),
+            "repo:owner/repo archived:false is:closed assignee:bob author:alice label:bug sort:updated-desc"
+        );
+    }
+
+    #[test]
+    fn quick_filter_state_shortcuts_toggle_query_state() {
+        let base = "repo:owner/repo is:open archived:false sort:updated-desc";
+        let closed = QuickFilter::parse("closed").unwrap().expect("closed");
+        let merged = QuickFilter::parse("state:merged").unwrap().expect("merged");
+        let draft = QuickFilter::parse("draft").unwrap().expect("draft");
+        let all = QuickFilter::parse("all").unwrap().expect("all");
+
+        assert!(quick_filter_query(base, &closed).contains("is:closed"));
+        assert!(quick_filter_query(base, &merged).contains("is:merged"));
+        assert!(quick_filter_query(base, &draft).contains("is:draft"));
+        assert_eq!(
+            quick_filter_query(base, &all),
+            "repo:owner/repo archived:false sort:updated-desc"
+        );
+    }
+
+    #[test]
+    fn quick_filter_applies_assignee_author_and_multiple_labels() {
+        let filter = QuickFilter::parse("assignee:bob author:alice labels:bug,regression")
+            .unwrap()
+            .expect("filter");
+
+        assert_eq!(
+            quick_filter_query("is:open sort:updated-desc", &filter),
+            "is:open assignee:bob author:alice label:bug label:regression sort:updated-desc"
+        );
+        assert_eq!(
+            filter.display(),
+            "assignee:bob author:alice label:bug label:regression"
+        );
+    }
+
+    #[test]
+    fn quick_filter_clear_inputs_reset_overlay() {
+        assert_eq!(QuickFilter::parse("").unwrap(), None);
+        assert_eq!(QuickFilter::parse("clear").unwrap(), None);
+        assert_eq!(QuickFilter::parse("reset").unwrap(), None);
+    }
+
+    #[test]
+    fn list_title_and_footer_show_active_quick_filter() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed label:bug")
+                .unwrap()
+                .expect("filter"),
+        );
+        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Test [state:closed label:bug]"));
+        assert!(rendered.contains("filter: state:closed label:bug"));
+    }
+
+    #[test]
+    fn filter_input_prompt_is_discoverable_and_prefilled() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed author:alice")
+                .unwrap()
+                .expect("filter"),
+        );
+
+        app.start_filter_input();
+
+        assert!(app.filter_input_active);
+        assert_eq!(app.filter_input_query, "state:closed author:alice");
+        assert_eq!(
+            active_list_input_prompt(&app).map(|(prompt, _)| prompt),
+            Some(
+                "Filter: fstate:closed author:alice_  Enter apply  empty/clear resets  Esc cancel"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn details_comment_search_input_focuses_matching_comment() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let item_id = app.current_item().expect("item").id.clone();
@@ -12807,6 +13422,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.global_search_active);
         assert!(!app.search_active);
+        assert!(!app.filter_input_active);
         assert_eq!(app.global_search_query, "");
         assert_eq!(app.status, "repo search mode in rust-lang/rust");
     }

@@ -20,7 +20,7 @@
 - Configurable sections and repo tabs, including multi-query sections such as `All Requests`.
 - Automatic current-repo tab when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
-- Fuzzy filtering in every loaded list with `/`, plus repo-scoped GitHub search with `S`.
+- Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, merge, close, and approve flows from inside the TUI.
@@ -65,6 +65,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `g` / `G` | Jump to top/bottom in list, details, or diff |
 | `[` / `]` | Load previous/next GitHub result page, or switch diff files in diff mode |
 | `/` | Fuzzy filter the current list |
+| `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
 | `S` | Search matching PRs and issues in the current repo |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |

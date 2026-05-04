@@ -34,12 +34,12 @@ use crate::github::{
     edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
     fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    refresh_dashboard_with_progress, refresh_section_page, rerun_failed_pull_request_checks,
+    search_global, with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
-    builtin_view_key, configured_sections, global_search_view_key,
+    ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, SectionKind,
+    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
     mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
     section_counts, section_view_key,
 };
@@ -247,12 +247,14 @@ enum PrAction {
     Merge,
     Close,
     Approve,
+    RerunFailedChecks,
 }
 
 #[derive(Debug, Clone)]
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+    summary: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1077,6 +1079,9 @@ fn start_pr_action(
                 PrAction::Approve => approve_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::RerunFailedChecks => rerun_failed_pull_request_checks(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -1088,6 +1093,13 @@ fn start_pr_action(
         });
 
         if should_refresh {
+            if let Some(number) = item.number {
+                let item_id = item.id.clone();
+                let actions = fetch_pull_request_action_hints(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
+            }
             let _ = tx.send(AppMsg::RefreshStarted);
             let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
@@ -1287,6 +1299,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1308,6 +1321,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1440,6 +1454,7 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
         KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
         KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -2679,7 +2694,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/F", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2693,7 +2708,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/F", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2717,7 +2732,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/F", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2726,7 +2741,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/F", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3033,23 +3048,30 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "merge",
         PrAction::Close => "close",
         PrAction::Approve => "approve",
+        PrAction::RerunFailedChecks => "rerun failed checks for",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
         PrAction::Close => "Close this pull request on GitHub?",
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::RerunFailedChecks => "Rerun failed GitHub Actions jobs for this pull request?",
     };
     let status = if running {
         "working...".to_string()
     } else {
         format!("y/Enter: yes, {action_label} PR    Esc: cancel")
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
         key_value_line("pull request", number),
         key_value_line("title", dialog.item.title.clone()),
+    ];
+    for (key, value) in &dialog.summary {
+        lines.push(key_value_line(key, value.clone()));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(vec![Span::styled(
             status,
@@ -3057,7 +3079,7 @@ fn draw_pr_action_dialog(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]),
-    ];
+    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -3067,6 +3089,7 @@ fn draw_pr_action_dialog(
                 PrAction::Merge => "Merge Pull Request",
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::RerunFailedChecks => "Rerun Failed Checks",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -3505,6 +3528,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
         help_heading("Diff Files"),
@@ -3542,6 +3566,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
@@ -6015,6 +6040,20 @@ fn check_summary_segments(summary: &CheckSummary) -> Vec<DetailSegment> {
     segments
 }
 
+fn failed_check_runs_summary(runs: &[FailedCheckRunSummary]) -> String {
+    runs.iter()
+        .map(|run| {
+            let label = run
+                .workflow
+                .as_deref()
+                .filter(|workflow| !workflow.trim().is_empty())
+                .unwrap_or("Actions run");
+            format!("{label} #{} ({})", run.run_id, run.checks.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn push_check_part(segments: &mut Vec<DetailSegment>, text: String, style: Style) {
     if !segments.is_empty() {
         segments.push(DetailSegment::raw(", "));
@@ -7595,6 +7634,9 @@ impl AppState {
                             PrAction::Merge => "pull request merged; refreshing".to_string(),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
+                            PrAction::RerunFailedChecks => {
+                                "failed checks rerun; refreshing".to_string()
+                            }
                         };
                         self.message_dialog = Some(success_message_dialog(
                             pr_action_success_title(action),
@@ -7765,6 +7807,7 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                    PrAction::RerunFailedChecks => {}
                 }
             }
         }
@@ -9078,16 +9121,77 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        let summary = match self.pr_action_dialog_summary(&item, action) {
+            Ok(summary) => summary,
+            Err((title, body, status)) => {
+                self.status = status;
+                self.message_dialog = Some(message_dialog(title, body));
+                return;
+            }
+        };
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
-        self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action,
+            summary,
+        });
         self.pr_action_running = false;
         self.status = match action {
             PrAction::Merge => "confirm pull request merge".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
+            PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
         };
+    }
+
+    fn pr_action_dialog_summary(
+        &self,
+        item: &WorkItem,
+        action: PrAction,
+    ) -> Result<Vec<(&'static str, String)>, (&'static str, String, String)> {
+        if action != PrAction::RerunFailedChecks {
+            return Ok(Vec::new());
+        }
+
+        match self.action_hints.get(&item.id) {
+            Some(ActionHintState::Loaded(hints)) => match &hints.checks {
+                Some(checks) if checks.failed == 0 => Err((
+                    "No Failed Checks",
+                    "This pull request has no failed checks in the latest loaded action hints. Refresh if checks changed.".to_string(),
+                    "no failed checks to rerun".to_string(),
+                )),
+                Some(checks) => {
+                    let mut summary =
+                        vec![("failed checks", format!("{} of {}", checks.failed, checks.total))];
+                    if hints.failed_check_runs.is_empty() {
+                        summary.push((
+                            "workflow runs",
+                            "not mapped in loaded hints; ghr will query latest PR checks before rerunning".to_string(),
+                        ));
+                    } else {
+                        summary.push((
+                            "workflow runs",
+                            failed_check_runs_summary(&hints.failed_check_runs),
+                        ));
+                    }
+                    Ok(summary)
+                }
+                None => Ok(vec![(
+                    "checks",
+                    "not loaded; ghr will query latest PR checks before rerunning".to_string(),
+                )]),
+            },
+            Some(ActionHintState::Loading) | None => Ok(vec![(
+                "checks",
+                "loading; ghr will query latest PR checks before rerunning".to_string(),
+            )]),
+            Some(ActionHintState::Error(error)) => Ok(vec![(
+                "checks",
+                format!("hints unavailable ({error}); ghr will query latest PR checks"),
+            )]),
+        }
     }
 
     fn handle_pr_action_dialog_key(
@@ -9138,6 +9242,7 @@ impl AppState {
             PrAction::Merge => "merging pull request".to_string(),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
+            PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
         };
         submit(item, action);
     }
@@ -12261,7 +12366,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("M/C/A/F pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -12280,7 +12385,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C/A/F pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -12298,7 +12403,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A/F pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -13068,6 +13173,7 @@ diff --git a/src/github.rs b/src/github.rs
                     total: 13,
                     incomplete: false,
                 }),
+                failed_check_runs: Vec::new(),
                 note: Some("Merge blocked: checks pending".to_string()),
             }),
         );
@@ -14146,6 +14252,52 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_f_key_opens_rerun_failed_checks_confirmation() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 2,
+                    failed: 1,
+                    pending: 0,
+                    skipped: 0,
+                    total: 3,
+                    incomplete: false,
+                }),
+                failed_check_runs: vec![FailedCheckRunSummary {
+                    run_id: 123,
+                    workflow: Some("CI".to_string()),
+                    checks: vec!["test".to_string()],
+                }],
+                ..ActionHints::default()
+            }),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('F')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("rerun dialog");
+        assert_eq!(dialog.action, PrAction::RerunFailedChecks);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm failed check rerun");
+        assert!(
+            dialog
+                .summary
+                .iter()
+                .any(|(_, value)| value.contains("CI #123"))
+        );
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -14172,6 +14324,64 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
         assert_eq!(app.status, "pull request action cancelled");
+    }
+
+    #[test]
+    fn rerun_failed_checks_rejects_pr_without_failed_checks() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 3,
+                    failed: 0,
+                    pending: 0,
+                    skipped: 0,
+                    total: 3,
+                    incomplete: false,
+                }),
+                ..ActionHints::default()
+            }),
+        );
+
+        app.start_pr_action_dialog(PrAction::RerunFailedChecks);
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "no failed checks to rerun");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "No Failed Checks");
+    }
+
+    #[test]
+    fn rerun_failed_checks_confirmation_submits_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 0,
+                    failed: 1,
+                    pending: 0,
+                    skipped: 0,
+                    total: 1,
+                    incomplete: false,
+                }),
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::RerunFailedChecks);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('y')), |item, action| {
+            submitted = Some((item.id, action));
+        });
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "rerunning failed checks");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::RerunFailedChecks))
+        );
     }
 
     #[test]

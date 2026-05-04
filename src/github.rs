@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReviewCommentPreview, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key, repo_section_filters,
-    repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind,
+    ReviewCommentPreview, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
+    global_search_view_key, repo_section_filters, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -251,6 +251,9 @@ struct PullRequestCheckConnectionRaw {
 enum PullRequestCheckContextRaw {
     CheckRun {
         conclusion: Option<String>,
+        #[serde(rename = "detailsUrl")]
+        details_url: Option<String>,
+        name: Option<String>,
         status: Option<String>,
     },
     StatusContext {
@@ -263,6 +266,21 @@ enum PullRequestCheckContextRaw {
 #[derive(Debug, Deserialize)]
 struct PullRequestViewerReviewRaw {
     state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestCheckStatusRaw {
+    bucket: Option<String>,
+    link: Option<String>,
+    name: Option<String>,
+    state: Option<String>,
+    workflow: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FailedCheckRunDiscovery {
+    runs: Vec<FailedCheckRunSummary>,
+    unmapped_failed_checks: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -889,8 +907,10 @@ query($owner: String!, $name: String!, $number: Int!) {
           nodes {
             __typename
             ... on CheckRun {
+              name
               status
               conclusion
+              detailsUrl
             }
             ... on StatusContext {
               state
@@ -923,6 +943,81 @@ query($owner: String!, $name: String!, $number: Int!) {
         .and_then(|repository| repository.pull_request)
         .ok_or_else(|| anyhow!("pull request {repository}#{number} was not found"))?;
     Ok(pull_request_action_hints(&pr))
+}
+
+pub async fn rerun_failed_pull_request_checks(repository: &str, number: u64) -> Result<()> {
+    let discovery = fetch_failed_check_runs_from_pr_checks(repository, number).await?;
+    if discovery.runs.is_empty() {
+        if discovery.unmapped_failed_checks.is_empty() {
+            bail!("no failed checks found for {repository}#{number}");
+        }
+        bail!(
+            "failed checks were found, but none linked to GitHub Actions workflow runs: {}",
+            discovery.unmapped_failed_checks.join(", ")
+        );
+    }
+
+    for run in &discovery.runs {
+        run_gh_json(&rerun_failed_check_run_args(repository, run.run_id)).await?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_failed_check_runs_from_pr_checks(
+    repository: &str,
+    number: u64,
+) -> Result<FailedCheckRunDiscovery> {
+    let output = run_gh_pr_checks_json(&pr_checks_args(repository, number)).await?;
+    failed_check_runs_from_pr_checks_json(&output)
+        .with_context(|| format!("failed to parse PR checks for {repository}#{number}"))
+}
+
+fn pr_checks_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "checks".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+        "--json".to_string(),
+        "name,state,bucket,workflow,link".to_string(),
+    ]
+}
+
+fn rerun_failed_check_run_args(repository: &str, run_id: u64) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "rerun".to_string(),
+        run_id.to_string(),
+        "--failed".to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ]
+}
+
+async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                anyhow!("{}", gh_missing_message(args))
+            } else {
+                anyhow!("failed to run gh {}: {error}", args.join(" "))
+            }
+        })?;
+
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        bail!("{}", gh_failure_message(args, &message));
+    }
+
+    String::from_utf8(output.stdout).context("gh output was not UTF-8")
 }
 
 pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<String> {
@@ -1468,6 +1563,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         .status_check_rollup
         .as_ref()
         .map(check_summary_from_rollup);
+    let failed_check_runs = failed_check_runs_from_rollup(pr.status_check_rollup.as_ref());
     let can_update = pr.viewer_can_update.unwrap_or(false);
     let can_auto_merge = pr.viewer_can_enable_auto_merge.unwrap_or(false);
     let can_admin_merge = pr.viewer_can_merge_as_admin.unwrap_or(false);
@@ -1512,6 +1608,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
     ActionHints {
         labels,
         checks,
+        failed_check_runs,
         note,
     }
 }
@@ -1587,9 +1684,9 @@ fn check_summary_from_rollup(rollup: &PullRequestStatusRollupRaw) -> CheckSummar
     let nodes = contexts.nodes.as_deref().unwrap_or(&[]);
     for node in nodes {
         match node {
-            PullRequestCheckContextRaw::CheckRun { conclusion, status } => {
-                add_check_run_to_summary(&mut summary, conclusion.as_deref(), status.as_deref())
-            }
+            PullRequestCheckContextRaw::CheckRun {
+                conclusion, status, ..
+            } => add_check_run_to_summary(&mut summary, conclusion.as_deref(), status.as_deref()),
             PullRequestCheckContextRaw::StatusContext { state } => {
                 add_status_context_to_summary(&mut summary, state.as_deref())
             }
@@ -1625,6 +1722,135 @@ fn add_status_context_to_summary(summary: &mut CheckSummary, state: Option<&str>
         Some("FAILURE" | "ERROR") => summary.failed += 1,
         Some("PENDING" | "EXPECTED") | None => summary.pending += 1,
         Some(_) => summary.pending += 1,
+    }
+}
+
+fn failed_check_runs_from_rollup(
+    rollup: Option<&PullRequestStatusRollupRaw>,
+) -> Vec<FailedCheckRunSummary> {
+    let mut runs = Vec::new();
+    let Some(contexts) = rollup.and_then(|rollup| rollup.contexts.as_ref()) else {
+        return runs;
+    };
+
+    for node in contexts.nodes.as_deref().unwrap_or(&[]) {
+        let PullRequestCheckContextRaw::CheckRun {
+            conclusion,
+            details_url,
+            name,
+            status,
+        } = node
+        else {
+            continue;
+        };
+        if !check_run_failed(conclusion.as_deref(), status.as_deref()) {
+            continue;
+        }
+        let Some(run_id) = details_url.as_deref().and_then(actions_run_id_from_url) else {
+            continue;
+        };
+        add_failed_check_run(
+            &mut runs,
+            run_id,
+            None,
+            name.clone().unwrap_or_else(|| "unknown check".to_string()),
+        );
+    }
+
+    runs
+}
+
+fn failed_check_runs_from_pr_checks_json(output: &str) -> Result<FailedCheckRunDiscovery> {
+    let checks = serde_json::from_str::<Vec<PullRequestCheckStatusRaw>>(output)?;
+    let mut discovery = FailedCheckRunDiscovery::default();
+
+    for check in checks {
+        if !pr_check_failed(&check) {
+            continue;
+        }
+        let name = check.name.unwrap_or_else(|| "unknown check".to_string());
+        let Some(run_id) = check.link.as_deref().and_then(actions_run_id_from_url) else {
+            push_unique_string(&mut discovery.unmapped_failed_checks, name);
+            continue;
+        };
+        add_failed_check_run(&mut discovery.runs, run_id, check.workflow, name);
+    }
+
+    Ok(discovery)
+}
+
+fn pr_check_failed(check: &PullRequestCheckStatusRaw) -> bool {
+    matches_normalized(check.bucket.as_deref(), &["fail", "cancel"])
+        || matches_normalized(
+            check.state.as_deref(),
+            &[
+                "fail",
+                "failure",
+                "error",
+                "cancel",
+                "cancelled",
+                "canceled",
+                "timed_out",
+                "action_required",
+                "startup_failure",
+            ],
+        )
+}
+
+fn check_run_failed(conclusion: Option<&str>, _status: Option<&str>) -> bool {
+    matches_normalized(
+        conclusion,
+        &[
+            "failure",
+            "error",
+            "cancelled",
+            "canceled",
+            "timed_out",
+            "action_required",
+            "startup_failure",
+        ],
+    )
+}
+
+fn matches_normalized(value: Option<&str>, expected: &[&str]) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    expected
+        .iter()
+        .any(|expected| value.eq_ignore_ascii_case(expected))
+}
+
+fn actions_run_id_from_url(url: &str) -> Option<u64> {
+    let rest = url.split_once("/actions/runs/")?.1;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn add_failed_check_run(
+    runs: &mut Vec<FailedCheckRunSummary>,
+    run_id: u64,
+    workflow: Option<String>,
+    check: String,
+) {
+    if let Some(existing) = runs.iter_mut().find(|existing| existing.run_id == run_id) {
+        if existing.workflow.is_none() {
+            existing.workflow = workflow;
+        }
+        push_unique_string(&mut existing.checks, check);
+        return;
+    }
+
+    runs.push(FailedCheckRunSummary {
+        run_id,
+        workflow,
+        checks: vec![check],
+    });
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -2290,10 +2516,14 @@ mod tests {
                     nodes: Some(vec![
                         PullRequestCheckContextRaw::CheckRun {
                             conclusion: Some("SUCCESS".to_string()),
+                            details_url: None,
+                            name: None,
                             status: Some("COMPLETED".to_string()),
                         },
                         PullRequestCheckContextRaw::CheckRun {
                             conclusion: Some("FAILURE".to_string()),
+                            details_url: None,
+                            name: None,
                             status: Some("COMPLETED".to_string()),
                         },
                         PullRequestCheckContextRaw::StatusContext {
@@ -2340,6 +2570,8 @@ mod tests {
                     total_count: 1,
                     nodes: Some(vec![PullRequestCheckContextRaw::CheckRun {
                         conclusion: Some("SUCCESS".to_string()),
+                        details_url: None,
+                        name: None,
                         status: Some("COMPLETED".to_string()),
                     }]),
                 }),
@@ -2367,6 +2599,125 @@ mod tests {
             })
         );
         assert!(hints.note.is_none());
+    }
+
+    #[test]
+    fn action_hints_collect_failed_actions_run_ids_from_rollup() {
+        let hints = pull_request_action_hints(&PullRequestActionRaw {
+            is_draft: Some(false),
+            merge_state_status: Some("BLOCKED".to_string()),
+            review_decision: None,
+            state: Some("OPEN".to_string()),
+            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                state: Some("FAILURE".to_string()),
+                contexts: Some(PullRequestCheckConnectionRaw {
+                    total_count: 2,
+                    nodes: Some(vec![
+                        PullRequestCheckContextRaw::CheckRun {
+                            conclusion: Some("FAILURE".to_string()),
+                            details_url: Some(
+                                "https://github.com/owner/repo/actions/runs/987/job/654"
+                                    .to_string(),
+                            ),
+                            name: Some("test".to_string()),
+                            status: Some("COMPLETED".to_string()),
+                        },
+                        PullRequestCheckContextRaw::CheckRun {
+                            conclusion: Some("SUCCESS".to_string()),
+                            details_url: Some(
+                                "https://github.com/owner/repo/actions/runs/111/job/222"
+                                    .to_string(),
+                            ),
+                            name: Some("lint".to_string()),
+                            status: Some("COMPLETED".to_string()),
+                        },
+                    ]),
+                }),
+            }),
+            viewer_can_enable_auto_merge: Some(false),
+            viewer_can_merge_as_admin: Some(false),
+            viewer_can_update: Some(true),
+            viewer_can_update_branch: Some(false),
+            viewer_did_author: Some(false),
+            viewer_latest_review: None,
+        });
+
+        assert_eq!(
+            hints.failed_check_runs,
+            vec![FailedCheckRunSummary {
+                run_id: 987,
+                workflow: None,
+                checks: vec!["test".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn pr_checks_json_groups_failed_checks_by_actions_run() {
+        let output = r#"
+[
+  {
+    "bucket": "fail",
+    "link": "https://github.com/owner/repo/actions/runs/1001/job/1?pr=2",
+    "name": "test",
+    "state": "FAILURE",
+    "workflow": "CI"
+  },
+  {
+    "bucket": "fail",
+    "link": "https://github.com/owner/repo/actions/runs/1001/job/2?pr=2",
+    "name": "lint",
+    "state": "FAILURE",
+    "workflow": "CI"
+  },
+  {
+    "bucket": "pass",
+    "link": "https://github.com/owner/repo/actions/runs/1002/job/3?pr=2",
+    "name": "fmt",
+    "state": "SUCCESS",
+    "workflow": "CI"
+  },
+  {
+    "bucket": "fail",
+    "link": "https://example.com/checks/9",
+    "name": "external",
+    "state": "ERROR",
+    "workflow": null
+  }
+]
+"#;
+
+        let discovery = failed_check_runs_from_pr_checks_json(output).expect("valid checks");
+
+        assert_eq!(
+            discovery.runs,
+            vec![FailedCheckRunSummary {
+                run_id: 1001,
+                workflow: Some("CI".to_string()),
+                checks: vec!["test".to_string(), "lint".to_string()],
+            }]
+        );
+        assert_eq!(discovery.unmapped_failed_checks, vec!["external"]);
+    }
+
+    #[test]
+    fn rerun_failed_checks_commands_are_constructed_for_pr_and_run() {
+        assert_eq!(
+            pr_checks_args("owner/repo", 42),
+            vec![
+                "pr",
+                "checks",
+                "42",
+                "--repo",
+                "owner/repo",
+                "--json",
+                "name,state,bucket,workflow,link",
+            ]
+        );
+        assert_eq!(
+            rerun_failed_check_run_args("owner/repo", 1001),
+            vec!["run", "rerun", "1001", "--failed", "--repo", "owner/repo"]
+        );
     }
 
     #[test]

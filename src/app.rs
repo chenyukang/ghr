@@ -29,7 +29,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 
-use crate::config::{Config, github_repo_from_remote_url};
+use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, github_repo_from_remote_url};
 use crate::dirs::Paths;
 use crate::github::{
     AssigneeAction, CommentFetchResult, ItemMetadataUpdate, MergeMethod,
@@ -40,10 +40,10 @@ use crate::github::{
     disable_pull_request_auto_merge, discard_pending_pull_request_review, edit_issue_comment,
     edit_item_metadata, edit_pull_request_review_comment, enable_pull_request_auto_merge,
     fetch_comments, fetch_open_milestones, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, fetch_repository_labels, mark_notification_thread_read,
-    mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
+    fetch_pull_request_diff, fetch_repository_assignees, fetch_repository_labels,
+    mark_notification_thread_read, mark_pull_request_ready_for_review, merge_pull_request,
+    post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
+    refresh_dashboard, refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
     remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
     request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
     submit_pending_pull_request_review, submit_pull_request_review, update_issue_assignees,
@@ -55,7 +55,7 @@ use crate::model::{
     configured_sections, global_search_view_key, mark_notification_read_in_section,
     merge_cached_sections, merge_refreshed_sections, section_counts, section_view_key,
 };
-use crate::snapshot::SnapshotStore;
+use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::UiState;
 
 mod diff;
@@ -130,6 +130,14 @@ enum AppMsg {
         result: std::result::Result<(), String>,
     },
     LabelSuggestionsLoaded {
+        repo: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    AssigneeSuggestionsLoaded {
+        repo: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    ReviewerSuggestionsLoaded {
         repo: String,
         result: std::result::Result<Vec<String>, String>,
     },
@@ -217,7 +225,7 @@ enum DetailState {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionHintState {
     Loading,
     Loaded(ActionHints),
@@ -601,6 +609,10 @@ struct AssigneeDialog {
     item: WorkItem,
     action: AssigneeAction,
     input: String,
+    suggestions: Vec<String>,
+    suggestions_loading: bool,
+    suggestions_error: Option<String>,
+    selected_suggestion: usize,
 }
 
 fn assignee_action_label(action: AssigneeAction) -> &'static str {
@@ -647,16 +659,130 @@ fn parse_assignee_input(input: &str) -> Vec<String> {
     assignees
 }
 
+fn dedupe_assignee_logins(logins: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for login in logins {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(login);
+        }
+    }
+    deduped
+}
+
+fn assignee_input_prefix(input: &str) -> String {
+    input
+        .rsplit(|ch: char| ch == ',' || ch.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+}
+
+fn assignee_dialog_suggestion_matches(dialog: &AssigneeDialog) -> Vec<String> {
+    let prefix = assignee_input_prefix(&dialog.input);
+    let candidates = match dialog.action {
+        AssigneeAction::Assign => &dialog.suggestions,
+        AssigneeAction::Unassign => &dialog.item.assignees,
+    };
+    candidates
+        .iter()
+        .filter(|login| {
+            dialog.action != AssigneeAction::Assign
+                || !dialog
+                    .item
+                    .assignees
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(login))
+        })
+        .filter(|login| prefix.is_empty() || login.to_ascii_lowercase().starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn selected_assignee_suggestion(dialog: &AssigneeDialog) -> Option<String> {
+    let matches = assignee_dialog_suggestion_matches(dialog);
+    if matches.is_empty() {
+        None
+    } else {
+        matches
+            .get(dialog.selected_suggestion.min(matches.len() - 1))
+            .cloned()
+    }
+}
+
+fn assignee_dialog_uses_default_unassign(dialog: &AssigneeDialog) -> bool {
+    dialog.action == AssigneeAction::Unassign
+        && dialog.input.trim().is_empty()
+        && dialog.item.assignees.len() == 1
+}
+
+fn assignee_dialog_submit_logins(dialog: &AssigneeDialog) -> Vec<String> {
+    let mut assignees = parse_assignee_input(&dialog.input);
+    if assignees.is_empty() && assignee_dialog_uses_default_unassign(dialog) {
+        return dialog.item.assignees.clone();
+    }
+    if !assignees.is_empty()
+        && !assignee_input_prefix(&dialog.input).is_empty()
+        && let Some(selected) = selected_assignee_suggestion(dialog)
+        && let Some(last) = assignees.last_mut()
+    {
+        *last = selected;
+    }
+    dedupe_assignee_logins(assignees)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CommandPalette {
     query: String,
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyBinding {
+    label: String,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    fn matches(&self, key: KeyEvent) -> bool {
+        let expected_modifiers = command_palette_modifier_bits(self.modifiers);
+        let actual_modifiers = command_palette_modifier_bits(key.modifiers);
+        if expected_modifiers != actual_modifiers {
+            return false;
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return false;
+        }
+
+        match (&self.code, key.code) {
+            (KeyCode::Char(expected), KeyCode::Char(actual))
+                if expected_modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                expected.eq_ignore_ascii_case(&actual)
+            }
+            (KeyCode::Char(expected), KeyCode::Char(actual)) => *expected == actual,
+            (expected, actual) => *expected == actual,
+        }
+    }
+
+    fn is_plain_text_char(&self) -> bool {
+        matches!(self.code, KeyCode::Char(value) if !value.is_control())
+            && !self
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PaletteCommand {
     title: &'static str,
-    keys: &'static str,
+    keys: String,
     scope: &'static str,
     detail: &'static str,
     action: PaletteAction,
@@ -686,6 +812,10 @@ struct ReviewerDialog {
     item: WorkItem,
     action: ReviewerAction,
     input: String,
+    suggestions: Vec<String>,
+    suggestions_loading: bool,
+    suggestions_error: Option<String>,
+    selected_suggestion: usize,
 }
 
 fn item_kind_label(kind: ItemKind) -> &'static str {
@@ -824,6 +954,9 @@ const COMMENT_DIALOG_MIN_EDITOR_HEIGHT: u16 = 4;
 const COMMENT_DIALOG_EDITOR_PADDING_LINES: u16 = 1;
 const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
+const HELP_DIALOG_WIDTH_PERCENT: u16 = 94;
+const HELP_TWO_COLUMN_MIN_WIDTH: usize = 104;
+const HELP_COLUMN_GAP: usize = 4;
 const PR_ACTION_REMOTE_BRANCH_LINE: u16 = 6;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
@@ -838,6 +971,8 @@ const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
+const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
+const REVIEWER_SUGGESTION_LIMIT: usize = 6;
 
 struct AppState {
     active_view: String,
@@ -866,6 +1001,7 @@ struct AppState {
     filter_input_active: bool,
     filter_input_query: String,
     command_palette: Option<CommandPalette>,
+    command_palette_key: String,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
@@ -880,6 +1016,11 @@ struct AppState {
     viewed_details_snapshot: HashMap<String, String>,
     viewed_comments_snapshot: HashMap<String, String>,
     action_hints: HashMap<String, ActionHintState>,
+    action_hints_stale: HashSet<String>,
+    action_hints_refreshing: HashSet<String>,
+    label_suggestions_cache: HashMap<String, Vec<String>>,
+    assignee_suggestions_cache: HashMap<String, Vec<String>>,
+    reviewer_suggestions_cache: HashMap<String, Vec<String>>,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
@@ -1027,7 +1168,7 @@ impl QuickFilterState {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "open" => Some(Self::Open),
-            "closed" => Some(Self::Closed),
+            "closed" | "close" => Some(Self::Closed),
             "merged" => Some(Self::Merged),
             "draft" => Some(Self::Draft),
             "all" => Some(Self::All),
@@ -1228,8 +1369,11 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     let cached = store.load_all()?;
     let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
+    let repo_candidate_cache = store.load_repo_candidate_cache()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    app.load_repo_candidate_cache(repo_candidate_cache);
+    app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
     let startup_setup_dialog = startup_setup_dialog();
     if let Some(dialog) = startup_setup_dialog {
         app.show_setup_dialog(dialog);
@@ -2059,13 +2203,73 @@ fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<A
     });
 }
 
-fn start_label_suggestions_load(repo: String, tx: UnboundedSender<AppMsg>) {
-    tokio::spawn(async move {
+fn start_label_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
         let result = fetch_repository_labels(&repo)
             .await
             .map_err(|error| error.to_string());
+        if let Ok(labels) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_label_candidates(&repo, labels)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist label candidates");
+        }
         let _ = tx.send(AppMsg::LabelSuggestionsLoaded { repo, result });
     });
+    true
+}
+
+fn start_assignee_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
+        let result = fetch_repository_assignees(&repo)
+            .await
+            .map_err(|error| error.to_string());
+        if let Ok(assignees) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_assignee_candidates(&repo, assignees)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist assignee candidates");
+        }
+        let _ = tx.send(AppMsg::AssigneeSuggestionsLoaded { repo, result });
+    });
+    true
+}
+
+fn start_reviewer_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
+        let result = fetch_repository_assignees(&repo)
+            .await
+            .map_err(|error| error.to_string());
+        if let Ok(reviewers) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_reviewer_candidates(&repo, reviewers)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist reviewer candidates");
+        }
+        let _ = tx.send(AppMsg::ReviewerSuggestionsLoaded { repo, result });
+    });
+    true
 }
 
 fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) {
@@ -2599,6 +2803,8 @@ fn handle_key_in_area(
     tx: &UnboundedSender<AppMsg>,
     area: Option<Rect>,
 ) -> bool {
+    app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
+
     if is_ctrl_c_key(key) {
         return true;
     }
@@ -2639,7 +2845,7 @@ fn handle_key_in_area(
         return app.handle_command_palette_key(key, config, store, tx, area);
     }
 
-    if is_command_palette_key(key) {
+    if should_open_command_palette(app, key) {
         app.show_command_palette();
         return false;
     }
@@ -2775,7 +2981,7 @@ fn handle_key_in_area(
             _ => {}
         },
         FocusTarget::List if app.details_mode == DetailsMode::Diff => {
-            handle_diff_file_list_key(app, key, config, area, tx)
+            handle_diff_file_list_key(app, key, config, area, store, tx)
         }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
@@ -2821,14 +3027,24 @@ fn handle_key_in_area(
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
-            KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
-            KeyCode::Char('Y') => app.start_reviewer_dialog(ReviewerAction::Remove),
+            KeyCode::Char('P') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+            }
+            KeyCode::Char('Y') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+            }
             KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
-            KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
+            KeyCode::Char('L') => app.start_add_label_dialog_with_store(Some(store), Some(tx)),
             KeyCode::Char('N') => app.start_new_issue_dialog(),
-            KeyCode::Char('+') => app.start_assignee_dialog(AssigneeAction::Assign),
-            KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
+            _ if is_assignee_assign_key(key) => {
+                app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
+            }
+            KeyCode::Char('-') => app.start_assignee_dialog_with_store(
+                AssigneeAction::Unassign,
+                Some(store),
+                Some(tx),
+            ),
             _ if is_reaction_key(key) => app.start_item_reaction_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -2857,17 +3073,25 @@ fn handle_key_in_area(
             KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
-                app.start_add_label_dialog(Some(tx))
+                app.start_add_label_dialog_with_store(Some(store), Some(tx))
             }
             KeyCode::Char('N') => app.start_new_issue_dialog(),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
-            KeyCode::Char('+') if app.details_mode == DetailsMode::Diff => {
-                app.start_assignee_dialog(AssigneeAction::Assign)
+            _ if is_assignee_assign_key(key) => {
+                app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
             }
-            KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
-            KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
-            KeyCode::Char('Y') => app.start_reviewer_dialog(ReviewerAction::Remove),
+            KeyCode::Char('-') => app.start_assignee_dialog_with_store(
+                AssigneeAction::Unassign,
+                Some(store),
+                Some(tx),
+            ),
+            KeyCode::Char('P') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+            }
+            KeyCode::Char('Y') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+            }
             KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
@@ -2969,14 +3193,19 @@ fn handle_diff_file_list_key(
     key: KeyEvent,
     config: &Config,
     area: Option<Rect>,
+    store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) {
     match key.code {
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
         KeyCode::Char('a') => app.start_new_comment_dialog(),
-        KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
-        KeyCode::Char('Y') => app.start_reviewer_dialog(ReviewerAction::Remove),
+        KeyCode::Char('P') => {
+            app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+        }
+        KeyCode::Char('Y') => {
+            app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+        }
         KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
@@ -3020,8 +3249,12 @@ fn handle_diff_file_list_key(
         KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
         KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
         KeyCode::Char('t') => app.start_milestone_dialog(tx),
-        KeyCode::Char('+') => app.start_assignee_dialog(AssigneeAction::Assign),
-        KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
+        _ if is_assignee_assign_key(key) => {
+            app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
+        }
+        KeyCode::Char('-') => {
+            app.start_assignee_dialog_with_store(AssigneeAction::Unassign, Some(store), Some(tx))
+        }
         KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
         KeyCode::Enter => app.focus_details(),
         _ => {}
@@ -3255,7 +3488,7 @@ fn handle_left_click(
     app.filter_input_active = false;
 
     if let Some(action) = document.action_at(line_index, column) {
-        app.handle_detail_action(action, tx);
+        app.handle_detail_action(action, store, tx);
         return;
     }
     let clicked_comment = document.comment_at(line_index);
@@ -3594,7 +3827,7 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if let Some(dialog) = &app.message_dialog {
         draw_message_dialog(frame, dialog, area);
     } else if app.help_dialog {
-        draw_help_dialog(frame, area);
+        draw_help_dialog(frame, area, &app.command_palette_key);
     } else if let Some(dialog) = &app.item_edit_dialog {
         draw_item_edit_dialog(frame, dialog, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
@@ -3620,7 +3853,7 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
 
     if let Some(palette) = &app.command_palette {
-        draw_command_palette(frame, palette, area);
+        draw_command_palette(frame, palette, area, &app.command_palette_key);
     }
 }
 
@@ -3648,6 +3881,7 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         BorderType::Plain
     };
     let title = if ghr_focused { "[Focus] ghr" } else { "ghr" };
+    let title_style = view_tabs_title_style(app, border_style);
 
     let tabs = Tabs::new(titles)
         .select(active)
@@ -3656,11 +3890,19 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(border_type)
                 .border_style(border_style)
-                .title(Span::styled(title, border_style)),
+                .title(Span::styled(title, title_style)),
         )
         .style(Style::default().fg(Color::Gray))
         .highlight_style(active_view_tab_style());
     frame.render_widget(tabs, area);
+}
+
+fn view_tabs_title_style(app: &AppState, base_style: Style) -> Style {
+    if app.focus == FocusTarget::Ghr || app.has_unread_notifications() {
+        base_style.add_modifier(Modifier::BOLD)
+    } else {
+        base_style
+    }
 }
 
 fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4226,6 +4468,7 @@ fn parse_reviewer_logins(input: &str) -> Vec<String> {
     for login in input
         .split(',')
         .map(str::trim)
+        .map(|login| login.trim_start_matches('@').trim())
         .filter(|login| !login.is_empty())
     {
         let key = login.to_ascii_lowercase();
@@ -4234,6 +4477,61 @@ fn parse_reviewer_logins(input: &str) -> Vec<String> {
         }
     }
     reviewers
+}
+
+fn reviewer_input_prefix(input: &str) -> String {
+    input
+        .rsplit(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+}
+
+fn reviewer_dialog_suggestion_matches(dialog: &ReviewerDialog) -> Vec<String> {
+    let prefix = reviewer_input_prefix(&dialog.input);
+    dialog
+        .suggestions
+        .iter()
+        .filter(|login| prefix.is_empty() || login.to_ascii_lowercase().starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn selected_reviewer_suggestion(dialog: &ReviewerDialog) -> Option<String> {
+    let matches = reviewer_dialog_suggestion_matches(dialog);
+    if matches.is_empty() {
+        None
+    } else {
+        matches
+            .get(dialog.selected_suggestion.min(matches.len() - 1))
+            .cloned()
+    }
+}
+
+fn reviewer_dialog_submit_logins(dialog: &ReviewerDialog) -> Vec<String> {
+    let mut reviewers = parse_reviewer_logins(&dialog.input);
+    if !reviewers.is_empty()
+        && !reviewer_input_prefix(&dialog.input).is_empty()
+        && let Some(selected) = selected_reviewer_suggestion(dialog)
+        && let Some(last) = reviewers.last_mut()
+    {
+        *last = selected;
+    }
+    dedupe_reviewer_logins(reviewers)
+}
+
+fn dedupe_reviewer_logins(logins: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for login in logins {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(login);
+        }
+    }
+    deduped
 }
 
 fn same_view_key(left: &str, right: &str) -> bool {
@@ -4361,10 +4659,21 @@ fn assignee_footer_keys(app: &AppState) -> &'static str {
         .current_item()
         .is_some_and(|item| item.assignees.is_empty())
     {
-        "+"
+        "@"
     } else {
-        "+/-"
+        "@/-"
     }
+}
+
+fn footer_has_selected_comment(app: &AppState) -> bool {
+    app.details_mode == DetailsMode::Conversation && app.current_selected_comment().is_some()
+}
+
+fn footer_selected_comment_is_editable(app: &AppState) -> bool {
+    app.details_mode == DetailsMode::Conversation
+        && app
+            .current_selected_comment()
+            .is_some_and(|comment| comment.is_mine && comment.id.is_some())
 }
 
 fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
@@ -4460,12 +4769,18 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
-                push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
-                push_footer_pair(spans, "enter", "expand", Color::Yellow);
+                if footer_has_selected_comment(app) {
+                    push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
+                    push_footer_pair(spans, "enter", "expand", Color::Yellow);
+                }
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
-                push_footer_pair(spans, "R", "reply", Color::LightBlue);
-                push_footer_pair(spans, "e", "edit", Color::LightBlue);
+                if footer_has_selected_comment(app) {
+                    push_footer_pair(spans, "R", "reply", Color::LightBlue);
+                }
+                if footer_selected_comment_is_editable(app) {
+                    push_footer_pair(spans, "e", "edit", Color::LightBlue);
+                }
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
                 push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
@@ -4742,10 +5057,11 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
-fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
-    let lines = help_dialog_content();
+fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect, command_palette_key: &str) {
+    let width = centered_rect_width(HELP_DIALOG_WIDTH_PERCENT, area);
+    let lines = help_dialog_content_for_width(width.saturating_sub(2), command_palette_key);
     let height = help_dialog_height(lines.len(), area);
-    let dialog_area = centered_rect(70, height, area);
+    let dialog_area = centered_rect_with_size(width, height, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightMagenta))
@@ -4765,8 +5081,13 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
-fn draw_command_palette(frame: &mut Frame<'_>, palette: &CommandPalette, area: Rect) {
-    let commands = command_palette_commands();
+fn draw_command_palette(
+    frame: &mut Frame<'_>,
+    palette: &CommandPalette,
+    area: Rect,
+    command_palette_key: &str,
+) {
+    let commands = command_palette_commands(command_palette_key);
     let matches = command_palette_filtered_indices(&commands, &palette.query);
     let dialog_area = command_palette_area(area);
     let inner = block_inner(dialog_area);
@@ -4835,9 +5156,7 @@ fn command_palette_area(area: Rect) -> Rect {
     let width = centered_rect_width(76, area).max(24).min(area.width);
     let max_height = area.height.saturating_sub(2).max(3);
     let height = 18.min(max_height).max(3);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height).min(2);
-    Rect::new(x, y, width, height)
+    centered_rect_with_size(width, height, area)
 }
 
 fn command_palette_visible_start(selected: usize, len: usize, height: usize) -> usize {
@@ -5194,7 +5513,7 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
                 "Add Label",
                 lines,
                 Color::LightMagenta,
-                Some(dialog.input.chars().count() as u16),
+                Some(display_width(&dialog.input).min(usize::from(u16::MAX)) as u16),
             )
         }
         LabelDialogMode::Remove { label } => {
@@ -5364,7 +5683,8 @@ fn issue_dialog_field_input_line(
     width: u16,
 ) -> Line<'static> {
     let prefix = issue_dialog_field_prefix(label);
-    let value_width = width.saturating_sub(prefix.chars().count() as u16);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
     Line::from(vec![
         Span::styled(prefix, issue_dialog_field_label_style(field, current)),
         Span::styled(
@@ -5427,16 +5747,19 @@ fn issue_dialog_cursor_position(
 ) -> Option<Position> {
     let inner = block_inner(dialog_area);
     let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
-    let repo_prefix_width = issue_dialog_field_prefix("Repo").chars().count() as u16;
-    let title_prefix_width = issue_dialog_field_prefix("Title").chars().count() as u16;
-    let labels_prefix_width = issue_dialog_field_prefix("Labels").chars().count() as u16;
+    let repo_prefix_width =
+        display_width(&issue_dialog_field_prefix("Repo")).min(usize::from(u16::MAX)) as u16;
+    let title_prefix_width =
+        display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
+    let labels_prefix_width =
+        display_width(&issue_dialog_field_prefix("Labels")).min(usize::from(u16::MAX)) as u16;
     match dialog.field {
         IssueDialogField::Repo => Some(Position::new(
             clamp_x(
                 inner
                     .x
                     .saturating_add(repo_prefix_width)
-                    .saturating_add(dialog.repo.chars().count() as u16),
+                    .saturating_add(display_width(&dialog.repo).min(usize::from(u16::MAX)) as u16),
             ),
             inner.y,
         )),
@@ -5445,19 +5768,18 @@ fn issue_dialog_cursor_position(
                 inner
                     .x
                     .saturating_add(title_prefix_width)
-                    .saturating_add(dialog.title.chars().count() as u16),
+                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
             ),
             inner.y.saturating_add(2),
         )),
-        IssueDialogField::Labels => Some(Position::new(
-            clamp_x(
-                inner
-                    .x
-                    .saturating_add(labels_prefix_width)
-                    .saturating_add(dialog.labels.chars().count() as u16),
-            ),
-            inner.y.saturating_add(4),
-        )),
+        IssueDialogField::Labels => {
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(labels_prefix_width).saturating_add(
+                    display_width(&dialog.labels).min(usize::from(u16::MAX)) as u16,
+                )),
+                inner.y.saturating_add(4),
+            ))
+        }
         IssueDialogField::Body => {
             let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
             let visible_end = scroll.saturating_add(editor_height.max(1));
@@ -5543,6 +5865,46 @@ fn label_suggestion_window_start(total: usize, selected: usize) -> usize {
             .saturating_add(1)
             .saturating_sub(LABEL_SUGGESTION_LIMIT)
             .min(total.saturating_sub(LABEL_SUGGESTION_LIMIT))
+    }
+}
+
+fn clamp_assignee_dialog_selection(dialog: &mut AssigneeDialog) {
+    let count = assignee_dialog_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_suggestion = 0;
+    } else {
+        dialog.selected_suggestion = dialog.selected_suggestion.min(count - 1);
+    }
+}
+
+fn assignee_suggestion_window_start(total: usize, selected: usize) -> usize {
+    if total <= ASSIGNEE_SUGGESTION_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(ASSIGNEE_SUGGESTION_LIMIT)
+            .min(total.saturating_sub(ASSIGNEE_SUGGESTION_LIMIT))
+    }
+}
+
+fn clamp_reviewer_dialog_selection(dialog: &mut ReviewerDialog) {
+    let count = reviewer_dialog_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_suggestion = 0;
+    } else {
+        dialog.selected_suggestion = dialog.selected_suggestion.min(count - 1);
+    }
+}
+
+fn reviewer_suggestion_window_start(total: usize, selected: usize) -> usize {
+    if total <= REVIEWER_SUGGESTION_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(REVIEWER_SUGGESTION_LIMIT)
+            .min(total.saturating_sub(REVIEWER_SUGGESTION_LIMIT))
     }
 }
 
@@ -5689,7 +6051,7 @@ fn draw_milestone_dialog(
 }
 
 fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running: bool, area: Rect) {
-    let dialog_area = centered_rect(68, 13, area);
+    let dialog_area = centered_rect(70, 17, area);
     let number = dialog
         .item
         .number
@@ -5703,23 +6065,85 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
     };
     let status = if running {
         "working...".to_string()
+    } else if assignee_dialog_uses_default_unassign(dialog) {
+        "Enter: unassign current    Esc: cancel".to_string()
     } else {
-        format!("Enter: {action} assignee(s)    Esc: cancel")
+        format!("Up/Down: choose    Enter: {action}    Esc: cancel")
     };
-    let lines = vec![
+    let matches = assignee_dialog_suggestion_matches(dialog);
+    let mut lines = vec![
         key_value_line("repo", dialog.item.repo.clone()),
         key_value_line("item", number),
         key_value_line("current", current),
         Line::from(""),
-        key_value_line("login(s)", format!("{}_", dialog.input)),
+        key_value_line("assignee(s)", format!("{}_", dialog.input)),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            status,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
     ];
+    if dialog.suggestions_loading {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates: loading assignable users...",
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if let Some(error) = &dialog.suggestions_error {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates unavailable",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_text(error, 64),
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if matches.is_empty() {
+        let message = match dialog.action {
+            AssigneeAction::Assign if dialog.input.trim().is_empty() => {
+                "No assignable users loaded. Type a login manually."
+            }
+            AssigneeAction::Assign => "No prefix matches. Enter uses the typed login.",
+            AssigneeAction::Unassign => "No current assignee matches this prefix.",
+        };
+        lines.push(Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(Color::Gray),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        let start = assignee_suggestion_window_start(matches.len(), dialog.selected_suggestion);
+        for (index, login) in matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(ASSIGNEE_SUGGESTION_LIMIT)
+        {
+            let selected = index == dialog.selected_suggestion;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(login.clone(), style),
+            ]));
+        }
+    }
+    while lines.len() < 13 {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        status,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
     let title = match dialog.action {
         AssigneeAction::Assign => "Assign Assignee",
         AssigneeAction::Unassign => "Unassign Assignee",
@@ -5744,7 +6168,7 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
 }
 
 fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running: bool, area: Rect) {
-    let dialog_area = centered_rect(70, 13, area);
+    let dialog_area = centered_rect(74, 20, area);
     let number = dialog
         .item
         .number
@@ -5764,7 +6188,7 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
     } else {
         dialog.input.clone()
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
@@ -5773,13 +6197,69 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
         Line::from(""),
         key_value_line("reviewers", input),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            status,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
     ];
+    let matches = reviewer_dialog_suggestion_matches(dialog);
+    if dialog.suggestions_loading {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates: loading reviewable users...",
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if let Some(error) = &dialog.suggestions_error {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates unavailable",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_text(error, 68),
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if matches.is_empty() {
+        let message = if dialog.input.trim().is_empty() {
+            "No reviewer candidates loaded. Type login manually."
+        } else {
+            "No prefix matches. Enter uses the typed login."
+        };
+        lines.push(Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(Color::Gray),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        let start = reviewer_suggestion_window_start(matches.len(), dialog.selected_suggestion);
+        for (index, login) in matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(REVIEWER_SUGGESTION_LIMIT)
+        {
+            let selected = index == dialog.selected_suggestion;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(login.clone(), style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        status,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
     let title = match dialog.action {
         ReviewerAction::Request => "Request Reviewers",
         ReviewerAction::Remove => "Remove Review Requests",
@@ -6005,11 +6485,11 @@ fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
         .min(area.height.saturating_sub(2).max(1))
 }
 
-fn command_palette_commands() -> Vec<PaletteCommand> {
+fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
     let mut commands = vec![
         palette_command(
             "Show Command Palette",
-            "Ctrl+L",
+            command_palette_key.to_string(),
             "General",
             "Open this searchable command list",
             PaletteAction::ShowCommandPalette,
@@ -6253,6 +6733,20 @@ fn command_palette_commands() -> Vec<PaletteCommand> {
             palette_key(KeyCode::Char('+')),
         ),
         palette_command(
+            "Assign Assignee",
+            "@",
+            "Issue/PR",
+            "Assign assignee logins to the selected issue or PR",
+            palette_key(KeyCode::Char('@')),
+        ),
+        palette_command(
+            "Unassign Assignee",
+            "-",
+            "Issue/PR",
+            "Remove assignee logins from the selected issue or PR",
+            palette_key(KeyCode::Char('-')),
+        ),
+        palette_command(
             "Search Details Comments",
             "/",
             "Details",
@@ -6420,14 +6914,14 @@ fn command_palette_commands() -> Vec<PaletteCommand> {
 
 fn palette_command(
     title: &'static str,
-    keys: &'static str,
+    keys: impl Into<String>,
     scope: &'static str,
     detail: &'static str,
     action: PaletteAction,
 ) -> PaletteCommand {
     PaletteCommand {
         title,
-        keys,
+        keys: keys.into(),
         scope,
         detail,
         action,
@@ -6812,12 +7306,13 @@ fn comment_dialog_body_lines(text: &str, width: u16) -> Vec<String> {
         let mut current = String::new();
         let mut column = 0_usize;
         for ch in raw_line.chars() {
-            if column >= width {
+            let char_width = display_width_char(ch);
+            if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
                 lines.push(std::mem::take(&mut current));
                 column = 0;
             }
             current.push(ch);
-            column += 1;
+            column = column.saturating_add(char_width);
         }
         lines.push(current);
     }
@@ -6868,9 +7363,8 @@ fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
     let mut parts = text.split('\n').peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
-            let len = part.chars().count();
-            line = line.saturating_add(len / width);
-            let column = len % width;
+            let (cursor_line, column) = comment_dialog_raw_line_cursor_offset(part, width);
+            line = line.saturating_add(cursor_line);
             return (
                 line.min(usize::from(u16::MAX)) as u16,
                 column.min(usize::from(u16::MAX)) as u16,
@@ -6884,8 +7378,38 @@ fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
 }
 
 fn comment_dialog_raw_line_height(text: &str, width: usize) -> usize {
-    let len = text.chars().count();
-    if len == 0 { 1 } else { len.div_ceil(width) }
+    if text.is_empty() {
+        return 1;
+    }
+    let mut lines = 1_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            lines = lines.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+    }
+    lines
+}
+
+fn comment_dialog_raw_line_cursor_offset(text: &str, width: usize) -> (usize, usize) {
+    let mut line = 0_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+        if column == width {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+    }
+    (line, column)
 }
 
 fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
@@ -6936,11 +7460,11 @@ fn command_line(command: &'static str) -> Line<'static> {
     ])
 }
 
-fn help_dialog_content() -> Vec<Line<'static>> {
+fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
     vec![
         help_heading("General"),
         help_key_line("? / Esc / Enter / q", "close this help"),
-        help_key_line("Ctrl+L", "open the command palette"),
+        help_key_line_owned(command_palette_key.to_string(), "open the command palette"),
         help_key_line("q", "quit ghr outside help"),
         help_key_line("q in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
@@ -6992,7 +7516,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
-        help_key_line("+ / -", "assign or unassign issue and PR assignees"),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
@@ -7007,7 +7531,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("D", "discard a pending PR review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
-        help_key_line("+ / -", "assign or unassign PR assignees"),
+        help_key_line("@ / -", "assign or unassign PR assignees"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
@@ -7029,10 +7553,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("c in diff", "add review comment on selected diff line"),
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
-        help_key_line(
-            "- or details action",
-            "assign or unassign issue and PR assignees",
-        ),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("+", "add a reaction to the visible focused comment or item"),
         help_key_line("e", "edit focused comment when it is yours"),
@@ -7056,80 +7577,6 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Y", "remove pending PR review requests"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
-        help_heading("Action Confirmation"),
-        help_key_line("m / s / r", "choose merge, squash, or rebase merge method"),
-        help_key_line("Tab", "cycle merge method in merge confirmation"),
-        help_key_line("y / Enter", "run the confirmed action"),
-        help_key_line(
-            "X action",
-            "runs gh pr checkout from the matching local checkout",
-        ),
-        help_key_line("Esc", "cancel action"),
-        Line::from(""),
-        help_heading("Review Summary Editor"),
-        help_key_line(
-            "Tab or 1 / 2 / 3",
-            "choose comment / request changes / approve",
-        ),
-        help_key_line("Ctrl+Enter", "submit the selected review event"),
-        help_key_line("Ctrl+P", "create a pending PR review draft"),
-        help_key_line("Enter", "insert newline"),
-        help_key_line("Esc", "cancel review editing"),
-        Line::from(""),
-        help_heading("Milestone Selector"),
-        help_key_line("type", "filter open milestones by prefix"),
-        help_key_line("Up/Down", "choose milestone or clear"),
-        help_key_line("Enter", "set or clear the milestone"),
-        help_key_line("Esc", "cancel milestone change"),
-        Line::from(""),
-        help_heading("Assignee Editor"),
-        help_key_line("Enter", "assign or unassign typed login(s)"),
-        help_key_line("Esc", "cancel assignee action"),
-        Line::from(""),
-        help_heading("Reviewer Actions"),
-        help_key_line("Enter", "submit comma-separated reviewer logins"),
-        help_key_line("Backspace", "delete previous character"),
-        help_key_line("Esc", "cancel reviewer action"),
-        Line::from(""),
-        help_heading("Repo Search"),
-        help_key_line("S", "open search input"),
-        help_key_line("Enter", "run gh search prs and gh search issues"),
-        help_key_line("Esc", "cancel global search input"),
-        Line::from(""),
-        help_heading("Section Filters"),
-        help_key_line("f", "open filter input for current PR/issue section"),
-        help_key_line("state:open/closed/merged/draft/all", "set state filter"),
-        help_key_line(
-            "assignee:user author:user label:name",
-            "set search qualifiers",
-        ),
-        help_key_line("empty or clear", "clear the current section filter"),
-        Line::from(""),
-        help_heading("Comment Editor"),
-        help_key_line("Enter", "insert newline"),
-        help_key_line("Ctrl+Enter", "send or update comment/title/body"),
-        help_key_line("Backspace", "delete previous character"),
-        help_key_line("PgDown/PgUp or mouse wheel", "scroll long drafts"),
-        help_key_line("Esc", "cancel editing"),
-        Line::from(""),
-        help_heading("Label Dialog"),
-        help_key_line("Up/Down or Tab", "choose a matching repo label"),
-        help_key_line("Enter", "add selected label or confirm removal"),
-        help_key_line("Backspace", "delete previous character while filtering"),
-        help_key_line("Esc", "cancel label update"),
-        Line::from(""),
-        help_heading("Reaction Dialog"),
-        help_key_line("1-8", "choose and add a reaction"),
-        help_key_line("j/k or Up/Down", "move reaction selection"),
-        help_key_line("Enter", "add selected reaction"),
-        help_key_line("Esc", "cancel reaction"),
-        Line::from(""),
-        help_heading("Issue Dialog"),
-        help_key_line("Tab / Shift+Tab", "switch issue fields"),
-        help_key_line("Enter", "move to next field or insert a body newline"),
-        help_key_line("Ctrl+Enter", "create issue"),
-        help_key_line("Esc", "cancel issue creation"),
-        Line::from(""),
         help_heading("Mouse"),
         help_key_line(
             "m",
@@ -7146,6 +7593,113 @@ fn help_dialog_content() -> Vec<Line<'static>> {
     ]
 }
 
+fn help_dialog_content_for_width(
+    content_width: u16,
+    command_palette_key: &str,
+) -> Vec<Line<'static>> {
+    let lines = help_dialog_content(command_palette_key);
+    let content_width = usize::from(content_width);
+    if content_width < HELP_TWO_COLUMN_MIN_WIDTH {
+        return lines;
+    }
+    help_dialog_two_column_content(lines, content_width)
+}
+
+fn help_dialog_two_column_content(
+    lines: Vec<Line<'static>>,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    if lines.len() < 8 {
+        return lines;
+    }
+    let column_width = content_width
+        .saturating_sub(HELP_COLUMN_GAP)
+        .saturating_div(2);
+    if column_width < 42 {
+        return lines;
+    }
+
+    let split = help_dialog_split_index(&lines);
+    let (left, right) = lines.split_at(split);
+    let row_count = left.len().max(right.len());
+    let mut rows = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let mut spans = left
+            .get(row)
+            .map(|line| clipped_line_spans(line, column_width))
+            .unwrap_or_default();
+        let left_width = spans_display_width(&spans);
+        spans.push(Span::raw(
+            " ".repeat(column_width.saturating_sub(left_width) + HELP_COLUMN_GAP),
+        ));
+        if let Some(line) = right.get(row) {
+            spans.extend(clipped_line_spans(line, column_width));
+        }
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
+fn help_dialog_split_index(lines: &[Line<'static>]) -> usize {
+    if lines.len() <= 1 {
+        return lines.len();
+    }
+
+    let target = lines.len().div_ceil(2);
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index == 0 || index + 1 >= lines.len() || !line.to_string().trim().is_empty() {
+                return None;
+            }
+            let split = index + 1;
+            Some((split.abs_diff(target), split))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, split)| split)
+        .unwrap_or(target)
+        .clamp(1, lines.len() - 1)
+}
+
+fn clipped_line_spans(line: &Line<'static>, max_width: usize) -> Vec<Span<'static>> {
+    let mut remaining = max_width;
+    let mut clipped = Vec::new();
+    for span in &line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let text = take_display_width(span.content.as_ref(), remaining);
+        if text.is_empty() {
+            continue;
+        }
+        remaining = remaining.saturating_sub(display_width(&text));
+        clipped.push(Span::styled(text, span.style));
+    }
+    clipped
+}
+
+fn take_display_width(text: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let ch_width = display_width_char(ch);
+        if width + ch_width > max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output
+}
+
+fn spans_display_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
 fn help_heading(text: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         text,
@@ -7156,6 +7710,10 @@ fn help_heading(text: &'static str) -> Line<'static> {
 }
 
 fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static> {
+    help_key_line_owned(keys.to_string(), description)
+}
+
+fn help_key_line_owned(keys: String, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -8286,13 +8844,13 @@ fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
             segments.push(DetailSegment::styled(label.clone(), label_style()));
             segments.push(DetailSegment::raw(" "));
             segments.push(DetailSegment::action(
-                "remove",
+                "×",
                 DetailAction::RemoveLabel(label.clone()),
             ));
         }
     }
     segments.push(DetailSegment::raw("  "));
-    segments.push(DetailSegment::action("add label", DetailAction::AddLabel));
+    segments.push(DetailSegment::action("+", DetailAction::AddLabel));
     builder.push_wrapped_limited(segments, 3);
 }
 
@@ -8407,7 +8965,7 @@ fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
     }
     segments.push(DetailSegment::raw("  "));
     segments.push(DetailSegment::action(
-        "+ assign",
+        "@ assign",
         DetailAction::AssignAssignee,
     ));
     if !item.assignees.is_empty() {
@@ -8631,7 +9189,7 @@ fn push_diff_inline_comment(
     append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
-        "react",
+        "+ react",
         DetailAction::ReactComment(index),
     ));
     header.push(DetailSegment::raw("  "));
@@ -9041,7 +9599,7 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
         }
     }
     segments.push(DetailSegment::raw("  "));
-    segments.push(DetailSegment::action("react", DetailAction::ReactItem));
+    segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
     builder.push_wrapped_limited(segments, 2);
 }
 
@@ -9112,7 +9670,7 @@ fn push_comment(
     append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
-        "react",
+        "+ react",
         DetailAction::ReactComment(index),
     ));
     if search_match {
@@ -10898,9 +11456,139 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'c'))
 }
 
-fn is_command_palette_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'l'))
+fn normalized_command_palette_key(value: &str) -> String {
+    command_palette_key_binding(value).label
+}
+
+fn command_palette_key_binding(value: &str) -> KeyBinding {
+    parse_key_binding(value).unwrap_or_else(|| {
+        parse_key_binding(DEFAULT_COMMAND_PALETTE_KEY).expect("default command palette key parses")
+    })
+}
+
+fn parse_key_binding(value: &str) -> Option<KeyBinding> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().count() == 1 {
+        let ch = value.chars().next()?;
+        return Some(KeyBinding {
+            label: value.to_string(),
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key = None;
+    for raw_part in value.split('+') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
+            "alt" | "option" => modifiers.insert(KeyModifiers::ALT),
+            "shift" => modifiers.insert(KeyModifiers::SHIFT),
+            _ if key.is_none() => key = Some(part.to_string()),
+            _ => return None,
+        }
+    }
+
+    let key = key?;
+    let code = parse_key_code(&key)?;
+    Some(KeyBinding {
+        label: key_binding_label(modifiers, &code),
+        code,
+        modifiers,
+    })
+}
+
+fn parse_key_code(value: &str) -> Option<KeyCode> {
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "esc" | "escape" => Some(KeyCode::Esc),
+        "enter" | "return" => Some(KeyCode::Enter),
+        "tab" => Some(KeyCode::Tab),
+        "backtab" => Some(KeyCode::BackTab),
+        "backspace" => Some(KeyCode::Backspace),
+        "space" => Some(KeyCode::Char(' ')),
+        _ if value.chars().count() == 1 => Some(KeyCode::Char(value.chars().next()?)),
+        _ => None,
+    }
+}
+
+fn key_binding_label(modifiers: KeyModifiers, code: &KeyCode) -> String {
+    let mut parts = Vec::new();
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        parts.push("Alt".to_string());
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("Shift".to_string());
+    }
+    parts.push(key_code_label_with_modifiers(code, modifiers));
+    parts.join("+")
+}
+
+fn key_code_label_with_modifiers(code: &KeyCode, modifiers: KeyModifiers) -> String {
+    match code {
+        KeyCode::Char(value)
+            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && value.is_ascii_alphabetic() =>
+        {
+            value.to_ascii_uppercase().to_string()
+        }
+        _ => key_code_label(code),
+    }
+}
+
+fn key_code_label(code: &KeyCode) -> String {
+    match code {
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift+Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(value) => value.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn command_palette_modifier_bits(modifiers: KeyModifiers) -> KeyModifiers {
+    modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn should_open_command_palette(app: &AppState, key: KeyEvent) -> bool {
+    let binding = command_palette_key_binding(&app.command_palette_key);
+    if !binding.matches(key) {
+        return false;
+    }
+    !(binding.is_plain_text_char() && text_input_active(app))
+}
+
+fn text_input_active(app: &AppState) -> bool {
+    app.search_active
+        || app.comment_search_active
+        || app.global_search_active
+        || app.filter_input_active
+        || app.comment_dialog.is_some()
+        || app.label_dialog.is_some()
+        || app.issue_dialog.is_some()
+        || app.review_submit_dialog.is_some()
+        || app.item_edit_dialog.is_some()
+        || app.milestone_dialog.is_some()
+        || app.assignee_dialog.is_some()
+        || app.reviewer_dialog.is_some()
+}
+
+fn is_assignee_assign_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('@'))
+        || (matches!(key.code, KeyCode::Char('2')) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 fn is_diff_key(key: KeyEvent) -> bool {
@@ -11015,6 +11703,7 @@ impl AppState {
             filter_input_active: false,
             filter_input_query: String::new(),
             command_palette: None,
+            command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
@@ -11029,6 +11718,11 @@ impl AppState {
             viewed_details_snapshot: ui_state.viewed_details_snapshot.clone(),
             viewed_comments_snapshot: ui_state.viewed_comments_snapshot.clone(),
             action_hints: HashMap::new(),
+            action_hints_stale: HashSet::new(),
+            action_hints_refreshing: HashSet::new(),
+            label_suggestions_cache: HashMap::new(),
+            assignee_suggestions_cache: HashMap::new(),
+            reviewer_suggestions_cache: HashMap::new(),
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
             pending_details_load: None,
@@ -11074,6 +11768,12 @@ impl AppState {
             state.restore_saved_details_mode();
         }
         state
+    }
+
+    fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
+        self.label_suggestions_cache = cache.labels;
+        self.assignee_suggestions_cache = cache.assignees;
+        self.reviewer_suggestions_cache = cache.reviewers;
     }
 
     fn ui_state(&self) -> UiState {
@@ -11352,12 +12052,24 @@ impl AppState {
             },
             AppMsg::ActionHintsLoaded { item_id, actions } => match actions {
                 Ok(actions) => {
-                    self.action_hints
-                        .insert(item_id, ActionHintState::Loaded(actions));
+                    self.action_hints_refreshing.remove(&item_id);
+                    if !matches!(
+                        self.action_hints.get(&item_id),
+                        Some(ActionHintState::Loaded(current)) if current == &actions
+                    ) {
+                        self.action_hints
+                            .insert(item_id, ActionHintState::Loaded(actions));
+                    }
                 }
                 Err(error) => {
-                    self.action_hints
-                        .insert(item_id, ActionHintState::Error(error));
+                    self.action_hints_refreshing.remove(&item_id);
+                    if !matches!(
+                        self.action_hints.get(&item_id),
+                        Some(ActionHintState::Loaded(_))
+                    ) {
+                        self.action_hints
+                            .insert(item_id, ActionHintState::Error(error));
+                    }
                 }
             },
             AppMsg::DiffLoaded { item_id, diff } => match diff {
@@ -11570,32 +12282,118 @@ impl AppState {
                     }
                 }
             }
-            AppMsg::LabelSuggestionsLoaded { repo, result } => {
-                let Some(dialog) = &mut self.label_dialog else {
-                    return;
-                };
-                let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode else {
-                    return;
-                };
-                if dialog_repo != &repo {
-                    return;
-                }
-                dialog.suggestions_loading = false;
-                match result {
-                    Ok(labels) => {
-                        dialog.suggestions = labels;
+            AppMsg::LabelSuggestionsLoaded { repo, result } => match result {
+                Ok(labels) => {
+                    self.label_suggestions_cache
+                        .insert(repo.clone(), labels.clone());
+                    if let Some(dialog) = &mut self.label_dialog
+                        && let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode
+                        && dialog_repo == &repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != labels {
+                            dialog.suggestions = labels;
+                        }
                         dialog.suggestions_error = None;
                         clamp_label_dialog_selection(dialog);
                         self.status = "label suggestions loaded".to_string();
                     }
-                    Err(error) => {
-                        dialog.suggestions.clear();
-                        dialog.suggestions_error = Some(error);
-                        dialog.selected_suggestion = 0;
-                        self.status = "label suggestions unavailable".to_string();
+                }
+                Err(error) => {
+                    let has_cached_suggestions = self.label_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.label_dialog
+                        && let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode
+                        && dialog_repo == &repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "label suggestions refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "label suggestions unavailable".to_string();
+                        }
                     }
                 }
-            }
+            },
+            AppMsg::AssigneeSuggestionsLoaded { repo, result } => match result {
+                Ok(assignees) => {
+                    self.assignee_suggestions_cache
+                        .insert(repo.clone(), assignees.clone());
+                    if let Some(dialog) = &mut self.assignee_dialog
+                        && dialog.action == AssigneeAction::Assign
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != assignees {
+                            dialog.suggestions = assignees;
+                        }
+                        dialog.suggestions_error = None;
+                        clamp_assignee_dialog_selection(dialog);
+                        self.status = "assignee candidates loaded".to_string();
+                    }
+                }
+                Err(error) => {
+                    let has_cached_suggestions =
+                        self.assignee_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.assignee_dialog
+                        && dialog.action == AssigneeAction::Assign
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "assignee candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "assignee candidates unavailable".to_string();
+                        }
+                    }
+                }
+            },
+            AppMsg::ReviewerSuggestionsLoaded { repo, result } => match result {
+                Ok(reviewers) => {
+                    self.reviewer_suggestions_cache
+                        .insert(repo.clone(), reviewers.clone());
+                    if let Some(dialog) = &mut self.reviewer_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != reviewers {
+                            dialog.suggestions = reviewers;
+                        }
+                        dialog.suggestions_error = None;
+                        clamp_reviewer_dialog_selection(dialog);
+                        self.status = "reviewer candidates loaded".to_string();
+                    }
+                }
+                Err(error) => {
+                    let has_cached_suggestions =
+                        self.reviewer_suggestions_cache.contains_key(&repo)
+                            || self.assignee_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.reviewer_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "reviewer candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "reviewer candidates unavailable".to_string();
+                        }
+                    }
+                }
+            },
             AppMsg::IssueCreated { result } => {
                 self.issue_creating = false;
                 self.issue_dialog = None;
@@ -11639,7 +12437,7 @@ impl AppState {
                     Ok(pending) => {
                         self.pending_reviews
                             .insert(item_id.clone(), pending.clone());
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.details_stale.insert(item_id);
                         self.status = "pending review created".to_string();
                         self.message_dialog = Some(success_message_dialog(
@@ -11672,7 +12470,7 @@ impl AppState {
                 self.review_submit_running = false;
                 match result {
                     Ok(()) => {
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.details_stale.insert(item_id.clone());
                         self.status = format!("{}; refreshing", event.success_label());
                         self.message_dialog = Some(success_message_dialog(
@@ -11707,7 +12505,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.pending_reviews.remove(&item_id);
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.details_stale.insert(item_id);
                         self.status = format!("{}; refreshing", event.success_label());
                         self.message_dialog = Some(success_message_dialog(
@@ -11741,7 +12539,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.pending_reviews.remove(&item_id);
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.details_stale.insert(item_id);
                         self.status = "pending review discarded; refreshing".to_string();
                         self.message_dialog = Some(success_message_dialog(
@@ -11778,7 +12576,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.diffs.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
                         self.status = if action == PrAction::Merge {
@@ -11995,7 +12793,7 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
-                        self.action_hints.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
                         self.status = match action {
                             ReviewerAction::Request => {
                                 format!(
@@ -12264,7 +13062,7 @@ impl AppState {
         let Some(palette) = &mut self.command_palette else {
             return;
         };
-        let commands = command_palette_commands();
+        let commands = command_palette_commands(&self.command_palette_key);
         let len = command_palette_filtered_indices(&commands, &palette.query).len();
         palette.selected = move_wrapping(palette.selected, len, delta);
     }
@@ -12318,7 +13116,7 @@ impl AppState {
 
     fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
         let palette = self.command_palette.as_ref()?;
-        let commands = command_palette_commands();
+        let commands = command_palette_commands(&self.command_palette_key);
         let matches = command_palette_filtered_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
         matches
@@ -12407,15 +13205,56 @@ impl AppState {
     }
 
     fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
-        for item_id in sections.iter().flat_map(|section| {
-            section
-                .items
-                .iter()
-                .filter(|item| item.kind == ItemKind::PullRequest)
-                .map(|item| item.id.as_str())
-        }) {
-            self.action_hints.remove(item_id);
+        let item_ids = sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .items
+                    .iter()
+                    .filter(|item| item.kind == ItemKind::PullRequest)
+                    .map(|item| item.id.clone())
+            })
+            .collect::<Vec<_>>();
+        for item_id in item_ids {
+            self.mark_action_hints_stale(item_id);
         }
+    }
+
+    fn mark_action_hints_stale(&mut self, item_id: impl Into<String>) {
+        let item_id = item_id.into();
+        if self.action_hints.contains_key(&item_id) {
+            self.action_hints_stale.insert(item_id);
+        }
+    }
+
+    fn action_hints_state_is_loading(&self, item_id: &str) -> bool {
+        matches!(
+            self.action_hints.get(item_id),
+            Some(ActionHintState::Loading)
+        )
+    }
+
+    fn action_hints_state_exists(&self, item_id: &str) -> bool {
+        self.action_hints.contains_key(item_id)
+    }
+
+    fn action_hints_can_refresh_in_background(&self, item_id: &str) -> bool {
+        self.action_hints_state_exists(item_id) && !self.action_hints_state_is_loading(item_id)
+    }
+
+    fn action_hints_refresh_is_needed(&self, item_id: &str) -> bool {
+        self.action_hints_stale.contains(item_id)
+            && self.action_hints_can_refresh_in_background(item_id)
+            && !self.action_hints_refreshing.contains(item_id)
+    }
+
+    fn action_hints_first_load_is_needed(&self, item_id: &str) -> bool {
+        !self.action_hints_state_exists(item_id)
+    }
+
+    fn action_hints_load_should_start(&self, item_id: &str) -> bool {
+        self.action_hints_first_load_is_needed(item_id)
+            || self.action_hints_refresh_is_needed(item_id)
     }
 
     fn insert_created_issue(&mut self, item: WorkItem) -> bool {
@@ -12723,7 +13562,7 @@ impl AppState {
     }
 
     fn action_hints_load_needed(&self, item: &WorkItem) -> bool {
-        matches!(item.kind, ItemKind::PullRequest) && !self.action_hints.contains_key(&item.id)
+        matches!(item.kind, ItemKind::PullRequest) && self.action_hints_load_should_start(&item.id)
     }
 
     fn details_load_ready(&mut self, item_id: &str) -> bool {
@@ -12884,8 +13723,13 @@ impl AppState {
         if !self.action_hints_load_needed(item) {
             return false;
         }
-        self.action_hints
-            .insert(item.id.clone(), ActionHintState::Loading);
+        if self.action_hints_state_exists(&item.id) {
+            self.action_hints_stale.remove(&item.id);
+            self.action_hints_refreshing.insert(item.id.clone());
+        } else {
+            self.action_hints
+                .insert(item.id.clone(), ActionHintState::Loading);
+        }
         true
     }
 
@@ -13802,7 +14646,12 @@ impl AppState {
         focus_line >= viewport_start && focus_line < viewport_end
     }
 
-    fn handle_detail_action(&mut self, action: DetailAction, tx: Option<&UnboundedSender<AppMsg>>) {
+    fn handle_detail_action(
+        &mut self,
+        action: DetailAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         match action {
             DetailAction::ReplyComment(index) => {
                 self.select_comment(index);
@@ -13821,10 +14670,14 @@ impl AppState {
                 self.select_comment(index);
                 self.start_comment_reaction_dialog(index);
             }
-            DetailAction::AddLabel => self.start_add_label_dialog(tx),
+            DetailAction::AddLabel => self.start_add_label_dialog_with_store(store, tx),
             DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
-            DetailAction::AssignAssignee => self.start_assignee_dialog(AssigneeAction::Assign),
-            DetailAction::UnassignAssignee => self.start_assignee_dialog(AssigneeAction::Unassign),
+            DetailAction::AssignAssignee => {
+                self.start_assignee_dialog_with_store(AssigneeAction::Assign, store, tx)
+            }
+            DetailAction::UnassignAssignee => {
+                self.start_assignee_dialog_with_store(AssigneeAction::Unassign, store, tx)
+            }
         }
     }
 
@@ -14718,7 +15571,21 @@ impl AppState {
         }
     }
 
-    fn start_assignee_dialog(&mut self, action: AssigneeAction) {
+    #[cfg(test)]
+    fn start_assignee_dialog(
+        &mut self,
+        action: AssigneeAction,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
+        self.start_assignee_dialog_with_store(action, None, tx);
+    }
+
+    fn start_assignee_dialog_with_store(
+        &mut self,
+        action: AssigneeAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -14742,13 +15609,35 @@ impl AppState {
         self.item_edit_dialog = None;
         self.milestone_dialog = None;
         self.pr_action_dialog = None;
+        let repo = item.repo.clone();
+        let cached_suggestions = (action == AssigneeAction::Assign)
+            .then(|| self.assignee_suggestions_cache.get(&repo).cloned())
+            .flatten();
+        let has_cached_suggestions = cached_suggestions.is_some();
         self.assignee_dialog = Some(AssigneeDialog {
             item,
             action,
             input: String::new(),
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
+            suggestions_error: None,
+            selected_suggestion: 0,
         });
         self.assignee_action_running = false;
+        let suggestions_refreshing = action == AssigneeAction::Assign
+            && tx
+                .map(|tx| start_assignee_suggestions_load(repo, store.cloned(), tx.clone()))
+                .unwrap_or(false);
+        if let Some(dialog) = &mut self.assignee_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
+        }
         self.status = match action {
+            AssigneeAction::Assign if has_cached_suggestions && suggestions_refreshing => {
+                "assignee candidates cached; refreshing".to_string()
+            }
+            AssigneeAction::Assign if suggestions_refreshing => {
+                "loading assignee candidates".to_string()
+            }
             AssigneeAction::Assign => "enter assignee to add".to_string(),
             AssigneeAction::Unassign => "enter assignee to remove".to_string(),
         };
@@ -14778,14 +15667,20 @@ impl AppState {
             KeyCode::Enter => {
                 self.submit_assignee_action(&mut submit);
             }
+            KeyCode::Down | KeyCode::Tab => self.move_assignee_suggestion(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_assignee_suggestion(-1),
             KeyCode::Backspace => {
                 if let Some(dialog) = &mut self.assignee_dialog {
                     dialog.input.pop();
+                    dialog.selected_suggestion = 0;
+                    clamp_assignee_dialog_selection(dialog);
                 }
             }
             KeyCode::Char(value) => {
                 if let Some(dialog) = &mut self.assignee_dialog {
                     dialog.input.push(value);
+                    dialog.selected_suggestion = 0;
+                    clamp_assignee_dialog_selection(dialog);
                 }
             }
             _ => {}
@@ -14799,7 +15694,7 @@ impl AppState {
         let Some(dialog) = &self.assignee_dialog else {
             return;
         };
-        let assignees = parse_assignee_input(&dialog.input);
+        let assignees = assignee_dialog_submit_logins(dialog);
         if assignees.is_empty() {
             self.status = "assignee login is empty".to_string();
             return;
@@ -14814,7 +15709,34 @@ impl AppState {
         submit(item, action, assignees);
     }
 
+    fn move_assignee_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.assignee_dialog else {
+            return;
+        };
+        let count = assignee_dialog_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no assignee candidates match".to_string();
+            return;
+        }
+        dialog.selected_suggestion = move_wrapping(dialog.selected_suggestion, count, delta);
+        let login = assignee_dialog_suggestion_matches(dialog)
+            .get(dialog.selected_suggestion)
+            .cloned()
+            .unwrap_or_else(|| dialog.input.trim().to_string());
+        self.status = format!("selected assignee candidate: {login}");
+    }
+
+    #[cfg(test)]
     fn start_reviewer_dialog(&mut self, action: ReviewerAction) {
+        self.start_reviewer_dialog_with_store(action, None, None);
+    }
+
+    fn start_reviewer_dialog_with_store(
+        &mut self,
+        action: ReviewerAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -14828,15 +15750,40 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
+        let repo = item.repo.clone();
+        let cached_suggestions = self
+            .reviewer_suggestions_cache
+            .get(&repo)
+            .cloned()
+            .or_else(|| self.assignee_suggestions_cache.get(&repo).cloned());
+        let has_cached_suggestions = cached_suggestions.is_some();
         self.reviewer_dialog = Some(ReviewerDialog {
             item,
             action,
             input: String::new(),
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
+            suggestions_error: None,
+            selected_suggestion: 0,
         });
         self.reviewer_action_running = false;
-        self.status = match action {
-            ReviewerAction::Request => "enter reviewer logins to request".to_string(),
-            ReviewerAction::Remove => "enter reviewer logins to remove".to_string(),
+        let suggestions_refreshing = tx
+            .map(|tx| start_reviewer_suggestions_load(repo, store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        if let Some(dialog) = &mut self.reviewer_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
+        }
+        self.status = match (action, has_cached_suggestions, suggestions_refreshing) {
+            (ReviewerAction::Request, true, true) => {
+                "reviewer candidates cached; refreshing".to_string()
+            }
+            (ReviewerAction::Remove, true, true) => {
+                "reviewer candidates cached; refreshing".to_string()
+            }
+            (ReviewerAction::Request, _, true) => "loading reviewer candidates".to_string(),
+            (ReviewerAction::Remove, _, true) => "loading reviewer candidates".to_string(),
+            (ReviewerAction::Request, _, _) => "enter reviewer logins to request".to_string(),
+            (ReviewerAction::Remove, _, _) => "enter reviewer logins to remove".to_string(),
         };
     }
 
@@ -14878,25 +15825,47 @@ impl AppState {
                     submit(item, action, reviewers);
                 }
             }
+            KeyCode::Up => self.move_reviewer_suggestion(-1),
+            KeyCode::Down => self.move_reviewer_suggestion(1),
             KeyCode::Backspace => {
                 if let Some(dialog) = &mut self.reviewer_dialog {
                     dialog.input.pop();
+                    clamp_reviewer_dialog_selection(dialog);
                 }
             }
             KeyCode::Char(value) => {
                 if let Some(dialog) = &mut self.reviewer_dialog {
                     dialog.input.push(value);
+                    dialog.selected_suggestion = 0;
+                    clamp_reviewer_dialog_selection(dialog);
                 }
             }
             _ => {}
         }
     }
 
+    fn move_reviewer_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.reviewer_dialog else {
+            return;
+        };
+        let count = reviewer_dialog_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no reviewer candidates match".to_string();
+            return;
+        }
+        dialog.selected_suggestion = move_wrapping(dialog.selected_suggestion, count, delta);
+        let login = reviewer_dialog_suggestion_matches(dialog)
+            .get(dialog.selected_suggestion)
+            .cloned()
+            .unwrap_or_else(|| dialog.input.trim().to_string());
+        self.status = format!("selected reviewer candidate: {login}");
+    }
+
     fn prepare_reviewer_submit(&mut self) -> Option<(WorkItem, ReviewerAction, Vec<String>)> {
         let Some(dialog) = &self.reviewer_dialog else {
             return None;
         };
-        let reviewers = parse_reviewer_logins(&dialog.input);
+        let reviewers = reviewer_dialog_submit_logins(dialog);
         if reviewers.is_empty() {
             self.status = "enter at least one reviewer login".to_string();
             return None;
@@ -15104,7 +16073,16 @@ impl AppState {
         });
     }
 
+    #[cfg(test)]
     fn start_add_label_dialog(&mut self, tx: Option<&UnboundedSender<AppMsg>>) {
+        self.start_add_label_dialog_with_store(None, tx);
+    }
+
+    fn start_add_label_dialog_with_store(
+        &mut self,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -15114,13 +16092,14 @@ impl AppState {
             return;
         };
         let repo = item.repo.clone();
-        let suggestions_loading = tx.is_some();
+        let cached_suggestions = self.label_suggestions_cache.get(&repo).cloned();
+        let has_cached_suggestions = cached_suggestions.is_some();
         self.label_dialog = Some(LabelDialog {
             mode: LabelDialogMode::Add { repo: repo.clone() },
             input: String::new(),
             existing_labels: item.labels,
-            suggestions: Vec::new(),
-            suggestions_loading,
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
             suggestions_error: None,
             selected_suggestion: 0,
         });
@@ -15133,10 +16112,15 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.focus = FocusTarget::Details;
-        if let Some(tx) = tx {
-            start_label_suggestions_load(repo, tx.clone());
+        let suggestions_refreshing = tx
+            .map(|tx| start_label_suggestions_load(repo, store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        if let Some(dialog) = &mut self.label_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
         }
-        self.status = if suggestions_loading {
+        self.status = if has_cached_suggestions && suggestions_refreshing {
+            "label suggestions cached; refreshing".to_string()
+        } else if suggestions_refreshing {
             "loading label suggestions".to_string()
         } else {
             "label input mode".to_string()
@@ -16285,6 +17269,16 @@ impl AppState {
         }
 
         tabs
+    }
+
+    fn has_unread_notifications(&self) -> bool {
+        self.sections.iter().any(|section| {
+            matches!(section.kind, SectionKind::Notifications)
+                && section
+                    .items
+                    .iter()
+                    .any(|item| item.unread.unwrap_or(false))
+        })
     }
 }
 
@@ -17815,7 +18809,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn refresh_finished_invalidates_pr_action_hints() {
+    fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.action_hints.insert(
             "1".to_string(),
@@ -17834,9 +18828,20 @@ diff --git a/src/github.rs b/src/github.rs
             save_error: None,
         });
 
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         let item = app.current_item().expect("current PR item").clone();
         assert!(app.action_hints_load_needed(&item));
+        assert!(app.start_action_hints_load_if_needed(&item));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_refreshing.contains("1"));
+        assert!(!app.action_hints_stale.contains("1"));
     }
 
     #[test]
@@ -18446,6 +19451,77 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn stale_pr_action_hints_refresh_keeps_loaded_fields_visible() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Mergeable".to_string()],
+                checks: Some(CheckSummary {
+                    passed: 4,
+                    failed: 0,
+                    pending: 0,
+                    skipped: 0,
+                    total: 4,
+                    incomplete: false,
+                }),
+                commits: Some(2),
+                failed_check_runs: Vec::new(),
+                note: Some("Mergeable".to_string()),
+                head: Some(PullRequestBranch {
+                    repository: "rust-lang/rust".to_string(),
+                    branch: "feature/no-flicker".to_string(),
+                }),
+            }),
+        );
+        app.action_hints_stale.insert("1".to_string());
+        let item = app.current_item().cloned().expect("item");
+
+        assert!(app.start_action_hints_load_if_needed(&item));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("commits: 2"));
+        assert!(rendered.contains("branch: rust-lang/rust:feature/no-flicker"));
+        assert!(rendered.contains("action: Mergeable"));
+        assert!(rendered.contains("checks: 4 pass"));
+        assert!(!rendered.contains("action: loading..."));
+        assert!(!rendered.contains("branch: loading..."));
+        assert!(!rendered.contains("checks: loading..."));
+    }
+
+    #[test]
+    fn background_action_hints_error_keeps_last_loaded_fields() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let hints = ActionHints {
+            labels: vec!["Mergeable".to_string()],
+            checks: None,
+            commits: None,
+            failed_check_runs: Vec::new(),
+            note: None,
+            head: None,
+        };
+        app.action_hints
+            .insert("1".to_string(), ActionHintState::Loaded(hints.clone()));
+        app.action_hints_refreshing.insert("1".to_string());
+
+        app.handle_msg(AppMsg::ActionHintsLoaded {
+            item_id: "1".to_string(),
+            actions: Err("temporary gh api failure".to_string()),
+        });
+
+        assert!(!app.action_hints_refreshing.contains("1"));
+        assert_eq!(
+            app.action_hints.get("1"),
+            Some(&ActionHintState::Loaded(hints))
+        );
+    }
+
+    #[test]
     fn list_focused_details_load_is_debounced_but_details_focus_is_immediate() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.focus_list();
@@ -18603,34 +19679,54 @@ diff --git a/src/github.rs b/src/github.rs
 
     #[test]
     fn help_dialog_content_lists_core_shortcuts() {
-        let text = help_dialog_content()
+        let text = help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
         assert!(text.contains("Tab / Shift+Tab"));
-        assert!(text.contains("Ctrl+L"));
-        assert!(text.contains("Ctrl+Enter"));
+        assert!(text.contains(":"));
         assert!(text.contains("R"));
         assert!(text.contains("edit focused comment"));
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
         assert!(text.contains("open close or reopen confirmation"));
-        assert!(text.contains("choose merge, squash, or rebase merge method"));
         assert!(text.contains("open PR enable auto-merge confirmation"));
         assert!(text.contains("open PR disable auto-merge confirmation"));
         assert!(text.contains("open PR update-branch confirmation"));
         assert!(text.contains("toggle PR draft / ready for review"));
-        assert!(text.contains("run the confirmed action"));
         assert!(text.contains("change issue or PR milestone"));
-        assert!(text.contains("filter open milestones by prefix"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
+        assert!(text.contains("@ / -"));
+        assert!(text.contains("add a reaction"));
+        assert!(!text.contains("Reaction Dialog"));
+        assert!(!text.contains("Ctrl+Enter"));
     }
 
     #[test]
-    fn ctrl_l_opens_command_palette() {
+    fn wide_help_dialog_uses_two_columns() {
+        let single_column = help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY);
+        let two_columns = help_dialog_content_for_width(140, DEFAULT_COMMAND_PALETTE_KEY);
+        let text = two_columns
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(two_columns.len() < single_column.len());
+        assert!(text.contains("General"));
+        assert!(text.contains("Mouse"));
+        assert!(
+            two_columns
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= 140)
+        );
+    }
+
+    #[test]
+    fn colon_opens_command_palette() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -18638,7 +19734,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(!handle_key(
             &mut app,
-            ctrl_key(KeyCode::Char('l')),
+            key(KeyCode::Char(':')),
             &config,
             &store,
             &tx
@@ -18649,10 +19745,68 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn command_palette_opens_over_comment_editor_without_editing_draft() {
+    fn printable_command_palette_key_is_text_inside_comment_editor() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft:")
+        );
+    }
+
+    #[test]
+    fn printable_command_palette_key_is_text_inside_filter_and_repo_search() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.start_filter_input();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.filter_input_query, ":");
+
+        app.filter_input_active = false;
+        app.start_global_search_input();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.global_search_query, ":");
+    }
+
+    #[test]
+    fn modified_command_palette_key_can_open_over_text_input() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.defaults.command_palette_key = "Ctrl+L".to_string();
         let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
         app.start_new_comment_dialog();
         app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
@@ -18672,12 +19826,13 @@ diff --git a/src/github.rs b/src/github.rs
                 .map(|dialog| dialog.body.as_str()),
             Some("draft")
         );
+        assert_eq!(app.command_palette_key, "Ctrl+L");
     }
 
     #[test]
     fn command_palette_lists_and_fuzzy_filters_shortcuts() {
-        let commands = command_palette_commands();
-        assert!(commands.iter().any(|command| command.keys == "Ctrl+L"));
+        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+        assert!(commands.iter().any(|command| command.keys == ":"));
         assert!(commands.iter().any(|command| command.keys == "Ctrl+Enter"));
         assert!(
             commands
@@ -18707,6 +19862,17 @@ diff --git a/src/github.rs b/src/github.rs
                 .iter()
                 .any(|index| commands[*index].title == "Create Issue from Dialog")
         );
+    }
+
+    #[test]
+    fn command_palette_area_is_centered_in_viewport() {
+        let area = Rect::new(0, 0, 120, 40);
+        let palette = command_palette_area(area);
+
+        assert_eq!(palette.width, 91);
+        assert_eq!(palette.height, 18);
+        assert_eq!(palette.x, 14);
+        assert_eq!(palette.y, 11);
     }
 
     #[test]
@@ -18899,7 +20065,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("s/A/D review"));
         assert!(text.contains("M/C/U/E/O/F/X/Z actions"));
         assert!(text.contains("t milestone"));
-        assert!(text.contains("+ assign"));
+        assert!(text.contains("@ assign"));
         assert!(text.contains(
             "| 1-4 focus  ? help  S repo  f filter  r refresh  o open  m text-select  q quit |"
         ));
@@ -18941,15 +20107,38 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  enter expand  c/a comment  + assign"));
-        assert!(details.contains("R reply  e edit"));
+        assert!(details.contains("v diff  / search  c/a comment  @ assign"));
+        assert!(!details.contains("R reply"));
+        assert!(!details.contains("e edit"));
+        assert!(!details.contains("enter expand"));
         assert!(details.contains("T edit item"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
 
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "Needs a reply", None)]),
+        );
+        let details_with_comment = footer_line(&app, &paths).to_string();
+        assert!(details_with_comment.contains("n/p comment  enter expand"));
+        assert!(details_with_comment.contains("R reply"));
+        assert!(!details_with_comment.contains("e edit"));
+
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![own_comment(
+                42,
+                "chenyukang",
+                "My editable comment",
+                None,
+            )]),
+        );
+        let details_with_own_comment = footer_line(&app, &paths).to_string();
+        assert!(details_with_own_comment.contains("R reply  e edit"));
+
         app.sections[0].items[0].assignees = vec!["alice".to_string()];
         let details_with_assignee = footer_line(&app, &paths).to_string();
-        assert!(details_with_assignee.contains("+/- assign"));
+        assert!(details_with_assignee.contains("@/- assign"));
 
         app.show_diff();
         app.focus_details();
@@ -18959,7 +20148,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(diff.contains("M/C/U/E/O/F/X/Z actions"));
         assert!(diff.contains("t milestone"));
         assert!(diff.contains("T edit item"));
-        assert!(diff.contains("+/- assign"));
+        assert!(diff.contains("@/- assign"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -19293,11 +20482,14 @@ diff --git a/src/github.rs b/src/github.rs
     fn quick_filter_state_shortcuts_toggle_query_state() {
         let base = "repo:owner/repo is:open archived:false sort:updated-desc";
         let closed = QuickFilter::parse("closed").unwrap().expect("closed");
+        let close = QuickFilter::parse("state:close").unwrap().expect("close");
         let merged = QuickFilter::parse("state:merged").unwrap().expect("merged");
         let draft = QuickFilter::parse("draft").unwrap().expect("draft");
         let all = QuickFilter::parse("all").unwrap().expect("all");
 
         assert!(quick_filter_query(base, &closed).contains("is:closed"));
+        assert!(quick_filter_query(base, &close).contains("is:closed"));
+        assert_eq!(close.display(), "state:closed");
         assert!(quick_filter_query(base, &merged).contains("is:merged"));
         assert!(quick_filter_query(base, &draft).contains("is:draft"));
         assert_eq!(
@@ -19473,6 +20665,44 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(section.fg, Some(Color::Black));
         assert_eq!(section.bg, Some(Color::LightYellow));
         assert!(section.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn ghr_title_is_bold_when_unread_notifications_exist() {
+        let notification_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Notifications".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::PullRequests,
+            vec![test_section(), notification_section],
+        );
+        app.focus_list();
+        let base = Style::default().fg(Color::DarkGray);
+
+        assert!(app.has_unread_notifications());
+        assert!(
+            view_tabs_title_style(&app, base)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+
+        app.sections[1].items[0].unread = Some(false);
+
+        assert!(!app.has_unread_notifications());
+        assert!(
+            !view_tabs_title_style(&app, base)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -19789,7 +21019,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains(&format!("created: {}", local_datetime(Some(created_at)))));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
-        assert!(rendered.contains("labels: T-compiler remove  add label"));
+        assert!(rendered.contains("labels: T-compiler ×  +"));
         assert!(!rendered.contains("reason: -"));
 
         let author_line = lines
@@ -19803,7 +21033,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert_document_action_for_text(
             &document,
-            "remove",
+            "×",
             DetailAction::RemoveLabel("T-compiler".to_string()),
         );
     }
@@ -19829,7 +21059,7 @@ diff --git a/src/github.rs b/src/github.rs
         let document = build_details_document(&app, 120);
 
         assert_document_link_for_text(&document, "alice", "https://github.com/alice");
-        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
+        assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     }
 
     #[test]
@@ -19859,8 +21089,8 @@ diff --git a/src/github.rs b/src/github.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("labels: none  add label"));
-        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
+        assert!(rendered.contains("labels: none  +"));
+        assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     }
 
     #[test]
@@ -20461,7 +21691,7 @@ diff --git a/src/github.rs b/src/github.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("reactions: ❤️ 1  👀 1  react"));
+        assert!(rendered.contains("reactions: ❤️ 1  👀 1  + react"));
         assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     }
 
@@ -20677,7 +21907,7 @@ diff --git a/src/github.rs b/src/github.rs
             Some(DetailAction::ToggleCommentExpanded(0))
         );
 
-        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0), None);
+        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0), None, None);
         let expanded = build_details_document(&app, 120)
             .lines
             .iter()
@@ -20890,7 +22120,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::EditComment(0), None);
+        app.handle_detail_action(DetailAction::EditComment(0), None, None);
 
         let dialog = app.comment_dialog.expect("edit dialog");
         assert_eq!(
@@ -20913,7 +22143,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![comment("alice", "Quoted body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::ReplyComment(0), None);
+        app.handle_detail_action(DetailAction::ReplyComment(0), None, None);
 
         let dialog = app.comment_dialog.expect("reply dialog");
         assert_eq!(
@@ -20939,7 +22169,7 @@ diff --git a/src/github.rs b/src/github.rs
             .position(|line| line.to_string().contains("assignees: -"))
             .expect("empty assignee row");
         let empty_line = document.lines[assignee_line].to_string();
-        let assign_column = empty_line.find("+ assign").expect("assign action") as u16;
+        let assign_column = empty_line.find("@ assign").expect("assign action") as u16;
         assert!(!empty_line.contains("- unassign"));
         assert_eq!(
             document.action_at(assignee_line, assign_column),
@@ -20956,7 +22186,7 @@ diff --git a/src/github.rs b/src/github.rs
             .expect("assignee row");
         let assign_column = document.lines[assignee_line]
             .to_string()
-            .find("+ assign")
+            .find("@ assign")
             .expect("assign action") as u16;
         let unassign_column = document.lines[assignee_line]
             .to_string()
@@ -20974,7 +22204,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn plus_and_minus_open_assignee_dialogs() {
+    fn at_and_minus_open_assignee_dialogs() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -20982,7 +22212,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('+')),
+            key(KeyCode::Char('@')),
             &config,
             &store,
             &tx
@@ -21022,7 +22252,7 @@ diff --git a/src/github.rs b/src/github.rs
     #[test]
     fn assignee_dialog_enter_submits_parsed_logins() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.start_assignee_dialog(AssigneeAction::Assign);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
         app.assignee_dialog.as_mut().unwrap().input = "@alice, bob alice".to_string();
         let mut submitted = None;
 
@@ -21046,9 +22276,190 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn assignee_dialog_enter_uses_prefix_candidate_for_last_login() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        let dialog = app.assignee_dialog.as_mut().expect("dialog");
+        dialog.input = "alice, bo".to_string();
+        dialog.suggestions = vec!["bob".to_string(), "bobby".to_string(), "carol".to_string()];
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_dialog_can_cycle_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        let dialog = app.assignee_dialog.as_mut().expect("dialog");
+        dialog.input = "bo".to_string();
+        dialog.suggestions = vec!["bob".to_string(), "bobby".to_string()];
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(key(KeyCode::Down), |_, _, _| {});
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["bobby".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_unassign_dialog_defaults_to_the_only_current_assignee() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].assignees = vec!["chenyukang".to_string()];
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert!(app.assignee_action_running);
+        assert_eq!(app.status, "removing assignee");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Unassign,
+                vec!["chenyukang".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn unassign_dialog_uses_current_assignees_as_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].assignees = vec!["alice".to_string(), "bob".to_string()];
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
+        app.assignee_dialog.as_mut().unwrap().input = "bo".to_string();
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Unassign,
+                vec!["bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_suggestions_loaded_updates_active_assign_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["alice".to_string(), "bob".to_string()]),
+        });
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["alice", "bob"]);
+        assert_eq!(
+            app.assignee_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["alice".to_string(), "bob".to_string()])
+        );
+        assert_eq!(app.status, "assignee candidates loaded");
+    }
+
+    #[test]
+    fn assignee_dialog_uses_cached_candidates_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-user".to_string(), "chenyukang".to_string()],
+        );
+
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-user", "chenyukang"]);
+    }
+
+    #[test]
+    fn assignee_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["alice".to_string()]),
+        });
+
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(
+            app.assignee_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["alice".to_string()])
+        );
+    }
+
+    #[test]
+    fn assignee_suggestion_refresh_error_keeps_cached_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-user".to_string()],
+        );
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-user"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(
+            app.status,
+            "assignee candidates refresh failed; using cache"
+        );
+    }
+
+    #[test]
     fn assignee_update_success_refreshes_item_state() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.start_assignee_dialog(AssigneeAction::Assign);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
         app.assignee_action_running = true;
         let mut updated = app.current_item().cloned().expect("item");
         updated.assignees = vec!["alice".to_string()];
@@ -21075,7 +22486,7 @@ diff --git a/src/github.rs b/src/github.rs
     #[test]
     fn assignee_update_failure_opens_message_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.start_assignee_dialog(AssigneeAction::Unassign);
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
         app.assignee_action_running = true;
 
         app.handle_msg(AppMsg::AssigneesUpdated {
@@ -21287,6 +22698,59 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn label_dialog_uses_cached_suggestions_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.label_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["T-compiler".to_string(), "A-diagnostics".to_string()],
+        );
+
+        app.start_add_label_dialog(None);
+
+        let dialog = app.label_dialog.as_ref().expect("label dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["T-compiler", "A-diagnostics"]);
+    }
+
+    #[test]
+    fn label_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::LabelSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["bug".to_string()]),
+        });
+
+        assert!(app.label_dialog.is_none());
+        assert_eq!(
+            app.label_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["bug".to_string()])
+        );
+    }
+
+    #[test]
+    fn label_suggestion_refresh_error_keeps_cached_suggestions() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.label_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-label".to_string()],
+        );
+        app.start_add_label_dialog(None);
+        app.label_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::LabelSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.label_dialog.as_ref().expect("label dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-label"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(app.status, "label suggestions refresh failed; using cache");
+    }
+
+    #[test]
     fn issue_label_input_parses_comma_separated_labels() {
         assert_eq!(
             parse_issue_labels("bug, needs review, bug, , T-compiler"),
@@ -21409,7 +22873,11 @@ diff --git a/src/github.rs b/src/github.rs
     fn remove_label_action_opens_confirmation_and_updates_local_item() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
-        app.handle_detail_action(DetailAction::RemoveLabel("T-compiler".to_string()), None);
+        app.handle_detail_action(
+            DetailAction::RemoveLabel("T-compiler".to_string()),
+            None,
+            None,
+        );
         assert_eq!(
             app.label_dialog.as_ref().map(|dialog| &dialog.mode),
             Some(&LabelDialogMode::Remove {
@@ -22055,6 +23523,135 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn reviewer_dialog_uses_cached_candidates_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.reviewer_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["chenyukang".to_string(), "reviewer-b".to_string()],
+        );
+
+        app.start_reviewer_dialog(ReviewerAction::Request);
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["chenyukang", "reviewer-b"]);
+    }
+
+    #[test]
+    fn reviewer_dialog_falls_back_to_assignee_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["assignable-user".to_string()],
+        );
+
+        app.start_reviewer_dialog(ReviewerAction::Request);
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert_eq!(dialog.suggestions, vec!["assignable-user"]);
+    }
+
+    #[test]
+    fn reviewer_dialog_enter_uses_prefix_candidate_for_last_login() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        let dialog = app.reviewer_dialog.as_mut().expect("reviewer dialog");
+        dialog.input = "alice, ch".to_string();
+        dialog.suggestions = vec![
+            "bob".to_string(),
+            "chenyukang".to_string(),
+            "chris".to_string(),
+        ];
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["alice".to_string(), "chenyukang".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_dialog_can_cycle_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        let dialog = app.reviewer_dialog.as_mut().expect("reviewer dialog");
+        dialog.input = "ch".to_string();
+        dialog.suggestions = vec![
+            "chenyukang".to_string(),
+            "chris".to_string(),
+            "reviewer".to_string(),
+        ];
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(key(KeyCode::Down), |_, _, _| {});
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["chris".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::ReviewerSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["chenyukang".to_string()]),
+        });
+
+        assert!(app.reviewer_dialog.is_none());
+        assert_eq!(
+            app.reviewer_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["chenyukang".to_string()])
+        );
+    }
+
+    #[test]
+    fn reviewer_suggestion_refresh_error_keeps_cached_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.reviewer_suggestions_cache
+            .insert("rust-lang/rust".to_string(), vec!["chenyukang".to_string()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::ReviewerSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["chenyukang"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(
+            app.status,
+            "reviewer candidates refresh failed; using cache"
+        );
+    }
+
+    #[test]
     fn reviewer_dialog_empty_input_stays_open() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_reviewer_dialog(ReviewerAction::Remove);
@@ -22125,7 +23722,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(app.reviewer_dialog.is_none());
         assert!(!app.reviewer_action_running);
         assert!(app.details_stale.contains("1"));
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loading)
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         assert_eq!(app.status, "requested review from alice; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Reviewers Requested");
@@ -23068,7 +24669,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.pr_action_running);
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
         assert!(app.details_stale.contains("1"));
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         assert_eq!(app.status, "pull request auto-merge enabled; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Auto-Merge Enabled");
@@ -23110,7 +24715,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.pr_action_running);
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
         assert!(app.details_stale.contains("1"));
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         assert!(!app.diffs.contains_key("1"));
         assert_eq!(
             app.status,
@@ -23173,7 +24782,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.pr_action_running);
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
         assert_eq!(app.sections[0].items[0].extra, None);
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         assert!(app.details_stale.contains("1"));
         assert_eq!(app.status, "pull request marked ready; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
@@ -24052,6 +25665,21 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn comment_dialog_cursor_uses_display_width_for_chinese_input() {
+        let area = Rect::new(10, 5, 30, 10);
+
+        assert_eq!(
+            comment_dialog_cursor_position("你好", 0, area, 28, 6),
+            Some(Position::new(15, 6))
+        );
+        assert_eq!(comment_dialog_body_lines("你好ab", 5), vec!["你好a", "b"]);
+        assert_eq!(
+            comment_dialog_cursor_position("你好ab", 0, area, 5, 6),
+            Some(Position::new(12, 7))
+        );
+    }
+
+    #[test]
     fn comment_dialog_cursor_is_hidden_when_scrolled_away_from_input() {
         let body = (1..=80)
             .map(|line| format!("line {line}"))
@@ -24069,6 +25697,24 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             comment_dialog_cursor_position("abcde", 0, area, 5, 6),
             Some(Position::new(11, 7))
+        );
+    }
+
+    #[test]
+    fn issue_dialog_single_line_cursor_uses_display_width_for_chinese_input() {
+        let dialog = IssueDialog {
+            repo: "rust-lang/rust".to_string(),
+            title: "中文".to_string(),
+            labels: "标签".to_string(),
+            body: String::new(),
+            field: IssueDialogField::Title,
+            body_scroll: 0,
+        };
+        let area = Rect::new(10, 5, 80, 22);
+
+        assert_eq!(
+            issue_dialog_cursor_position(&dialog, 0, area, 78, 12),
+            Some(Position::new(22, 8))
         );
     }
 
@@ -25746,6 +27392,15 @@ diff --git a/d.rs b/d.rs
         text: &str,
         expected_action: DetailAction,
     ) {
+        assert_document_action_for_text_on_line(document, text, text, expected_action);
+    }
+
+    fn assert_document_action_for_text_on_line(
+        document: &DetailsDocument,
+        line_text: &str,
+        text: &str,
+        expected_action: DetailAction,
+    ) {
         let rendered = document
             .lines
             .iter()
@@ -25753,9 +27408,11 @@ diff --git a/d.rs b/d.rs
             .collect::<Vec<_>>();
         let line_index = rendered
             .iter()
-            .position(|line| line.contains(text))
+            .position(|line| line.contains(line_text))
             .expect("action text line");
-        let column = rendered[line_index].find(text).expect("action text column") as u16;
+        let column = display_width(
+            &rendered[line_index][..rendered[line_index].find(text).expect("action text column")],
+        ) as u16;
         assert_eq!(
             document.action_at(line_index, column),
             Some(expected_action)

@@ -147,6 +147,11 @@ struct RepositoryLabelRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct RepositoryAssigneeRaw {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRepositoryRaw {
     name_with_owner: String,
@@ -1274,6 +1279,24 @@ pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
     .with_context(|| format!("failed to fetch labels for {repository}"))?;
     parse_repository_labels_output(&output)
         .with_context(|| format!("failed to parse labels for {repository}"))
+}
+
+pub async fn fetch_repository_assignees(repository: &str) -> Result<Vec<String>> {
+    let path = format!("repos/{repository}/assignees");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+        "-f".to_string(),
+        "per_page=100".to_string(),
+    ])
+    .await
+    .with_context(|| format!("failed to fetch assignees for {repository}"))?;
+    parse_repository_assignees_output(&output)
+        .with_context(|| format!("failed to parse assignees for {repository}"))
 }
 
 pub async fn add_issue_label(repository: &str, number: u64, label: &str) -> Result<()> {
@@ -3024,6 +3047,20 @@ fn parse_repository_labels_output(output: &str) -> Result<Vec<String>> {
     Ok(labels)
 }
 
+fn parse_repository_assignees_output(output: &str) -> Result<Vec<String>> {
+    let pages = serde_json::from_str::<Vec<Vec<RepositoryAssigneeRaw>>>(output)
+        .context("failed to parse paginated repository assignees")?;
+    let mut assignees = pages
+        .into_iter()
+        .flatten()
+        .map(|assignee| assignee.login.trim().to_string())
+        .filter(|assignee| !assignee.is_empty())
+        .collect::<Vec<_>>();
+    assignees.sort_by_key(|assignee| assignee.to_ascii_lowercase());
+    assignees.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(assignees)
+}
+
 fn percent_encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -3526,6 +3563,19 @@ mod tests {
         assert_eq!(
             parse_repository_labels_output(output).unwrap(),
             vec!["bug", "enhancement", "T-compiler"]
+        );
+    }
+
+    #[test]
+    fn paginated_repository_assignees_are_sorted_and_deduped() {
+        let output = r#"[
+          [{"login": "Bob"}, {"login": "alice"}],
+          [{"login": "ALICE"}, {"login": "chenyukang"}]
+        ]"#;
+
+        assert_eq!(
+            parse_repository_assignees_output(output).unwrap(),
+            vec!["alice", "Bob", "chenyukang"]
         );
     }
 

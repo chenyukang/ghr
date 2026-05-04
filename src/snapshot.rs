@@ -8,6 +8,13 @@ use rusqlite::{Connection, params};
 
 use crate::model::{SectionKind, SectionSnapshot, mark_notification_read_in_section};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoCandidateCache {
+    pub labels: HashMap<String, Vec<String>>,
+    pub assignees: HashMap<String, Vec<String>>,
+    pub reviewers: HashMap<String, Vec<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     path: PathBuf,
@@ -33,6 +40,13 @@ impl SnapshotStore {
                 page INTEGER NOT NULL DEFAULT 1,
                 page_size INTEGER NOT NULL DEFAULT 0,
                 refreshed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS repo_candidate_cache (
+                repo TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                values_json TEXT NOT NULL,
+                refreshed_at TEXT NOT NULL,
+                PRIMARY KEY (repo, kind)
             );
             "#,
         )
@@ -100,6 +114,56 @@ impl SnapshotStore {
         Ok(sections)
     }
 
+    pub fn load_repo_candidate_cache(&self) -> Result<RepoCandidateCache> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT repo, kind, values_json
+                FROM repo_candidate_cache
+                "#,
+            )
+            .context("failed to prepare repo candidate cache load")?;
+
+        let mut rows = stmt
+            .query([])
+            .context("failed to load repo candidate cache")?;
+        let mut cache = RepoCandidateCache::default();
+        while let Some(row) = rows.next().context("failed to read candidate cache row")? {
+            let repo: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let values_json: String = row.get(2)?;
+            let values = serde_json::from_str(&values_json)
+                .with_context(|| format!("failed to parse cached {kind} candidates for {repo}"))?;
+            match kind.as_str() {
+                "labels" => {
+                    cache.labels.insert(repo, values);
+                }
+                "assignees" => {
+                    cache.assignees.insert(repo, values);
+                }
+                "reviewers" => {
+                    cache.reviewers.insert(repo, values);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(cache)
+    }
+
+    pub fn save_label_candidates(&self, repo: &str, labels: &[String]) -> Result<()> {
+        self.save_repo_candidates(repo, "labels", labels)
+    }
+
+    pub fn save_assignee_candidates(&self, repo: &str, assignees: &[String]) -> Result<()> {
+        self.save_repo_candidates(repo, "assignees", assignees)
+    }
+
+    pub fn save_reviewer_candidates(&self, repo: &str, reviewers: &[String]) -> Result<()> {
+        self.save_repo_candidates(repo, "reviewers", reviewers)
+    }
+
     pub fn save_section(&self, section: &SectionSnapshot) -> Result<()> {
         let Some(refreshed_at) = section.refreshed_at else {
             return Ok(());
@@ -149,6 +213,25 @@ impl SnapshotStore {
             }
         }
         Ok(changed)
+    }
+
+    fn save_repo_candidates(&self, repo: &str, kind: &str, values: &[String]) -> Result<()> {
+        let conn = self.connect()?;
+        let values_json = serde_json::to_string(values)
+            .with_context(|| format!("failed to encode cached {kind} candidates for {repo}"))?;
+        conn.execute(
+            r#"
+            INSERT INTO repo_candidate_cache (repo, kind, values_json, refreshed_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(repo, kind) DO UPDATE SET
+                values_json = excluded.values_json,
+                refreshed_at = excluded.refreshed_at
+            "#,
+            params![repo, kind, values_json, Utc::now().to_rfc3339()],
+        )
+        .with_context(|| format!("failed to save cached {kind} candidates for {repo}"))?;
+
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -243,6 +326,78 @@ mod tests {
         assert_eq!(all.items[0].unread, Some(false));
 
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn repo_candidate_cache_round_trips_and_updates() {
+        let path = temp_db_path("repo-candidate-cache");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        store
+            .save_label_candidates(
+                "rust-lang/rust",
+                &["T-compiler".to_string(), "A-diagnostics".to_string()],
+            )
+            .expect("save label candidates");
+        store
+            .save_assignee_candidates(
+                "rust-lang/rust",
+                &["rustbot".to_string(), "compiler-errors".to_string()],
+            )
+            .expect("save assignee candidates");
+        store
+            .save_reviewer_candidates(
+                "rust-lang/rust",
+                &["reviewer-a".to_string(), "reviewer-b".to_string()],
+            )
+            .expect("save reviewer candidates");
+
+        let cache = store
+            .load_repo_candidate_cache()
+            .expect("load repo candidate cache");
+        assert_eq!(
+            cache.labels.get("rust-lang/rust"),
+            Some(&vec!["T-compiler".to_string(), "A-diagnostics".to_string()])
+        );
+        assert_eq!(
+            cache.assignees.get("rust-lang/rust"),
+            Some(&vec!["rustbot".to_string(), "compiler-errors".to_string()])
+        );
+        assert_eq!(
+            cache.reviewers.get("rust-lang/rust"),
+            Some(&vec!["reviewer-a".to_string(), "reviewer-b".to_string()])
+        );
+
+        store
+            .save_label_candidates("rust-lang/rust", &["T-rustdoc".to_string()])
+            .expect("update label candidates");
+        let cache = store
+            .load_repo_candidate_cache()
+            .expect("reload repo candidate cache");
+        assert_eq!(
+            cache.labels.get("rust-lang/rust"),
+            Some(&vec!["T-rustdoc".to_string()])
+        );
+
+        remove_db_files(&path);
+    }
+
+    fn temp_db_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ghr-{prefix}-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
+    }
+
+    fn remove_db_files(path: &PathBuf) {
+        let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
     }

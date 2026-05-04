@@ -54,7 +54,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+L` | Open the command palette and fuzzy search every shortcut |
+| `:` | Open the command palette and fuzzy search every shortcut |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Move within the focused tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
@@ -74,7 +74,8 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `a` | Add a normal issue or PR comment |
 | `L` | Add a label to the selected issue or PR; type a prefix and choose from repo labels |
 | `N` | Create an issue in the current repo; edit repo, title, labels, and body |
-| `+` / `-` | Assign or unassign assignees on the selected issue or PR |
+| `+` | Add a reaction to the selected issue, PR, or focused comment |
+| `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment when it is yours; in diff mode, end a review range |
@@ -180,6 +181,7 @@ issue_labels = ["E-easy"]
 
 [defaults]
 view = "pull_requests"
+command_palette_key = ":"
 pr_per_page = 50
 issue_per_page = 50
 notification_limit = 50
@@ -206,6 +208,8 @@ Use `filters` for a single GitHub search query. Use `queries` when a section sho
 Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`. Repo tabs default to open PRs and open issues. Set `labels` to filter both repo PR and issue lists, or use `pr_labels` / `issue_labels` for kind-specific filters.
 
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a runtime repo tab if it is not already configured. This does not write back to `config.toml`.
+
+Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

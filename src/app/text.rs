@@ -25,19 +25,26 @@ pub(super) fn truncate_text(text: &str, max_chars: usize) -> String {
     truncated
 }
 
-pub(super) fn truncate_inline(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+pub(super) fn truncate_inline(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
         return text.to_string();
     }
 
-    if max_chars <= 3 {
-        return "...".chars().take(max_chars).collect();
+    if max_width <= 3 {
+        return ".".repeat(max_width);
     }
 
-    let mut truncated = text
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>();
+    let mut truncated = String::new();
+    let mut width = 0_usize;
+    let limit = max_width.saturating_sub(3);
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if width.saturating_add(char_width) > limit {
+            break;
+        }
+        truncated.push(ch);
+        width = width.saturating_add(char_width);
+    }
     truncated.push_str("...");
     truncated
 }

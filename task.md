@@ -43,7 +43,7 @@ review.
 | Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Later wave | Todo | - | Existing merge confirmation should expose method selection. |
 | Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Later wave | Todo | - | Existing approve and inline comment flows are a starting point. |
 | Rerun failed checks | `codex/pr-rerun-checks` | Later wave | Todo | - | Needs check-suite/job discovery and a safe rerun action. |
-| Checkout PR locally | `codex/pr-checkout-local` | Cicero | In progress | - | Should run a local checkout command with a clear confirmation/status. |
+| Checkout PR locally | `codex/pr-checkout-local` | Cicero | In review | [#19](https://github.com/chenyukang/ghr/pull/19) | Should run a local checkout command with a clear confirmation/status. |
 
 ## Agent queue
 
@@ -57,4 +57,4 @@ review.
 | Hegel | Change milestone | `~/.codex/worktrees/ghr-milestone-actions` | `codex/milestone-actions` | In progress |
 | Hooke | Quick state/search filters | `~/.codex/worktrees/ghr-search-filter-shortcuts` | `codex/search-filter-shortcuts` | In progress |
 | Boyle | Update PR branch | `~/.codex/worktrees/ghr-pr-update-branch` | `codex/pr-update-branch` | In review: [#18](https://github.com/chenyukang/ghr/pull/18) |
-| Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In progress |
+| Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In review: [#19](https://github.com/chenyukang/ghr/pull/19) |

@@ -323,21 +323,22 @@ pub fn configured_sections(config: &Config) -> Vec<SectionSnapshot> {
         }
 
         let view = repo_view_key(&repo.name);
-        let filters = repo_section_filters(&repo.repo);
         if repo.show_prs {
+            let labels = repo.label_filters(SectionKind::PullRequests);
             sections.push(SectionSnapshot::empty_for_view(
                 &view,
                 SectionKind::PullRequests,
                 "Pull Requests",
-                filters.clone(),
+                repo_section_filters_with_labels(&repo.repo, &labels),
             ));
         }
         if repo.show_issues {
+            let labels = repo.label_filters(SectionKind::Issues);
             sections.push(SectionSnapshot::empty_for_view(
                 &view,
                 SectionKind::Issues,
                 "Issues",
-                filters.clone(),
+                repo_section_filters_with_labels(&repo.repo, &labels),
             ));
         }
     }
@@ -345,8 +346,25 @@ pub fn configured_sections(config: &Config) -> Vec<SectionSnapshot> {
     sections
 }
 
-pub fn repo_section_filters(repo: &str) -> String {
-    format!("repo:{repo} is:open archived:false sort:created-desc")
+pub fn repo_section_filters_with_labels(repo: &str, labels: &[String]) -> String {
+    let mut tokens = vec![
+        format!("repo:{repo}"),
+        "is:open".to_string(),
+        "archived:false".to_string(),
+    ];
+    tokens.extend(labels.iter().filter_map(|label| label_filter(label)));
+    tokens.push("sort:created-desc".to_string());
+    tokens.join(" ")
+}
+
+fn label_filter(label: &str) -> Option<String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+
+    let escaped = label.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("label:\"{escaped}\""))
 }
 
 pub fn merge_cached_sections(
@@ -468,6 +486,9 @@ mod tests {
             local_dir: None,
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
 
         let sections = configured_sections(&config);
@@ -483,6 +504,53 @@ mod tests {
         assert_eq!(
             repo_sections[0].filters,
             "repo:nervosnetwork/fiber is:open archived:false sort:created-desc"
+        );
+    }
+
+    #[test]
+    fn repo_sections_apply_common_and_kind_specific_label_filters() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "rust".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: vec!["T-compiler".to_string()],
+            pr_labels: vec!["S-waiting-on-review".to_string()],
+            issue_labels: vec!["E-easy".to_string()],
+        });
+
+        let sections = configured_sections(&config);
+        let repo_sections = sections
+            .iter()
+            .filter(|section| section_view_key(section) == "repo:rust")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            repo_sections[0].filters,
+            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"S-waiting-on-review\" sort:created-desc"
+        );
+        assert_eq!(
+            repo_sections[1].filters,
+            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"E-easy\" sort:created-desc"
+        );
+    }
+
+    #[test]
+    fn repo_section_label_filters_trim_skip_and_quote_labels() {
+        let filters = repo_section_filters_with_labels(
+            "rust-lang/rust",
+            &[
+                " T-compiler ".to_string(),
+                "good first issue".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(
+            filters,
+            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"good first issue\" sort:created-desc"
         );
     }
 

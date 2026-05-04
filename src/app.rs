@@ -24302,6 +24302,9 @@ diff --git a/src/github.rs b/src/github.rs
             local_dir: None,
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         config.repos.push(crate::config::RepoConfig {
             name: "Fiber".to_string(),
@@ -24309,6 +24312,9 @@ diff --git a/src/github.rs b/src/github.rs
             local_dir: None,
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         let app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
 
@@ -25602,6 +25608,9 @@ diff --git a/d.rs b/d.rs
             local_dir: Some(local_dir.display().to_string()),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         config
     }

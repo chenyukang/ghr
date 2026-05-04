@@ -174,6 +174,9 @@ name = "Rust"
 repo = "rust-lang/rust"
 show_prs = true
 show_issues = true
+labels = ["T-compiler"]
+pr_labels = ["S-waiting-on-review"]
+issue_labels = ["E-easy"]
 
 [defaults]
 view = "pull_requests"
@@ -198,9 +201,9 @@ queries = [
 exclude_repos = ["some-org/archive-*"]
 ```
 
-Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list.
+Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:updated-desc"` or `label:"good first issue"` for labels with spaces.
 
-Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`. Repo tabs default to open PRs and open issues.
+Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`. Repo tabs default to open PRs and open issues. Set `labels` to filter both repo PR and issue lists, or use `pr_labels` / `issue_labels` for kind-specific filters.
 
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a runtime repo tab if it is not already configured. This does not write back to `config.toml`.
 

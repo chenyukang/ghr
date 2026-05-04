@@ -16,7 +16,8 @@ use crate::config::{Config, SearchSection};
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
     PullRequestBranch, ReactionSummary, ReviewCommentPreview, SectionKind, SectionSnapshot,
-    WorkItem, builtin_view_key, global_search_view_key, repo_section_filters, repo_view_key,
+    WorkItem, builtin_view_key, global_search_view_key, repo_section_filters_with_labels,
+    repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -572,12 +573,12 @@ async fn refresh_search_sections(
         }
 
         let view = repo_view_key(&repo.name);
-        let filters = repo_section_filters(&repo.repo);
         if repo.show_prs {
             let limit = config.defaults.pr_per_page;
+            let labels = repo.label_filters(SectionKind::PullRequests);
             let section = SearchSection {
                 title: "Pull Requests".to_string(),
-                filters: filters.clone(),
+                filters: repo_section_filters_with_labels(&repo.repo, &labels),
                 queries: Vec::new(),
                 limit: None,
             };
@@ -591,9 +592,10 @@ async fn refresh_search_sections(
 
         if repo.show_issues {
             let limit = config.defaults.issue_per_page;
+            let labels = repo.label_filters(SectionKind::Issues);
             let section = SearchSection {
                 title: "Issues".to_string(),
-                filters: filters.clone(),
+                filters: repo_section_filters_with_labels(&repo.repo, &labels),
                 queries: Vec::new(),
                 limit: None,
             };
@@ -3357,6 +3359,36 @@ mod tests {
                 "repos/owner/repo/issues/42/assignees",
                 "-f",
                 "assignees[]=alice",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_page_args_preserve_label_filters() {
+        let args = search_page_args(
+            SectionKind::PullRequests,
+            "repo:rust-lang/rust is:open label:\"good first issue\" sort:updated-desc",
+            1,
+            50,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "--method",
+                "GET",
+                "search/issues",
+                "-f",
+                "q=is:pr repo:rust-lang/rust is:open label:\"good first issue\"",
+                "-f",
+                "per_page=50",
+                "-f",
+                "page=1",
+                "-f",
+                "sort=updated",
+                "-f",
+                "order=desc"
             ]
         );
     }

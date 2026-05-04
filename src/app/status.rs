@@ -2,8 +2,9 @@ use std::time::Instant;
 
 use super::{
     MessageDialog, MessageDialogKind, PendingCommentMode, PrAction, ReviewerAction,
-    SUCCESS_DIALOG_AUTO_CLOSE, SetupDialog, text::truncate_inline,
+    SUCCESS_DIALOG_AUTO_CLOSE, SetupDialog, item_kind_label, text::truncate_inline,
 };
+use crate::model::ItemKind;
 
 pub(super) fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
     let Some(first_error) = first_error else {
@@ -102,10 +103,13 @@ fn info_message_dialog(title: impl Into<String>, body: impl Into<String>) -> Mes
     }
 }
 
-pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
+pub(super) fn pr_action_success_title(action: PrAction, item_kind: ItemKind) -> String {
     match action {
         PrAction::Merge => "Pull Request Merged",
+        PrAction::Close if item_kind == ItemKind::Issue => "Issue Closed",
         PrAction::Close => "Pull Request Closed",
+        PrAction::Reopen if item_kind == ItemKind::Issue => "Issue Reopened",
+        PrAction::Reopen => "Pull Request Reopened",
         PrAction::Approve => "Pull Request Approved",
         PrAction::EnableAutoMerge => "Auto-Merge Enabled",
         PrAction::DisableAutoMerge => "Auto-Merge Disabled",
@@ -115,12 +119,14 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::ConvertToDraft => "Pull Request Converted to Draft",
         PrAction::MarkReadyForReview => "Pull Request Ready for Review",
     }
+    .to_string()
 }
 
-pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
+pub(super) fn pr_action_success_body(action: PrAction, _item_kind: ItemKind) -> String {
     match action {
         PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
+        PrAction::Reopen => "GitHub accepted the reopen action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
         PrAction::EnableAutoMerge => "GitHub enabled auto-merge. Refreshing details.",
         PrAction::DisableAutoMerge => "GitHub disabled auto-merge. Refreshing details.",
@@ -136,12 +142,14 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
             "GitHub marked the pull request ready for review. Refreshing details."
         }
     }
+    .to_string()
 }
 
-pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
+pub(super) fn pr_action_error_title(action: PrAction, _item_kind: ItemKind) -> String {
     match action {
         PrAction::Merge => "Merge Failed",
         PrAction::Close => "Close Failed",
+        PrAction::Reopen => "Reopen Failed",
         PrAction::Approve => "Approve Failed",
         PrAction::EnableAutoMerge => "Enable Auto-Merge Failed",
         PrAction::DisableAutoMerge => "Disable Auto-Merge Failed",
@@ -151,20 +159,23 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::ConvertToDraft => "Convert to Draft Failed",
         PrAction::MarkReadyForReview => "Ready for Review Failed",
     }
+    .to_string()
 }
 
-pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
+pub(super) fn pr_action_error_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
     match action {
-        PrAction::Merge => "pull request merge failed",
-        PrAction::Close => "pull request close failed",
-        PrAction::Approve => "pull request approval failed",
-        PrAction::EnableAutoMerge => "pull request auto-merge enable failed",
-        PrAction::DisableAutoMerge => "pull request auto-merge disable failed",
-        PrAction::Checkout => "pull request checkout failed",
-        PrAction::RerunFailedChecks => "failed check rerun failed",
-        PrAction::UpdateBranch => "pull request branch update failed",
-        PrAction::ConvertToDraft => "pull request draft conversion failed",
-        PrAction::MarkReadyForReview => "pull request ready-for-review failed",
+        PrAction::Merge => "pull request merge failed".to_string(),
+        PrAction::Close => format!("{label} close failed"),
+        PrAction::Reopen => format!("{label} reopen failed"),
+        PrAction::Approve => "pull request approval failed".to_string(),
+        PrAction::EnableAutoMerge => "pull request auto-merge enable failed".to_string(),
+        PrAction::DisableAutoMerge => "pull request auto-merge disable failed".to_string(),
+        PrAction::Checkout => "pull request checkout failed".to_string(),
+        PrAction::RerunFailedChecks => "failed check rerun failed".to_string(),
+        PrAction::UpdateBranch => "pull request branch update failed".to_string(),
+        PrAction::ConvertToDraft => "pull request draft conversion failed".to_string(),
+        PrAction::MarkReadyForReview => "pull request ready-for-review failed".to_string(),
     }
 }
 

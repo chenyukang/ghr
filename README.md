@@ -23,7 +23,7 @@
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
-- Comment, reply, edit, milestone, merge, close, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
+- Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Unread notification handling with local cache updates and GitHub read-state sync.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
@@ -81,7 +81,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `T` | Edit the selected issue or PR title/body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
-| `C` | Open a close confirmation for the selected PR |
+| `C` | Open a close or reopen confirmation for the selected issue or PR |
 | `X` | Open a confirmation to run `gh pr checkout <number> --repo <owner/repo>` from the matching local checkout |
 | `F` | Rerun failed checks for the selected PR |
 | `U` | Open an update-branch confirmation for the selected PR |
@@ -96,7 +96,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `P` | Request or re-request PR reviewers with comma-separated logins |
 | `Y` | Remove pending PR review requests with comma-separated logins |
 | `t` | Change or clear the selected issue/PR milestone |
-| `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
+| `y` / `Enter` | Confirm the current action in the confirmation dialog |
 | `Enter` in Reviewer Action | Submit the reviewer login list |
 | `Ctrl+Enter` | Send or update a comment/title/body from the editor dialog |
 | `Ctrl+Enter` in issue dialog | Create the issue |

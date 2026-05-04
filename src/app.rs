@@ -35,7 +35,7 @@ use crate::github::{
     AssigneeAction, CommentFetchResult, ItemMetadataUpdate, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
-    approve_pull_request, change_issue_milestone, close_pull_request,
+    approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
     convert_pull_request_to_draft, create_issue, create_pending_pull_request_review,
     disable_pull_request_auto_merge, discard_pending_pull_request_review, edit_issue_comment,
     edit_item_metadata, edit_pull_request_review_comment, enable_pull_request_auto_merge,
@@ -44,10 +44,10 @@ use crate::github::{
     mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
-    remove_pull_request_reviewers, request_pull_request_reviewers,
-    rerun_failed_pull_request_checks, search_global, submit_pending_pull_request_review,
-    submit_pull_request_review, update_issue_assignees, update_pull_request_branch,
-    with_background_github_priority,
+    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
+    submit_pending_pull_request_review, submit_pull_request_review, update_issue_assignees,
+    update_pull_request_branch, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
@@ -158,6 +158,7 @@ enum AppMsg {
     },
     PrActionFinished {
         item_id: String,
+        item_kind: ItemKind,
         action: PrAction,
         merge_method: Option<MergeMethod>,
         result: std::result::Result<(), String>,
@@ -537,6 +538,7 @@ struct ItemEditDialog {
 enum PrAction {
     Merge,
     Close,
+    Reopen,
     #[allow(dead_code)]
     Approve,
     EnableAutoMerge,
@@ -684,6 +686,91 @@ struct ReviewerDialog {
     item: WorkItem,
     action: ReviewerAction,
     input: String,
+}
+
+fn item_kind_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "pull request",
+        ItemKind::Notification => "notification",
+    }
+}
+
+fn item_kind_confirmation_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "PR",
+        ItemKind::Notification => "item",
+    }
+}
+
+fn pr_action_success_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "pull request merged; refreshing".to_string(),
+        PrAction::Close => format!("{label} closed; refreshing"),
+        PrAction::Reopen => format!("{label} reopened; refreshing"),
+        PrAction::Approve => "pull request approved; refreshing".to_string(),
+        PrAction::EnableAutoMerge => "pull request auto-merge enabled; refreshing".to_string(),
+        PrAction::DisableAutoMerge => "pull request auto-merge disabled; refreshing".to_string(),
+        PrAction::Checkout => "pull request checked out locally".to_string(),
+        PrAction::RerunFailedChecks => "failed checks rerun; refreshing".to_string(),
+        PrAction::UpdateBranch => "pull request branch update accepted; refreshing".to_string(),
+        PrAction::ConvertToDraft => "pull request converted to draft; refreshing".to_string(),
+        PrAction::MarkReadyForReview => "pull request marked ready; refreshing".to_string(),
+    }
+}
+
+fn pr_action_confirm_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "confirm pull request merge".to_string(),
+        PrAction::Close => format!("confirm {label} close"),
+        PrAction::Reopen => format!("confirm {label} reopen"),
+        PrAction::Approve => "confirm pull request approval".to_string(),
+        PrAction::EnableAutoMerge => "confirm pull request auto-merge enable".to_string(),
+        PrAction::DisableAutoMerge => "confirm pull request auto-merge disable".to_string(),
+        PrAction::Checkout => "confirm local pull request checkout".to_string(),
+        PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
+        PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
+        PrAction::ConvertToDraft => "confirm convert pull request to draft".to_string(),
+        PrAction::MarkReadyForReview => "confirm mark pull request ready".to_string(),
+    }
+}
+
+fn pr_action_running_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "merging pull request".to_string(),
+        PrAction::Close => format!("closing {label}"),
+        PrAction::Reopen => format!("reopening {label}"),
+        PrAction::Approve => "approving pull request".to_string(),
+        PrAction::EnableAutoMerge => "enabling pull request auto-merge".to_string(),
+        PrAction::DisableAutoMerge => "disabling pull request auto-merge".to_string(),
+        PrAction::Checkout => "checking out pull request locally".to_string(),
+        PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
+        PrAction::UpdateBranch => "updating pull request branch".to_string(),
+        PrAction::ConvertToDraft => "converting pull request to draft".to_string(),
+        PrAction::MarkReadyForReview => "marking pull request ready for review".to_string(),
+    }
+}
+
+fn close_or_reopen_action_for_item(item: &WorkItem) -> std::result::Result<PrAction, &'static str> {
+    if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        return Err("selected item is not an issue or pull request");
+    }
+    if item.number.is_none() {
+        return Err("selected item has no issue or pull request number");
+    }
+
+    let state = item.state.as_deref().unwrap_or("open").to_ascii_lowercase();
+    match state.as_str() {
+        "closed" => Ok(PrAction::Reopen),
+        "merged" if item.kind == ItemKind::PullRequest => {
+            Err("merged pull requests cannot be reopened")
+        }
+        _ => Ok(PrAction::Close),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2006,6 +2093,7 @@ fn start_pr_action(
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        let item_kind = item.kind;
         if action == PrAction::Checkout {
             let Some(checkout) = checkout else {
                 let _ = tx.send(AppMsg::PrCheckoutFinished {
@@ -2020,44 +2108,85 @@ fn start_pr_action(
 
         let result = match item.number {
             Some(number) => match action {
-                PrAction::Merge => {
+                PrAction::Merge if item.kind == ItemKind::PullRequest => {
                     merge_pull_request(&item.repo, number, merge_method.unwrap_or_default())
                         .await
                         .map_err(|error| error.to_string())
                 }
-                PrAction::Close => close_pull_request(&item.repo, number)
+                PrAction::Close if item.kind == ItemKind::PullRequest => {
+                    close_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Close if item.kind == ItemKind::Issue => close_issue(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
-                PrAction::Approve => approve_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::EnableAutoMerge => enable_pull_request_auto_merge(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::DisableAutoMerge => disable_pull_request_auto_merge(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
+                PrAction::Reopen if item.kind == ItemKind::PullRequest => {
+                    reopen_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Reopen if item.kind == ItemKind::Issue => {
+                    reopen_issue(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Approve if item.kind == ItemKind::PullRequest => {
+                    approve_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::EnableAutoMerge if item.kind == ItemKind::PullRequest => {
+                    enable_pull_request_auto_merge(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::DisableAutoMerge if item.kind == ItemKind::PullRequest => {
+                    disable_pull_request_auto_merge(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
                 PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
-                PrAction::RerunFailedChecks => rerun_failed_pull_request_checks(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::UpdateBranch => update_pull_request_branch(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::ConvertToDraft => convert_pull_request_to_draft(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::MarkReadyForReview => {
+                PrAction::RerunFailedChecks if item.kind == ItemKind::PullRequest => {
+                    rerun_failed_pull_request_checks(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::UpdateBranch if item.kind == ItemKind::PullRequest => {
+                    update_pull_request_branch(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::ConvertToDraft if item.kind == ItemKind::PullRequest => {
+                    convert_pull_request_to_draft(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::MarkReadyForReview if item.kind == ItemKind::PullRequest => {
                     mark_pull_request_ready_for_review(&item.repo, number)
                         .await
                         .map_err(|error| error.to_string())
                 }
+                PrAction::Merge
+                | PrAction::Approve
+                | PrAction::EnableAutoMerge
+                | PrAction::DisableAutoMerge
+                | PrAction::RerunFailedChecks
+                | PrAction::UpdateBranch
+                | PrAction::ConvertToDraft
+                | PrAction::MarkReadyForReview => {
+                    Err("selected item is not a pull request".to_string())
+                }
+                PrAction::Close | PrAction::Reopen => {
+                    Err("selected item is not an issue or pull request".to_string())
+                }
             },
-            None => Err("selected item has no pull request number".to_string()),
+            None => Err("selected item has no issue or pull request number".to_string()),
         };
         let should_refresh = result.is_ok();
         let _ = tx.send(AppMsg::PrActionFinished {
             item_id,
+            item_kind,
             action,
             merge_method,
             result,
@@ -2682,7 +2811,7 @@ fn handle_key_in_area(
             KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
             KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
             KeyCode::Char('D') => app.discard_pending_review(tx),
@@ -2719,7 +2848,7 @@ fn handle_key_in_area(
                 app.start_comment_search()
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
             KeyCode::Char('D') => app.discard_pending_review(tx),
@@ -2881,7 +3010,7 @@ fn handle_diff_file_list_key(
         KeyCode::Char('[') => app.move_diff_file(-1),
         KeyCode::Char(']') => app.move_diff_file(1),
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-        KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+        KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
         KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
         KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
         KeyCode::Char('D') => app.discard_pending_review(tx),
@@ -4276,7 +4405,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4295,7 +4424,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4323,7 +4452,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
@@ -4338,7 +4467,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4783,9 +4912,12 @@ fn draw_pr_action_dialog(
         .number
         .map(|number| format!("#{number}"))
         .unwrap_or_else(|| "-".to_string());
+    let item_label = item_kind_label(dialog.item.kind);
+    let confirm_item_label = item_kind_confirmation_label(dialog.item.kind);
     let action_label = match dialog.action {
         PrAction::Merge => "merge",
         PrAction::Close => "close",
+        PrAction::Reopen => "reopen",
         PrAction::Approve => "approve",
         PrAction::EnableAutoMerge => "enable auto-merge for",
         PrAction::DisableAutoMerge => "disable auto-merge for",
@@ -4797,7 +4929,14 @@ fn draw_pr_action_dialog(
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
-        PrAction::Close => "Close this pull request on GitHub?",
+        PrAction::Close => match dialog.item.kind {
+            ItemKind::Issue => "Close this issue on GitHub?",
+            _ => "Close this pull request on GitHub?",
+        },
+        PrAction::Reopen => match dialog.item.kind {
+            ItemKind::Issue => "Reopen this issue on GitHub?",
+            _ => "Reopen this pull request on GitHub?",
+        },
         PrAction::Approve => "Approve this pull request on GitHub?",
         PrAction::EnableAutoMerge => "Enable auto-merge for this pull request on GitHub?",
         PrAction::DisableAutoMerge => "Disable auto-merge for this pull request on GitHub?",
@@ -4818,13 +4957,13 @@ fn draw_pr_action_dialog(
             dialog.merge_method.label()
         )
     } else {
-        format!("y/Enter: yes, {action_label} PR    Esc: cancel")
+        format!("y/Enter: yes, {action_label} {confirm_item_label}    Esc: cancel")
     };
     let mut lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
-        key_value_line("pull request", number),
+        key_value_line(item_label, number),
         key_value_line("title", dialog.item.title.clone()),
     ];
     if dialog.action == PrAction::Checkout {
@@ -4871,7 +5010,14 @@ fn draw_pr_action_dialog(
         .title(Span::styled(
             match dialog.action {
                 PrAction::Merge => "Merge Pull Request",
-                PrAction::Close => "Close Pull Request",
+                PrAction::Close => match dialog.item.kind {
+                    ItemKind::Issue => "Close Issue",
+                    _ => "Close Pull Request",
+                },
+                PrAction::Reopen => match dialog.item.kind {
+                    ItemKind::Issue => "Reopen Issue",
+                    _ => "Reopen Pull Request",
+                },
                 PrAction::Approve => "Approve Pull Request",
                 PrAction::EnableAutoMerge => "Enable Auto-Merge",
                 PrAction::DisableAutoMerge => "Disable Auto-Merge",
@@ -6832,7 +6978,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("v", "show pull request diff"),
         help_key_line("T", "edit selected issue or PR title/body"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("F", "rerun failed PR checks"),
         help_key_line("U", "open PR update-branch confirmation"),
@@ -6895,7 +7041,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("T", "edit selected issue or PR title/body"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("F", "rerun failed PR checks"),
         help_key_line("U", "open PR update-branch confirmation"),
@@ -6910,15 +7056,15 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Y", "remove pending PR review requests"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
-        help_heading("Pull Request Confirmation"),
+        help_heading("Action Confirmation"),
         help_key_line("m / s / r", "choose merge, squash, or rebase merge method"),
         help_key_line("Tab", "cycle merge method in merge confirmation"),
-        help_key_line("y / Enter", "run the confirmed PR action"),
+        help_key_line("y / Enter", "run the confirmed action"),
         help_key_line(
             "X action",
             "runs gh pr checkout from the matching local checkout",
         ),
-        help_key_line("Esc", "cancel PR action"),
+        help_key_line("Esc", "cancel action"),
         Line::from(""),
         help_heading("Review Summary Editor"),
         help_key_line(
@@ -11617,6 +11763,7 @@ impl AppState {
             }
             AppMsg::PrActionFinished {
                 item_id,
+                item_kind,
                 action,
                 merge_method,
                 result,
@@ -11629,37 +11776,17 @@ impl AppState {
                         self.action_hints.remove(&item_id);
                         self.diffs.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
-                        self.action_hints.remove(&item_id);
-                        self.status = match action {
-                            PrAction::Merge => format!(
+                        self.status = if action == PrAction::Merge {
+                            format!(
                                 "pull request merged using {}; refreshing",
                                 merge_method.unwrap_or_default().label()
-                            ),
-                            PrAction::Close => "pull request closed; refreshing".to_string(),
-                            PrAction::Approve => "pull request approved; refreshing".to_string(),
-                            PrAction::EnableAutoMerge => {
-                                "pull request auto-merge enabled; refreshing".to_string()
-                            }
-                            PrAction::DisableAutoMerge => {
-                                "pull request auto-merge disabled; refreshing".to_string()
-                            }
-                            PrAction::Checkout => "pull request checked out locally".to_string(),
-                            PrAction::RerunFailedChecks => {
-                                "failed checks rerun; refreshing".to_string()
-                            }
-                            PrAction::UpdateBranch => {
-                                "pull request branch update accepted; refreshing".to_string()
-                            }
-                            PrAction::ConvertToDraft => {
-                                "pull request converted to draft; refreshing".to_string()
-                            }
-                            PrAction::MarkReadyForReview => {
-                                "pull request marked ready; refreshing".to_string()
-                            }
+                            )
+                        } else {
+                            pr_action_success_status(action, item_kind)
                         };
                         self.message_dialog = Some(success_message_dialog(
-                            pr_action_success_title(action),
-                            pr_action_success_body(action),
+                            pr_action_success_title(action, item_kind),
+                            pr_action_success_body(action, item_kind),
                         ));
                     }
                     Err(error) => {
@@ -11669,7 +11796,7 @@ impl AppState {
                         }
                         if setup_dialog.is_none() {
                             self.message_dialog = Some(message_dialog(
-                                pr_action_error_title(action),
+                                pr_action_error_title(action, item_kind),
                                 pr_action_error_body(&error),
                             ));
                         } else {
@@ -11681,7 +11808,7 @@ impl AppState {
                                 merge_method.unwrap_or_default().label()
                             )
                         } else {
-                            pr_action_error_status(action).to_string()
+                            pr_action_error_status(action, item_kind)
                         };
                     }
                 }
@@ -11693,7 +11820,7 @@ impl AppState {
                     Ok(result) => {
                         self.status = "pull request checked out locally".to_string();
                         self.message_dialog = Some(persistent_success_message_dialog(
-                            pr_action_success_title(PrAction::Checkout),
+                            pr_action_success_title(PrAction::Checkout, ItemKind::PullRequest),
                             format!(
                                 "{}\n\n{}\n\n{}",
                                 result.command,
@@ -11709,13 +11836,14 @@ impl AppState {
                         }
                         if setup_dialog.is_none() {
                             self.message_dialog = Some(message_dialog(
-                                pr_action_error_title(PrAction::Checkout),
+                                pr_action_error_title(PrAction::Checkout, ItemKind::PullRequest),
                                 pr_action_error_body(&error),
                             ));
                         } else {
                             self.message_dialog = None;
                         }
-                        self.status = pr_action_error_status(PrAction::Checkout).to_string();
+                        self.status =
+                            pr_action_error_status(PrAction::Checkout, ItemKind::PullRequest);
                     }
                 }
             }
@@ -12203,6 +12331,7 @@ impl AppState {
                 match action {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
+                    PrAction::Reopen => item.state = Some("open".to_string()),
                     PrAction::Approve => {}
                     PrAction::EnableAutoMerge => {}
                     PrAction::DisableAutoMerge => {}
@@ -13847,6 +13976,21 @@ impl AppState {
         }
     }
 
+    fn start_close_or_reopen_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        let action = match close_or_reopen_action_for_item(&item) {
+            Ok(action) => action,
+            Err(message) => {
+                self.status = message.to_string();
+                return;
+            }
+        };
+        self.start_item_action_dialog(item, action);
+    }
+
     fn start_pr_action_dialog(&mut self, action: PrAction) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
@@ -13856,6 +14000,10 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        self.start_item_action_dialog(item, action);
+    }
+
+    fn start_item_action_dialog(&mut self, item: WorkItem, action: PrAction) {
         if pr_action_requires_open_pull_request(action) && !item_is_open_pull_request(&item) {
             self.status = "selected pull request is not open".to_string();
             return;
@@ -13868,6 +14016,7 @@ impl AppState {
                 return;
             }
         };
+        let item_kind = item.kind;
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -13888,17 +14037,10 @@ impl AppState {
             merge_method: MergeMethod::default(),
         });
         self.pr_action_running = false;
-        self.status = match action {
-            PrAction::Merge => "confirm pull request merge (method: merge)".to_string(),
-            PrAction::Close => "confirm pull request close".to_string(),
-            PrAction::Approve => "confirm pull request approval".to_string(),
-            PrAction::EnableAutoMerge => "confirm pull request auto-merge enable".to_string(),
-            PrAction::DisableAutoMerge => "confirm pull request auto-merge disable".to_string(),
-            PrAction::Checkout => "confirm local pull request checkout".to_string(),
-            PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
-            PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
-            PrAction::ConvertToDraft => "confirm convert pull request to draft".to_string(),
-            PrAction::MarkReadyForReview => "confirm mark pull request ready".to_string(),
+        self.status = if action == PrAction::Merge {
+            "confirm pull request merge (method: merge)".to_string()
+        } else {
+            pr_action_confirm_status(action, item_kind)
         };
     }
 
@@ -14107,14 +14249,14 @@ impl AppState {
         F: FnMut(WorkItem, PrAction, Option<PrCheckoutPlan>, Option<MergeMethod>),
     {
         if self.pr_action_running {
-            self.status = "pull request action already running".to_string();
+            self.status = "item action already running".to_string();
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
                 self.pr_action_dialog = None;
-                self.status = "pull request action cancelled".to_string();
+                self.status = "item action cancelled".to_string();
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(action) = self.pr_action_dialog.as_ref().map(|dialog| dialog.action) {
@@ -14144,20 +14286,13 @@ impl AppState {
         let checkout = dialog.checkout.clone();
         let merge_method = (action == PrAction::Merge).then_some(dialog.merge_method);
         self.pr_action_running = true;
-        self.status = match action {
-            PrAction::Merge => format!(
+        self.status = if action == PrAction::Merge {
+            format!(
                 "merging pull request with {}",
                 merge_method.unwrap_or_default().label()
-            ),
-            PrAction::Close => "closing pull request".to_string(),
-            PrAction::Approve => "approving pull request".to_string(),
-            PrAction::EnableAutoMerge => "enabling pull request auto-merge".to_string(),
-            PrAction::DisableAutoMerge => "disabling pull request auto-merge".to_string(),
-            PrAction::Checkout => "checking out pull request locally".to_string(),
-            PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
-            PrAction::UpdateBranch => "updating pull request branch".to_string(),
-            PrAction::ConvertToDraft => "converting pull request to draft".to_string(),
-            PrAction::MarkReadyForReview => "marking pull request ready for review".to_string(),
+            )
+        } else {
+            pr_action_running_status(action, item.kind)
         };
         submit(item, action, checkout, merge_method);
     }
@@ -18460,13 +18595,13 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("edit focused comment"));
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
-        assert!(text.contains("open PR close confirmation"));
+        assert!(text.contains("open close or reopen confirmation"));
         assert!(text.contains("choose merge, squash, or rebase merge method"));
         assert!(text.contains("open PR enable auto-merge confirmation"));
         assert!(text.contains("open PR disable auto-merge confirmation"));
         assert!(text.contains("open PR update-branch confirmation"));
         assert!(text.contains("toggle PR draft / ready for review"));
-        assert!(text.contains("run the confirmed PR action"));
+        assert!(text.contains("run the confirmed action"));
         assert!(text.contains("change issue or PR milestone"));
         assert!(text.contains("filter open milestones by prefix"));
         assert!(text.contains("search PRs and issues in the current repo"));
@@ -18741,7 +18876,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("v diff"));
         assert!(text.contains("T edit item"));
         assert!(text.contains("s/A/D review"));
-        assert!(text.contains("M/C/U/E/O/F/X/Z pr action"));
+        assert!(text.contains("M/C/U/E/O/F/X/Z actions"));
         assert!(text.contains("t milestone"));
         assert!(text.contains("+ assign"));
         assert!(text.contains(
@@ -18774,7 +18909,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/U/E/O/F/X/Z pr action"));
+        assert!(!ghr.contains("M/C/U/E/O/F/X/Z actions"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
@@ -18800,7 +18935,7 @@ diff --git a/src/github.rs b/src/github.rs
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
         assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
-        assert!(diff.contains("M/C/U/E/O/F/X/Z pr action"));
+        assert!(diff.contains("M/C/U/E/O/F/X/Z actions"));
         assert!(diff.contains("t milestone"));
         assert!(diff.contains("T edit item"));
         assert!(diff.contains("+/- assign"));
@@ -21405,6 +21540,102 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_c_key_opens_reopen_confirmation_for_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request reopen");
+    }
+
+    #[test]
+    fn capital_c_key_rejects_merged_pull_request_reopen() {
+        let mut section = test_section();
+        section.items[0].state = Some("merged".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "merged pull requests cannot be reopened");
+    }
+
+    #[test]
+    fn capital_c_key_opens_issue_close_or_reopen_confirmation() {
+        let mut open_issue = work_item("issue-1", "rust-lang/rust", 1, "Open issue", None);
+        open_issue.kind = ItemKind::Issue;
+        open_issue.state = Some("open".to_string());
+        let mut closed_issue = work_item("issue-2", "rust-lang/rust", 2, "Closed issue", None);
+        closed_issue.kind = ItemKind::Issue;
+        closed_issue.state = Some("CLOSED".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![open_issue, closed_issue],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue close dialog");
+        assert_eq!(dialog.action, PrAction::Close);
+        assert_eq!(dialog.item.kind, ItemKind::Issue);
+        assert_eq!(app.status, "confirm issue close");
+
+        app.pr_action_dialog = None;
+        app.move_selection(1);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "issue-2");
+        assert_eq!(app.status, "confirm issue reopen");
+    }
+
+    #[test]
     fn capital_a_key_opens_approve_review_summary_for_pull_request_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -22053,6 +22284,42 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn issue_state_action_confirmation_submits_selected_action() {
+        let mut item = work_item("issue-1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.state = Some("closed".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.start_close_or_reopen_dialog();
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, _merge_method| {
+                submitted = Some((item.id, item.kind, action));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "reopening issue");
+        assert_eq!(
+            submitted,
+            Some(("issue-1".to_string(), ItemKind::Issue, PrAction::Reopen))
+        );
+    }
+
+    #[test]
     fn pr_action_dialog_escape_cancels() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -22066,7 +22333,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
-        assert_eq!(app.status, "pull request action cancelled");
+        assert_eq!(app.status, "item action cancelled");
     }
 
     #[test]
@@ -22683,6 +22950,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
             merge_method: Some(MergeMethod::Merge),
             result: Ok(()),
@@ -22701,6 +22969,32 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn reopen_action_finished_marks_item_open_and_refreshes_details() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.start_close_or_reopen_dialog();
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::Reopen,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "pull request reopened; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Reopened");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
     fn approve_action_finished_keeps_item_open_and_refreshes_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -22708,6 +23002,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Approve,
             merge_method: None,
             result: Ok(()),
@@ -22742,6 +23037,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::EnableAutoMerge,
             merge_method: None,
             result: Ok(()),
@@ -22783,6 +23079,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::UpdateBranch,
             merge_method: None,
             result: Ok(()),
@@ -22811,6 +23108,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::DisableAutoMerge,
             merge_method: None,
             result: Err("auto-merge is already disabled for owner/repo#1".to_string()),
@@ -22844,6 +23142,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::MarkReadyForReview,
             merge_method: None,
             result: Ok(()),
@@ -22862,6 +23161,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::ConvertToDraft,
             merge_method: None,
             result: Ok(()),
@@ -22879,6 +23179,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
             merge_method: Some(MergeMethod::Squash),
             result: Err(

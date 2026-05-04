@@ -48,6 +48,12 @@ pub struct RepoConfig {
     pub repo: String,
     pub show_prs: bool,
     pub show_issues: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pr_labels: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub issue_labels: Vec<String>,
 }
 
 impl SearchSection {
@@ -111,6 +117,9 @@ impl Config {
                 repo,
                 show_prs: true,
                 show_issues: true,
+                labels: Vec::new(),
+                pr_labels: Vec::new(),
+                issue_labels: Vec::new(),
             },
         );
         true
@@ -296,7 +305,22 @@ impl Default for RepoConfig {
             repo: String::new(),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         }
+    }
+}
+
+impl RepoConfig {
+    pub fn label_filters(&self, kind: SectionKind) -> Vec<String> {
+        let mut labels = self.labels.clone();
+        match kind {
+            SectionKind::PullRequests => labels.extend(self.pr_labels.clone()),
+            SectionKind::Issues => labels.extend(self.issue_labels.clone()),
+            SectionKind::Notifications => {}
+        }
+        labels
     }
 }
 
@@ -386,6 +410,9 @@ mod tests {
             repo: "someone-else/ghr".to_string(),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
 
         assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
@@ -401,6 +428,9 @@ mod tests {
             repo: "nervosnetwork/fiber".to_string(),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
 
         assert!(config.add_runtime_repo("chenyukang/runnel".to_string()));
@@ -467,6 +497,9 @@ mod tests {
             repo = "nervosnetwork/fiber"
             show_prs = true
             show_issues = true
+            labels = ["T-compiler"]
+            pr_labels = ["S-waiting-on-review"]
+            issue_labels = ["E-easy"]
 
             [defaults]
             view = "pull_requests"
@@ -499,7 +532,32 @@ mod tests {
         assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
+        assert_eq!(config.repos[0].labels, vec!["T-compiler"]);
+        assert_eq!(config.repos[0].pr_labels, vec!["S-waiting-on-review"]);
+        assert_eq!(config.repos[0].issue_labels, vec!["E-easy"]);
         assert_eq!(config.pr_sections[0].title, "Assigned to Me");
+    }
+
+    #[test]
+    fn repo_label_filters_include_common_and_kind_specific_labels() {
+        let repo = RepoConfig {
+            name: "Rust".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            show_prs: true,
+            show_issues: true,
+            labels: vec!["T-compiler".to_string()],
+            pr_labels: vec!["S-waiting-on-review".to_string()],
+            issue_labels: vec!["E-easy".to_string()],
+        };
+
+        assert_eq!(
+            repo.label_filters(SectionKind::PullRequests),
+            vec!["T-compiler", "S-waiting-on-review"]
+        );
+        assert_eq!(
+            repo.label_filters(SectionKind::Issues),
+            vec!["T-compiler", "E-easy"]
+        );
     }
 
     #[test]

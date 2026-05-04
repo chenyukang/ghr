@@ -15097,12 +15097,18 @@ diff --git a/src/github.rs b/src/github.rs
             repo: "chenyukang/runnel".to_string(),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         config.repos.push(crate::config::RepoConfig {
             name: "Fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         let app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
 

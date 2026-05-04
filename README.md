@@ -23,7 +23,7 @@
 - Fuzzy filtering in every loaded list with `/`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
-- Comment, reply, edit, merge, close, and approve flows from inside the TUI.
+- Comment, reply, edit, merge, close, approve, and local PR checkout flows from inside the TUI.
 - Unread notification handling with local cache updates and GitHub read-state sync.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
@@ -77,6 +77,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `M` | Open a merge confirmation for the selected PR |
 | `C` | Open a close confirmation for the selected PR |
 | `A` | Open an approve confirmation for the selected PR |
+| `X` | Open a confirmation to run `gh pr checkout <number> --repo <owner/repo>` from the current working directory |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `r` | Refresh from GitHub |
@@ -87,6 +88,11 @@ Diff review ranges:
 - Press `m` on a diff line to begin a range, move the highlight, then press `e` to end it.
 - Press `c` after ending a range to post an inline review comment for the selected range.
 - A single mouse click begins or moves a range; a double click ends it.
+
+Local PR checkout:
+
+- Press `X` on a pull request in the list or Details pane, then confirm with `y` or `Enter`.
+- Checkout runs from the directory where `ghr` was launched. GitHub CLI and GitHub are the source of truth for the target repository and branch, so launching `ghr` outside the intended local repository can make `gh pr checkout` fail or mutate a different checkout.
 
 Mouse behavior:
 

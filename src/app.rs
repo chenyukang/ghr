@@ -24,6 +24,7 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::{Frame, Terminal};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 
@@ -110,6 +111,9 @@ enum AppMsg {
         item_id: String,
         action: PrAction,
         result: std::result::Result<(), String>,
+    },
+    PrCheckoutFinished {
+        result: std::result::Result<PrCheckoutResult, String>,
     },
     NotificationReadFinished {
         thread_id: String,
@@ -247,12 +251,19 @@ enum PrAction {
     Merge,
     Close,
     Approve,
+    Checkout,
 }
 
 #[derive(Debug, Clone)]
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCheckoutResult {
+    command: String,
+    output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1066,6 +1077,12 @@ fn start_pr_action(
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        if action == PrAction::Checkout {
+            let result = run_pr_checkout(item).await;
+            let _ = tx.send(AppMsg::PrCheckoutFinished { result });
+            return;
+        }
+
         let result = match item.number {
             Some(number) => match action {
                 PrAction::Merge => merge_pull_request(&item.repo, number)
@@ -1077,6 +1094,7 @@ fn start_pr_action(
                 PrAction::Approve => approve_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -1108,6 +1126,88 @@ fn start_pr_action(
             });
         }
     });
+}
+
+async fn run_pr_checkout(item: WorkItem) -> std::result::Result<PrCheckoutResult, String> {
+    let number = item
+        .number
+        .ok_or_else(|| "selected item has no pull request number".to_string())?;
+    let args = pr_checkout_command_args(&item.repo, number);
+    let command = pr_checkout_command_display(&args);
+    let output = TokioCommand::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
+                    checkout_cwd_notice(),
+                )
+            } else {
+                format!(
+                    "failed to run {command}: {error}\n\n{}",
+                    checkout_cwd_notice(),
+                )
+            }
+        })?;
+
+    let output_text = command_output_text(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        let detail = if output_text.is_empty() {
+            "gh did not return any output".to_string()
+        } else {
+            output_text
+        };
+        return Err(format!(
+            "{} failed.\n\n{}\n\n{}",
+            command,
+            checkout_cwd_notice(),
+            truncate_text(&detail, 900),
+        ));
+    }
+
+    let output = if output_text.is_empty() {
+        "gh pr checkout completed successfully.".to_string()
+    } else {
+        truncate_text(&output_text, 900)
+    };
+    Ok(PrCheckoutResult { command, output })
+}
+
+fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "checkout".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ]
+}
+
+fn pr_checkout_command_display(args: &[String]) -> String {
+    format!("gh {}", args.join(" "))
+}
+
+fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn checkout_cwd_notice() -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    format!(
+        "Checkout runs from the current working directory ({cwd}). GitHub CLI and GitHub are the source of truth for which repository and branch are checked out."
+    )
 }
 
 #[cfg(test)]
@@ -1287,6 +1387,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('X') => app.start_pr_action_dialog(PrAction::Checkout),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1308,6 +1409,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('X') => app.start_pr_action_dialog(PrAction::Checkout),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1440,6 +1542,7 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
         KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
         KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('X') => app.start_pr_action_dialog(PrAction::Checkout),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -2679,7 +2782,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2693,7 +2796,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2717,7 +2820,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2726,7 +2829,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3023,7 +3126,12 @@ fn draw_pr_action_dialog(
     running: bool,
     area: Rect,
 ) {
-    let dialog_area = centered_rect(66, 12, area);
+    let dialog_height = if dialog.action == PrAction::Checkout {
+        14
+    } else {
+        12
+    };
+    let dialog_area = centered_rect(66, dialog_height, area);
     let number = dialog
         .item
         .number
@@ -3033,11 +3141,13 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "merge",
         PrAction::Close => "close",
         PrAction::Approve => "approve",
+        PrAction::Checkout => "checkout",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
         PrAction::Close => "Close this pull request on GitHub?",
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::Checkout => "Checkout this pull request locally?",
     };
     let status = if running {
         "working...".to_string()
@@ -3050,6 +3160,16 @@ fn draw_pr_action_dialog(
         key_value_line("repo", dialog.item.repo.clone()),
         key_value_line("pull request", number),
         key_value_line("title", dialog.item.title.clone()),
+        if dialog.action == PrAction::Checkout {
+            Line::from("Runs gh pr checkout from the current working directory.")
+        } else {
+            Line::from("")
+        },
+        if dialog.action == PrAction::Checkout {
+            Line::from("GitHub CLI and GitHub are the source of truth.")
+        } else {
+            Line::from("")
+        },
         Line::from(""),
         Line::from(vec![Span::styled(
             status,
@@ -3067,6 +3187,7 @@ fn draw_pr_action_dialog(
                 PrAction::Merge => "Merge Pull Request",
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::Checkout => "Checkout Pull Request Locally",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -3505,6 +3626,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
         help_heading("Diff Files"),
@@ -3542,10 +3664,15 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
+        help_key_line(
+            "X action",
+            "runs gh pr checkout from the current working directory",
+        ),
         help_key_line("Esc", "cancel PR action"),
         Line::from(""),
         help_heading("Repo Search"),
@@ -7595,6 +7722,7 @@ impl AppState {
                             PrAction::Merge => "pull request merged; refreshing".to_string(),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
+                            PrAction::Checkout => "pull request checked out locally".to_string(),
                         };
                         self.message_dialog = Some(success_message_dialog(
                             pr_action_success_title(action),
@@ -7615,6 +7743,39 @@ impl AppState {
                             self.message_dialog = None;
                         }
                         self.status = pr_action_error_status(action).to_string();
+                    }
+                }
+            }
+            AppMsg::PrCheckoutFinished { result } => {
+                self.pr_action_running = false;
+                self.pr_action_dialog = None;
+                match result {
+                    Ok(result) => {
+                        self.status = "pull request checked out locally".to_string();
+                        self.message_dialog = Some(message_dialog(
+                            pr_action_success_title(PrAction::Checkout),
+                            format!(
+                                "{}\n\n{}\n\n{}",
+                                result.command,
+                                checkout_cwd_notice(),
+                                result.output
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                pr_action_error_title(PrAction::Checkout),
+                                pr_action_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = pr_action_error_status(PrAction::Checkout).to_string();
                     }
                 }
             }
@@ -7765,6 +7926,7 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                    PrAction::Checkout => {}
                 }
             }
         }
@@ -9087,6 +9249,7 @@ impl AppState {
             PrAction::Merge => "confirm pull request merge".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
+            PrAction::Checkout => "confirm local pull request checkout".to_string(),
         };
     }
 
@@ -9138,6 +9301,7 @@ impl AppState {
             PrAction::Merge => "merging pull request".to_string(),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
+            PrAction::Checkout => "checking out pull request locally".to_string(),
         };
         submit(item, action);
     }
@@ -12261,7 +12425,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("M/C/A/X pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -12280,7 +12444,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C/A/X pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -12298,7 +12462,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A/X pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14146,6 +14310,84 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_list() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn checkout_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action| {
+            submitted = Some((item.id, action));
+        });
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "checking out pull request locally");
+        assert_eq!(submitted, Some(("1".to_string(), PrAction::Checkout)));
+    }
+
+    #[test]
+    fn pr_checkout_command_construction_uses_repo_and_number() {
+        let args = pr_checkout_command_args("rust-lang/rust", 123);
+
+        assert_eq!(
+            args,
+            vec![
+                "pr".to_string(),
+                "checkout".to_string(),
+                "123".to_string(),
+                "--repo".to_string(),
+                "rust-lang/rust".to_string(),
+            ]
+        );
+        assert_eq!(
+            pr_checkout_command_display(&args),
+            "gh pr checkout 123 --repo rust-lang/rust"
+        );
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -14199,6 +14441,40 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!handle_key(
             &mut app,
             key(KeyCode::Char('M')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn checkout_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
             &config,
             &store,
             &tx
@@ -14273,6 +14549,57 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_finished_shows_success_output() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Ok(PrCheckoutResult {
+                command: "gh pr checkout 1 --repo rust-lang/rust".to_string(),
+                output: "Switched to branch 'diagnostics'".to_string(),
+            }),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checked out locally");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Checked Out");
+        assert!(
+            dialog
+                .body
+                .contains("gh pr checkout 1 --repo rust-lang/rust")
+        );
+        assert!(dialog.body.contains("current working directory"));
+        assert!(dialog.body.contains("Switched to branch"));
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Err(
+                "gh pr checkout 1 --repo rust-lang/rust failed.\n\nCheckout runs from the current working directory (/tmp). GitHub CLI and GitHub are the source of truth.\n\nfatal: not a git repository"
+                    .to_string(),
+            ),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checkout failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Checkout Failed");
+        assert!(dialog.body.contains("current working directory"));
+        assert!(dialog.body.contains("fatal: not a git repository"));
         assert!(dialog.auto_close_at.is_none());
     }
 

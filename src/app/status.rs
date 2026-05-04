@@ -84,6 +84,7 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Pull Request Merged",
         PrAction::Close => "Pull Request Closed",
         PrAction::Approve => "Pull Request Approved",
+        PrAction::Checkout => "Pull Request Checked Out",
     }
 }
 
@@ -92,6 +93,7 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
+        PrAction::Checkout => "GitHub CLI checked out the pull request locally.",
     }
 }
 
@@ -100,6 +102,7 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Merge Failed",
         PrAction::Close => "Close Failed",
         PrAction::Approve => "Approve Failed",
+        PrAction::Checkout => "Checkout Failed",
     }
 }
 
@@ -108,6 +111,7 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Merge => "pull request merge failed",
         PrAction::Close => "pull request close failed",
         PrAction::Approve => "pull request approval failed",
+        PrAction::Checkout => "pull request checkout failed",
     }
 }
 

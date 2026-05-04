@@ -67,13 +67,13 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `/` | Fuzzy filter the current list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
 | `S` | Search matching PRs and issues in the current repo |
-| `N` | In issues list, create a new issue in the current repo |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |
 | `a` | Add a normal issue or PR comment |
 | `L` | Add a label to the selected issue or PR; type a prefix and choose from repo labels |
 | `N` | Create an issue in the current repo; edit repo, title, labels, and body |
+| `+` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment when it is yours; in diff mode, end a review range |

@@ -116,6 +116,7 @@ async fn wait_for_user_gh_requests() {
 #[serde(rename_all = "camelCase")]
 struct SearchItemRaw {
     author: Option<SearchAuthorRaw>,
+    assignees: Option<Vec<SearchAuthorRaw>>,
     body: Option<String>,
     comments_count: Option<u64>,
     created_at: Option<DateTime<Utc>>,
@@ -158,6 +159,7 @@ struct SearchPageRaw {
 
 #[derive(Debug, Deserialize)]
 struct SearchApiIssueRaw {
+    assignees: Option<Vec<SearchAuthorRaw>>,
     body: Option<String>,
     comments: Option<u64>,
     created_at: Option<DateTime<Utc>>,
@@ -225,6 +227,21 @@ pub struct ItemMetadataUpdate {
     pub title: String,
     pub body: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueItemRaw {
+    assignees: Option<Vec<SearchAuthorRaw>>,
+    body: Option<String>,
+    comments: Option<u64>,
+    html_url: String,
+    labels: Option<Vec<SearchLabelRaw>>,
+    number: u64,
+    repository_url: String,
+    state: Option<String>,
+    title: String,
+    updated_at: Option<DateTime<Utc>>,
+    user: Option<SearchAuthorRaw>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -947,10 +964,10 @@ fn is_plain_search_term(token: &str) -> bool {
 fn search_fields(kind: SectionKind) -> &'static str {
     match kind {
         SectionKind::PullRequests => {
-            "number,title,body,repository,author,createdAt,updatedAt,url,state,isDraft,labels,commentsCount"
+            "number,title,body,repository,author,assignees,createdAt,updatedAt,url,state,isDraft,labels,commentsCount"
         }
         SectionKind::Issues => {
-            "number,title,body,repository,author,createdAt,updatedAt,url,state,labels,commentsCount"
+            "number,title,body,repository,author,assignees,createdAt,updatedAt,url,state,labels,commentsCount"
         }
         SectionKind::Notifications => unreachable!("notifications are not fetched via search"),
     }
@@ -1918,6 +1935,68 @@ pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
     submit_pull_request_review(repository, number, PullRequestReviewEvent::Approve, "").await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssigneeAction {
+    Assign,
+    Unassign,
+}
+
+impl AssigneeAction {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Assign => "PUT",
+            Self::Unassign => "DELETE",
+        }
+    }
+}
+
+pub async fn update_issue_assignees(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+    action: AssigneeAction,
+    assignees: &[String],
+) -> Result<WorkItem> {
+    if assignees.is_empty() {
+        bail!("assignee login is required");
+    }
+    let args = assignee_api_args(repository, number, action, assignees);
+    let output = run_gh_json(&args).await?;
+    parse_issue_item_output(&output, repository, number, kind)
+}
+
+fn assignee_api_args(
+    repository: &str,
+    number: u64,
+    action: AssigneeAction,
+    assignees: &[String],
+) -> Vec<String> {
+    let path = format!("repos/{repository}/issues/{number}/assignees");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        action.method().to_string(),
+        path,
+    ];
+    for assignee in assignees {
+        args.push("-f".to_string());
+        args.push(format!("assignees[]={assignee}"));
+    }
+    args
+}
+
+fn parse_issue_item_output(
+    output: &str,
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<WorkItem> {
+    let item = serde_json::from_str::<IssueItemRaw>(output).with_context(|| {
+        format!("failed to parse assignee update response for {repository}#{number}")
+    })?;
+    Ok(issue_api_item_to_work_item(kind, item))
+}
+
 fn parse_issue_comments_output(
     output: &str,
     repository: &str,
@@ -2654,6 +2733,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         .into_iter()
         .map(|label| label.name)
         .collect::<Vec<_>>();
+    let assignees = assignees_from_raw(item.assignees);
 
     WorkItem {
         id: format!("{repo}#{}", item.number),
@@ -2670,6 +2750,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         labels,
         reactions: ReactionSummary::default(),
         milestone: None,
+        assignees,
         comments: item.comments_count,
         unread: None,
         reason: None,
@@ -2693,6 +2774,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         .into_iter()
         .map(|label| label.name)
         .collect::<Vec<_>>();
+    let assignees = assignees_from_raw(item.assignees);
 
     WorkItem {
         id: format!("{repo}#{}", item.number),
@@ -2715,6 +2797,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
             number: milestone.number,
             title: milestone.title,
         }),
+        assignees,
         comments: item.comments,
         unread: None,
         reason: None,
@@ -2764,6 +2847,47 @@ fn parse_open_milestones_output(output: &str, repository: &str) -> Result<Vec<Mi
             title: milestone.title,
         })
         .collect())
+}
+
+fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
+    let repo = repo_from_repository_url(&item.repository_url);
+    let labels = item
+        .labels
+        .unwrap_or_default()
+        .into_iter()
+        .map(|label| label.name)
+        .collect::<Vec<_>>();
+    let assignees = assignees_from_raw(item.assignees);
+
+    WorkItem {
+        id: format!("{repo}#{}", item.number),
+        kind,
+        repo,
+        number: Some(item.number),
+        title: item.title,
+        body: item.body.filter(|body| !body.trim().is_empty()),
+        author: item.user.map(|author| author.login),
+        state: item.state,
+        url: item.html_url,
+        created_at: None,
+        updated_at: item.updated_at,
+        labels,
+        reactions: ReactionSummary::default(),
+        milestone: None,
+        assignees,
+        comments: item.comments,
+        unread: None,
+        reason: None,
+        extra: None,
+    }
+}
+
+fn assignees_from_raw(assignees: Option<Vec<SearchAuthorRaw>>) -> Vec<String> {
+    assignees
+        .unwrap_or_default()
+        .into_iter()
+        .map(|assignee| assignee.login)
+        .collect()
 }
 
 fn repo_from_repository_url(url: &str) -> String {
@@ -2824,6 +2948,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         labels: Vec::new(),
         reactions: ReactionSummary::default(),
         milestone: None,
+        assignees: Vec::new(),
         comments: None,
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
@@ -3074,8 +3199,52 @@ mod tests {
     }
 
     #[test]
+    fn assignee_api_args_use_issue_assignee_endpoint_for_assign_and_unassign() {
+        let assign = assignee_api_args(
+            "owner/repo",
+            42,
+            AssigneeAction::Assign,
+            &["alice".to_string(), "bob".to_string()],
+        );
+        assert_eq!(
+            assign,
+            vec![
+                "api",
+                "-X",
+                "PUT",
+                "repos/owner/repo/issues/42/assignees",
+                "-f",
+                "assignees[]=alice",
+                "-f",
+                "assignees[]=bob",
+            ]
+        );
+
+        let unassign = assignee_api_args(
+            "owner/repo",
+            42,
+            AssigneeAction::Unassign,
+            &["alice".to_string()],
+        );
+        assert_eq!(
+            unassign,
+            vec![
+                "api",
+                "-X",
+                "DELETE",
+                "repos/owner/repo/issues/42/assignees",
+                "-f",
+                "assignees[]=alice",
+            ]
+        );
+    }
+
+    #[test]
     fn search_api_item_maps_repository_url() {
         let item = SearchApiIssueRaw {
+            assignees: Some(vec![SearchAuthorRaw {
+                login: "triager".to_string(),
+            }]),
             body: Some("hello".to_string()),
             comments: Some(7),
             created_at: DateTime::parse_from_rfc3339("2026-01-01T08:30:00Z")
@@ -3106,6 +3275,7 @@ mod tests {
         assert_eq!(mapped.id, "rust-lang/rust#1");
         assert_eq!(mapped.repo, "rust-lang/rust");
         assert_eq!(mapped.author.as_deref(), Some("chenyukang"));
+        assert_eq!(mapped.assignees, vec!["triager"]);
         assert_eq!(mapped.comments, Some(7));
         assert!(mapped.created_at.is_some());
         assert_eq!(mapped.labels, vec!["T-compiler"]);

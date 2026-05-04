@@ -46,6 +46,8 @@ pub struct WorkItem {
     pub reactions: ReactionSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub milestone: Option<Milestone>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,

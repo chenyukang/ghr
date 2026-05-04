@@ -30,12 +30,12 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    MergeMethod, PullRequestReviewCommentTarget, approve_pull_request, close_pull_request,
+    edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, search_global, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -109,6 +109,7 @@ enum AppMsg {
     PrActionFinished {
         item_id: String,
         action: PrAction,
+        merge_method: Option<MergeMethod>,
         result: std::result::Result<(), String>,
     },
     NotificationReadFinished {
@@ -253,6 +254,7 @@ enum PrAction {
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+    merge_method: MergeMethod,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1060,6 +1062,7 @@ fn start_review_comment_submit(
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
+    merge_method: Option<MergeMethod>,
     config: Config,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
@@ -1068,9 +1071,11 @@ fn start_pr_action(
         let item_id = item.id.clone();
         let result = match item.number {
             Some(number) => match action {
-                PrAction::Merge => merge_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
+                PrAction::Merge => {
+                    merge_pull_request(&item.repo, number, merge_method.unwrap_or_default())
+                        .await
+                        .map_err(|error| error.to_string())
+                }
                 PrAction::Close => close_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
@@ -1084,6 +1089,7 @@ fn start_pr_action(
         let _ = tx.send(AppMsg::PrActionFinished {
             item_id,
             action,
+            merge_method,
             result,
         });
 
@@ -2655,6 +2661,17 @@ fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'stat
 }
 
 fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
+    if let Some(dialog) = &app.pr_action_dialog {
+        push_footer_context(spans, "Confirm", "PR action");
+        if dialog.action == PrAction::Merge {
+            push_footer_pair(spans, "m/s/r", "method", Color::LightMagenta);
+            push_footer_pair(spans, "tab", "next method", Color::LightMagenta);
+        }
+        push_footer_pair(spans, "y/enter", "run", Color::Yellow);
+        push_footer_pair(spans, "esc", "cancel", Color::Cyan);
+        return;
+    }
+
     match app.focus {
         FocusTarget::Ghr => {
             push_footer_context(spans, "ghr", "tabs");
@@ -3023,7 +3040,12 @@ fn draw_pr_action_dialog(
     running: bool,
     area: Rect,
 ) {
-    let dialog_area = centered_rect(66, 12, area);
+    let dialog_height = if dialog.action == PrAction::Merge {
+        14
+    } else {
+        12
+    };
+    let dialog_area = centered_rect(66, dialog_height, area);
     let number = dialog
         .item
         .number
@@ -3040,16 +3062,35 @@ fn draw_pr_action_dialog(
         PrAction::Approve => "Approve this pull request on GitHub?",
     };
     let status = if running {
-        "working...".to_string()
+        match dialog.action {
+            PrAction::Merge => format!("working: {} merge...", dialog.merge_method.label()),
+            _ => "working...".to_string(),
+        }
+    } else if dialog.action == PrAction::Merge {
+        format!(
+            "y/Enter: {} merge    m/s/r: method    Tab: next    Esc",
+            dialog.merge_method.label()
+        )
     } else {
         format!("y/Enter: yes, {action_label} PR    Esc: cancel")
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
         key_value_line("pull request", number),
         key_value_line("title", dialog.item.title.clone()),
+    ];
+    if dialog.action == PrAction::Merge {
+        lines.push(key_value_line(
+            "method",
+            format!(
+                "{}  (m: merge, s: squash, r: rebase)",
+                dialog.merge_method.label()
+            ),
+        ));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(vec![Span::styled(
             status,
@@ -3057,7 +3098,7 @@ fn draw_pr_action_dialog(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]),
-    ];
+    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -3545,6 +3586,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
+        help_key_line("m / s / r", "choose merge, squash, or rebase merge method"),
+        help_key_line("Tab", "cycle merge method in merge confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
         help_key_line("Esc", "cancel PR action"),
         Line::from(""),
@@ -7583,6 +7626,7 @@ impl AppState {
             AppMsg::PrActionFinished {
                 item_id,
                 action,
+                merge_method,
                 result,
             } => {
                 self.pr_action_running = false;
@@ -7592,7 +7636,10 @@ impl AppState {
                         self.details_stale.insert(item_id.clone());
                         self.mark_item_after_pr_action(&item_id, action);
                         self.status = match action {
-                            PrAction::Merge => "pull request merged; refreshing".to_string(),
+                            PrAction::Merge => format!(
+                                "pull request merged using {}; refreshing",
+                                merge_method.unwrap_or_default().label()
+                            ),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
                         };
@@ -7614,7 +7661,14 @@ impl AppState {
                         } else {
                             self.message_dialog = None;
                         }
-                        self.status = pr_action_error_status(action).to_string();
+                        self.status = if action == PrAction::Merge {
+                            format!(
+                                "pull request {} merge failed",
+                                merge_method.unwrap_or_default().label()
+                            )
+                        } else {
+                            pr_action_error_status(action).to_string()
+                        };
                     }
                 }
             }
@@ -9081,10 +9135,14 @@ impl AppState {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
-        self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action,
+            merge_method: MergeMethod::default(),
+        });
         self.pr_action_running = false;
         self.status = match action {
-            PrAction::Merge => "confirm pull request merge".to_string(),
+            PrAction::Merge => "confirm pull request merge (method: merge)".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
         };
@@ -9097,14 +9155,21 @@ impl AppState {
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        self.handle_pr_action_dialog_key_with_submit(key, |item, action| {
-            start_pr_action(item, action, config.clone(), store.clone(), tx.clone());
+        self.handle_pr_action_dialog_key_with_submit(key, |item, action, merge_method| {
+            start_pr_action(
+                item,
+                action,
+                merge_method,
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+            );
         });
     }
 
     fn handle_pr_action_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
     where
-        F: FnMut(WorkItem, PrAction),
+        F: FnMut(WorkItem, PrAction, Option<MergeMethod>),
     {
         if self.pr_action_running {
             self.status = "pull request action already running".to_string();
@@ -9121,25 +9186,60 @@ impl AppState {
                     self.submit_pr_action(action, &mut submit);
                 }
             }
+            KeyCode::Tab => self.cycle_merge_method(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.select_merge_method(MergeMethod::Merge),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.select_merge_method(MergeMethod::Squash)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.select_merge_method(MergeMethod::Rebase)
+            }
             _ => {}
         }
     }
 
     fn submit_pr_action<F>(&mut self, action: PrAction, submit: &mut F)
     where
-        F: FnMut(WorkItem, PrAction),
+        F: FnMut(WorkItem, PrAction, Option<MergeMethod>),
     {
         let Some(dialog) = &self.pr_action_dialog else {
             return;
         };
         let item = dialog.item.clone();
+        let merge_method = (action == PrAction::Merge).then_some(dialog.merge_method);
         self.pr_action_running = true;
         self.status = match action {
-            PrAction::Merge => "merging pull request".to_string(),
+            PrAction::Merge => format!(
+                "merging pull request with {}",
+                merge_method.unwrap_or_default().label()
+            ),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
         };
-        submit(item, action);
+        submit(item, action, merge_method);
+    }
+
+    fn select_merge_method(&mut self, method: MergeMethod) {
+        let Some(dialog) = &mut self.pr_action_dialog else {
+            return;
+        };
+        if dialog.action != PrAction::Merge {
+            return;
+        }
+        dialog.merge_method = method;
+        self.status = format!("merge method: {}", method.label());
+    }
+
+    fn cycle_merge_method(&mut self) {
+        let Some(method) = self
+            .pr_action_dialog
+            .as_ref()
+            .filter(|dialog| dialog.action == PrAction::Merge)
+            .map(|dialog| dialog.merge_method.next())
+        else {
+            return;
+        };
+        self.select_merge_method(method);
     }
 
     fn start_new_comment_dialog(&mut self) {
@@ -12149,6 +12249,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
         assert!(text.contains("open PR close confirmation"));
+        assert!(text.contains("choose merge, squash, or rebase merge method"));
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
@@ -12270,6 +12371,20 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("| focus List  refresh idle  state list focused"));
         assert!(!text.contains("1 ghr  2 Sections  3 list  4 Details"));
         assert!(!text.contains("n/p comment"));
+    }
+
+    #[test]
+    fn footer_shows_merge_method_shortcuts_in_merge_confirmation() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        let paths = test_paths();
+        let text = footer_line(&app, &paths).to_string();
+
+        assert!(text.contains("Confirm PR action"));
+        assert!(text.contains("m/s/r method"));
+        assert!(text.contains("tab next method"));
+        assert!(text.contains("y/enter run"));
+        assert!(text.contains("esc cancel"));
     }
 
     #[test]
@@ -14099,7 +14214,68 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.pr_action_dialog.as_ref().expect("merge dialog");
         assert_eq!(dialog.action, PrAction::Merge);
         assert_eq!(dialog.item.id, "1");
-        assert_eq!(app.status, "confirm pull request merge");
+        assert_eq!(dialog.merge_method, MergeMethod::Merge);
+        assert_eq!(app.status, "confirm pull request merge (method: merge)");
+    }
+
+    #[test]
+    fn merge_confirmation_switches_methods() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('s')), |_, _, _| {
+            panic!("method switch should not submit");
+        });
+
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Squash
+        );
+        assert_eq!(app.status, "merge method: squash");
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('r')), |_, _, _| {
+            panic!("method switch should not submit");
+        });
+
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Rebase
+        );
+        assert_eq!(app.status, "merge method: rebase");
+    }
+
+    #[test]
+    fn merge_confirmation_cycles_methods_with_tab() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Tab), |_, _, _| {
+            panic!("method switch should not submit");
+        });
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Squash
+        );
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Tab), |_, _, _| {
+            panic!("method switch should not submit");
+        });
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Rebase
+        );
     }
 
     #[test]
@@ -14151,13 +14327,59 @@ diff --git a/src/github.rs b/src/github.rs
         app.start_pr_action_dialog(PrAction::Approve);
         let mut submitted = None;
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action| {
-            submitted = Some((item.id, action));
-        });
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
 
         assert!(app.pr_action_running);
         assert_eq!(app.status, "approving pull request");
-        assert_eq!(submitted, Some(("1".to_string(), PrAction::Approve)));
+        assert_eq!(submitted, Some(("1".to_string(), PrAction::Approve, None)));
+    }
+
+    #[test]
+    fn merge_confirmation_submits_selected_method() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        app.select_merge_method(MergeMethod::Squash);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "merging pull request with squash");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::Merge, Some(MergeMethod::Squash)))
+        );
+    }
+
+    #[test]
+    fn merge_confirmation_submits_default_merge_method() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "merging pull request with merge");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::Merge, Some(MergeMethod::Merge)))
+        );
     }
 
     #[test]
@@ -14165,9 +14387,12 @@ diff --git a/src/github.rs b/src/github.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Esc), |_item, _action| {
-            panic!("escape should not submit the action");
-        });
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Esc),
+            |_item, _action, _merge_method| {
+                panic!("escape should not submit the action");
+            },
+        );
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
@@ -14217,6 +14442,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
             action: PrAction::Merge,
+            merge_method: Some(MergeMethod::Merge),
             result: Ok(()),
         });
 
@@ -14224,7 +14450,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.pr_action_running);
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("merged"));
         assert!(app.details_stale.contains("1"));
-        assert_eq!(app.status, "pull request merged; refreshing");
+        assert_eq!(app.status, "pull request merged using merge; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Merged");
         assert!(dialog.auto_close_at.is_some());
@@ -14239,6 +14465,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
             action: PrAction::Approve,
+            merge_method: None,
             result: Ok(()),
         });
 
@@ -14261,6 +14488,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
             action: PrAction::Merge,
+            merge_method: Some(MergeMethod::Squash),
             result: Err(
                 "merge blocked for owner/repo#1: review approval required; 1 check(s) failing"
                     .to_string(),
@@ -14269,7 +14497,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
-        assert_eq!(app.status, "pull request merge failed");
+        assert_eq!(app.status, "pull request squash merge failed");
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));

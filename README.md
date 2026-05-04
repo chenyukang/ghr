@@ -74,9 +74,11 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment when it is yours; in diff mode, end a review range |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
-| `M` | Open a merge confirmation for the selected PR |
+| `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close confirmation for the selected PR |
 | `A` | Open an approve confirmation for the selected PR |
+| `m` / `s` / `r` in merge confirmation | Choose merge, squash, or rebase before confirming |
+| `Tab` in merge confirmation | Cycle merge method |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `r` | Refresh from GitHub |

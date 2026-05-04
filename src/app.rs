@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
@@ -2719,6 +2719,15 @@ fn pull_request_changes_url(item: &WorkItem) -> String {
     }
 }
 
+fn pull_request_commits_url(item: &WorkItem) -> String {
+    match item.number {
+        Some(number) if !item.repo.trim().is_empty() => {
+            format!("https://github.com/{}/pull/{number}/commits", item.repo)
+        }
+        _ => format!("{}/commits", item.url.trim_end_matches('/')),
+    }
+}
+
 fn same_view_key(left: &str, right: &str) -> bool {
     left == right
         || (left.starts_with("repo:")
@@ -5172,7 +5181,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         3,
     );
 
-    builder.push_meta_line(vec![
+    let mut primary_meta = vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
         (
             "number",
@@ -5188,11 +5197,18 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
                 item.state.clone().unwrap_or_else(|| "-".to_string()),
             )],
         ),
-        (
-            "updated",
-            vec![DetailSegment::raw(relative_time(item.updated_at))],
-        ),
-    ]);
+    ];
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        primary_meta.push((
+            "created",
+            vec![DetailSegment::raw(local_datetime(item.created_at))],
+        ));
+    }
+    primary_meta.push((
+        "updated",
+        vec![DetailSegment::raw(relative_time(item.updated_at))],
+    ));
+    builder.push_meta_line(primary_meta);
 
     let mut secondary_meta = Vec::new();
     let mut action_note = None;
@@ -5207,6 +5223,12 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
     if let Some(comments) = details_comment_count(app, item) {
         secondary_meta.push(("comments", vec![DetailSegment::raw(comments.to_string())]));
+    }
+    if matches!(item.kind, ItemKind::PullRequest) {
+        secondary_meta.push((
+            "commits",
+            commit_count_segments(app.action_hints.get(&item.id), item),
+        ));
     }
     if let Some(reason) = useful_meta_value(item.reason.as_deref()) {
         secondary_meta.push(("reason", vec![DetailSegment::raw(reason.to_string())]));
@@ -6653,6 +6675,22 @@ fn check_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
             .checks
             .as_ref()
             .map(check_summary_segments)
+            .unwrap_or_else(|| vec![DetailSegment::raw("-")]),
+        Some(ActionHintState::Loading) | None => vec![DetailSegment::raw("loading...")],
+        Some(ActionHintState::Error(_)) => vec![DetailSegment::raw("unavailable")],
+    }
+}
+
+fn commit_count_segments(state: Option<&ActionHintState>, item: &WorkItem) -> Vec<DetailSegment> {
+    match state {
+        Some(ActionHintState::Loaded(hints)) => hints
+            .commits
+            .map(|commits| {
+                vec![DetailSegment::link(
+                    commits.to_string(),
+                    pull_request_commits_url(item),
+                )]
+            })
             .unwrap_or_else(|| vec![DetailSegment::raw("-")]),
         Some(ActionHintState::Loading) | None => vec![DetailSegment::raw("loading...")],
         Some(ActionHintState::Error(_)) => vec![DetailSegment::raw("unavailable")],
@@ -11406,6 +11444,17 @@ fn relative_time(value: Option<DateTime<Utc>>) -> String {
     }
 }
 
+fn local_datetime(value: Option<DateTime<Utc>>) -> String {
+    value
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn item_meta(item: &WorkItem) -> String {
     let mut parts = Vec::new();
     if item.unread.unwrap_or(false) {
@@ -11457,7 +11506,7 @@ mod tests {
 
     #[test]
     fn compact_error_label_hides_long_gh_command_context() {
-        let error = "gh search prs --json number,title,body,repository,author,updatedAt,url,state,isDraft,labels,commentsCount --limit 500 -- repo:rust-lang/rust is:open failed: HTTP 403: API rate limit exceeded for user ID 230646";
+        let error = "gh search prs --json number,title,body,repository,author,createdAt,updatedAt,url,state,isDraft,labels,commentsCount --limit 500 -- repo:rust-lang/rust is:open failed: HTTP 403: API rate limit exceeded for user ID 230646";
 
         assert_eq!(compact_error_label(error), "GitHub search rate limited");
         assert!(!compact_error_label(error).contains("--json"));
@@ -14326,6 +14375,10 @@ diff --git a/src/github.rs b/src/github.rs
     #[test]
     fn details_meta_is_compact_and_links_author() {
         let mut item = work_item("1", "chenyukang/ghr", 1, "More on tui", Some("chenyukang"));
+        let created_at = DateTime::parse_from_rfc3339("2026-05-04T01:02:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        item.created_at = Some(created_at);
         item.reason = Some("-".to_string());
         item.comments = Some(3);
         let section = SectionSnapshot {
@@ -14352,6 +14405,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains("repo: chenyukang/ghr"));
         assert!(rendered.contains("number: #1"));
         assert!(rendered.contains("state: open"));
+        assert!(rendered.contains(&format!("created: {}", local_datetime(Some(created_at)))));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
         assert!(rendered.contains("labels: T-compiler remove  add label"));
@@ -14461,11 +14515,13 @@ diff --git a/src/github.rs b/src/github.rs
                     total: 13,
                     incomplete: false,
                 }),
+                commits: Some(4),
                 note: Some("Merge blocked: checks pending".to_string()),
             }),
         );
 
-        let rendered = build_details_document(&app, 120)
+        let document = build_details_document(&app, 120);
+        let rendered = document
             .lines
             .iter()
             .map(|line| line.to_string())
@@ -14474,6 +14530,12 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(rendered.contains("action: Approvable, Mergeable"));
         assert!(rendered.contains("checks: 10 pass, 2 fail, 1 pending"));
+        assert!(rendered.contains("commits: 4"));
+        assert_document_link_for_text(
+            &document,
+            "4",
+            "https://github.com/chenyukang/ghr/pull/1/commits",
+        );
         assert!(rendered.contains("action note: Merge blocked: checks pending"));
     }
 
@@ -18114,6 +18176,7 @@ diff --git a/d.rs b/d.rs
             author: author.map(str::to_string),
             state: Some("open".to_string()),
             url: format!("https://github.com/{repo}/pull/{number}"),
+            created_at: None,
             updated_at: None,
             labels: vec!["T-compiler".to_string()],
             comments: Some(0),
@@ -18134,6 +18197,7 @@ diff --git a/d.rs b/d.rs
             author: None,
             state: None,
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+            created_at: None,
             updated_at: None,
             labels: Vec::new(),
             comments: None,

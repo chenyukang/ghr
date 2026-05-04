@@ -258,6 +258,7 @@ mod tests {
             author: None,
             state: None,
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+            created_at: None,
             updated_at: None,
             labels: Vec::new(),
             comments: None,

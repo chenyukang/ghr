@@ -30,17 +30,17 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, add_issue_label, approve_pull_request, close_pull_request,
-    create_issue, edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
-    fetch_pull_request_action_hints, fetch_pull_request_diff, fetch_repository_labels,
-    mark_notification_thread_read, merge_pull_request, post_issue_comment,
+    CommentFetchResult, PullRequestReviewCommentTarget, add_issue_label, approve_pull_request,
+    close_pull_request, create_issue, edit_issue_comment, edit_pull_request_review_comment,
+    fetch_comments, fetch_pull_request_action_hints, fetch_pull_request_diff,
+    fetch_repository_labels, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_dashboard_with_progress, refresh_section_page, remove_issue_label, search_global,
     with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
-    builtin_view_key, configured_sections, global_search_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, SectionKind,
+    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
     mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
     section_counts, section_view_key,
 };
@@ -84,7 +84,7 @@ enum AppMsg {
     },
     CommentsLoaded {
         item_id: String,
-        comments: std::result::Result<Vec<CommentPreview>, String>,
+        comments: std::result::Result<CommentFetchResult, String>,
     },
     ActionHintsLoaded {
         item_id: String,
@@ -96,12 +96,12 @@ enum AppMsg {
     },
     CommentPosted {
         item_id: String,
-        result: std::result::Result<Vec<CommentPreview>, String>,
+        result: std::result::Result<CommentFetchResult, String>,
     },
     CommentUpdated {
         item_id: String,
         comment_index: usize,
-        result: std::result::Result<Vec<CommentPreview>, String>,
+        result: std::result::Result<CommentFetchResult, String>,
     },
     ReviewCommentPosted {
         item_id: String,
@@ -1009,7 +1009,10 @@ fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
             Some(number) => fetch_comments(&item.repo, number, item.kind)
                 .await
                 .map_err(|error| error.to_string()),
-            None => Ok(Vec::new()),
+            None => Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                comments: Vec::new(),
+            }),
         };
         let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
     });
@@ -5247,6 +5250,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         22,
         2_400,
     );
+    push_reactions_line(&mut builder, &item.reactions);
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -5635,6 +5639,7 @@ fn push_diff_inline_comment(
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::link("open", url.clone()));
     }
+    append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
         "reply",
@@ -6017,6 +6022,46 @@ fn comment_author_link_segment(author: &str, selected: bool) -> DetailSegment {
     )
 }
 
+fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary) {
+    if reactions.is_empty() {
+        return;
+    }
+    builder.push_blank();
+    let mut segments = vec![DetailSegment::styled(
+        "reactions: ",
+        Style::default().fg(Color::Gray),
+    )];
+    segments.extend(reaction_segments(reactions));
+    builder.push_wrapped_limited(segments, 2);
+}
+
+fn append_reaction_segments(segments: &mut Vec<DetailSegment>, reactions: &ReactionSummary) {
+    if reactions.is_empty() {
+        return;
+    }
+    for segment in reaction_segments(reactions) {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(segment);
+    }
+}
+
+fn reaction_segments(reactions: &ReactionSummary) -> Vec<DetailSegment> {
+    [
+        ("👍", reactions.plus_one),
+        ("👎", reactions.minus_one),
+        ("😄", reactions.laugh),
+        ("🎉", reactions.hooray),
+        ("😕", reactions.confused),
+        ("❤️", reactions.heart),
+        ("🚀", reactions.rocket),
+        ("👀", reactions.eyes),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(emoji, count)| DetailSegment::styled(format!("{emoji} {count}"), reaction_style()))
+    .collect()
+}
+
 fn push_comment(
     builder: &mut DetailsBuilder,
     index: usize,
@@ -6054,6 +6099,7 @@ fn push_comment(
             diff_metadata_style(),
         ));
     }
+    append_reaction_segments(&mut header, &comment.reactions);
     if search_match {
         header.push(DetailSegment::styled(
             "  match",
@@ -7595,6 +7641,10 @@ fn label_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn reaction_style() -> Style {
+    Style::default().fg(Color::LightYellow)
+}
+
 fn quote_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
@@ -7767,6 +7817,7 @@ fn details_snapshot_hash(item: &WorkItem) -> String {
         "url": &item.url,
         "updated_at": &item.updated_at,
         "labels": &item.labels,
+        "reactions": &item.reactions,
         "comments_count": item.comments,
     });
     let bytes = serde_json::to_vec(&value).unwrap_or_default();
@@ -8121,11 +8172,12 @@ impl AppState {
                 };
             }
             AppMsg::CommentsLoaded { item_id, comments } => match comments {
-                Ok(comments) => {
+                Ok(result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.update_item_reactions(&item_id, result.item_reactions);
                     self.details
-                        .insert(item_id.clone(), DetailState::Loaded(comments));
+                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                 }
@@ -8179,12 +8231,13 @@ impl AppState {
                 }
             },
             AppMsg::CommentPosted { item_id, result } => match result {
-                Ok(comments) => {
-                    self.selected_comment_index = comments.len().saturating_sub(1);
+                Ok(result) => {
+                    self.selected_comment_index = result.comments.len().saturating_sub(1);
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.update_item_reactions(&item_id, result.item_reactions);
                     self.details
-                        .insert(item_id.clone(), DetailState::Loaded(comments));
+                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
@@ -8216,13 +8269,14 @@ impl AppState {
                 comment_index,
                 result,
             } => match result {
-                Ok(comments) => {
+                Ok(result) => {
                     self.selected_comment_index =
-                        comment_index.min(comments.len().saturating_sub(1));
+                        comment_index.min(result.comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.update_item_reactions(&item_id, result.item_reactions);
                     self.details
-                        .insert(item_id.clone(), DetailState::Loaded(comments));
+                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
@@ -8672,6 +8726,16 @@ impl AppState {
             self.clamp_positions();
         }
         changed
+    }
+
+    fn update_item_reactions(&mut self, item_id: &str, reactions: ReactionSummary) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id == item_id {
+                    item.reactions = reactions.clone();
+                }
+            }
+        }
     }
 
     fn replace_section_page(&mut self, section_key: &str, refreshed: SectionSnapshot) {
@@ -13005,10 +13069,10 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_list();
         app.handle_msg(AppMsg::CommentsLoaded {
             item_id: "1".to_string(),
-            comments: Ok(vec![
-                comment("alice", "old", None),
-                comment("bob", "new", None),
-            ]),
+            comments: Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
+            }),
         });
         assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 
@@ -14832,6 +14896,7 @@ diff --git a/src/github.rs b/src/github.rs
                     url: None,
                     parent_id: None,
                     is_mine: false,
+                    reactions: ReactionSummary::default(),
                     review: None,
                 },
                 CommentPreview {
@@ -14845,6 +14910,7 @@ diff --git a/src/github.rs b/src/github.rs
                     ),
                     parent_id: None,
                     is_mine: false,
+                    reactions: ReactionSummary::default(),
                     review: None,
                 },
             ]),
@@ -14937,6 +15003,29 @@ diff --git a/src/github.rs b/src/github.rs
         );
         let issue_document = build_details_document(&issue_app, 120);
         assert_document_link_for_text(&issue_document, "carol", "https://github.com/carol");
+    }
+
+    #[test]
+    fn details_render_description_and_comment_reactions() {
+        let mut section = test_section();
+        section.items[0].reactions.heart = 1;
+        let mut comment = comment("alice", "A reacted comment", None);
+        comment.reactions.rocket = 2;
+        comment.reactions.eyes = 1;
+
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+        let rendered = build_details_document(&app, 100)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("reactions: ❤️ 1"));
+        assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     }
 
     #[test]
@@ -16279,7 +16368,10 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
-            result: Ok(vec![comment("alice", "posted", None)]),
+            result: Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                comments: vec![comment("alice", "posted", None)],
+            }),
         });
 
         assert!(!app.posting_comment);
@@ -16334,7 +16426,10 @@ diff --git a/src/github.rs b/src/github.rs
         app.handle_msg(AppMsg::CommentUpdated {
             item_id: "1".to_string(),
             comment_index: 0,
-            result: Ok(vec![own_comment(42, "chenyukang", "updated", None)]),
+            result: Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                comments: vec![own_comment(42, "chenyukang", "updated", None)],
+            }),
         });
 
         assert!(!app.posting_comment);
@@ -16579,6 +16674,7 @@ diff --git a/src/github.rs b/src/github.rs
                 url: None,
                 parent_id: None,
                 is_mine: false,
+                reactions: ReactionSummary::default(),
                 review: None,
             }]),
         );
@@ -18085,6 +18181,7 @@ diff --git a/d.rs b/d.rs
             url: url.map(str::to_string),
             parent_id: None,
             is_mine: false,
+            reactions: ReactionSummary::default(),
             review: None,
         }
     }
@@ -18099,6 +18196,7 @@ diff --git a/d.rs b/d.rs
             url: url.map(str::to_string),
             parent_id: None,
             is_mine: true,
+            reactions: ReactionSummary::default(),
             review: None,
         }
     }
@@ -18116,6 +18214,7 @@ diff --git a/d.rs b/d.rs
             url: format!("https://github.com/{repo}/pull/{number}"),
             updated_at: None,
             labels: vec!["T-compiler".to_string()],
+            reactions: ReactionSummary::default(),
             comments: Some(0),
             unread: None,
             reason: None,
@@ -18136,6 +18235,7 @@ diff --git a/d.rs b/d.rs
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
             updated_at: None,
             labels: Vec::new(),
+            reactions: ReactionSummary::default(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

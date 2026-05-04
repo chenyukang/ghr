@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReviewCommentPreview, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key, repo_section_filters,
-    repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, PullRequestBranch, ReviewCommentPreview,
+    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
+    repo_section_filters, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -220,6 +220,8 @@ struct PullRequestActionRepositoryRaw {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestActionRaw {
+    head_ref_name: Option<String>,
+    head_repository: Option<PullRequestHeadRepositoryRaw>,
     is_draft: Option<bool>,
     merge_state_status: Option<String>,
     review_decision: Option<String>,
@@ -231,6 +233,12 @@ struct PullRequestActionRaw {
     viewer_can_update_branch: Option<bool>,
     viewer_did_author: Option<bool>,
     viewer_latest_review: Option<PullRequestViewerReviewRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestHeadRepositoryRaw {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -871,6 +879,10 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       state
+      headRefName
+      headRepository {
+        nameWithOwner
+      }
       isDraft
       mergeStateStatus
       reviewDecision
@@ -1508,12 +1520,32 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
     } else {
         Some(format!("Merge blocked: {}", blockers.join("; ")))
     };
+    let head = pull_request_branch(pr);
 
     ActionHints {
         labels,
         checks,
         note,
+        head,
     }
+}
+
+fn pull_request_branch(pr: &PullRequestActionRaw) -> Option<PullRequestBranch> {
+    let branch = pr
+        .head_ref_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())?;
+    let repository = pr
+        .head_repository
+        .as_ref()
+        .map(|repository| repository.name_with_owner.trim())
+        .filter(|repository| !repository.is_empty())?;
+
+    Some(PullRequestBranch {
+        repository: repository.to_string(),
+        branch: branch.to_string(),
+    })
 }
 
 fn pull_request_action_blockers(pr: &PullRequestActionRaw) -> Vec<String> {
@@ -2279,6 +2311,10 @@ mod tests {
     #[test]
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            head_ref_name: Some("feature/diagnostics".to_string()),
+            head_repository: Some(PullRequestHeadRepositoryRaw {
+                name_with_owner: "rust-lang/rust".to_string(),
+            }),
             is_draft: Some(false),
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: Some("REVIEW_REQUIRED".to_string()),
@@ -2325,11 +2361,20 @@ mod tests {
         let note = hints.note.expect("blocked PR should explain why");
         assert!(note.contains("review approval required"));
         assert!(note.contains("checks failing"));
+        assert_eq!(
+            hints.head,
+            Some(PullRequestBranch {
+                repository: "rust-lang/rust".to_string(),
+                branch: "feature/diagnostics".to_string(),
+            })
+        );
     }
 
     #[test]
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            head_ref_name: None,
+            head_repository: None,
             is_draft: Some(false),
             merge_state_status: Some("CLEAN".to_string()),
             review_decision: Some("APPROVED".to_string()),

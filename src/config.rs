@@ -46,6 +46,8 @@ pub struct SearchSection {
 pub struct RepoConfig {
     pub name: String,
     pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_dir: Option<String>,
     pub show_prs: bool,
     pub show_issues: bool,
 }
@@ -109,12 +111,19 @@ impl Config {
             RepoConfig {
                 name,
                 repo,
+                local_dir: current_dir_for_config(),
                 show_prs: true,
                 show_issues: true,
             },
         );
         true
     }
+}
+
+fn current_dir_for_config() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
 }
 
 fn current_github_repo() -> Option<String> {
@@ -165,7 +174,7 @@ fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-fn github_repo_from_remote_url(url: &str) -> Option<String> {
+pub(crate) fn github_repo_from_remote_url(url: &str) -> Option<String> {
     let path = if let Some(path) = url.strip_prefix("git@github.com:") {
         path
     } else if let Some(path) = url.strip_prefix("ssh://git@github.com/") {
@@ -294,6 +303,7 @@ impl Default for RepoConfig {
         Self {
             name: String::new(),
             repo: String::new(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         }
@@ -371,6 +381,7 @@ mod tests {
         assert_eq!(config.repos.len(), 1);
         assert_eq!(config.repos[0].name, "ghr");
         assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+        assert!(config.repos[0].local_dir.is_some());
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
 
@@ -384,6 +395,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "ghr".to_string(),
             repo: "someone-else/ghr".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         });
@@ -399,6 +411,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "Fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         });
@@ -465,6 +478,7 @@ mod tests {
             [[repos]]
             name = "fiber"
             repo = "nervosnetwork/fiber"
+            local_dir = "~/code/fiber"
             show_prs = true
             show_issues = true
 
@@ -497,6 +511,7 @@ mod tests {
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
         assert_eq!(config.repos[0].name, "fiber");
         assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
+        assert_eq!(config.repos[0].local_dir.as_deref(), Some("~/code/fiber"));
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
         assert_eq!(config.pr_sections[0].title, "Assigned to Me");

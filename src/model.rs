@@ -38,6 +38,8 @@ pub struct WorkItem {
     pub author: Option<String>,
     pub state: Option<String>,
     pub url: String,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
     #[serde(default)]
@@ -123,6 +125,7 @@ pub struct ReviewCommentPreview {
 pub struct ActionHints {
     pub labels: Vec<String>,
     pub checks: Option<CheckSummary>,
+    pub commits: Option<usize>,
     pub note: Option<String>,
 }
 

@@ -84,6 +84,7 @@ struct SearchItemRaw {
     author: Option<SearchAuthorRaw>,
     body: Option<String>,
     comments_count: Option<u64>,
+    created_at: Option<DateTime<Utc>>,
     is_draft: Option<bool>,
     labels: Option<Vec<SearchLabelRaw>>,
     number: u64,
@@ -125,6 +126,7 @@ struct SearchPageRaw {
 struct SearchApiIssueRaw {
     body: Option<String>,
     comments: Option<u64>,
+    created_at: Option<DateTime<Utc>>,
     draft: Option<bool>,
     html_url: String,
     labels: Option<Vec<SearchLabelRaw>>,
@@ -267,6 +269,7 @@ struct PullRequestActionRepositoryRaw {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestActionRaw {
+    commits: Option<PullRequestCommitConnectionRaw>,
     is_draft: Option<bool>,
     merge_state_status: Option<String>,
     review_decision: Option<String>,
@@ -278,6 +281,12 @@ struct PullRequestActionRaw {
     viewer_can_update_branch: Option<bool>,
     viewer_did_author: Option<bool>,
     viewer_latest_review: Option<PullRequestViewerReviewRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitConnectionRaw {
+    total_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -827,10 +836,10 @@ fn is_plain_search_term(token: &str) -> bool {
 fn search_fields(kind: SectionKind) -> &'static str {
     match kind {
         SectionKind::PullRequests => {
-            "number,title,body,repository,author,updatedAt,url,state,isDraft,labels,commentsCount"
+            "number,title,body,repository,author,createdAt,updatedAt,url,state,isDraft,labels,commentsCount"
         }
         SectionKind::Issues => {
-            "number,title,body,repository,author,updatedAt,url,state,labels,commentsCount"
+            "number,title,body,repository,author,createdAt,updatedAt,url,state,labels,commentsCount"
         }
         SectionKind::Notifications => unreachable!("notifications are not fetched via search"),
     }
@@ -959,6 +968,9 @@ query($owner: String!, $name: String!, $number: Int!) {
       viewerCanEnableAutoMerge
       viewerCanMergeAsAdmin
       viewerDidAuthor
+      commits {
+        totalCount
+      }
       viewerLatestReview {
         state
       }
@@ -1734,6 +1746,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
     ActionHints {
         labels,
         checks,
+        commits: pr.commits.as_ref().map(|commits| commits.total_count),
         note,
     }
 }
@@ -1900,6 +1913,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         author: item.author.map(|author| author.login),
         state: item.state,
         url: item.url,
+        created_at: item.created_at,
         updated_at: item.updated_at,
         labels,
         reactions: ReactionSummary::default(),
@@ -1937,6 +1951,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         author: item.user.map(|author| author.login),
         state: item.state,
         url: item.html_url,
+        created_at: item.created_at,
         updated_at: item.updated_at,
         labels,
         reactions: item
@@ -2006,6 +2021,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         author: None,
         state: None,
         url,
+        created_at: None,
         updated_at: notification.updated_at,
         labels: Vec::new(),
         reactions: ReactionSummary::default(),
@@ -2263,6 +2279,9 @@ mod tests {
         let item = SearchApiIssueRaw {
             body: Some("hello".to_string()),
             comments: Some(7),
+            created_at: DateTime::parse_from_rfc3339("2026-01-01T08:30:00Z")
+                .ok()
+                .map(|value| value.with_timezone(&Utc)),
             draft: Some(false),
             html_url: "https://github.com/rust-lang/rust/issues/1".to_string(),
             labels: Some(vec![SearchLabelRaw {
@@ -2285,6 +2304,7 @@ mod tests {
         assert_eq!(mapped.repo, "rust-lang/rust");
         assert_eq!(mapped.author.as_deref(), Some("chenyukang"));
         assert_eq!(mapped.comments, Some(7));
+        assert!(mapped.created_at.is_some());
         assert_eq!(mapped.labels, vec!["T-compiler"]);
     }
 
@@ -2353,6 +2373,7 @@ mod tests {
         assert_eq!(item.kind, ItemKind::PullRequest);
         assert_eq!(item.number, Some(42));
         assert_eq!(item.url, "https://github.com/owner/repo/pull/42");
+        assert!(item.created_at.is_none());
         assert_eq!(item.unread, Some(true));
         assert_eq!(item.reason.as_deref(), Some("review-requested"));
         assert_eq!(item.extra.as_deref(), Some("PullRequest"));
@@ -2394,6 +2415,8 @@ mod tests {
     fn search_fields_include_body_for_preview() {
         assert!(search_fields(SectionKind::PullRequests).contains("body"));
         assert!(search_fields(SectionKind::Issues).contains("body"));
+        assert!(search_fields(SectionKind::PullRequests).contains("createdAt"));
+        assert!(search_fields(SectionKind::Issues).contains("createdAt"));
     }
 
     #[test]
@@ -2578,6 +2601,7 @@ mod tests {
     #[test]
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            commits: Some(PullRequestCommitConnectionRaw { total_count: 5 }),
             is_draft: Some(false),
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: Some("REVIEW_REQUIRED".to_string()),
@@ -2610,6 +2634,7 @@ mod tests {
         });
 
         assert_eq!(hints.labels, vec!["Approvable"]);
+        assert_eq!(hints.commits, Some(5));
         assert_eq!(
             hints.checks,
             Some(CheckSummary {
@@ -2629,6 +2654,7 @@ mod tests {
     #[test]
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
+            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
             is_draft: Some(false),
             merge_state_status: Some("CLEAN".to_string()),
             review_decision: Some("APPROVED".to_string()),
@@ -2654,6 +2680,7 @@ mod tests {
         });
 
         assert_eq!(hints.labels, vec!["Mergeable"]);
+        assert_eq!(hints.commits, Some(2));
         assert_eq!(
             hints.checks,
             Some(CheckSummary {

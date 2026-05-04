@@ -30,11 +30,12 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
+    PullRequestReviewCommentTarget, approve_pull_request, close_issue, close_pull_request,
+    edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, reopen_issue, reopen_pull_request, search_global,
     with_background_github_priority,
 };
 use crate::model::{
@@ -108,6 +109,7 @@ enum AppMsg {
     },
     PrActionFinished {
         item_id: String,
+        item_kind: ItemKind,
         action: PrAction,
         result: std::result::Result<(), String>,
     },
@@ -246,6 +248,7 @@ struct PendingCommentSubmit {
 enum PrAction {
     Merge,
     Close,
+    Reopen,
     Approve,
 }
 
@@ -253,6 +256,62 @@ enum PrAction {
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+}
+
+fn item_kind_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "pull request",
+        ItemKind::Notification => "notification",
+    }
+}
+
+fn pr_action_success_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "pull request merged; refreshing".to_string(),
+        PrAction::Close => format!("{label} closed; refreshing"),
+        PrAction::Reopen => format!("{label} reopened; refreshing"),
+        PrAction::Approve => "pull request approved; refreshing".to_string(),
+    }
+}
+
+fn pr_action_confirm_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "confirm pull request merge".to_string(),
+        PrAction::Close => format!("confirm {label} close"),
+        PrAction::Reopen => format!("confirm {label} reopen"),
+        PrAction::Approve => "confirm pull request approval".to_string(),
+    }
+}
+
+fn pr_action_running_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "merging pull request".to_string(),
+        PrAction::Close => format!("closing {label}"),
+        PrAction::Reopen => format!("reopening {label}"),
+        PrAction::Approve => "approving pull request".to_string(),
+    }
+}
+
+fn close_or_reopen_action_for_item(item: &WorkItem) -> std::result::Result<PrAction, &'static str> {
+    if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        return Err("selected item is not an issue or pull request");
+    }
+    if item.number.is_none() {
+        return Err("selected item has no issue or pull request number");
+    }
+
+    let state = item.state.as_deref().unwrap_or("open").to_ascii_lowercase();
+    match state.as_str() {
+        "closed" => Ok(PrAction::Reopen),
+        "merged" if item.kind == ItemKind::PullRequest => {
+            Err("merged pull requests cannot be reopened")
+        }
+        _ => Ok(PrAction::Close),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1066,23 +1125,50 @@ fn start_pr_action(
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        let item_kind = item.kind;
         let result = match item.number {
             Some(number) => match action {
-                PrAction::Merge => merge_pull_request(&item.repo, number)
+                PrAction::Merge if item.kind == ItemKind::PullRequest => {
+                    merge_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Close if item.kind == ItemKind::PullRequest => {
+                    close_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Close if item.kind == ItemKind::Issue => close_issue(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
-                PrAction::Close => close_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::Approve => approve_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
+                PrAction::Reopen if item.kind == ItemKind::PullRequest => {
+                    reopen_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Reopen if item.kind == ItemKind::Issue => {
+                    reopen_issue(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Approve if item.kind == ItemKind::PullRequest => {
+                    approve_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Merge | PrAction::Approve => {
+                    Err("selected item is not a pull request".to_string())
+                }
+                PrAction::Close | PrAction::Reopen => {
+                    Err("selected item is not an issue or pull request".to_string())
+                }
             },
-            None => Err("selected item has no pull request number".to_string()),
+            None => Err("selected item has no issue or pull request number".to_string()),
         };
         let should_refresh = result.is_ok();
         let _ = tx.send(AppMsg::PrActionFinished {
             item_id,
+            item_kind,
             action,
             result,
         });
@@ -1285,7 +1371,7 @@ fn handle_key_in_area(
             KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
             KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
@@ -1306,7 +1392,7 @@ fn handle_key_in_area(
                 app.start_comment_search()
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
@@ -1438,7 +1524,7 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('[') => app.move_diff_file(-1),
         KeyCode::Char(']') => app.move_diff_file(1),
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-        KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
+        KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
         KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
         KeyCode::Enter => app.focus_details(),
         _ => {}
@@ -2679,7 +2765,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A", "actions", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2693,7 +2779,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A", "actions", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2717,7 +2803,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A", "actions", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2726,7 +2812,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A", "actions", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3029,26 +3115,35 @@ fn draw_pr_action_dialog(
         .number
         .map(|number| format!("#{number}"))
         .unwrap_or_else(|| "-".to_string());
+    let item_label = item_kind_label(dialog.item.kind);
     let action_label = match dialog.action {
         PrAction::Merge => "merge",
         PrAction::Close => "close",
+        PrAction::Reopen => "reopen",
         PrAction::Approve => "approve",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
-        PrAction::Close => "Close this pull request on GitHub?",
+        PrAction::Close => match dialog.item.kind {
+            ItemKind::Issue => "Close this issue on GitHub?",
+            _ => "Close this pull request on GitHub?",
+        },
+        PrAction::Reopen => match dialog.item.kind {
+            ItemKind::Issue => "Reopen this issue on GitHub?",
+            _ => "Reopen this pull request on GitHub?",
+        },
         PrAction::Approve => "Approve this pull request on GitHub?",
     };
     let status = if running {
         "working...".to_string()
     } else {
-        format!("y/Enter: yes, {action_label} PR    Esc: cancel")
+        format!("y/Enter: yes, {action_label} {item_label}    Esc: cancel")
     };
     let lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
-        key_value_line("pull request", number),
+        key_value_line(item_label, number),
         key_value_line("title", dialog.item.title.clone()),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -3065,7 +3160,14 @@ fn draw_pr_action_dialog(
         .title(Span::styled(
             match dialog.action {
                 PrAction::Merge => "Merge Pull Request",
-                PrAction::Close => "Close Pull Request",
+                PrAction::Close => match dialog.item.kind {
+                    ItemKind::Issue => "Close Issue",
+                    _ => "Close Pull Request",
+                },
+                PrAction::Reopen => match dialog.item.kind {
+                    ItemKind::Issue => "Reopen Issue",
+                    _ => "Reopen Pull Request",
+                },
                 PrAction::Approve => "Approve Pull Request",
             },
             Style::default()
@@ -3503,7 +3605,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("v", "show pull request diff"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
         help_key_line("A", "open PR approve confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
@@ -3540,13 +3642,13 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
         help_key_line("A", "open PR approve confirmation"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
-        help_heading("Pull Request Confirmation"),
-        help_key_line("y / Enter", "run the confirmed PR action"),
-        help_key_line("Esc", "cancel PR action"),
+        help_heading("Action Confirmation"),
+        help_key_line("y / Enter", "run the confirmed action"),
+        help_key_line("Esc", "cancel action"),
         Line::from(""),
         help_heading("Repo Search"),
         help_key_line("S", "open search input"),
@@ -7582,6 +7684,7 @@ impl AppState {
             },
             AppMsg::PrActionFinished {
                 item_id,
+                item_kind,
                 action,
                 result,
             } => {
@@ -7591,14 +7694,10 @@ impl AppState {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
                         self.mark_item_after_pr_action(&item_id, action);
-                        self.status = match action {
-                            PrAction::Merge => "pull request merged; refreshing".to_string(),
-                            PrAction::Close => "pull request closed; refreshing".to_string(),
-                            PrAction::Approve => "pull request approved; refreshing".to_string(),
-                        };
+                        self.status = pr_action_success_status(action, item_kind);
                         self.message_dialog = Some(success_message_dialog(
-                            pr_action_success_title(action),
-                            pr_action_success_body(action),
+                            pr_action_success_title(action, item_kind),
+                            pr_action_success_body(action, item_kind),
                         ));
                     }
                     Err(error) => {
@@ -7608,13 +7707,13 @@ impl AppState {
                         }
                         if setup_dialog.is_none() {
                             self.message_dialog = Some(message_dialog(
-                                pr_action_error_title(action),
+                                pr_action_error_title(action, item_kind),
                                 pr_action_error_body(&error),
                             ));
                         } else {
                             self.message_dialog = None;
                         }
-                        self.status = pr_action_error_status(action).to_string();
+                        self.status = pr_action_error_status(action, item_kind);
                     }
                 }
             }
@@ -7764,6 +7863,7 @@ impl AppState {
                 match action {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
+                    PrAction::Reopen => item.state = Some("open".to_string()),
                     PrAction::Approve => {}
                 }
             }
@@ -9069,25 +9169,45 @@ impl AppState {
         }
     }
 
+    fn start_close_or_reopen_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        let action = match close_or_reopen_action_for_item(&item) {
+            Ok(action) => action,
+            Err(message) => {
+                self.status = message.to_string();
+                return;
+            }
+        };
+        self.start_item_action_dialog(item, action);
+    }
+
     fn start_pr_action_dialog(&mut self, action: PrAction) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
         };
+        if !matches!(action, PrAction::Merge | PrAction::Approve) {
+            self.start_item_action_dialog(item, action);
+            return;
+        }
         if item.kind != ItemKind::PullRequest || item.number.is_none() {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        self.start_item_action_dialog(item, action);
+    }
+
+    fn start_item_action_dialog(&mut self, item: WorkItem, action: PrAction) {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
+        let status = pr_action_confirm_status(action, item.kind);
         self.pr_action_dialog = Some(PrActionDialog { item, action });
         self.pr_action_running = false;
-        self.status = match action {
-            PrAction::Merge => "confirm pull request merge".to_string(),
-            PrAction::Close => "confirm pull request close".to_string(),
-            PrAction::Approve => "confirm pull request approval".to_string(),
-        };
+        self.status = status;
     }
 
     fn handle_pr_action_dialog_key(
@@ -9107,14 +9227,14 @@ impl AppState {
         F: FnMut(WorkItem, PrAction),
     {
         if self.pr_action_running {
-            self.status = "pull request action already running".to_string();
+            self.status = "item action already running".to_string();
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
                 self.pr_action_dialog = None;
-                self.status = "pull request action cancelled".to_string();
+                self.status = "item action cancelled".to_string();
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(action) = self.pr_action_dialog.as_ref().map(|dialog| dialog.action) {
@@ -9134,11 +9254,7 @@ impl AppState {
         };
         let item = dialog.item.clone();
         self.pr_action_running = true;
-        self.status = match action {
-            PrAction::Merge => "merging pull request".to_string(),
-            PrAction::Close => "closing pull request".to_string(),
-            PrAction::Approve => "approving pull request".to_string(),
-        };
+        self.status = pr_action_running_status(action, item.kind);
         submit(item, action);
     }
 
@@ -12148,8 +12264,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("edit focused comment"));
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
-        assert!(text.contains("open PR close confirmation"));
-        assert!(text.contains("run the confirmed PR action"));
+        assert!(text.contains("open close or reopen confirmation"));
+        assert!(text.contains("run the confirmed action"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
     }
@@ -12261,7 +12377,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("M/C/A actions"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -12280,7 +12396,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C/A actions"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -12298,7 +12414,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A actions"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14124,6 +14240,102 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_c_key_opens_reopen_confirmation_for_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request reopen");
+    }
+
+    #[test]
+    fn capital_c_key_rejects_merged_pull_request_reopen() {
+        let mut section = test_section();
+        section.items[0].state = Some("merged".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "merged pull requests cannot be reopened");
+    }
+
+    #[test]
+    fn capital_c_key_opens_issue_close_or_reopen_confirmation() {
+        let mut open_issue = work_item("issue-1", "rust-lang/rust", 1, "Open issue", None);
+        open_issue.kind = ItemKind::Issue;
+        open_issue.state = Some("open".to_string());
+        let mut closed_issue = work_item("issue-2", "rust-lang/rust", 2, "Closed issue", None);
+        closed_issue.kind = ItemKind::Issue;
+        closed_issue.state = Some("CLOSED".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![open_issue, closed_issue],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue close dialog");
+        assert_eq!(dialog.action, PrAction::Close);
+        assert_eq!(dialog.item.kind, ItemKind::Issue);
+        assert_eq!(app.status, "confirm issue close");
+
+        app.pr_action_dialog = None;
+        app.move_selection(1);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "issue-2");
+        assert_eq!(app.status, "confirm issue reopen");
+    }
+
+    #[test]
     fn capital_a_key_opens_approve_confirmation_for_pull_request_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -14161,6 +14373,39 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn issue_state_action_confirmation_submits_selected_action() {
+        let mut item = work_item("issue-1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.state = Some("closed".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.start_close_or_reopen_dialog();
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action| {
+            submitted = Some((item.id, item.kind, action));
+        });
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "reopening issue");
+        assert_eq!(
+            submitted,
+            Some(("issue-1".to_string(), ItemKind::Issue, PrAction::Reopen))
+        );
+    }
+
+    #[test]
     fn pr_action_dialog_escape_cancels() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -14171,7 +14416,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
-        assert_eq!(app.status, "pull request action cancelled");
+        assert_eq!(app.status, "item action cancelled");
     }
 
     #[test]
@@ -14216,6 +14461,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
             result: Ok(()),
         });
@@ -14231,6 +14477,31 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn reopen_action_finished_marks_item_open_and_refreshes_details() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.start_close_or_reopen_dialog();
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::Reopen,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "pull request reopened; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Reopened");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
     fn approve_action_finished_keeps_item_open_and_refreshes_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -14238,6 +14509,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Approve,
             result: Ok(()),
         });
@@ -14260,6 +14532,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
             result: Err(
                 "merge blocked for owner/repo#1: review approval required; 1 check(s) failing"

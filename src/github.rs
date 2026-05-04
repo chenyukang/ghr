@@ -1100,6 +1100,42 @@ pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+pub async fn reopen_pull_request(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&[
+        "pr".to_string(),
+        "reopen".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub async fn close_issue(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&[
+        "issue".to_string(),
+        "close".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub async fn reopen_issue(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&[
+        "issue".to_string(),
+        "reopen".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ])
+    .await?;
+    Ok(())
+}
+
 pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
     run_gh_json(&[
         "pr".to_string(),

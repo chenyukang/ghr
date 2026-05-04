@@ -71,7 +71,7 @@ use status::{
     pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
     pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
 };
-use text::{display_width, normalize_text, truncate_inline, truncate_text};
+use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
 enum AppMsg {
     RefreshStarted,
@@ -1570,6 +1570,7 @@ fn handle_key_in_area(
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
             KeyCode::Char('N') => app.start_new_issue_dialog(),
+            _ if is_reaction_key(key) => app.start_item_reaction_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
                 app.mark_current_notification_read(store, tx);
@@ -1608,8 +1609,8 @@ fn handle_key_in_area(
             KeyCode::Char('R') if app.details_mode == DetailsMode::Conversation => {
                 app.start_reply_to_selected_comment()
             }
-            KeyCode::Char('+') if app.details_mode == DetailsMode::Conversation => {
-                app.start_selected_comment_reaction_dialog()
+            _ if app.details_mode == DetailsMode::Conversation && is_reaction_key(key) => {
+                app.start_keyboard_reaction_dialog(area)
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
                 app.start_edit_selected_comment_dialog()
@@ -4338,6 +4339,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
+        help_key_line("+", "add a reaction to the selected issue or PR"),
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
@@ -4369,7 +4371,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
-        help_key_line("+", "add a reaction to the focused comment"),
+        help_key_line("+", "add a reaction to the visible focused comment or item"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
@@ -5126,7 +5128,6 @@ impl DetailsBuilder {
                     if !self.push_hard_wrapped_token(
                         &token,
                         prefix,
-                        prefix_width,
                         &mut current,
                         &mut column,
                         &mut wrote_content,
@@ -5188,10 +5189,9 @@ impl DetailsBuilder {
                         return false;
                     }
                     current = prefix.to_vec();
-                    column = prefix_width;
                 }
                 push_char_segment(&mut current, segment, ch);
-                column += display_width_char(ch);
+                column = segments_width(&current);
             }
         }
 
@@ -5203,7 +5203,6 @@ impl DetailsBuilder {
         &mut self,
         token: &WrapToken,
         prefix: &[DetailSegment],
-        prefix_width: usize,
         current: &mut Vec<DetailSegment>,
         column: &mut usize,
         wrote_content: &mut bool,
@@ -5217,12 +5216,11 @@ impl DetailsBuilder {
                         return false;
                     }
                     *current = prefix.to_vec();
-                    *column = prefix_width;
                     *wrote_content = false;
                 }
 
                 push_char_segment(current, segment, ch);
-                *column += display_width_char(ch);
+                *column = segments_width(current);
                 *wrote_content = true;
             }
         }
@@ -5280,16 +5278,17 @@ fn push_wrap_token_char(
         && last.kind == kind
     {
         push_char_segment(&mut last.segments, template, ch);
-        last.width += display_width_char(ch);
+        last.width = segments_width(&last.segments);
         return;
     }
 
     let mut segments = Vec::new();
     push_char_segment(&mut segments, template, ch);
+    let width = segments_width(&segments);
     tokens.push(WrapToken {
         kind,
         segments,
-        width: display_width_char(ch),
+        width,
     });
 }
 
@@ -5344,10 +5343,6 @@ fn trim_trailing_wrap_whitespace(
             current.pop();
         }
     }
-}
-
-fn display_width_char(_ch: char) -> usize {
-    1
 }
 
 fn reserved_width(width: usize, right_padding: usize) -> usize {
@@ -6255,7 +6250,12 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
             Style::default().fg(Color::DarkGray),
         ));
     } else {
-        segments.extend(reaction_segments(reactions));
+        for (index, segment) in reaction_segments(reactions).into_iter().enumerate() {
+            if index > 0 {
+                segments.push(DetailSegment::raw("  "));
+            }
+            segments.push(segment);
+        }
     }
     segments.push(DetailSegment::raw("  "));
     segments.push(DetailSegment::action("react", DetailAction::ReactItem));
@@ -8025,6 +8025,11 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
 
 fn is_diff_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'v'))
+}
+
+fn is_reaction_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('+'))
+        || (matches!(key.code, KeyCode::Char('=')) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
@@ -10229,6 +10234,36 @@ impl AppState {
         self.details_scroll = self
             .details_scroll
             .min(max_details_scroll(self, details_area));
+    }
+
+    fn start_keyboard_reaction_dialog(&mut self, area: Option<Rect>) {
+        if self.selected_comment_is_visible(area) {
+            self.start_selected_comment_reaction_dialog();
+        } else {
+            self.start_item_reaction_dialog();
+        }
+    }
+
+    fn selected_comment_is_visible(&self, area: Option<Rect>) -> bool {
+        if self.details_mode != DetailsMode::Conversation {
+            return false;
+        }
+        let Some(area) = area else {
+            return self.current_selected_comment().is_some();
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            return false;
+        }
+        let document = build_details_document(self, inner.width);
+        let Some(region) = document.comment_region(self.selected_comment_index) else {
+            return false;
+        };
+        let viewport_start = usize::from(self.details_scroll);
+        let viewport_end = viewport_start.saturating_add(usize::from(inner.height));
+        let focus_line = region.focus_line();
+        focus_line >= viewport_start && focus_line < viewport_end
     }
 
     fn handle_detail_action(&mut self, action: DetailAction, tx: Option<&UnboundedSender<AppMsg>>) {
@@ -15426,6 +15461,7 @@ diff --git a/src/github.rs b/src/github.rs
     fn details_render_description_and_comment_reactions() {
         let mut section = test_section();
         section.items[0].reactions.heart = 1;
+        section.items[0].reactions.eyes = 1;
         let mut comment = comment("alice", "A reacted comment", None);
         comment.reactions.rocket = 2;
         comment.reactions.eyes = 1;
@@ -15441,8 +15477,71 @@ diff --git a/src/github.rs b/src/github.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("reactions: ❤️ 1"));
+        assert!(rendered.contains("reactions: ❤️ 1  👀 1  react"));
         assert!(rendered.contains("alice - -  🚀 2  👀 1"));
+    }
+
+    #[test]
+    fn display_width_counts_reaction_emoji_columns() {
+        assert_eq!(display_width("😄"), 2);
+        assert_eq!(display_width("👀"), 2);
+        assert_eq!(display_width("😄 1  👀 1  react"), 17);
+    }
+
+    #[test]
+    fn plus_in_pr_details_opens_item_reaction_when_no_comment_is_visible() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 120, 36);
+
+        app.focus_details();
+        assert!(!handle_key_in_area(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('='), KeyModifiers::SHIFT),
+            &config,
+            &store,
+            &tx,
+            Some(area),
+        ));
+
+        assert!(matches!(
+            app.reaction_dialog.as_ref().map(|dialog| &dialog.target),
+            Some(ReactionTarget::Item)
+        ));
+    }
+
+    #[test]
+    fn plus_in_pr_details_reacts_to_visible_focused_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![own_comment(42, "alice", "visible", None)]),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 120, 40);
+
+        app.focus_details();
+        app.scroll_selected_comment_into_view(Some(area));
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('+')),
+            &config,
+            &store,
+            &tx,
+            Some(area),
+        ));
+
+        assert!(matches!(
+            app.reaction_dialog.as_ref().map(|dialog| &dialog.target),
+            Some(ReactionTarget::IssueComment {
+                index: 0,
+                comment_id: 42
+            })
+        ));
     }
 
     #[test]

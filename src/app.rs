@@ -14693,7 +14693,7 @@ diff --git a/src/github.rs b/src/github.rs
         section.page = 1;
         section.page_size = 100;
         section.filters =
-            "repo:rust-lang/rust is:open archived:false sort:updated-desc".to_string();
+            "repo:rust-lang/rust is:open archived:false sort:created-desc".to_string();
         let app = AppState::new(SectionKind::PullRequests, vec![section]);
         let request = app
             .section_page_request(1, &Config::default())
@@ -14704,7 +14704,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(request.total_pages, 3);
         assert_eq!(
             request.filters,
-            "repo:rust-lang/rust is:open archived:false sort:updated-desc"
+            "repo:rust-lang/rust is:open archived:false sort:created-desc"
         );
     }
 
@@ -14792,7 +14792,7 @@ diff --git a/src/github.rs b/src/github.rs
             key: "repo:Fiber:pull_requests:Pull Requests".to_string(),
             kind: SectionKind::PullRequests,
             title: "Pull Requests".to_string(),
-            filters: "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc"
+            filters: "repo:nervosnetwork/fiber is:open archived:false sort:created-desc"
                 .to_string(),
             items: Vec::new(),
             total_count: None,
@@ -17397,13 +17397,13 @@ diff --git a/src/github.rs b/src/github.rs
                 "repo:fiber",
                 SectionKind::PullRequests,
                 "Pull Requests",
-                "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc",
+                "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
             SectionSnapshot::empty_for_view(
                 "repo:fiber",
                 SectionKind::Issues,
                 "Issues",
-                "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc",
+                "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
         ];
         let mut app = AppState::new(SectionKind::PullRequests, sections);

@@ -813,7 +813,7 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         tokens.push("archived:false".to_string());
     }
     if !tokens.iter().any(|token| token.starts_with("sort:")) {
-        tokens.push("sort:updated-desc".to_string());
+        tokens.push("sort:created-desc".to_string());
     }
     tokens.join(" ")
 }
@@ -2205,7 +2205,7 @@ mod tests {
         let args = search_args(
             "prs",
             "number,title",
-            "reviewed-by:chenyukang -author:chenyukang sort:updated-desc",
+            "reviewed-by:chenyukang -author:chenyukang sort:created-desc",
             50,
         );
 
@@ -2221,7 +2221,7 @@ mod tests {
                 "--",
                 "reviewed-by:chenyukang",
                 "-author:chenyukang",
-                "sort:updated-desc"
+                "sort:created-desc"
             ]
         );
     }
@@ -2254,7 +2254,7 @@ mod tests {
     fn search_page_args_use_rest_search_pagination_and_sort() {
         let args = search_page_args(
             SectionKind::Issues,
-            "repo:rust-lang/rust is:open archived:false sort:updated-desc",
+            "repo:rust-lang/rust is:open archived:false sort:created-desc",
             3,
             250,
         );
@@ -2273,7 +2273,7 @@ mod tests {
                 "-f",
                 "page=3",
                 "-f",
-                "sort=updated",
+                "sort=created",
                 "-f",
                 "order=desc"
             ]
@@ -2389,7 +2389,7 @@ mod tests {
     fn global_search_filters_add_default_sort_and_archive_filter() {
         assert_eq!(
             global_search_filters("fiber rpc", None),
-            "fiber rpc in:title archived:false sort:updated-desc"
+            "fiber rpc in:title archived:false sort:created-desc"
         );
         assert_eq!(
             global_search_filters("fiber archived:true sort:created-desc", None),
@@ -2397,11 +2397,11 @@ mod tests {
         );
         assert_eq!(
             global_search_filters("fiber in:body", None),
-            "fiber in:body archived:false sort:updated-desc"
+            "fiber in:body archived:false sort:created-desc"
         );
         assert_eq!(
             global_search_filters("author:chenyukang", None),
-            "author:chenyukang archived:false sort:updated-desc"
+            "author:chenyukang archived:false sort:created-desc"
         );
     }
 
@@ -2409,11 +2409,11 @@ mod tests {
     fn global_search_filters_scope_to_current_repo_when_available() {
         assert_eq!(
             global_search_filters("payment channel", Some("nervosnetwork/fiber")),
-            "payment channel in:title repo:nervosnetwork/fiber archived:false sort:updated-desc"
+            "payment channel in:title repo:nervosnetwork/fiber archived:false sort:created-desc"
         );
         assert_eq!(
             global_search_filters("rpc repo:rust-lang/rust", Some("nervosnetwork/fiber")),
-            "rpc repo:rust-lang/rust in:title archived:false sort:updated-desc"
+            "rpc repo:rust-lang/rust in:title archived:false sort:created-desc"
         );
     }
 

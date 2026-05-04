@@ -100,6 +100,11 @@ struct SearchLabelRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct RepositoryLabelRaw {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchRepositoryRaw {
     name_with_owner: String,
@@ -951,6 +956,83 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
     Ok(())
 }
 
+pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
+    let path = format!("repos/{repository}/labels");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+        "-f".to_string(),
+        "per_page=100".to_string(),
+    ])
+    .await
+    .with_context(|| format!("failed to fetch labels for {repository}"))?;
+    parse_repository_labels_output(&output)
+        .with_context(|| format!("failed to parse labels for {repository}"))
+}
+
+pub async fn add_issue_label(repository: &str, number: u64, label: &str) -> Result<()> {
+    let path = format!("repos/{repository}/issues/{number}/labels");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("labels[]={label}"),
+    ])
+    .await
+    .with_context(|| format!("failed to add label {label} to {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn remove_issue_label(repository: &str, number: u64, label: &str) -> Result<()> {
+    let encoded_label = percent_encode_path_segment(label);
+    let path = format!("repos/{repository}/issues/{number}/labels/{encoded_label}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "DELETE".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to remove label {label} from {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn create_issue(
+    repository: &str,
+    title: &str,
+    body: &str,
+    labels: &[String],
+) -> Result<WorkItem> {
+    let path = format!("repos/{repository}/issues");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("title={title}"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ];
+    for label in labels {
+        args.push("-f".to_string());
+        args.push(format!("labels[]={label}"));
+    }
+
+    let output = run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to create issue in {repository}"))?;
+    let raw = serde_json::from_str::<SearchApiIssueRaw>(&output)
+        .with_context(|| format!("failed to parse created issue in {repository}"))?;
+    Ok(search_api_item_to_work_item(SectionKind::Issues, raw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullRequestReviewCommentTarget<'a> {
     pub path: &'a str,
@@ -1734,6 +1816,32 @@ fn repo_from_repository_url(url: &str) -> String {
         .to_string()
 }
 
+fn parse_repository_labels_output(output: &str) -> Result<Vec<String>> {
+    let pages = serde_json::from_str::<Vec<Vec<RepositoryLabelRaw>>>(output)
+        .context("failed to parse paginated repository labels")?;
+    let mut labels = pages
+        .into_iter()
+        .flatten()
+        .map(|label| label.name.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    labels.sort_by_key(|label| label.to_ascii_lowercase());
+    labels.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(labels)
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
     let number = notification
         .subject
@@ -2031,6 +2139,28 @@ mod tests {
         assert_eq!(mapped.author.as_deref(), Some("chenyukang"));
         assert_eq!(mapped.comments, Some(7));
         assert_eq!(mapped.labels, vec!["T-compiler"]);
+    }
+
+    #[test]
+    fn label_path_segments_are_percent_encoded() {
+        assert_eq!(percent_encode_path_segment("T-compiler"), "T-compiler");
+        assert_eq!(
+            percent_encode_path_segment("needs review/triage"),
+            "needs%20review%2Ftriage"
+        );
+    }
+
+    #[test]
+    fn paginated_repository_labels_are_sorted_and_deduped() {
+        let output = r#"[
+          [{"name": "bug"}, {"name": "T-compiler"}],
+          [{"name": "enhancement"}, {"name": "Bug"}]
+        ]"#;
+
+        assert_eq!(
+            parse_repository_labels_output(output).unwrap(),
+            vec!["bug", "enhancement", "T-compiler"]
+        );
     }
 
     #[test]

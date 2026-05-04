@@ -112,6 +112,8 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Checkout => "Pull Request Checked Out",
         PrAction::RerunFailedChecks => "Failed Checks Rerun",
         PrAction::UpdateBranch => "Pull Request Branch Updated",
+        PrAction::ConvertToDraft => "Pull Request Converted to Draft",
+        PrAction::MarkReadyForReview => "Pull Request Ready for Review",
     }
 }
 
@@ -127,6 +129,12 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
             "GitHub accepted the failed-check rerun request. Refreshing details."
         }
         PrAction::UpdateBranch => "GitHub accepted the branch update. Refreshing details.",
+        PrAction::ConvertToDraft => {
+            "GitHub converted the pull request to draft. Refreshing details."
+        }
+        PrAction::MarkReadyForReview => {
+            "GitHub marked the pull request ready for review. Refreshing details."
+        }
     }
 }
 
@@ -140,6 +148,8 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Checkout => "Checkout Failed",
         PrAction::RerunFailedChecks => "Rerun Failed",
         PrAction::UpdateBranch => "Update Branch Failed",
+        PrAction::ConvertToDraft => "Convert to Draft Failed",
+        PrAction::MarkReadyForReview => "Ready for Review Failed",
     }
 }
 
@@ -153,6 +163,8 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Checkout => "pull request checkout failed",
         PrAction::RerunFailedChecks => "failed check rerun failed",
         PrAction::UpdateBranch => "pull request branch update failed",
+        PrAction::ConvertToDraft => "pull request draft conversion failed",
+        PrAction::MarkReadyForReview => "pull request ready-for-review failed",
     }
 }
 

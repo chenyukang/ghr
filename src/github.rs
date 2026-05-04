@@ -1944,7 +1944,7 @@ pub enum AssigneeAction {
 impl AssigneeAction {
     fn method(self) -> &'static str {
         match self {
-            Self::Assign => "PUT",
+            Self::Assign => "POST",
             Self::Unassign => "DELETE",
         }
     }
@@ -1981,6 +1981,30 @@ fn assignee_api_args(
     for assignee in assignees {
         args.push("-f".to_string());
         args.push(format!("assignees[]={assignee}"));
+    }
+    args
+}
+
+pub async fn convert_pull_request_to_draft(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&pull_request_ready_args(repository, number, true)).await?;
+    Ok(())
+}
+
+pub async fn mark_pull_request_ready_for_review(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&pull_request_ready_args(repository, number, false)).await?;
+    Ok(())
+}
+
+fn pull_request_ready_args(repository: &str, number: u64, undo: bool) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "ready".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ];
+    if undo {
+        args.push("--undo".to_string());
     }
     args
 }
@@ -3219,6 +3243,18 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_ready_args_toggle_ready_and_draft() {
+        assert_eq!(
+            pull_request_ready_args("owner/repo", 42, false),
+            vec!["pr", "ready", "42", "--repo", "owner/repo"]
+        );
+        assert_eq!(
+            pull_request_ready_args("owner/repo", 42, true),
+            vec!["pr", "ready", "42", "--repo", "owner/repo", "--undo"]
+        );
+    }
+
+    #[test]
     fn search_page_args_use_rest_search_pagination_and_sort() {
         let args = search_page_args(
             SectionKind::Issues,
@@ -3261,7 +3297,7 @@ mod tests {
             vec![
                 "api",
                 "-X",
-                "PUT",
+                "POST",
                 "repos/owner/repo/issues/42/assignees",
                 "-f",
                 "assignees[]=alice",

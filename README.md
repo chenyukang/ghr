@@ -23,7 +23,7 @@
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
-- Comment, reply, edit, milestone, merge, close, update-branch, rerun-failed-checks, local PR checkout, and full PR review submit flows from inside the TUI.
+- Comment, reply, edit, milestone, merge, close, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Unread notification handling with local cache updates and GitHub read-state sync.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
@@ -92,6 +92,7 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `D` | Discard a pending PR review created in this session |
 | `E` | Open an enable auto-merge confirmation for the selected PR |
 | `O` | Open a disable auto-merge confirmation for the selected PR |
+| `Z` | Toggle the selected open PR between draft and ready for review |
 | `P` | Request or re-request PR reviewers with comma-separated logins |
 | `Y` | Remove pending PR review requests with comma-separated logins |
 | `t` | Change or clear the selected issue/PR milestone |

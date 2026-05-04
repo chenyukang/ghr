@@ -35,12 +35,13 @@ use crate::github::{
     AssigneeAction, CommentFetchResult, ItemMetadataUpdate, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
-    approve_pull_request, change_issue_milestone, close_pull_request, create_issue,
-    create_pending_pull_request_review, disable_pull_request_auto_merge,
-    discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
-    edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
-    fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
-    fetch_repository_labels, mark_notification_thread_read, merge_pull_request, post_issue_comment,
+    approve_pull_request, change_issue_milestone, close_pull_request,
+    convert_pull_request_to_draft, create_issue, create_pending_pull_request_review,
+    disable_pull_request_auto_merge, discard_pending_pull_request_review, edit_issue_comment,
+    edit_item_metadata, edit_pull_request_review_comment, enable_pull_request_auto_merge,
+    fetch_comments, fetch_open_milestones, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, fetch_repository_labels, mark_notification_thread_read,
+    mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
     remove_pull_request_reviewers, request_pull_request_reviewers,
@@ -543,6 +544,8 @@ enum PrAction {
     Checkout,
     RerunFailedChecks,
     UpdateBranch,
+    ConvertToDraft,
+    MarkReadyForReview,
 }
 
 type PrActionDialogSummary = Vec<(&'static str, String)>;
@@ -2041,6 +2044,14 @@ fn start_pr_action(
                 PrAction::UpdateBranch => update_pull_request_branch(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::ConvertToDraft => convert_pull_request_to_draft(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
+                PrAction::MarkReadyForReview => {
+                    mark_pull_request_ready_for_review(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -2683,6 +2694,7 @@ fn handle_key_in_area(
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
             KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
             KeyCode::Char('Y') => app.start_reviewer_dialog(ReviewerAction::Remove),
+            KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
             KeyCode::Char('N') => app.start_new_issue_dialog(),
@@ -2727,6 +2739,7 @@ fn handle_key_in_area(
             KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
             KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
             KeyCode::Char('Y') => app.start_reviewer_dialog(ReviewerAction::Remove),
+            KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -2880,6 +2893,7 @@ fn handle_diff_file_list_key(
         KeyCode::Char('t') => app.start_milestone_dialog(tx),
         KeyCode::Char('+') => app.start_assignee_dialog(AssigneeAction::Assign),
         KeyCode::Char('-') => app.start_assignee_dialog(AssigneeAction::Unassign),
+        KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -4213,7 +4227,19 @@ fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'stat
     (Some("text-select"), None)
 }
 
+fn assignee_footer_keys(app: &AppState) -> &'static str {
+    if app
+        .current_item()
+        .is_some_and(|item| item.assignees.is_empty())
+    {
+        "+"
+    } else {
+        "+/-"
+    }
+}
+
 fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
+    let assignee_keys = assignee_footer_keys(app);
     if let Some(dialog) = &app.pr_action_dialog {
         push_footer_context(spans, "Confirm", "PR action");
         if dialog.action == PrAction::Merge {
@@ -4250,9 +4276,9 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
-                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
+                push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
@@ -4269,9 +4295,9 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
-                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
+                push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
             }
         }
@@ -4297,10 +4323,10 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
-                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
+                push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
@@ -4308,11 +4334,11 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(spans, "enter", "expand", Color::Yellow);
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "+/-", "assign", Color::LightBlue);
+                push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4766,6 +4792,8 @@ fn draw_pr_action_dialog(
         PrAction::Checkout => "checkout",
         PrAction::RerunFailedChecks => "rerun failed checks for",
         PrAction::UpdateBranch => "update",
+        PrAction::ConvertToDraft => "convert",
+        PrAction::MarkReadyForReview => "mark ready",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
@@ -4776,6 +4804,8 @@ fn draw_pr_action_dialog(
         PrAction::Checkout => "Checkout this pull request locally?",
         PrAction::RerunFailedChecks => "Rerun failed GitHub Actions jobs for this pull request?",
         PrAction::UpdateBranch => "Update this pull request branch from its base branch?",
+        PrAction::ConvertToDraft => "Convert this pull request to draft on GitHub?",
+        PrAction::MarkReadyForReview => "Mark this pull request ready for review on GitHub?",
     };
     let status = if running {
         match dialog.action {
@@ -4848,6 +4878,8 @@ fn draw_pr_action_dialog(
                 PrAction::Checkout => "Checkout Pull Request Locally",
                 PrAction::RerunFailedChecks => "Rerun Failed Checks",
                 PrAction::UpdateBranch => "Update Pull Request Branch",
+                PrAction::ConvertToDraft => "Convert to Draft",
+                PrAction::MarkReadyForReview => "Ready for Review",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -6809,6 +6841,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("D", "discard a pending PR review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("Z", "toggle PR draft / ready for review"),
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
@@ -6871,6 +6904,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("D", "discard a pending PR review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("Z", "toggle PR draft / ready for review"),
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("P", "request or re-request PR reviewers"),
         help_key_line("Y", "remove pending PR review requests"),
@@ -8230,11 +8264,13 @@ fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
         "+ assign",
         DetailAction::AssignAssignee,
     ));
-    segments.push(DetailSegment::raw("  "));
-    segments.push(DetailSegment::action(
-        "- unassign",
-        DetailAction::UnassignAssignee,
-    ));
+    if !item.assignees.is_empty() {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(DetailSegment::action(
+            "- unassign",
+            DetailAction::UnassignAssignee,
+        ));
+    }
     segments
 }
 
@@ -11593,6 +11629,7 @@ impl AppState {
                         self.action_hints.remove(&item_id);
                         self.diffs.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
+                        self.action_hints.remove(&item_id);
                         self.status = match action {
                             PrAction::Merge => format!(
                                 "pull request merged using {}; refreshing",
@@ -11612,6 +11649,12 @@ impl AppState {
                             }
                             PrAction::UpdateBranch => {
                                 "pull request branch update accepted; refreshing".to_string()
+                            }
+                            PrAction::ConvertToDraft => {
+                                "pull request converted to draft; refreshing".to_string()
+                            }
+                            PrAction::MarkReadyForReview => {
+                                "pull request marked ready; refreshing".to_string()
                             }
                         };
                         self.message_dialog = Some(success_message_dialog(
@@ -12166,6 +12209,8 @@ impl AppState {
                     PrAction::Checkout => {}
                     PrAction::RerunFailedChecks => {}
                     PrAction::UpdateBranch => {}
+                    PrAction::ConvertToDraft => mark_item_draft(item),
+                    PrAction::MarkReadyForReview => mark_item_ready_for_review(item),
                 }
             }
         }
@@ -13811,12 +13856,7 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
-        if action == PrAction::UpdateBranch
-            && item
-                .state
-                .as_deref()
-                .is_some_and(|state| !state.eq_ignore_ascii_case("open"))
-        {
+        if pr_action_requires_open_pull_request(action) && !item_is_open_pull_request(&item) {
             self.status = "selected pull request is not open".to_string();
             return;
         }
@@ -13857,6 +13897,8 @@ impl AppState {
             PrAction::Checkout => "confirm local pull request checkout".to_string(),
             PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
             PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
+            PrAction::ConvertToDraft => "confirm convert pull request to draft".to_string(),
+            PrAction::MarkReadyForReview => "confirm mark pull request ready".to_string(),
         };
     }
 
@@ -13889,11 +13931,13 @@ impl AppState {
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
         self.review_submit_dialog = None;
+        self.reviewer_dialog = None;
         self.item_edit_dialog = None;
         self.milestone_dialog = None;
         self.pr_action_dialog = Some(PrActionDialog {
@@ -13905,6 +13949,28 @@ impl AppState {
         });
         self.pr_action_running = false;
         self.status = "confirm local pull request checkout".to_string();
+    }
+
+    fn start_pr_draft_ready_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        if !item_is_open_pull_request(&item) {
+            self.status = "selected pull request is not open".to_string();
+            return;
+        }
+
+        let action = if item_is_draft_pull_request(&item) {
+            PrAction::MarkReadyForReview
+        } else {
+            PrAction::ConvertToDraft
+        };
+        self.start_pr_action_dialog(action);
     }
 
     fn pr_action_dialog_summary(
@@ -14090,6 +14156,8 @@ impl AppState {
             PrAction::Checkout => "checking out pull request locally".to_string(),
             PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
             PrAction::UpdateBranch => "updating pull request branch".to_string(),
+            PrAction::ConvertToDraft => "converting pull request to draft".to_string(),
+            PrAction::MarkReadyForReview => "marking pull request ready for review".to_string(),
         };
         submit(item, action, checkout, merge_method);
     }
@@ -14517,6 +14585,10 @@ impl AppState {
         };
         if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
             self.status = "selected item cannot have assignees".to_string();
+            return;
+        }
+        if action == AssigneeAction::Unassign && item.assignees.is_empty() {
+            self.status = "selected item has no assignees".to_string();
             return;
         }
         self.search_active = false;
@@ -16240,6 +16312,46 @@ fn item_meta(item: &WorkItem) -> String {
         parts.push(extra.clone());
     }
     parts.join(" ")
+}
+
+fn item_is_open_pull_request(item: &WorkItem) -> bool {
+    item.state
+        .as_deref()
+        .is_none_or(|state| state.eq_ignore_ascii_case("open"))
+}
+
+fn item_is_draft_pull_request(item: &WorkItem) -> bool {
+    item.extra
+        .as_deref()
+        .is_some_and(|extra| extra.split_whitespace().any(|part| part == "draft"))
+}
+
+fn pr_action_requires_open_pull_request(action: PrAction) -> bool {
+    matches!(
+        action,
+        PrAction::UpdateBranch | PrAction::ConvertToDraft | PrAction::MarkReadyForReview
+    )
+}
+
+fn mark_item_draft(item: &mut WorkItem) {
+    if !item_is_draft_pull_request(item) {
+        item.extra = Some(match item.extra.take() {
+            Some(extra) if !extra.trim().is_empty() => format!("{extra} draft"),
+            _ => "draft".to_string(),
+        });
+    }
+}
+
+fn mark_item_ready_for_review(item: &mut WorkItem) {
+    let Some(extra) = item.extra.take() else {
+        return;
+    };
+    let remaining = extra
+        .split_whitespace()
+        .filter(|part| *part != "draft")
+        .collect::<Vec<_>>()
+        .join(" ");
+    item.extra = (!remaining.is_empty()).then_some(remaining);
 }
 
 #[cfg(test)]
@@ -18353,6 +18465,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("open PR enable auto-merge confirmation"));
         assert!(text.contains("open PR disable auto-merge confirmation"));
         assert!(text.contains("open PR update-branch confirmation"));
+        assert!(text.contains("toggle PR draft / ready for review"));
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("change issue or PR milestone"));
         assert!(text.contains("filter open milestones by prefix"));
@@ -18628,9 +18741,9 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("v diff"));
         assert!(text.contains("T edit item"));
         assert!(text.contains("s/A/D review"));
-        assert!(text.contains("M/C/U/E/O/F/X pr action"));
+        assert!(text.contains("M/C/U/E/O/F/X/Z pr action"));
         assert!(text.contains("t milestone"));
-        assert!(text.contains("+/- assign"));
+        assert!(text.contains("+ assign"));
         assert!(text.contains(
             "| 1-4 focus  ? help  S repo  f filter  r refresh  o open  m text-select  q quit |"
         ));
@@ -18661,7 +18774,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/U/E/O/F/X pr action"));
+        assert!(!ghr.contains("M/C/U/E/O/F/X/Z pr action"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
@@ -18672,18 +18785,22 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  enter expand  c/a comment  +/- assign"));
+        assert!(details.contains("n/p comment  enter expand  c/a comment  + assign"));
         assert!(details.contains("R reply  e edit"));
         assert!(details.contains("T edit item"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
+
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
+        let details_with_assignee = footer_line(&app, &paths).to_string();
+        assert!(details_with_assignee.contains("+/- assign"));
 
         app.show_diff();
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
         assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
-        assert!(diff.contains("M/C/U/E/O/F/X pr action"));
+        assert!(diff.contains("M/C/U/E/O/F/X/Z pr action"));
         assert!(diff.contains("t milestone"));
         assert!(diff.contains("T edit item"));
         assert!(diff.contains("+/- assign"));
@@ -20658,6 +20775,21 @@ diff --git a/src/github.rs b/src/github.rs
     #[test]
     fn assignee_actions_are_rendered_in_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        let document = build_details_document(&app, 100);
+        let assignee_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("assignees: -"))
+            .expect("empty assignee row");
+        let empty_line = document.lines[assignee_line].to_string();
+        let assign_column = empty_line.find("+ assign").expect("assign action") as u16;
+        assert!(!empty_line.contains("- unassign"));
+        assert_eq!(
+            document.action_at(assignee_line, assign_column),
+            Some(DetailAction::AssignAssignee)
+        );
+
         app.sections[0].items[0].assignees = vec!["alice".to_string()];
 
         let document = build_details_document(&app, 100);
@@ -20706,6 +20838,17 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "enter assignee to add");
 
         app.assignee_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('-')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(app.status, "selected item has no assignees");
+
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
         assert!(!handle_key(
             &mut app,
             key(KeyCode::Char('-')),
@@ -21738,6 +21881,73 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_z_key_opens_convert_to_draft_confirmation_for_ready_pr() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('Z')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("draft dialog");
+        assert_eq!(dialog.action, PrAction::ConvertToDraft);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm convert pull request to draft");
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Convert this pull request to draft on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, convert PR"));
+    }
+
+    #[test]
+    fn capital_z_key_opens_ready_confirmation_for_draft_pr_details() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('Z')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("ready dialog");
+        assert_eq!(dialog.action, PrAction::MarkReadyForReview);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm mark pull request ready");
+
+        let backend = ratatui::backend::TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Mark this pull request ready for review on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, mark ready PR"));
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -21816,6 +22026,29 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             submitted,
             Some(("1".to_string(), PrAction::UpdateBranch, None))
+        );
+    }
+
+    #[test]
+    fn draft_ready_confirmation_submits_selected_action() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.start_pr_draft_ready_dialog();
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, _merge_method| {
+                submitted = Some((item.id, action));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "marking pull request ready for review");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::MarkReadyForReview))
         );
     }
 
@@ -22422,6 +22655,27 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn draft_ready_action_rejects_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('Z')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected pull request is not open");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -22569,6 +22823,52 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(dialog.title, "Disable Auto-Merge Failed");
         assert!(dialog.body.contains("auto-merge is already disabled"));
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn draft_ready_action_finished_updates_item_extra_and_refreshes_action_hints() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Draft".to_string()],
+                checks: None,
+                note: Some("Merge blocked: draft".to_string()),
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_draft_ready_dialog();
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::MarkReadyForReview,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert_eq!(app.sections[0].items[0].extra, None);
+        assert!(!app.action_hints.contains_key("1"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "pull request marked ready; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Ready for Review");
+        assert!(dialog.auto_close_at.is_some());
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::ConvertToDraft,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert_eq!(app.sections[0].items[0].extra.as_deref(), Some("draft"));
+        assert_eq!(app.status, "pull request converted to draft; refreshing");
     }
 
     #[test]

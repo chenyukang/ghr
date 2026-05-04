@@ -108,6 +108,7 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Close => "Pull Request Closed",
         PrAction::Approve => "Pull Request Approved",
         PrAction::Checkout => "Pull Request Checked Out",
+        PrAction::RerunFailedChecks => "Failed Checks Rerun",
     }
 }
 
@@ -117,6 +118,9 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
         PrAction::Checkout => "GitHub CLI checked out the pull request locally.",
+        PrAction::RerunFailedChecks => {
+            "GitHub accepted the failed-check rerun request. Refreshing details."
+        }
     }
 }
 
@@ -126,6 +130,7 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Close => "Close Failed",
         PrAction::Approve => "Approve Failed",
         PrAction::Checkout => "Checkout Failed",
+        PrAction::RerunFailedChecks => "Rerun Failed",
     }
 }
 
@@ -135,6 +140,7 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Close => "pull request close failed",
         PrAction::Approve => "pull request approval failed",
         PrAction::Checkout => "pull request checkout failed",
+        PrAction::RerunFailedChecks => "failed check rerun failed",
     }
 }
 

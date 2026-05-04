@@ -126,8 +126,16 @@ pub struct ActionHints {
     pub labels: Vec<String>,
     pub checks: Option<CheckSummary>,
     pub commits: Option<usize>,
+    pub failed_check_runs: Vec<FailedCheckRunSummary>,
     pub note: Option<String>,
     pub head: Option<PullRequestBranch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCheckRunSummary {
+    pub run_id: u64,
+    pub workflow: Option<String>,
+    pub checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

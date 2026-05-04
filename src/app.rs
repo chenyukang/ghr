@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(not(test))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(test))]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -54,7 +58,8 @@ use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
     PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
     configured_sections, global_search_view_key, mark_notification_read_in_section,
-    merge_cached_sections, merge_refreshed_sections, section_counts, section_view_key,
+    merge_cached_sections, merge_refreshed_sections, repo_view_key, section_counts,
+    section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::UiState;
@@ -742,6 +747,28 @@ struct CommandPalette {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectSwitcher {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectRemoveDialog {
+    query: String,
+    selected: usize,
+    candidates: Vec<ProjectRemoveCandidate>,
+    confirm: Option<ProjectRemoveCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectRemoveCandidate {
+    index: usize,
+    name: String,
+    repo: String,
+    local_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyBinding {
     label: String,
@@ -798,6 +825,9 @@ enum PaletteAction {
     ShowCommandPalette,
     Refresh,
     SearchCurrentRepo,
+    SwitchProject,
+    ProjectRemove,
+    CopyGithubLink,
     ToggleMouseCapture,
     OpenSelected,
     ShowDiff,
@@ -1003,6 +1033,8 @@ struct AppState {
     filter_input_active: bool,
     filter_input_query: String,
     command_palette: Option<CommandPalette>,
+    project_switcher: Option<ProjectSwitcher>,
+    project_remove_dialog: Option<ProjectRemoveDialog>,
     command_palette_key: String,
     status: String,
     refreshing: bool,
@@ -1367,7 +1399,7 @@ enum RefreshPriority {
     Background,
 }
 
-pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
+pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
     let cached = store.load_all()?;
     let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
@@ -1410,7 +1442,7 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     let result = run_loop(
         &mut terminal,
         &mut app,
-        &config,
+        &mut config,
         &paths,
         &store,
         &tx,
@@ -1455,7 +1487,7 @@ fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDia
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
-    config: &Config,
+    config: &mut Config,
     paths: &Paths,
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
@@ -1490,7 +1522,7 @@ async fn run_loop(
             let events = read_event_batch(event::read()?)?;
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
-            should_quit = handle_event_batch(app, events, area, config, paths, store, tx);
+            should_quit = handle_event_batch_mut(app, events, area, config, paths, store, tx);
         }
         sync_mouse_capture(terminal, app, &mut mouse_capture_enabled)?;
         if should_quit {
@@ -1510,11 +1542,11 @@ fn read_event_batch(first: Event) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn handle_event_batch(
+fn handle_event_batch_mut(
     app: &mut AppState,
     events: Vec<Event>,
     area: Rect,
-    config: &Config,
+    config: &mut Config,
     paths: &Paths,
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
@@ -1528,7 +1560,7 @@ fn handle_event_batch(
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                if handle_key_in_area(app, key, config, store, tx, Some(area)) {
+                if handle_key_in_area_mut(app, key, config, paths, store, tx, Some(area)) {
                     save_ui_state(app, paths);
                     return true;
                 }
@@ -1548,6 +1580,20 @@ fn handle_event_batch(
 
     flush_pending_mouse_scroll(app, &mut pending_scroll);
     false
+}
+
+#[cfg(test)]
+fn handle_event_batch(
+    app: &mut AppState,
+    events: Vec<Event>,
+    area: Rect,
+    config: &Config,
+    paths: &Paths,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+) -> bool {
+    let mut config = config.clone();
+    handle_event_batch_mut(app, events, area, &mut config, paths, store, tx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1643,6 +1689,8 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.setup_dialog.is_some()
         || app.startup_dialog.is_some()
         || app.command_palette.is_some()
+        || app.project_switcher.is_some()
+        || app.project_remove_dialog.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.item_edit_dialog.is_some()
@@ -2812,10 +2860,37 @@ fn handle_key(
     handle_key_in_area(app, key, config, store, tx, None)
 }
 
+#[cfg(test)]
 fn handle_key_in_area(
     app: &mut AppState,
     key: KeyEvent,
     config: &Config,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+    area: Option<Rect>,
+) -> bool {
+    let mut config = config.clone();
+    let paths = test_key_paths();
+    handle_key_in_area_mut(app, key, &mut config, &paths, store, tx, area)
+}
+
+#[cfg(test)]
+fn test_key_paths() -> Paths {
+    let root = std::path::PathBuf::from("/tmp/ghr-test-key");
+    Paths {
+        config_path: root.join("config.toml"),
+        db_path: root.join("ghr.db"),
+        log_path: root.join("ghr.log"),
+        state_path: root.join("state.toml"),
+        root,
+    }
+}
+
+fn handle_key_in_area_mut(
+    app: &mut AppState,
+    key: KeyEvent,
+    config: &mut Config,
+    paths: &Paths,
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
     area: Option<Rect>,
@@ -2859,7 +2934,17 @@ fn handle_key_in_area(
     }
 
     if app.command_palette.is_some() {
-        return app.handle_command_palette_key(key, config, store, tx, area);
+        return app.handle_command_palette_key(key, config, paths, store, tx, area);
+    }
+
+    if app.project_switcher.is_some() {
+        app.handle_project_switcher_key(key);
+        return false;
+    }
+
+    if app.project_remove_dialog.is_some() {
+        app.handle_project_remove_key(key, config, paths);
+        return false;
     }
 
     if should_open_command_palette(app, key) {
@@ -3333,6 +3418,12 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.message_dialog.is_some() {
+        return false;
+    }
+    if app.command_palette.is_some()
+        || app.project_switcher.is_some()
+        || app.project_remove_dialog.is_some()
+    {
         return false;
     }
     if let Some(dialog) = &app.pr_action_dialog {
@@ -3876,6 +3967,12 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     if let Some(palette) = &app.command_palette {
         draw_command_palette(frame, palette, area, &app.command_palette_key);
     }
+    if let Some(switcher) = &app.project_switcher {
+        draw_project_switcher(frame, app, switcher, area);
+    }
+    if let Some(dialog) = &app.project_remove_dialog {
+        draw_project_remove_dialog(frame, dialog, area);
+    }
 }
 
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4098,6 +4195,10 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .style(row_style)
         })
         .collect::<Vec<_>>();
+    let empty_state = rows
+        .is_empty()
+        .then(|| list_empty_state_message(app, section, &filtered_indices))
+        .flatten();
 
     let list_focused = app.focus == FocusTarget::List;
     let header_style = if list_focused {
@@ -4232,6 +4333,74 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         table_state.select(Some(selected));
     }
     frame.render_stateful_widget(table, area, &mut table_state);
+    if let Some((message, style)) = empty_state {
+        draw_list_empty_state_message(frame, area, &message, style);
+    }
+}
+
+fn draw_list_empty_state_message(frame: &mut Frame<'_>, area: Rect, message: &str, style: Style) {
+    let inner = block_inner(area);
+    if inner.height <= 2 || inner.width <= 2 {
+        return;
+    }
+
+    let message_area = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y.saturating_add(2),
+        inner.width.saturating_sub(2),
+        1,
+    );
+    let width = usize::from(message_area.width.max(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_inline(message, width),
+            style,
+        ))),
+        message_area,
+    );
+}
+
+fn list_empty_state_message(
+    app: &AppState,
+    section: &SectionSnapshot,
+    filtered_indices: &[usize],
+) -> Option<(String, Style)> {
+    if !filtered_indices.is_empty() {
+        return None;
+    }
+    if let Some(error) = &section.error {
+        return Some((
+            format!("Error: {}", compact_error_label(error)),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    if section.items.is_empty() && section.refreshed_at.is_none() {
+        if app.refreshing {
+            let message = if section_view_key(section).starts_with("repo:") {
+                "Git repo is loading ..."
+            } else {
+                "GitHub data is loading ..."
+            };
+            return Some((message.to_string(), Style::default().fg(Color::Gray)));
+        }
+        return Some((
+            "No cached data yet. Press r to refresh.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if section.items.is_empty() {
+        return Some((
+            "No items found.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !app.search_query.is_empty() {
+        return Some((
+            "No items match the current search.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    None
 }
 
 fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -5178,6 +5347,284 @@ fn command_palette_area(area: Rect) -> Rect {
     let max_height = area.height.saturating_sub(2).max(3);
     let height = 18.min(max_height).max(3);
     centered_rect_with_size(width, height, area)
+}
+
+fn draw_project_switcher(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    switcher: &ProjectSwitcher,
+    area: Rect,
+) {
+    let candidates = app.project_switcher_candidates_for_query(&switcher.query);
+    let dialog_area = project_switcher_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(3));
+    let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(project_switcher_input_line(&switcher.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No projects found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(project_switcher_candidate_line(
+                candidate,
+                candidate.key == app.active_view,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter: switch    Esc: close    Up/Down: select",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Switch Project",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+
+    let cursor_column =
+        display_width(&switcher.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn project_switcher_area(area: Rect) -> Rect {
+    let width = centered_rect_width(52, area).max(32).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_switcher_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type a project prefix",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+    ])
+}
+
+fn project_switcher_candidate_line(
+    candidate: &ViewTab,
+    current: bool,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let current_label = if current { "  current" } else { "" };
+    let text = truncate_inline(
+        &format!("{marker}{}{current_label}", candidate.label),
+        width,
+    );
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if current {
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn draw_project_remove_dialog(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialog, area: Rect) {
+    if let Some(candidate) = &dialog.confirm {
+        draw_project_remove_confirmation(frame, candidate, area);
+    } else {
+        draw_project_remove_picker(frame, dialog, area);
+    }
+}
+
+fn draw_project_remove_picker(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialog, area: Rect) {
+    let candidates = project_remove_filtered_candidates(dialog);
+    let dialog_area = project_remove_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(3));
+    let selected = dialog.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(project_switcher_input_line(&dialog.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No projects found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(project_remove_candidate_line(
+                candidate,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter: choose    Esc: close    Up/Down: select",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Project Remove",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+
+    let cursor_column =
+        display_width(&dialog.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn draw_project_remove_confirmation(
+    frame: &mut Frame<'_>,
+    candidate: &ProjectRemoveCandidate,
+    area: Rect,
+) {
+    let dialog_area = project_remove_confirm_area(area);
+    let local_dir = candidate.local_dir.as_deref().unwrap_or("(none)");
+    let lines = vec![
+        Line::from("Remove this project from config.toml?"),
+        Line::from(""),
+        key_value_line("project", candidate.name.clone()),
+        key_value_line("repo", candidate.repo.clone()),
+        key_value_line("local_dir", local_dir.to_string()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "y/Enter: remove project",
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("    "),
+            Span::styled("Esc: cancel", Style::default().fg(Color::Gray)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Confirm Project Remove",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn project_remove_area(area: Rect) -> Rect {
+    let width = centered_rect_width(58, area).max(36).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_remove_confirm_area(area: Rect) -> Rect {
+    let width = centered_rect_width(58, area).max(42).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 11.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_remove_candidate_line(
+    candidate: &ProjectRemoveCandidate,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = format!("{marker}{:<20} {}", candidate.name, candidate.repo);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(truncate_inline(&text, width), style))
 }
 
 fn command_palette_visible_start(selected: usize, len: usize, height: usize) -> usize {
@@ -6567,6 +7014,27 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             PaletteAction::SearchCurrentRepo,
         ),
         palette_command(
+            "Switch Project",
+            "",
+            "General",
+            "Filter configured repo projects and switch to one",
+            PaletteAction::SwitchProject,
+        ),
+        palette_command(
+            "Project Remove",
+            "",
+            "General",
+            "Remove a configured repo project from config.toml",
+            PaletteAction::ProjectRemove,
+        ),
+        palette_command(
+            "Copy GitHub Link",
+            "",
+            "General",
+            "Copy the selected comment or issue/PR link to the clipboard",
+            PaletteAction::CopyGithubLink,
+        ),
+        palette_command(
             "Toggle Mouse Text Selection",
             "m",
             "General",
@@ -7102,6 +7570,140 @@ fn command_palette_normalized_text(text: &str) -> String {
 
 fn command_palette_search_symbol(ch: char) -> bool {
     matches!(ch, ':' | '/' | '?' | '+' | '-' | '@' | '[' | ']')
+}
+
+fn project_switcher_candidate_matches(candidate: &ViewTab, query: &str) -> bool {
+    let query = command_palette_normalized_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let label = command_palette_normalized_text(&candidate.label);
+    let key = command_palette_normalized_text(
+        candidate
+            .key
+            .strip_prefix("repo:")
+            .unwrap_or(candidate.key.as_str()),
+    );
+    label.starts_with(&query) || key.starts_with(&query)
+}
+
+fn project_remove_filtered_candidates(
+    dialog: &ProjectRemoveDialog,
+) -> Vec<&ProjectRemoveCandidate> {
+    dialog
+        .candidates
+        .iter()
+        .filter(|candidate| project_remove_candidate_matches(candidate, &dialog.query))
+        .collect()
+}
+
+fn project_remove_candidate_matches(candidate: &ProjectRemoveCandidate, query: &str) -> bool {
+    let query = command_palette_normalized_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let name = command_palette_normalized_text(&candidate.name);
+    let repo = command_palette_normalized_text(&candidate.repo);
+    name.starts_with(&query) || repo.starts_with(&query)
+}
+
+fn project_remove_candidate_config_index(
+    config: &Config,
+    candidate: &ProjectRemoveCandidate,
+) -> Option<usize> {
+    if config
+        .repos
+        .get(candidate.index)
+        .is_some_and(|repo| repo.name == candidate.name && repo.repo == candidate.repo)
+    {
+        return Some(candidate.index);
+    }
+
+    config
+        .repos
+        .iter()
+        .position(|repo| repo.name == candidate.name && repo.repo == candidate.repo)
+}
+
+fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let _ = text;
+        Ok(())
+    }
+
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        copy_text_with_command("pbcopy", &[], text)
+    }
+
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        copy_text_with_command("cmd", &["/C", "clip"], text)
+    }
+
+    #[cfg(all(not(test), unix, not(target_os = "macos")))]
+    {
+        let mut last_error = None;
+        for (command, args) in [
+            ("wl-copy", Vec::<&str>::new()),
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+        ] {
+            match copy_text_with_command(command, &args, text) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no clipboard command found; tried wl-copy, xclip, and xsel",
+            )
+        }))
+    }
+
+    #[cfg(not(any(test, unix, target_os = "windows")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "clipboard copy is not supported on this platform",
+        ))
+    }
+}
+
+#[cfg(not(test))]
+fn copy_text_with_command(command: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("failed to open stdin for {command}"),
+            )
+        })?;
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{command} exited with status {status}"
+        )))
+    }
 }
 
 fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
@@ -11729,6 +12331,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.milestone_dialog.is_some()
         || app.assignee_dialog.is_some()
         || app.reviewer_dialog.is_some()
+        || app.project_remove_dialog.is_some()
 }
 
 fn is_assignee_assign_key(key: KeyEvent) -> bool {
@@ -11848,6 +12451,8 @@ impl AppState {
             filter_input_active: false,
             filter_input_query: String::new(),
             command_palette: None,
+            project_switcher: None,
+            project_remove_dialog: None,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
@@ -13144,6 +13749,8 @@ impl AppState {
 
     fn show_command_palette(&mut self) {
         self.command_palette = Some(CommandPalette::default());
+        self.project_switcher = None;
+        self.project_remove_dialog = None;
         self.status = "command palette".to_string();
     }
 
@@ -13155,7 +13762,8 @@ impl AppState {
     fn handle_command_palette_key(
         &mut self,
         key: KeyEvent,
-        config: &Config,
+        config: &mut Config,
+        paths: &Paths,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
@@ -13165,7 +13773,7 @@ impl AppState {
                 self.dismiss_command_palette();
                 false
             }
-            KeyCode::Enter => self.submit_command_palette_selection(config, store, tx, area),
+            KeyCode::Enter => self.submit_command_palette_selection(config, paths, store, tx, area),
             KeyCode::Down | KeyCode::Tab => {
                 self.move_command_palette_selection(1);
                 false
@@ -13214,7 +13822,8 @@ impl AppState {
 
     fn submit_command_palette_selection(
         &mut self,
-        config: &Config,
+        config: &mut Config,
+        paths: &Paths,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
@@ -13226,7 +13835,9 @@ impl AppState {
 
         self.command_palette = None;
         match command.action {
-            PaletteAction::Key(key) => handle_key_in_area(self, key, config, store, tx, area),
+            PaletteAction::Key(key) => {
+                handle_key_in_area_mut(self, key, config, paths, store, tx, area)
+            }
             PaletteAction::Quit => true,
             PaletteAction::ShowHelp => {
                 self.show_help_dialog();
@@ -13242,6 +13853,18 @@ impl AppState {
             }
             PaletteAction::SearchCurrentRepo => {
                 self.start_global_search_input();
+                false
+            }
+            PaletteAction::SwitchProject => {
+                self.show_project_switcher();
+                false
+            }
+            PaletteAction::ProjectRemove => {
+                self.show_project_remove_dialog(config);
+                false
+            }
+            PaletteAction::CopyGithubLink => {
+                self.copy_github_link();
                 false
             }
             PaletteAction::ToggleMouseCapture => {
@@ -13268,6 +13891,264 @@ impl AppState {
             .get(selected)
             .and_then(|index| commands.get(*index))
             .cloned()
+    }
+
+    fn show_project_switcher(&mut self) {
+        let candidates = self.project_switcher_candidates();
+        if candidates.is_empty() {
+            self.project_switcher = None;
+            self.status = "no configured projects".to_string();
+            return;
+        }
+
+        let selected = candidates
+            .iter()
+            .position(|candidate| candidate.key == self.active_view)
+            .unwrap_or(0);
+        self.command_palette = None;
+        self.project_switcher = Some(ProjectSwitcher {
+            query: String::new(),
+            selected,
+        });
+        self.status = "switch project".to_string();
+    }
+
+    fn dismiss_project_switcher(&mut self) {
+        self.project_switcher = None;
+        self.status = "project switch cancelled".to_string();
+    }
+
+    fn handle_project_switcher_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_project_switcher(),
+            KeyCode::Enter => self.submit_project_switcher_selection(),
+            KeyCode::Down | KeyCode::Tab => self.move_project_switcher_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_project_switcher_selection(-1),
+            KeyCode::PageDown => self.move_project_switcher_selection(8),
+            KeyCode::PageUp => self.move_project_switcher_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(switcher) = &mut self.project_switcher {
+                    switcher.query.pop();
+                    switcher.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(switcher) = &mut self.project_switcher {
+                    switcher.query.push(value);
+                    switcher.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_project_switcher_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .project_switcher
+            .as_ref()
+            .map(|switcher| switcher.query.clone())
+        else {
+            return;
+        };
+        let len = self.project_switcher_candidates_for_query(&query).len();
+        if let Some(switcher) = &mut self.project_switcher {
+            switcher.selected = move_wrapping(switcher.selected, len, delta);
+        }
+    }
+
+    fn submit_project_switcher_selection(&mut self) {
+        let Some(switcher) = &self.project_switcher else {
+            return;
+        };
+        let candidates = self.project_switcher_candidates_for_query(&switcher.query);
+        let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+        let Some(candidate) = candidates.get(selected) else {
+            self.status = "no matching project".to_string();
+            return;
+        };
+
+        let key = candidate.key.clone();
+        let label = candidate.label.clone();
+        self.project_switcher = None;
+        self.switch_view(key);
+        self.focus = FocusTarget::Ghr;
+        self.status = format!("project switched: {label}");
+    }
+
+    fn project_switcher_candidates(&self) -> Vec<ViewTab> {
+        self.view_tabs()
+            .into_iter()
+            .filter(|view| view.key.starts_with("repo:"))
+            .collect()
+    }
+
+    fn project_switcher_candidates_for_query(&self, query: &str) -> Vec<ViewTab> {
+        self.project_switcher_candidates()
+            .into_iter()
+            .filter(|view| project_switcher_candidate_matches(view, query))
+            .collect()
+    }
+
+    fn show_project_remove_dialog(&mut self, config: &Config) {
+        let candidates = config
+            .repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| ProjectRemoveCandidate {
+                index,
+                name: repo.name.clone(),
+                repo: repo.repo.clone(),
+                local_dir: repo.local_dir.clone(),
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.project_remove_dialog = None;
+            self.status = "no configured projects".to_string();
+            return;
+        }
+
+        let active_project = self.active_view.strip_prefix("repo:");
+        let selected = active_project
+            .and_then(|active| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.name.eq_ignore_ascii_case(active))
+            })
+            .unwrap_or(0);
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.project_remove_dialog = Some(ProjectRemoveDialog {
+            query: String::new(),
+            selected,
+            candidates,
+            confirm: None,
+        });
+        self.status = "project remove".to_string();
+    }
+
+    fn dismiss_project_remove_dialog(&mut self) {
+        self.project_remove_dialog = None;
+        self.status = "project remove cancelled".to_string();
+    }
+
+    fn handle_project_remove_key(&mut self, key: KeyEvent, config: &mut Config, paths: &Paths) {
+        if self
+            .project_remove_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.confirm.is_some())
+        {
+            match key.code {
+                KeyCode::Esc => self.dismiss_project_remove_dialog(),
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_project_remove(config, paths)
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.dismiss_project_remove_dialog(),
+            KeyCode::Enter => self.start_project_remove_confirmation(),
+            KeyCode::Down | KeyCode::Tab => self.move_project_remove_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_project_remove_selection(-1),
+            KeyCode::PageDown => self.move_project_remove_selection(8),
+            KeyCode::PageUp => self.move_project_remove_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.project_remove_dialog {
+                    dialog.query.pop();
+                    dialog.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(dialog) = &mut self.project_remove_dialog {
+                    dialog.query.push(value);
+                    dialog.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_project_remove_selection(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.project_remove_dialog else {
+            return;
+        };
+        let len = project_remove_filtered_candidates(dialog).len();
+        dialog.selected = move_wrapping(dialog.selected, len, delta);
+    }
+
+    fn start_project_remove_confirmation(&mut self) {
+        let Some(candidate) = self.selected_project_remove_candidate() else {
+            self.status = "no matching project".to_string();
+            return;
+        };
+        if let Some(dialog) = &mut self.project_remove_dialog {
+            dialog.confirm = Some(candidate.clone());
+        }
+        self.status = format!("confirm remove project {}", candidate.name);
+    }
+
+    fn selected_project_remove_candidate(&self) -> Option<ProjectRemoveCandidate> {
+        let dialog = self.project_remove_dialog.as_ref()?;
+        let matches = project_remove_filtered_candidates(dialog);
+        let selected = dialog.selected.min(matches.len().saturating_sub(1));
+        matches.get(selected).map(|candidate| (*candidate).clone())
+    }
+
+    fn confirm_project_remove(&mut self, config: &mut Config, paths: &Paths) {
+        let Some(candidate) = self
+            .project_remove_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.confirm.clone())
+        else {
+            return;
+        };
+        let Some(index) = project_remove_candidate_config_index(config, &candidate) else {
+            self.project_remove_dialog = None;
+            self.status = format!("project already removed: {}", candidate.name);
+            return;
+        };
+        let Some(removed) = config.remove_repo_at(index) else {
+            self.project_remove_dialog = None;
+            self.status = format!("project already removed: {}", candidate.name);
+            return;
+        };
+
+        if let Err(error) = config.save(&paths.config_path) {
+            config.repos.insert(index, removed);
+            self.project_remove_dialog = None;
+            self.status = format!("project remove failed: {error}");
+            return;
+        }
+
+        self.project_remove_dialog = None;
+        self.remove_project_view(&removed.name);
+        self.status = format!("project removed: {}", removed.name);
+    }
+
+    fn remove_project_view(&mut self, name: &str) {
+        let view = repo_view_key(name);
+        let removed_section_keys = self
+            .sections
+            .iter()
+            .filter(|section| same_view_key(&section_view_key(section), &view))
+            .map(|section| section.key.clone())
+            .collect::<Vec<_>>();
+        self.sections
+            .retain(|section| !same_view_key(&section_view_key(section), &view));
+        self.section_index.remove(&view);
+        self.selected_index.remove(&view);
+        for key in removed_section_keys {
+            self.list_scroll_offset.remove(&key);
+        }
+        self.clamp_positions();
     }
 
     fn mark_item_after_pr_action(&mut self, item_id: &str, action: PrAction) {
@@ -16996,6 +17877,46 @@ impl AppState {
         self.open_url(&url);
     }
 
+    fn copy_github_link(&mut self) {
+        let Some((url, label)) = self.selected_github_link() else {
+            self.status = "no GitHub link selected".to_string();
+            return;
+        };
+
+        match copy_text_to_clipboard(&url) {
+            Ok(()) => {
+                self.status = format!("copied {label} link");
+            }
+            Err(error) => {
+                self.status = format!("copy failed: {error}");
+            }
+        }
+    }
+
+    fn selected_github_link(&self) -> Option<(String, &'static str)> {
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
+                .current_selected_comment()
+                .and_then(|comment| comment.url.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some((url.to_string(), "comment"));
+        }
+
+        let item = self.current_item()?;
+        let url = item.url.trim();
+        if url.is_empty() {
+            return None;
+        }
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request",
+            ItemKind::Issue => "issue",
+            ItemKind::Notification => "GitHub",
+        };
+        Some((url.to_string(), label))
+    }
+
     fn selected_open_url(&self) -> Option<String> {
         let item = self.current_item()?;
         if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
@@ -20034,6 +20955,250 @@ diff --git a/src/github.rs b/src/github.rs
                 .any(|index| commands[*index].title == "Add Reaction")
         );
         assert!(command_palette_filtered_indices(&commands, ".").is_empty());
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Switch Project")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Project Remove")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Copy GitHub Link")
+        );
+    }
+
+    #[test]
+    fn project_switcher_lists_repo_tabs_and_filters_by_prefix() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "CKB".to_string(),
+            repo: "nervosnetwork/ckb".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        app.show_project_switcher();
+
+        assert_eq!(
+            app.project_switcher_candidates_for_query("")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["ghr", "Fiber", "CKB"]
+        );
+        assert_eq!(
+            app.project_switcher_candidates_for_query("fi")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["Fiber"]
+        );
+    }
+
+    #[test]
+    fn command_palette_switch_project_opens_project_switcher() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "switch project".to_string(),
+            selected: 0,
+        });
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &config,
+            &store,
+            &tx,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.project_switcher, Some(ProjectSwitcher::default()));
+        assert_eq!(app.status, "switch project");
+    }
+
+    #[test]
+    fn project_switcher_enter_switches_to_selected_project() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        app.show_project_switcher();
+        app.handle_project_switcher_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_project_switcher_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_view, "repo:Fiber");
+        assert_eq!(app.focus, FocusTarget::Ghr);
+        assert!(app.project_switcher.is_none());
+        assert_eq!(app.status, "project switched: Fiber");
+    }
+
+    #[test]
+    fn command_palette_project_remove_opens_configured_project_picker() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: Some("/tmp/fiber".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let paths = unique_test_paths("project-remove-open");
+        app.command_palette = Some(CommandPalette {
+            query: "project remove".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        let dialog = app
+            .project_remove_dialog
+            .as_ref()
+            .expect("remove dialog should open");
+        assert!(app.command_palette.is_none());
+        assert_eq!(dialog.candidates.len(), 1);
+        assert_eq!(dialog.candidates[0].name, "Fiber");
+        assert_eq!(app.status, "project remove");
+    }
+
+    #[test]
+    fn project_remove_confirmation_removes_repo_from_config_and_ui() {
+        let paths = unique_test_paths("project-remove-confirm");
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some("/tmp/ghr".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: Some("/tmp/fiber".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.save(&paths.config_path).expect("save config");
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        app.switch_view("repo:Fiber");
+
+        app.show_project_remove_dialog(&config);
+        app.handle_project_remove_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+
+        assert_eq!(
+            app.project_remove_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.confirm.as_ref())
+                .map(|candidate| candidate.name.as_str()),
+            Some("Fiber")
+        );
+
+        app.handle_project_remove_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "ghr");
+        assert!(app.project_remove_dialog.is_none());
+        assert!(
+            !app.sections
+                .iter()
+                .any(|section| section_view_key(section) == "repo:Fiber")
+        );
+        assert_ne!(app.active_view, "repo:Fiber");
+        assert_eq!(app.status, "project removed: Fiber");
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.repos.len(), 1);
+        assert_eq!(saved.repos[0].name, "ghr");
     }
 
     #[test]
@@ -20219,6 +21384,55 @@ diff --git a/src/github.rs b/src/github.rs
         let meta_pos = row.find("open 0c").expect("meta cell");
         assert!(title_pos < updated_pos);
         assert!(updated_pos < meta_pos);
+    }
+
+    #[test]
+    fn first_load_repo_section_renders_loading_hint_in_list() {
+        let section = SectionSnapshot::empty_for_view(
+            "repo:ghr",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:chenyukang/ghr is:open archived:false sort:created-desc",
+        );
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.switch_view("repo:ghr");
+        app.refreshing = true;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Git repo is loading ..."));
+    }
+
+    #[test]
+    fn empty_loaded_repo_section_renders_empty_hint_not_loading() {
+        let mut section = SectionSnapshot::empty_for_view(
+            "repo:ghr",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:chenyukang/ghr is:open archived:false sort:created-desc",
+        );
+        section.refreshed_at = Some(Utc::now());
+        section.total_count = Some(0);
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.switch_view("repo:ghr");
+        app.refreshing = true;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("No items found."));
+        assert!(!rendered.contains("Git repo is loading ..."));
     }
 
     #[test]
@@ -22874,6 +24088,72 @@ diff --git a/src/github.rs b/src/github.rs
             app.selected_open_url().as_deref(),
             Some("https://github.com/chenyukang/ghr/pull/8/changes")
         );
+    }
+
+    #[test]
+    fn copy_github_link_prefers_selected_comment_when_details_focused() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment(
+                "alice",
+                "looks good",
+                Some("https://github.com/rust-lang/rust/pull/1#issuecomment-1"),
+            )]),
+        );
+        app.focus_details();
+
+        assert_eq!(
+            app.selected_github_link(),
+            Some((
+                "https://github.com/rust-lang/rust/pull/1#issuecomment-1".to_string(),
+                "comment"
+            ))
+        );
+
+        app.copy_github_link();
+
+        assert_eq!(app.status, "copied comment link");
+    }
+
+    #[test]
+    fn copy_github_link_uses_item_link_without_selected_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        assert_eq!(
+            app.selected_github_link(),
+            Some((
+                "https://github.com/rust-lang/rust/pull/1".to_string(),
+                "pull request"
+            ))
+        );
+
+        app.copy_github_link();
+
+        assert_eq!(app.status, "copied pull request link");
+    }
+
+    #[test]
+    fn command_palette_copy_github_link_copies_current_item_link() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "copy github".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.status, "copied pull request link");
+        assert!(app.command_palette.is_none());
     }
 
     #[test]
@@ -27479,6 +28759,23 @@ diff --git a/d.rs b/d.rs
 
     fn test_paths() -> Paths {
         let root = std::path::PathBuf::from("/tmp/ghr-test");
+        Paths {
+            config_path: root.join("config.toml"),
+            db_path: root.join("ghr.db"),
+            log_path: root.join("ghr.log"),
+            state_path: root.join("state.toml"),
+            root,
+        }
+    }
+
+    fn unique_test_paths(prefix: &str) -> Paths {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ghr-{prefix}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create test root");
         Paths {
             config_path: root.join("config.toml"),
             db_path: root.join("ghr.db"),

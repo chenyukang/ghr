@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -62,7 +63,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    config = config.include_current_git_repo();
+    let (updated_config, repo_save_result) =
+        config.include_current_git_repo_and_save(&paths.config_path);
+    config = updated_config;
+    if let Some(result) = repo_save_result {
+        match result {
+            Ok(repo) => info!(repo, "saved current git repo to config"),
+            Err(error) => warn!(
+                error = %error,
+                "failed to save current git repo to config; using it for this run only"
+            ),
+        }
+    }
 
     if cli.refresh {
         let refreshed = refresh_dashboard(&config).await;

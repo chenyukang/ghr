@@ -98,20 +98,58 @@ impl Config {
         Ok(config)
     }
 
-    pub fn include_current_git_repo(mut self) -> Self {
-        if let Some(repo) = current_github_repo() {
-            self.add_runtime_repo(repo);
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        self
+        let content = toml::to_string_pretty(self).context("failed to encode config")?;
+        fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
     }
 
-    fn add_runtime_repo(&mut self, repo: String) -> bool {
-        if self
+    pub fn include_current_git_repo_and_save(self, path: &Path) -> (Self, Option<Result<String>>) {
+        let Some(directory) = std::env::current_dir().ok() else {
+            return (self, None);
+        };
+        self.include_git_repo_at_and_save(path, &directory)
+    }
+
+    pub fn remove_repo_at(&mut self, index: usize) -> Option<RepoConfig> {
+        (index < self.repos.len()).then(|| self.repos.remove(index))
+    }
+
+    fn include_git_repo_at_and_save(
+        mut self,
+        path: &Path,
+        directory: &Path,
+    ) -> (Self, Option<Result<String>>) {
+        let Some(repo) = current_github_repo_in(directory) else {
+            return (self, None);
+        };
+        let local_dir = Some(directory.display().to_string());
+        if !self.add_runtime_repo_with_local_dir(repo.clone(), local_dir) {
+            return (self, None);
+        }
+
+        let save_result = self.save(path).map(|()| repo);
+        (self, Some(save_result))
+    }
+
+    fn add_runtime_repo_with_local_dir(&mut self, repo: String, local_dir: Option<String>) -> bool {
+        if let Some(configured) = self
             .repos
-            .iter()
-            .any(|configured| configured.repo.eq_ignore_ascii_case(&repo))
+            .iter_mut()
+            .find(|configured| configured.repo.eq_ignore_ascii_case(&repo))
         {
-            return false;
+            let has_local_dir = configured
+                .local_dir
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if has_local_dir || local_dir.is_none() {
+                return false;
+            }
+            configured.local_dir = local_dir;
+            return true;
         }
 
         let name = runtime_repo_name(&self.repos, &repo);
@@ -120,7 +158,7 @@ impl Config {
             RepoConfig {
                 name,
                 repo,
-                local_dir: current_dir_for_config(),
+                local_dir,
                 show_prs: true,
                 show_issues: true,
                 labels: Vec::new(),
@@ -132,36 +170,30 @@ impl Config {
     }
 }
 
-fn current_dir_for_config() -> Option<String> {
-    std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
-}
-
-fn current_github_repo() -> Option<String> {
-    if git_output(["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+fn current_github_repo_in(directory: &Path) -> Option<String> {
+    if git_output(directory, ["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
         return None;
     }
 
-    git_remote_candidates()
+    git_remote_candidates(directory)
         .into_iter()
-        .filter_map(|remote| git_output(["remote", "get-url", remote.as_str()]))
+        .filter_map(|remote| git_output(directory, ["remote", "get-url", remote.as_str()]))
         .find_map(|url| github_repo_from_remote_url(url.trim()))
 }
 
-fn git_remote_candidates() -> Vec<String> {
+fn git_remote_candidates(directory: &Path) -> Vec<String> {
     let mut remotes = Vec::new();
 
-    if let Some(branch) = git_output(["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+    if let Some(branch) = git_output(directory, ["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         let key = format!("branch.{}.remote", branch.trim());
-        if let Some(remote) = git_output(["config", "--get", key.as_str()]) {
+        if let Some(remote) = git_output(directory, ["config", "--get", key.as_str()]) {
             push_unique_remote(&mut remotes, remote.trim());
         }
     }
 
     push_unique_remote(&mut remotes, "origin");
 
-    if let Some(output) = git_output(["remote"]) {
+    if let Some(output) = git_output(directory, ["remote"]) {
         for remote in output.lines() {
             push_unique_remote(&mut remotes, remote.trim());
         }
@@ -177,8 +209,13 @@ fn push_unique_remote(remotes: &mut Vec<String>, remote: &str) {
     remotes.push(remote.to_string());
 }
 
-fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+fn git_output<const N: usize>(directory: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -405,15 +442,21 @@ mod tests {
     #[test]
     fn runtime_repo_is_added_once() {
         let mut config = Config::default();
-        assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
+        assert!(config.add_runtime_repo_with_local_dir(
+            "chenyukang/ghr".to_string(),
+            Some("/tmp/ghr".to_string())
+        ));
         assert_eq!(config.repos.len(), 1);
         assert_eq!(config.repos[0].name, "ghr");
         assert_eq!(config.repos[0].repo, "chenyukang/ghr");
-        assert!(config.repos[0].local_dir.is_some());
+        assert_eq!(config.repos[0].local_dir.as_deref(), Some("/tmp/ghr"));
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
 
-        assert!(!config.add_runtime_repo("chenyukang/GHR".to_string()));
+        assert!(!config.add_runtime_repo_with_local_dir(
+            "chenyukang/GHR".to_string(),
+            Some("/tmp/other-ghr".to_string())
+        ));
         assert_eq!(config.repos.len(), 1);
     }
 
@@ -431,7 +474,10 @@ mod tests {
             issue_labels: Vec::new(),
         });
 
-        assert!(config.add_runtime_repo("chenyukang/ghr".to_string()));
+        assert!(config.add_runtime_repo_with_local_dir(
+            "chenyukang/ghr".to_string(),
+            Some("/tmp/ghr".to_string())
+        ));
         assert_eq!(config.repos[0].name, "chenyukang/ghr");
         assert_eq!(config.repos[0].repo, "chenyukang/ghr");
     }
@@ -450,10 +496,90 @@ mod tests {
             issue_labels: Vec::new(),
         });
 
-        assert!(config.add_runtime_repo("chenyukang/runnel".to_string()));
+        assert!(config.add_runtime_repo_with_local_dir(
+            "chenyukang/runnel".to_string(),
+            Some("/tmp/runnel".to_string())
+        ));
         assert_eq!(config.repos[0].name, "runnel");
         assert_eq!(config.repos[0].repo, "chenyukang/runnel");
         assert_eq!(config.repos[1].name, "Fiber");
+    }
+
+    #[test]
+    fn runtime_repo_fills_missing_local_dir_without_duplicating_repo() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        assert!(config.add_runtime_repo_with_local_dir(
+            "chenyukang/GHR".to_string(),
+            Some("/tmp/ghr".to_string())
+        ));
+
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].local_dir.as_deref(), Some("/tmp/ghr"));
+    }
+
+    #[test]
+    fn runtime_repo_does_not_overwrite_existing_local_dir() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some("/tmp/original-ghr".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        assert!(!config.add_runtime_repo_with_local_dir(
+            "chenyukang/ghr".to_string(),
+            Some("/tmp/new-ghr".to_string())
+        ));
+
+        assert_eq!(
+            config.repos[0].local_dir.as_deref(),
+            Some("/tmp/original-ghr")
+        );
+    }
+
+    #[test]
+    fn current_git_repo_is_saved_to_config_with_local_dir() {
+        let repo_dir = test_git_repo("https://github.com/chenyukang/ghr.git");
+        let config_path = repo_dir.join("saved-config.toml");
+        let local_dir = repo_dir.display().to_string();
+
+        let (config, save_result) =
+            Config::default().include_git_repo_at_and_save(&config_path, &repo_dir);
+
+        assert_eq!(
+            save_result
+                .expect("repo should be detected")
+                .expect("config should save"),
+            "chenyukang/ghr"
+        );
+        assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+        assert_eq!(
+            config.repos[0].local_dir.as_deref(),
+            Some(local_dir.as_str())
+        );
+
+        let saved = Config::load_or_create(&config_path).expect("load saved config");
+        assert_eq!(saved.repos[0].repo, "chenyukang/ghr");
+        assert_eq!(
+            saved.repos[0].local_dir.as_deref(),
+            Some(local_dir.as_str())
+        );
     }
 
     #[test]
@@ -609,5 +735,41 @@ mod tests {
 
         assert!(error.contains("unknown field"));
         assert!(error.contains("pr_limit"));
+    }
+
+    fn test_git_repo(remote_url: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ghr-config-test-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create config test dir");
+
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("run git init");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let remote = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["remote", "add", "origin", remote_url])
+            .output()
+            .expect("run git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {}",
+            String::from_utf8_lossy(&remote.stderr)
+        );
+
+        dir
     }
 }

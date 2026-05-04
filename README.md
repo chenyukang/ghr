@@ -18,7 +18,7 @@
 - Pull request, issue, and notification views.
 - Snapshot-first startup: cached data is shown immediately, then refreshed in the background.
 - Configurable sections and repo tabs, including multi-query sections such as `All Requests`.
-- Automatic current-repo tab when launched inside a Git checkout with a GitHub remote.
+- Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
@@ -55,6 +55,9 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | Key | Action |
 | --- | --- |
 | `:` | Open the command palette and fuzzy search every shortcut |
+| `:` then `Switch Project` | Filter configured repos by prefix and switch project tabs |
+| `:` then `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
+| `:` then `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Move within the focused tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
@@ -185,7 +188,7 @@ command_palette_key = ":"
 pr_per_page = 50
 issue_per_page = 50
 notification_limit = 50
-refetch_interval_seconds = 120
+refetch_interval_seconds = 60
 include_read_notifications = true
 
 [[pr_sections]]
@@ -207,7 +210,7 @@ Use `filters` for a single GitHub search query. Use `queries` when a section sho
 
 Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`. Repo tabs default to open PRs and open issues. Set `labels` to filter both repo PR and issue lists, or use `pr_labels` / `issue_labels` for kind-specific filters.
 
-When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a runtime repo tab if it is not already configured. This does not write back to `config.toml`.
+When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 
 Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
 

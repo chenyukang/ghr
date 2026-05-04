@@ -1179,6 +1179,50 @@ pub async fn post_pull_request_review_reply(
     Ok(())
 }
 
+pub async fn add_issue_reaction(repository: &str, number: u64, content: &str) -> Result<()> {
+    let path = format!("repos/{repository}/issues/{number}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to {repository}#{number}"))
+}
+
+pub async fn add_issue_comment_reaction(
+    repository: &str,
+    comment_id: u64,
+    content: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/issues/comments/{comment_id}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to issue comment {comment_id}"))
+}
+
+pub async fn add_pull_request_review_comment_reaction(
+    repository: &str,
+    comment_id: u64,
+    content: &str,
+) -> Result<()> {
+    let path = format!("repos/{repository}/pulls/comments/{comment_id}/reactions");
+    post_reaction(path, content)
+        .await
+        .with_context(|| format!("failed to add reaction to review comment {comment_id}"))
+}
+
+async fn post_reaction(path: String, content: &str) -> Result<()> {
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        path,
+        "-f".to_string(),
+        format!("content={content}"),
+    ])
+    .await?;
+    Ok(())
+}
+
 pub async fn edit_issue_comment(repository: &str, comment_id: u64, body: &str) -> Result<()> {
     let path = format!("repos/{repository}/issues/comments/{comment_id}");
     run_gh_json(&[

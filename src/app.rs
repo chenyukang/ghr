@@ -30,13 +30,14 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    CommentFetchResult, PullRequestReviewCommentTarget, add_issue_label, approve_pull_request,
-    close_pull_request, create_issue, edit_issue_comment, edit_pull_request_review_comment,
-    fetch_comments, fetch_pull_request_action_hints, fetch_pull_request_diff,
-    fetch_repository_labels, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label, search_global,
-    with_background_github_priority,
+    CommentFetchResult, PullRequestReviewCommentTarget, add_issue_comment_reaction,
+    add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
+    approve_pull_request, close_pull_request, create_issue, edit_issue_comment,
+    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, fetch_repository_labels, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, remove_issue_label, search_global, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, SectionKind,
@@ -106,6 +107,10 @@ enum AppMsg {
     ReviewCommentPosted {
         item_id: String,
         result: std::result::Result<(), String>,
+    },
+    ReactionPosted {
+        item_id: String,
+        result: std::result::Result<CommentFetchResult, String>,
     },
     LabelUpdated {
         item_id: String,
@@ -253,6 +258,89 @@ struct PendingCommentSubmit {
     item: WorkItem,
     body: String,
     mode: PendingCommentMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReactionContent {
+    PlusOne,
+    MinusOne,
+    Laugh,
+    Hooray,
+    Confused,
+    Heart,
+    Rocket,
+    Eyes,
+}
+
+impl ReactionContent {
+    const ALL: [Self; 8] = [
+        Self::PlusOne,
+        Self::MinusOne,
+        Self::Laugh,
+        Self::Hooray,
+        Self::Confused,
+        Self::Heart,
+        Self::Rocket,
+        Self::Eyes,
+    ];
+
+    fn api_value(self) -> &'static str {
+        match self {
+            Self::PlusOne => "+1",
+            Self::MinusOne => "-1",
+            Self::Laugh => "laugh",
+            Self::Hooray => "hooray",
+            Self::Confused => "confused",
+            Self::Heart => "heart",
+            Self::Rocket => "rocket",
+            Self::Eyes => "eyes",
+        }
+    }
+
+    fn emoji(self) -> &'static str {
+        match self {
+            Self::PlusOne => "👍",
+            Self::MinusOne => "👎",
+            Self::Laugh => "😄",
+            Self::Hooray => "🎉",
+            Self::Confused => "😕",
+            Self::Heart => "❤️",
+            Self::Rocket => "🚀",
+            Self::Eyes => "👀",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlusOne => "+1",
+            Self::MinusOne => "-1",
+            Self::Laugh => "laugh",
+            Self::Hooray => "hooray",
+            Self::Confused => "confused",
+            Self::Heart => "heart",
+            Self::Rocket => "rocket",
+            Self::Eyes => "eyes",
+        }
+    }
+
+    fn from_digit(value: char) -> Option<Self> {
+        let index = value.to_digit(10)?.checked_sub(1)? as usize;
+        Self::ALL.get(index).copied()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReactionTarget {
+    Item,
+    IssueComment { index: usize, comment_id: u64 },
+    ReviewComment { index: usize, comment_id: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReactionDialog {
+    target: ReactionTarget,
+    target_label: String,
+    selected: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +521,8 @@ struct AppState {
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
+    reaction_dialog: Option<ReactionDialog>,
+    posting_reaction: bool,
     label_dialog: Option<LabelDialog>,
     label_updating: bool,
     issue_dialog: Option<IssueDialog>,
@@ -1147,6 +1237,46 @@ fn start_review_comment_submit(
     });
 }
 
+fn start_reaction_submit(
+    item: WorkItem,
+    target: ReactionTarget,
+    content: ReactionContent,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                let add_result = match target {
+                    ReactionTarget::Item => {
+                        add_issue_reaction(&item.repo, number, content.api_value()).await
+                    }
+                    ReactionTarget::IssueComment { comment_id, .. } => {
+                        add_issue_comment_reaction(&item.repo, comment_id, content.api_value())
+                            .await
+                    }
+                    ReactionTarget::ReviewComment { comment_id, .. } => {
+                        add_pull_request_review_comment_reaction(
+                            &item.repo,
+                            comment_id,
+                            content.api_value(),
+                        )
+                        .await
+                    }
+                };
+                match add_result {
+                    Ok(()) => fetch_comments(&item.repo, number, item.kind)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReactionPosted { item_id, result });
+    });
+}
+
 fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
@@ -1315,6 +1445,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.reaction_dialog.is_some() {
+        app.handle_reaction_dialog_key(key, tx);
+        return false;
+    }
+
     if app.pr_action_dialog.is_some() {
         app.handle_pr_action_dialog_key(key, config, store, tx);
         return false;
@@ -1472,6 +1607,9 @@ fn handle_key_in_area(
             }
             KeyCode::Char('R') if app.details_mode == DetailsMode::Conversation => {
                 app.start_reply_to_selected_comment()
+            }
+            KeyCode::Char('+') if app.details_mode == DetailsMode::Conversation => {
+                app.start_selected_comment_reaction_dialog()
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
                 app.start_edit_selected_comment_dialog()
@@ -1656,6 +1794,9 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.issue_dialog.is_some() {
+        return false;
+    }
+    if app.reaction_dialog.is_some() {
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
@@ -2145,6 +2286,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_label_dialog(frame, dialog, app.label_updating, area);
     } else if let Some(dialog) = &app.issue_dialog {
         draw_issue_dialog(frame, dialog, app.issue_creating, area);
+    } else if let Some(dialog) = &app.reaction_dialog {
+        draw_reaction_dialog(frame, dialog, app.posting_reaction, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
@@ -3262,6 +3405,67 @@ fn draw_pr_action_dialog(
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(60, 14, area);
+    let mut lines = vec![
+        Line::from("Target"),
+        Line::from(vec![Span::styled(
+            truncate_inline(&dialog.target_label, 54),
+            Style::default().fg(Color::Cyan),
+        )]),
+        Line::from(""),
+    ];
+    for (index, reaction) in ReactionContent::ALL.iter().copied().enumerate() {
+        let selected = index == dialog.selected;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "{} {}. {} {}",
+                if selected { ">" } else { " " },
+                index + 1,
+                reaction.emoji(),
+                reaction.label()
+            ),
+            style,
+        )]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        if running {
+            "working...".to_string()
+        } else {
+            "Enter: add reaction    Esc: cancel".to_string()
+        },
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Add Reaction",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
 fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool, area: Rect) {
     let dialog_area = if matches!(dialog.mode, LabelDialogMode::Add { .. }) {
         centered_rect(74, 16, area)
@@ -4165,6 +4369,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
+        help_key_line("+", "add a reaction to the focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
@@ -4196,6 +4401,12 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Backspace", "delete previous character while filtering"),
         help_key_line("Esc", "cancel label update"),
         Line::from(""),
+        help_heading("Reaction Dialog"),
+        help_key_line("1-8", "choose and add a reaction"),
+        help_key_line("j/k or Up/Down", "move reaction selection"),
+        help_key_line("Enter", "add selected reaction"),
+        help_key_line("Esc", "cancel reaction"),
+        Line::from(""),
         help_heading("Issue Dialog"),
         help_key_line("Tab / Shift+Tab", "switch issue fields"),
         help_key_line("Enter", "move to next field or insert a body newline"),
@@ -4209,7 +4420,10 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         ),
         help_key_line("click tabs / sections", "switch view or section"),
         help_key_line("click list row", "select item or diff file"),
-        help_key_line("click links / open / reply / edit", "run that action"),
+        help_key_line(
+            "click links / open / reply / edit / react",
+            "run that action",
+        ),
         help_key_line("wheel over list/details/dialog", "scroll that area"),
         help_key_line("drag split border", "resize list/details ratio"),
     ]
@@ -4430,6 +4644,8 @@ enum DetailAction {
     ReplyComment(usize),
     EditComment(usize),
     ToggleCommentExpanded(usize),
+    ReactItem,
+    ReactComment(usize),
     AddLabel,
     RemoveLabel(String),
 }
@@ -5642,6 +5858,11 @@ fn push_diff_inline_comment(
     append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
+        "react",
+        DetailAction::ReactComment(index),
+    ));
+    header.push(DetailSegment::raw("  "));
+    header.push(DetailSegment::action(
         "reply",
         DetailAction::ReplyComment(index),
     ));
@@ -6023,15 +6244,21 @@ fn comment_author_link_segment(author: &str, selected: bool) -> DetailSegment {
 }
 
 fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary) {
-    if reactions.is_empty() {
-        return;
-    }
     builder.push_blank();
     let mut segments = vec![DetailSegment::styled(
         "reactions: ",
         Style::default().fg(Color::Gray),
     )];
-    segments.extend(reaction_segments(reactions));
+    if reactions.is_empty() {
+        segments.push(DetailSegment::styled(
+            "none",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        segments.extend(reaction_segments(reactions));
+    }
+    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::action("react", DetailAction::ReactItem));
     builder.push_wrapped_limited(segments, 2);
 }
 
@@ -6100,6 +6327,11 @@ fn push_comment(
         ));
     }
     append_reaction_segments(&mut header, &comment.reactions);
+    header.push(DetailSegment::raw("  "));
+    header.push(DetailSegment::action(
+        "react",
+        DetailAction::ReactComment(index),
+    ));
     if search_match {
         header.push(DetailSegment::styled(
             "  match",
@@ -7911,6 +8143,8 @@ impl AppState {
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             posting_comment: false,
+            reaction_dialog: None,
+            posting_reaction: false,
             label_dialog: None,
             label_updating: false,
             issue_dialog: None,
@@ -8330,6 +8564,51 @@ impl AppState {
                     self.status = "review comment failed".to_string();
                 }
             },
+            AppMsg::ReactionPosted { item_id, result } => match result {
+                Ok(result) => {
+                    if let Some(dialog) = &self.reaction_dialog {
+                        match dialog.target {
+                            ReactionTarget::IssueComment { index, .. }
+                            | ReactionTarget::ReviewComment { index, .. } => {
+                                self.selected_comment_index =
+                                    index.min(result.comments.len().saturating_sub(1));
+                            }
+                            ReactionTarget::Item => {}
+                        }
+                    }
+                    self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
+                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
+                    self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
+                    self.posting_reaction = false;
+                    self.reaction_dialog = None;
+                    self.status = "reaction added".to_string();
+                    self.message_dialog = Some(success_message_dialog(
+                        "Reaction Added",
+                        "GitHub accepted the reaction and comments were refreshed.",
+                    ));
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    if setup_dialog.is_none() {
+                        self.message_dialog = Some(message_dialog(
+                            "Reaction Failed",
+                            operation_error_body(&error),
+                        ));
+                    } else {
+                        self.message_dialog = None;
+                    }
+                    self.posting_reaction = false;
+                    self.reaction_dialog = None;
+                    self.status = "reaction failed".to_string();
+                }
+            },
             AppMsg::LabelUpdated {
                 item_id,
                 action,
@@ -8597,6 +8876,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.reaction_dialog = None;
         self.status = "help".to_string();
     }
 
@@ -9965,9 +10245,137 @@ impl AppState {
                 self.select_comment(index);
                 self.toggle_selected_comment_expanded();
             }
+            DetailAction::ReactItem => self.start_item_reaction_dialog(),
+            DetailAction::ReactComment(index) => {
+                self.select_comment(index);
+                self.start_comment_reaction_dialog(index);
+            }
             DetailAction::AddLabel => self.start_add_label_dialog(tx),
             DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
         }
+    }
+
+    fn start_item_reaction_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+            self.status = "reactions are available for issues and pull requests".to_string();
+            return;
+        }
+        self.reaction_dialog = Some(ReactionDialog {
+            target: ReactionTarget::Item,
+            target_label: format!("{} #{} {}", item.repo, item.number.unwrap_or(0), item.title),
+            selected: 0,
+        });
+        self.posting_reaction = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.focus = FocusTarget::Details;
+        self.status = "reaction mode".to_string();
+    }
+
+    fn start_selected_comment_reaction_dialog(&mut self) {
+        self.start_comment_reaction_dialog(self.selected_comment_index);
+    }
+
+    fn start_comment_reaction_dialog(&mut self, index: usize) {
+        let Some(comment) = self
+            .current_comments()
+            .and_then(|comments| comments.get(index))
+            .cloned()
+        else {
+            self.status = "no comment selected".to_string();
+            return;
+        };
+        let Some(comment_id) = comment.id else {
+            self.status = "comment has no GitHub id".to_string();
+            return;
+        };
+        let target = if comment.review.is_some() {
+            ReactionTarget::ReviewComment { index, comment_id }
+        } else {
+            ReactionTarget::IssueComment { index, comment_id }
+        };
+        self.reaction_dialog = Some(ReactionDialog {
+            target,
+            target_label: format!("comment by {}", comment.author),
+            selected: 0,
+        });
+        self.posting_reaction = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.focus = FocusTarget::Details;
+        self.status = "reaction mode".to_string();
+    }
+
+    fn handle_reaction_dialog_key(&mut self, key: KeyEvent, tx: &UnboundedSender<AppMsg>) {
+        if self.posting_reaction {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.reaction_dialog = None;
+                self.status = "reaction cancelled".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.move_reaction_selection(1),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => self.move_reaction_selection(-1),
+            KeyCode::Enter => self.submit_selected_reaction(tx),
+            KeyCode::Char(value) => {
+                if let Some(reaction) = ReactionContent::from_digit(value) {
+                    self.submit_reaction(reaction, tx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_reaction_selection(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.reaction_dialog {
+            dialog.selected = move_wrapping(dialog.selected, ReactionContent::ALL.len(), delta);
+            let reaction = ReactionContent::ALL[dialog.selected];
+            self.status = format!(
+                "selected reaction {} {}",
+                reaction.emoji(),
+                reaction.label()
+            );
+        }
+    }
+
+    fn submit_selected_reaction(&mut self, tx: &UnboundedSender<AppMsg>) {
+        let Some(dialog) = &self.reaction_dialog else {
+            return;
+        };
+        let reaction = ReactionContent::ALL[dialog.selected.min(ReactionContent::ALL.len() - 1)];
+        self.submit_reaction(reaction, tx);
+    }
+
+    fn submit_reaction(&mut self, reaction: ReactionContent, tx: &UnboundedSender<AppMsg>) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        let Some(target) = self
+            .reaction_dialog
+            .as_ref()
+            .map(|dialog| dialog.target.clone())
+        else {
+            return;
+        };
+        self.posting_reaction = true;
+        self.status = format!("adding reaction {} {}", reaction.emoji(), reaction.label());
+        start_reaction_submit(item, target, reaction, tx.clone());
     }
 
     fn toggle_selected_comment_expanded(&mut self) {
@@ -10007,6 +10415,7 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
         self.pr_action_running = false;
         self.status = match action {
@@ -10080,6 +10489,7 @@ impl AppState {
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -10107,6 +10517,7 @@ impl AppState {
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -10145,6 +10556,7 @@ impl AppState {
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -10190,6 +10602,7 @@ impl AppState {
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -10258,6 +10671,7 @@ impl AppState {
         self.label_updating = false;
         self.comment_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
         self.comment_search_active = false;
@@ -10290,6 +10704,7 @@ impl AppState {
         self.label_updating = false;
         self.comment_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
         self.comment_search_active = false;
@@ -10429,6 +10844,7 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.issue_dialog = Some(IssueDialog {
             repo,
@@ -10733,6 +11149,7 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),

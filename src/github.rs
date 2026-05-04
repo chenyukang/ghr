@@ -27,17 +27,12 @@ const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MergeMethod {
+    #[default]
     Merge,
     Squash,
     Rebase,
-}
-
-impl Default for MergeMethod {
-    fn default() -> Self {
-        Self::Merge
-    }
 }
 
 impl MergeMethod {

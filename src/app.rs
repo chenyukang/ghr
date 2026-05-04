@@ -3416,12 +3416,30 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
     let scroll = dialog.body_scroll.min(max_scroll);
     let mut lines = vec![
-        issue_dialog_field_label("Repo", IssueDialogField::Repo, dialog.field),
-        issue_dialog_input_line(&dialog.repo, editor_width),
-        issue_dialog_field_label("Title", IssueDialogField::Title, dialog.field),
-        issue_dialog_input_line(&dialog.title, editor_width),
-        issue_dialog_field_label("Labels", IssueDialogField::Labels, dialog.field),
-        issue_dialog_input_line(&dialog.labels, editor_width),
+        issue_dialog_field_input_line(
+            "Repo",
+            &dialog.repo,
+            IssueDialogField::Repo,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        issue_dialog_field_input_line(
+            "Title",
+            &dialog.title,
+            IssueDialogField::Title,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        issue_dialog_field_input_line(
+            "Labels",
+            &dialog.labels,
+            IssueDialogField::Labels,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
         issue_dialog_field_label("Body", IssueDialogField::Body, dialog.field),
     ];
     lines.extend(
@@ -3496,28 +3514,66 @@ fn issue_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
     )
 }
 
+fn issue_dialog_field_input_line(
+    label: &'static str,
+    value: &str,
+    field: IssueDialogField,
+    current: IssueDialogField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value_width = width.saturating_sub(prefix.chars().count() as u16);
+    Line::from(vec![
+        Span::styled(prefix, issue_dialog_field_label_style(field, current)),
+        Span::styled(
+            issue_dialog_input_text(value, value_width),
+            Style::default().fg(Color::White),
+        ),
+    ])
+}
+
 fn issue_dialog_field_label(
     label: &'static str,
     field: IssueDialogField,
     current: IssueDialogField,
 ) -> Line<'static> {
-    let style = if field == current {
+    Line::from(Span::styled(
+        issue_dialog_field_label_text(label),
+        issue_dialog_field_label_style(field, current),
+    ))
+}
+
+fn issue_dialog_field_label_style(field: IssueDialogField, current: IssueDialogField) -> Style {
+    if field == current {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Gray)
-    };
-    Line::from(Span::styled(label, style))
+    }
 }
 
-fn issue_dialog_input_line(value: &str, width: u16) -> Line<'static> {
-    let text = if value.is_empty() {
+fn issue_dialog_field_prefix(label: &'static str) -> String {
+    format!("{label}: ")
+}
+
+fn issue_dialog_field_label_text(label: &'static str) -> String {
+    format!("{label}:")
+}
+
+fn issue_dialog_separator_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(usize::from(width.max(1))),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn issue_dialog_input_text(value: &str, width: u16) -> String {
+    if value.is_empty() {
         " ".to_string()
     } else {
         truncate_inline(value, usize::from(width.max(1)))
-    };
-    Line::from(Span::styled(text, Style::default().fg(Color::White)))
+    }
 }
 
 fn issue_dialog_cursor_position(
@@ -3529,18 +3585,36 @@ fn issue_dialog_cursor_position(
 ) -> Option<Position> {
     let inner = block_inner(dialog_area);
     let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    let repo_prefix_width = issue_dialog_field_prefix("Repo").chars().count() as u16;
+    let title_prefix_width = issue_dialog_field_prefix("Title").chars().count() as u16;
+    let labels_prefix_width = issue_dialog_field_prefix("Labels").chars().count() as u16;
     match dialog.field {
         IssueDialogField::Repo => Some(Position::new(
-            clamp_x(inner.x.saturating_add(dialog.repo.chars().count() as u16)),
-            inner.y.saturating_add(1),
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(repo_prefix_width)
+                    .saturating_add(dialog.repo.chars().count() as u16),
+            ),
+            inner.y,
         )),
         IssueDialogField::Title => Some(Position::new(
-            clamp_x(inner.x.saturating_add(dialog.title.chars().count() as u16)),
-            inner.y.saturating_add(3),
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(title_prefix_width)
+                    .saturating_add(dialog.title.chars().count() as u16),
+            ),
+            inner.y.saturating_add(2),
         )),
         IssueDialogField::Labels => Some(Position::new(
-            clamp_x(inner.x.saturating_add(dialog.labels.chars().count() as u16)),
-            inner.y.saturating_add(5),
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(labels_prefix_width)
+                    .saturating_add(dialog.labels.chars().count() as u16),
+            ),
+            inner.y.saturating_add(4),
         )),
         IssueDialogField::Body => {
             let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
@@ -15466,6 +15540,32 @@ diff --git a/src/github.rs b/src/github.rs
             parse_issue_labels("bug, needs review, bug, , T-compiler"),
             vec!["bug", "needs review", "T-compiler"]
         );
+    }
+
+    #[test]
+    fn issue_dialog_renders_field_colons_and_separators() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_new_issue_dialog();
+        if let Some(dialog) = &mut app.issue_dialog {
+            dialog.labels = "bug, T-compiler".to_string();
+            dialog.body = "Steps to reproduce".to_string();
+        }
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Repo: rust-lang/rust"));
+        assert!(rendered.contains("Title:"));
+        assert!(rendered.contains("Labels: bug, T-compiler"));
+        assert!(rendered.contains("Body:"));
+        assert!(rendered.lines().any(|line| line.contains("────────")));
     }
 
     #[test]

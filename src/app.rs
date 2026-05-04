@@ -35,7 +35,7 @@ use crate::github::{
     fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
     refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    update_pull_request_branch, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -247,6 +247,7 @@ enum PrAction {
     Merge,
     Close,
     Approve,
+    UpdateBranch,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,6 +1078,9 @@ fn start_pr_action(
                 PrAction::Approve => approve_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::UpdateBranch => update_pull_request_branch(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -1287,6 +1291,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1308,6 +1313,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1440,6 +1446,7 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
         KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
         KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -2679,7 +2686,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/U", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2693,7 +2700,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/U", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2717,7 +2724,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/U", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2726,7 +2733,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/U", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3033,11 +3040,13 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "merge",
         PrAction::Close => "close",
         PrAction::Approve => "approve",
+        PrAction::UpdateBranch => "update",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
         PrAction::Close => "Close this pull request on GitHub?",
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::UpdateBranch => "Update this pull request branch from its base branch?",
     };
     let status = if running {
         "working...".to_string()
@@ -3067,6 +3076,7 @@ fn draw_pr_action_dialog(
                 PrAction::Merge => "Merge Pull Request",
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::UpdateBranch => "Update Pull Request Branch",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -3505,6 +3515,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
         help_heading("Diff Files"),
@@ -3542,6 +3553,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
@@ -7590,11 +7602,16 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
+                        self.action_hints.remove(&item_id);
+                        self.diffs.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
                         self.status = match action {
                             PrAction::Merge => "pull request merged; refreshing".to_string(),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
+                            PrAction::UpdateBranch => {
+                                "pull request branch update accepted; refreshing".to_string()
+                            }
                         };
                         self.message_dialog = Some(success_message_dialog(
                             pr_action_success_title(action),
@@ -7765,6 +7782,7 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                    PrAction::UpdateBranch => {}
                 }
             }
         }
@@ -9078,6 +9096,15 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        if action == PrAction::UpdateBranch
+            && item
+                .state
+                .as_deref()
+                .is_some_and(|state| !state.eq_ignore_ascii_case("open"))
+        {
+            self.status = "selected pull request is not open".to_string();
+            return;
+        }
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -9087,6 +9114,7 @@ impl AppState {
             PrAction::Merge => "confirm pull request merge".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
+            PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
         };
     }
 
@@ -9138,6 +9166,7 @@ impl AppState {
             PrAction::Merge => "merging pull request".to_string(),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
+            PrAction::UpdateBranch => "updating pull request branch".to_string(),
         };
         submit(item, action);
     }
@@ -12149,6 +12178,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
         assert!(text.contains("open PR close confirmation"));
+        assert!(text.contains("open PR update-branch confirmation"));
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
@@ -12261,7 +12291,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("M/C/A/U pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -12280,7 +12310,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C/A/U pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -12298,7 +12328,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A/U pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14146,6 +14176,48 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_u_key_opens_update_branch_confirmation_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('U')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("update branch dialog");
+        assert_eq!(dialog.action, PrAction::UpdateBranch);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request branch update");
+    }
+
+    #[test]
+    fn update_branch_dialog_prompt_names_base_branch_update() {
+        let mut section = test_section();
+        let item = section.items.remove(0);
+        let dialog = PrActionDialog {
+            item,
+            action: PrAction::UpdateBranch,
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_pr_action_dialog(frame, &dialog, false, frame.area()))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Update Pull Request Branch"));
+        assert!(rendered.contains("Update this pull request branch from its base branch?"));
+        assert!(rendered.contains("y/Enter: yes, update PR"));
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -14158,6 +14230,21 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(app.pr_action_running);
         assert_eq!(app.status, "approving pull request");
         assert_eq!(submitted, Some(("1".to_string(), PrAction::Approve)));
+    }
+
+    #[test]
+    fn update_branch_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('y')), |item, action| {
+            submitted = Some((item.id, action));
+        });
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "updating pull request branch");
+        assert_eq!(submitted, Some(("1".to_string(), PrAction::UpdateBranch)));
     }
 
     #[test]
@@ -14209,6 +14296,18 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn update_branch_rejects_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected pull request is not open");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -14249,6 +14348,49 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request approved; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Approved");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn update_branch_finished_keeps_item_open_and_refreshes_details_and_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Update branch".to_string()],
+                checks: None,
+                note: None,
+            }),
+        );
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(PullRequestDiff {
+                files: Vec::new(),
+                additions: 0,
+                deletions: 0,
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::UpdateBranch,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert!(!app.action_hints.contains_key("1"));
+        assert!(!app.diffs.contains_key("1"));
+        assert_eq!(
+            app.status,
+            "pull request branch update accepted; refreshing"
+        );
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Branch Updated");
         assert!(dialog.auto_close_at.is_some());
     }
 

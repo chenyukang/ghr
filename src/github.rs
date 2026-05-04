@@ -14,9 +14,9 @@ use tracing::{info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, ReviewCommentPreview,
-    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
-    repo_section_filters, repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, PullRequestBranch, ReactionSummary,
+    ReviewCommentPreview, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
+    global_search_view_key, repo_section_filters, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -270,6 +270,8 @@ struct PullRequestActionRepositoryRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestActionRaw {
     commits: Option<PullRequestCommitConnectionRaw>,
+    head_ref_name: Option<String>,
+    head_repository: Option<PullRequestHeadRepositoryRaw>,
     is_draft: Option<bool>,
     mergeable: Option<String>,
     merge_state_status: Option<String>,
@@ -288,6 +290,12 @@ struct PullRequestActionRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestCommitConnectionRaw {
     total_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestHeadRepositoryRaw {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -961,6 +969,10 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       state
+      headRefName
+      headRepository {
+        nameWithOwner
+      }
       isDraft
       mergeable
       mergeStateStatus
@@ -1744,13 +1756,33 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
     } else {
         Some(format!("Merge blocked: {}", blockers.join("; ")))
     };
+    let head = pull_request_branch(pr);
 
     ActionHints {
         labels,
         checks,
         commits: pr.commits.as_ref().map(|commits| commits.total_count),
         note,
+        head,
     }
+}
+
+fn pull_request_branch(pr: &PullRequestActionRaw) -> Option<PullRequestBranch> {
+    let branch = pr
+        .head_ref_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())?;
+    let repository = pr
+        .head_repository
+        .as_ref()
+        .map(|repository| repository.name_with_owner.trim())
+        .filter(|repository| !repository.is_empty())?;
+
+    Some(PullRequestBranch {
+        repository: repository.to_string(),
+        branch: branch.to_string(),
+    })
 }
 
 fn pull_request_action_blockers(pr: &PullRequestActionRaw) -> Vec<String> {
@@ -2608,6 +2640,10 @@ mod tests {
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 5 }),
+            head_ref_name: Some("feature/diagnostics".to_string()),
+            head_repository: Some(PullRequestHeadRepositoryRaw {
+                name_with_owner: "rust-lang/rust".to_string(),
+            }),
             is_draft: Some(false),
             mergeable: Some("MERGEABLE".to_string()),
             merge_state_status: Some("BLOCKED".to_string()),
@@ -2656,12 +2692,21 @@ mod tests {
         let note = hints.note.expect("blocked PR should explain why");
         assert!(note.contains("review approval required"));
         assert!(note.contains("checks failing"));
+        assert_eq!(
+            hints.head,
+            Some(PullRequestBranch {
+                repository: "rust-lang/rust".to_string(),
+                branch: "feature/diagnostics".to_string(),
+            })
+        );
     }
 
     #[test]
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            head_ref_name: None,
+            head_repository: None,
             is_draft: Some(false),
             mergeable: Some("MERGEABLE".to_string()),
             merge_state_status: Some("CLEAN".to_string()),
@@ -2707,6 +2752,8 @@ mod tests {
     fn action_hints_show_conflicts_when_mergeable_is_conflicting() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            head_ref_name: None,
+            head_repository: None,
             is_draft: Some(true),
             mergeable: Some("CONFLICTING".to_string()),
             merge_state_status: Some("UNKNOWN".to_string()),

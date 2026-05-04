@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use super::{
-    MessageDialog, PendingCommentMode, PrAction, SUCCESS_DIALOG_AUTO_CLOSE, SetupDialog,
-    text::truncate_inline,
+    MessageDialog, MessageDialogKind, PendingCommentMode, PrAction, SUCCESS_DIALOG_AUTO_CLOSE,
+    SetupDialog, text::truncate_inline,
 };
 
 pub(super) fn refresh_error_status(count: usize, first_error: Option<&str>) -> String {
@@ -64,6 +64,7 @@ pub(super) fn message_dialog(title: impl Into<String>, body: impl Into<String>) 
     MessageDialog {
         title: title.into(),
         body: body.into(),
+        kind: MessageDialogKind::Error,
         auto_close_at: None,
     }
 }
@@ -75,7 +76,29 @@ pub(super) fn success_message_dialog(
     MessageDialog {
         title: title.into(),
         body: body.into(),
+        kind: MessageDialogKind::Success,
         auto_close_at: Some(Instant::now() + SUCCESS_DIALOG_AUTO_CLOSE),
+    }
+}
+
+pub(super) fn persistent_success_message_dialog(
+    title: impl Into<String>,
+    body: impl Into<String>,
+) -> MessageDialog {
+    MessageDialog {
+        title: title.into(),
+        body: body.into(),
+        kind: MessageDialogKind::Success,
+        auto_close_at: None,
+    }
+}
+
+fn info_message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
+    MessageDialog {
+        title: title.into(),
+        body: body.into(),
+        kind: MessageDialogKind::Info,
+        auto_close_at: None,
     }
 }
 
@@ -84,6 +107,7 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Pull Request Merged",
         PrAction::Close => "Pull Request Closed",
         PrAction::Approve => "Pull Request Approved",
+        PrAction::Checkout => "Pull Request Checked Out",
     }
 }
 
@@ -92,6 +116,7 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::Merge => "GitHub accepted the merge. Refreshing details.",
         PrAction::Close => "GitHub accepted the close action. Refreshing details.",
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
+        PrAction::Checkout => "GitHub CLI checked out the pull request locally.",
     }
 }
 
@@ -100,6 +125,7 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::Merge => "Merge Failed",
         PrAction::Close => "Close Failed",
         PrAction::Approve => "Approve Failed",
+        PrAction::Checkout => "Checkout Failed",
     }
 }
 
@@ -108,6 +134,7 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::Merge => "pull request merge failed",
         PrAction::Close => "pull request close failed",
         PrAction::Approve => "pull request approval failed",
+        PrAction::Checkout => "pull request checkout failed",
     }
 }
 
@@ -126,19 +153,19 @@ pub(super) fn operation_error_body(error: &str) -> String {
 
 pub(super) fn comment_pending_dialog(mode: &PendingCommentMode) -> MessageDialog {
     match mode {
-        PendingCommentMode::Post => message_dialog(
+        PendingCommentMode::Post => info_message_dialog(
             "Posting Comment",
             "Waiting for GitHub to accept the comment...",
         ),
-        PendingCommentMode::ReviewReply { .. } => message_dialog(
+        PendingCommentMode::ReviewReply { .. } => info_message_dialog(
             "Posting Review Reply",
             "Waiting for GitHub to accept the review reply...",
         ),
-        PendingCommentMode::Edit { .. } => message_dialog(
+        PendingCommentMode::Edit { .. } => info_message_dialog(
             "Updating Comment",
             "Waiting for GitHub to accept the update...",
         ),
-        PendingCommentMode::Review { .. } => message_dialog(
+        PendingCommentMode::Review { .. } => info_message_dialog(
             "Posting Review Comment",
             "Waiting for GitHub to accept the review comment...",
         ),

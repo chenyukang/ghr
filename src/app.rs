@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -24,10 +25,11 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::{Frame, Terminal};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{Config, github_repo_from_remote_url};
 use crate::dirs::Paths;
 use crate::github::{
     CommentFetchResult, PullRequestReviewCommentTarget, add_issue_comment_reaction,
@@ -40,10 +42,10 @@ use crate::github::{
     refresh_section_page, remove_issue_label, search_global, with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
-    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    section_counts, section_view_key,
+    ActionHints, CheckSummary, CommentPreview, ItemKind, PullRequestBranch, ReactionSummary,
+    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
+    global_search_view_key, mark_notification_read_in_section, merge_cached_sections,
+    merge_refreshed_sections, section_counts, section_view_key,
 };
 use crate::snapshot::SnapshotStore;
 use crate::state::UiState;
@@ -68,8 +70,9 @@ use layout::{body_area, body_areas};
 use search::{filtered_indices, fuzzy_score};
 use status::{
     comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
-    pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
-    pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
+    persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
+    pr_action_error_title, pr_action_success_body, pr_action_success_title, refresh_error_status,
+    setup_dialog_from_error, success_message_dialog,
 };
 use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
@@ -128,6 +131,9 @@ enum AppMsg {
         item_id: String,
         action: PrAction,
         result: std::result::Result<(), String>,
+    },
+    PrCheckoutFinished {
+        result: std::result::Result<PrCheckoutResult, String>,
     },
     NotificationReadFinished {
         thread_id: String,
@@ -415,19 +421,42 @@ enum PrAction {
     Merge,
     Close,
     Approve,
+    Checkout,
 }
 
 #[derive(Debug, Clone)]
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+    checkout: Option<PrCheckoutPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCheckoutResult {
+    command: String,
+    directory: PathBuf,
+    output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCheckoutPlan {
+    directory: PathBuf,
+    branch: Option<PullRequestBranch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialog {
     title: String,
     body: String,
+    kind: MessageDialogKind,
     auto_close_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageDialogKind {
+    Info,
+    Success,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +492,7 @@ const COMMENT_DIALOG_MIN_EDITOR_HEIGHT: u16 = 4;
 const COMMENT_DIALOG_EDITOR_PADDING_LINES: u16 = 1;
 const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
+const PR_ACTION_REMOTE_BRANCH_LINE: u16 = 6;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
 const COMMENT_COLLAPSE_MIN_LINES: usize = 36;
@@ -1325,12 +1355,25 @@ fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) 
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
+    checkout: Option<PrCheckoutPlan>,
     config: Config,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        if action == PrAction::Checkout {
+            let Some(checkout) = checkout else {
+                let _ = tx.send(AppMsg::PrCheckoutFinished {
+                    result: Err("missing local checkout target".to_string()),
+                });
+                return;
+            };
+            let result = run_pr_checkout(item, checkout.directory).await;
+            let _ = tx.send(AppMsg::PrCheckoutFinished { result });
+            return;
+        }
+
         let result = match item.number {
             Some(number) => match action {
                 PrAction::Merge => merge_pull_request(&item.repo, number)
@@ -1342,6 +1385,7 @@ fn start_pr_action(
                 PrAction::Approve => approve_pull_request(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -1373,6 +1417,227 @@ fn start_pr_action(
             });
         }
     });
+}
+
+async fn run_pr_checkout(
+    item: WorkItem,
+    directory: PathBuf,
+) -> std::result::Result<PrCheckoutResult, String> {
+    let number = item
+        .number
+        .ok_or_else(|| "selected item has no pull request number".to_string())?;
+    let args = pr_checkout_command_args(&item.repo, number);
+    let command = pr_checkout_command_display(&args);
+    let output = TokioCommand::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .current_dir(&directory)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
+                    checkout_directory_notice(&directory),
+                )
+            } else {
+                format!(
+                    "failed to run {command}: {error}\n\n{}",
+                    checkout_directory_notice(&directory),
+                )
+            }
+        })?;
+
+    let output_text = command_output_text(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        let detail = if output_text.is_empty() {
+            "gh did not return any output".to_string()
+        } else {
+            output_text
+        };
+        return Err(format!(
+            "{} failed.\n\n{}\n\n{}",
+            command,
+            checkout_directory_notice(&directory),
+            truncate_text(&detail, 900),
+        ));
+    }
+
+    let output = if output_text.is_empty() {
+        "gh pr checkout completed successfully.".to_string()
+    } else {
+        truncate_text(&output_text, 900)
+    };
+    Ok(PrCheckoutResult {
+        command,
+        directory,
+        output,
+    })
+}
+
+fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "checkout".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ]
+}
+
+fn pr_checkout_command_display(args: &[String]) -> String {
+    format!("gh {}", args.join(" "))
+}
+
+fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn checkout_directory_notice(directory: &Path) -> String {
+    format!("Checkout runs from {}.", directory.display())
+}
+
+fn resolve_pr_checkout_directory(
+    config: &Config,
+    repository: &str,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(directory) = configured_local_dir_for_repo(config, repository) {
+        ensure_directory_tracks_repo(&directory, repository).map_err(|error| {
+            format!(
+                "Configured local_dir for {repository} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repository}."
+            )
+        })?;
+        return Ok(directory);
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| {
+        format!(
+            "Could not inspect the current working directory for {repository}: {error}\n\nSet [[repos]].local_dir for this repository."
+        )
+    })?;
+    ensure_directory_tracks_repo(&cwd, repository).map_err(|error| {
+        format!(
+            "No local checkout found for {repository}.\n\n{error}\n\nLaunch ghr inside a checkout whose git remote points at {repository}, or set [[repos]].local_dir for this repository."
+        )
+    })?;
+    Ok(cwd)
+}
+
+fn configured_local_dir_for_repo(config: &Config, repository: &str) -> Option<PathBuf> {
+    config
+        .repos
+        .iter()
+        .find(|repo| repo.repo.eq_ignore_ascii_case(repository))
+        .and_then(|repo| repo.local_dir.as_deref())
+        .map(str::trim)
+        .filter(|local_dir| !local_dir.is_empty())
+        .map(expand_user_path)
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(value)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(::dirs::home_dir)
+}
+
+fn ensure_directory_tracks_repo(
+    directory: &Path,
+    repository: &str,
+) -> std::result::Result<(), String> {
+    if !directory.is_dir() {
+        return Err(format!("{} is not a directory.", directory.display()));
+    }
+    let remotes = git_remotes_for_directory(directory)?;
+    if remotes
+        .iter()
+        .any(|(_, repo)| repo.eq_ignore_ascii_case(repository))
+    {
+        return Ok(());
+    }
+
+    let remote_list = if remotes.is_empty() {
+        "no GitHub remotes found".to_string()
+    } else {
+        remotes
+            .iter()
+            .map(|(remote, repo)| format!("{remote} -> {repo}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(format!(
+        "{} does not track {repository}; found {remote_list}.",
+        directory.display()
+    ))
+}
+
+fn git_remotes_for_directory(
+    directory: &Path,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .arg("remote")
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run git remote in {}: {error}",
+                directory.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} is not a usable git checkout: {}",
+            directory.display(),
+            command_output_text(&output.stdout, &output.stderr)
+        ));
+    }
+
+    let mut remotes = Vec::new();
+    let names = String::from_utf8_lossy(&output.stdout);
+    for remote in names
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+    {
+        if let Some(repo) = git_remote_repo(directory, remote) {
+            remotes.push((remote.to_string(), repo));
+        }
+    }
+    Ok(remotes)
+}
+
+fn git_remote_repo(directory: &Path, remote: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["remote", "get-url", remote])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    github_repo_from_remote_url(url.trim())
 }
 
 #[cfg(test)]
@@ -1529,7 +1794,7 @@ fn handle_key_in_area(
             _ => {}
         },
         FocusTarget::List if app.details_mode == DetailsMode::Diff => {
-            handle_diff_file_list_key(app, key, area)
+            handle_diff_file_list_key(app, key, config, area)
         }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
@@ -1567,6 +1832,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
             KeyCode::Char('N') => app.start_new_issue_dialog(),
@@ -1591,6 +1857,7 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
                 app.start_add_label_dialog(Some(tx))
             }
@@ -1690,7 +1957,12 @@ fn handle_mouse_or_mark_key(app: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
-fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rect>) {
+fn handle_diff_file_list_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    config: &Config,
+    area: Option<Rect>,
+) {
     match key.code {
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
@@ -1730,6 +2002,7 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
         KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
         KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -1788,7 +2061,12 @@ fn handle_mouse_with_sync(
     if app.message_dialog.is_some() {
         return false;
     }
-    if app.pr_action_dialog.is_some() {
+    if let Some(dialog) = &app.pr_action_dialog {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(url) = pr_action_dialog_link_at(dialog, area, mouse.column, mouse.row)
+        {
+            app.open_url(&url);
+        }
         return false;
     }
     if app.label_dialog.is_some() {
@@ -3013,7 +3291,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -3027,7 +3305,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -3051,7 +3329,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -3060,7 +3338,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/A/X", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3357,7 +3635,7 @@ fn draw_pr_action_dialog(
     running: bool,
     area: Rect,
 ) {
-    let dialog_area = centered_rect(66, 12, area);
+    let dialog_area = pr_action_dialog_area(dialog, area);
     let number = dialog
         .item
         .number
@@ -3367,11 +3645,13 @@ fn draw_pr_action_dialog(
         PrAction::Merge => "merge",
         PrAction::Close => "close",
         PrAction::Approve => "approve",
+        PrAction::Checkout => "checkout",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
         PrAction::Close => "Close this pull request on GitHub?",
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::Checkout => "Checkout this pull request locally?",
     };
     let status = if running {
         "working...".to_string()
@@ -3384,6 +3664,28 @@ fn draw_pr_action_dialog(
         key_value_line("repo", dialog.item.repo.clone()),
         key_value_line("pull request", number),
         key_value_line("title", dialog.item.title.clone()),
+        if dialog.action == PrAction::Checkout {
+            key_value_line(
+                "local dir",
+                dialog
+                    .checkout
+                    .as_ref()
+                    .map(|checkout| checkout.directory.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            )
+        } else {
+            Line::from("")
+        },
+        if dialog.action == PrAction::Checkout {
+            remote_branch_line(
+                dialog
+                    .checkout
+                    .as_ref()
+                    .and_then(|checkout| checkout.branch.as_ref()),
+            )
+        } else {
+            Line::from("")
+        },
         Line::from(""),
         Line::from(vec![Span::styled(
             status,
@@ -3401,6 +3703,7 @@ fn draw_pr_action_dialog(
                 PrAction::Merge => "Merge Pull Request",
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::Checkout => "Checkout Pull Request Locally",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -3921,6 +4224,54 @@ fn label_suggestion_window_start(total: usize, selected: usize) -> usize {
     }
 }
 
+fn pr_action_dialog_area(dialog: &PrActionDialog, area: Rect) -> Rect {
+    let dialog_height = if dialog.action == PrAction::Checkout {
+        14
+    } else {
+        12
+    };
+    centered_rect(66, dialog_height, area)
+}
+
+fn remote_branch_line(branch: Option<&PullRequestBranch>) -> Line<'static> {
+    let Some(branch) = branch else {
+        return key_value_line("remote branch", "unavailable".to_string());
+    };
+    Line::from(vec![
+        Span::styled("remote branch: ", Style::default().fg(Color::Gray)),
+        Span::styled(pull_request_branch_label(branch), link_style()),
+    ])
+}
+
+fn pr_action_dialog_link_at(
+    dialog: &PrActionDialog,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    if dialog.action != PrAction::Checkout {
+        return None;
+    }
+    let branch = dialog
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.branch.as_ref())?;
+    let dialog_area = pr_action_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+    let content_row = row.saturating_sub(inner.y);
+    if content_row != PR_ACTION_REMOTE_BRANCH_LINE {
+        return None;
+    }
+    let label = pull_request_branch_label(branch);
+    let start = display_width("remote branch: ") as u16;
+    let end = start.saturating_add(display_width(&label) as u16);
+    let clicked = column.saturating_sub(inner.x);
+    (clicked >= start && clicked < end).then(|| pull_request_branch_url(branch))
+}
+
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
     let dialog_area = centered_rect(78, 14, area);
     let footer = if dialog.auto_close_at.is_some() {
@@ -3929,11 +4280,7 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
         "Enter/Esc: close"
     };
     let text = format!("{}\n\n{footer}", dialog.body);
-    let accent = if dialog.auto_close_at.is_some() {
-        Color::LightGreen
-    } else {
-        Color::LightRed
-    };
+    let accent = message_dialog_accent(dialog);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
@@ -3949,6 +4296,14 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+}
+
+fn message_dialog_accent(dialog: &MessageDialog) -> Color {
+    match dialog.kind {
+        MessageDialogKind::Info => Color::Yellow,
+        MessageDialogKind::Success => Color::LightGreen,
+        MessageDialogKind::Error => Color::LightRed,
+    }
 }
 
 fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4345,6 +4700,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue in the current repo"),
@@ -4388,10 +4744,15 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
+        help_key_line(
+            "X action",
+            "runs gh pr checkout from the matching local checkout",
+        ),
         help_key_line("Esc", "cancel PR action"),
         Line::from(""),
         help_heading("Repo Search"),
@@ -4863,13 +5224,16 @@ impl DetailsBuilder {
     }
 
     fn push_key_value(&mut self, key: &str, value: impl Into<String>) {
-        self.push_wrapped_limited(
-            vec![
-                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
-                DetailSegment::raw(value.into()),
-            ],
-            1,
-        );
+        self.push_styled_key_value(key, vec![DetailSegment::raw(value.into())]);
+    }
+
+    fn push_styled_key_value(&mut self, key: &str, value: Vec<DetailSegment>) {
+        let mut segments = vec![DetailSegment::styled(
+            format!("{key}: "),
+            Style::default().fg(Color::Gray),
+        )];
+        segments.extend(value);
+        self.push_wrapped_limited(segments, 1);
     }
 
     fn push_link_value(&mut self, key: &str, url: &str) {
@@ -5425,6 +5789,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     builder.push_meta_line(primary_meta);
 
     let mut secondary_meta = Vec::new();
+    let mut action_meta = Vec::new();
     let mut action_note = None;
     if let Some(author) = useful_meta_value(item.author.as_deref()) {
         secondary_meta.push((
@@ -5448,9 +5813,13 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         secondary_meta.push(("reason", vec![DetailSegment::raw(reason.to_string())]));
     }
     if matches!(item.kind, ItemKind::PullRequest) {
-        let (action_text, note) = action_hint_text(app.action_hints.get(&item.id));
-        secondary_meta.push(("action", vec![DetailSegment::raw(action_text)]));
+        let (action_segments, note) = action_hint_segments(app.action_hints.get(&item.id));
         secondary_meta.push((
+            "branch",
+            branch_hint_segments(app.action_hints.get(&item.id)),
+        ));
+        action_meta.push(("action", action_segments));
+        action_meta.push((
             "checks",
             check_hint_segments(app.action_hints.get(&item.id)),
         ));
@@ -5459,8 +5828,11 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     if !secondary_meta.is_empty() {
         builder.push_meta_line(secondary_meta);
     }
+    if !action_meta.is_empty() {
+        builder.push_meta_line(action_meta);
+    }
     if let Some(note) = action_note {
-        builder.push_key_value("action note", note);
+        builder.push_styled_key_value("action note", action_note_segments(&note));
     }
     builder.push_link_value("url", &item.url);
 
@@ -6929,22 +7301,84 @@ fn comment_right_padding(selected: bool) -> usize {
     COMMENT_RIGHT_PADDING + usize::from(selected)
 }
 
-fn action_hint_text(state: Option<&ActionHintState>) -> (String, Option<String>) {
+fn action_hint_segments(state: Option<&ActionHintState>) -> (Vec<DetailSegment>, Option<String>) {
     match state {
         Some(ActionHintState::Loaded(hints)) => {
-            let text = if hints.labels.is_empty() {
-                "-".to_string()
+            let segments = if hints.labels.is_empty() {
+                vec![DetailSegment::raw("-")]
             } else {
-                hints.labels.join(", ")
+                action_label_segments(&hints.labels)
             };
-            (text, hints.note.clone())
+            (segments, hints.note.clone())
         }
-        Some(ActionHintState::Loading) | None => ("loading...".to_string(), None),
+        Some(ActionHintState::Loading) | None => (vec![DetailSegment::raw("loading...")], None),
         Some(ActionHintState::Error(error)) => (
-            "unavailable".to_string(),
+            vec![DetailSegment::raw("unavailable")],
             Some(format!("Failed to load action hints: {error}")),
         ),
     }
+}
+
+fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for label in labels {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw(", "));
+        }
+        let style = if label == "Mergeable" {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default()
+        };
+        segments.push(DetailSegment::styled(label, style));
+    }
+    segments
+}
+
+fn action_note_segments(note: &str) -> Vec<DetailSegment> {
+    const CONFLICTS: &str = "merge conflicts must be resolved";
+    let mut segments = Vec::new();
+    let mut rest = note;
+    while let Some(index) = rest.find(CONFLICTS) {
+        if index > 0 {
+            segments.push(DetailSegment::raw(rest[..index].to_string()));
+        }
+        segments.push(DetailSegment::styled(
+            CONFLICTS,
+            log_error_style().add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[index + CONFLICTS.len()..];
+    }
+    if !rest.is_empty() {
+        segments.push(DetailSegment::raw(rest.to_string()));
+    }
+    if segments.is_empty() {
+        segments.push(DetailSegment::raw(note.to_string()));
+    }
+    segments
+}
+
+fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
+    match state {
+        Some(ActionHintState::Loaded(hints)) => hints
+            .head
+            .as_ref()
+            .map(|branch| vec![DetailSegment::raw(pull_request_branch_label(branch))])
+            .unwrap_or_else(|| vec![DetailSegment::raw("unavailable")]),
+        Some(ActionHintState::Loading) | None => vec![DetailSegment::raw("loading...")],
+        Some(ActionHintState::Error(_)) => vec![DetailSegment::raw("unavailable")],
+    }
+}
+
+fn pull_request_branch_label(branch: &PullRequestBranch) -> String {
+    format!("{}:{}", branch.repository, branch.branch)
+}
+
+fn pull_request_branch_url(branch: &PullRequestBranch) -> String {
+    format!(
+        "https://github.com/{}/tree/{}",
+        branch.repository, branch.branch
+    )
 }
 
 fn check_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
@@ -8768,6 +9202,7 @@ impl AppState {
                             PrAction::Merge => "pull request merged; refreshing".to_string(),
                             PrAction::Close => "pull request closed; refreshing".to_string(),
                             PrAction::Approve => "pull request approved; refreshing".to_string(),
+                            PrAction::Checkout => "pull request checked out locally".to_string(),
                         };
                         self.message_dialog = Some(success_message_dialog(
                             pr_action_success_title(action),
@@ -8788,6 +9223,39 @@ impl AppState {
                             self.message_dialog = None;
                         }
                         self.status = pr_action_error_status(action).to_string();
+                    }
+                }
+            }
+            AppMsg::PrCheckoutFinished { result } => {
+                self.pr_action_running = false;
+                self.pr_action_dialog = None;
+                match result {
+                    Ok(result) => {
+                        self.status = "pull request checked out locally".to_string();
+                        self.message_dialog = Some(persistent_success_message_dialog(
+                            pr_action_success_title(PrAction::Checkout),
+                            format!(
+                                "{}\n\n{}\n\n{}",
+                                result.command,
+                                checkout_directory_notice(&result.directory),
+                                result.output
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                pr_action_error_title(PrAction::Checkout),
+                                pr_action_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = pr_action_error_status(PrAction::Checkout).to_string();
                     }
                 }
             }
@@ -8942,6 +9410,7 @@ impl AppState {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
                     PrAction::Approve => {}
+                    PrAction::Checkout => {}
                 }
             }
         }
@@ -10505,13 +10974,56 @@ impl AppState {
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
-        self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action,
+            checkout: None,
+        });
         self.pr_action_running = false;
         self.status = match action {
             PrAction::Merge => "confirm pull request merge".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
+            PrAction::Checkout => "confirm local pull request checkout".to_string(),
         };
+    }
+
+    fn start_pr_checkout_dialog(&mut self, config: &Config) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+
+        let directory = match resolve_pr_checkout_directory(config, &item.repo) {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.message_dialog = Some(message_dialog("Checkout Unavailable", error));
+                self.status = "pull request checkout unavailable".to_string();
+                return;
+            }
+        };
+        let branch = self
+            .action_hints
+            .get(&item.id)
+            .and_then(|state| match state {
+                ActionHintState::Loaded(hints) => hints.head.clone(),
+                _ => None,
+            });
+
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action: PrAction::Checkout,
+            checkout: Some(PrCheckoutPlan { directory, branch }),
+        });
+        self.pr_action_running = false;
+        self.status = "confirm local pull request checkout".to_string();
     }
 
     fn handle_pr_action_dialog_key(
@@ -10521,14 +11033,21 @@ impl AppState {
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        self.handle_pr_action_dialog_key_with_submit(key, |item, action| {
-            start_pr_action(item, action, config.clone(), store.clone(), tx.clone());
+        self.handle_pr_action_dialog_key_with_submit(key, |item, action, checkout| {
+            start_pr_action(
+                item,
+                action,
+                checkout,
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+            );
         });
     }
 
     fn handle_pr_action_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
     where
-        F: FnMut(WorkItem, PrAction),
+        F: FnMut(WorkItem, PrAction, Option<PrCheckoutPlan>),
     {
         if self.pr_action_running {
             self.status = "pull request action already running".to_string();
@@ -10551,19 +11070,21 @@ impl AppState {
 
     fn submit_pr_action<F>(&mut self, action: PrAction, submit: &mut F)
     where
-        F: FnMut(WorkItem, PrAction),
+        F: FnMut(WorkItem, PrAction, Option<PrCheckoutPlan>),
     {
         let Some(dialog) = &self.pr_action_dialog else {
             return;
         };
         let item = dialog.item.clone();
+        let checkout = dialog.checkout.clone();
         self.pr_action_running = true;
         self.status = match action {
             PrAction::Merge => "merging pull request".to_string(),
             PrAction::Close => "closing pull request".to_string(),
             PrAction::Approve => "approving pull request".to_string(),
+            PrAction::Checkout => "checking out pull request locally".to_string(),
         };
-        submit(item, action);
+        submit(item, action, checkout);
     }
 
     fn start_new_comment_dialog(&mut self) {
@@ -13321,6 +13842,7 @@ diff --git a/src/github.rs b/src/github.rs
                 checks: None,
                 commits: None,
                 note: Some("Merge blocked: GitHub is still computing mergeability".to_string()),
+                head: None,
             }),
         );
 
@@ -14197,7 +14719,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("M/C/A/X pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -14216,7 +14738,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C/A/X pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -14234,7 +14756,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A/X pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -15072,16 +15594,20 @@ diff --git a/src/github.rs b/src/github.rs
                 }),
                 commits: Some(4),
                 note: Some("Merge blocked: checks pending".to_string()),
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "feature/checks".to_string(),
+                }),
             }),
         );
 
         let document = build_details_document(&app, 120);
-        let rendered = document
+        let lines = document
             .lines
             .iter()
             .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("action: Approvable, Mergeable"));
         assert!(rendered.contains("checks: 10 pass, 2 fail, 1 pending"));
@@ -15091,7 +15617,20 @@ diff --git a/src/github.rs b/src/github.rs
             "4",
             "https://github.com/chenyukang/ghr/pull/1/commits",
         );
+        assert!(rendered.contains("branch: chenyukang/ghr:feature/checks"));
         assert!(rendered.contains("action note: Merge blocked: checks pending"));
+        let branch_line = lines
+            .iter()
+            .position(|line| line.contains("branch: chenyukang/ghr:feature/checks"))
+            .expect("branch line");
+        let action_line = lines
+            .iter()
+            .position(|line| line.contains("action: Approvable, Mergeable"))
+            .expect("action line");
+        assert!(
+            action_line > branch_line,
+            "action/checks should start on a new line"
+        );
     }
 
     #[test]
@@ -15111,6 +15650,45 @@ diff --git a/src/github.rs b/src/github.rs
             .expect("failed check segment");
         assert_eq!(failed.style.fg, Some(Color::LightRed));
         assert!(failed.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn mergeable_action_label_is_rendered_green() {
+        let segments = action_label_segments(&["Approvable".to_string(), "Mergeable".to_string()]);
+
+        let approvable = segments
+            .iter()
+            .find(|segment| segment.text == "Approvable")
+            .expect("approvable segment");
+        assert_eq!(approvable.style, Style::default());
+
+        let mergeable = segments
+            .iter()
+            .find(|segment| segment.text == "Mergeable")
+            .expect("mergeable segment");
+        assert_eq!(mergeable.style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn merge_conflict_action_note_is_rendered_red() {
+        let segments =
+            action_note_segments("Merge blocked: draft; merge conflicts must be resolved");
+
+        let conflict = segments
+            .iter()
+            .find(|segment| segment.text == "merge conflicts must be resolved")
+            .expect("conflict segment");
+        assert_eq!(conflict.style.fg, Some(Color::LightRed));
+        assert!(conflict.style.add_modifier.contains(Modifier::BOLD));
+
+        let rendered = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            "Merge blocked: draft; merge conflicts must be resolved"
+        );
     }
 
     #[test]
@@ -16476,12 +17054,157 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_list() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = checkout_test_config();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "checkout-pr");
+        assert!(dialog.checkout.is_some());
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = checkout_test_config();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.action_hints.insert(
+            "checkout-pr".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                note: None,
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "codex/pr-checkout-local".to_string(),
+                }),
+            }),
+        );
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "checkout-pr");
+        assert_eq!(
+            dialog
+                .checkout
+                .as_ref()
+                .and_then(|checkout| checkout.branch.as_ref())
+                .map(pull_request_branch_label)
+                .as_deref(),
+            Some("chenyukang/ghr:codex/pr-checkout-local")
+        );
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn checkout_confirmation_remote_branch_is_clickable() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let config = checkout_test_config();
+        app.action_hints.insert(
+            "checkout-pr".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                note: None,
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "codex/pr-checkout-local".to_string(),
+                }),
+            }),
+        );
+        app.start_pr_checkout_dialog(&config);
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        let area = Rect::new(0, 0, 120, 40);
+        let inner = block_inner(pr_action_dialog_area(dialog, area));
+        let branch_column = inner
+            .x
+            .saturating_add(display_width("remote branch: ") as u16)
+            .saturating_add(1);
+        let branch_row = inner.y.saturating_add(PR_ACTION_REMOTE_BRANCH_LINE);
+
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column, branch_row).as_deref(),
+            Some("https://github.com/chenyukang/ghr/tree/codex/pr-checkout-local")
+        );
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column.saturating_sub(2), branch_row),
+            None
+        );
+    }
+
+    #[test]
+    fn checkout_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let config = checkout_test_config();
+        app.start_pr_checkout_dialog(&config);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, checkout| {
+                submitted = Some((item.id, action, checkout));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "checking out pull request locally");
+        assert!(matches!(
+            submitted,
+            Some((id, PrAction::Checkout, Some(_))) if id == "checkout-pr"
+        ));
+    }
+
+    #[test]
+    fn pr_checkout_command_construction_uses_repo_and_number() {
+        let args = pr_checkout_command_args("rust-lang/rust", 123);
+
+        assert_eq!(
+            args,
+            vec![
+                "pr".to_string(),
+                "checkout".to_string(),
+                "123".to_string(),
+                "--repo".to_string(),
+                "rust-lang/rust".to_string(),
+            ]
+        );
+        assert_eq!(
+            pr_checkout_command_display(&args),
+            "gh pr checkout 123 --repo rust-lang/rust"
+        );
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
         let mut submitted = None;
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action| {
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action, _| {
             submitted = Some((item.id, action));
         });
 
@@ -16495,7 +17218,7 @@ diff --git a/src/github.rs b/src/github.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Esc), |_item, _action| {
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Esc), |_item, _action, _| {
             panic!("escape should not submit the action");
         });
 
@@ -16539,6 +17262,40 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn checkout_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -16557,6 +17314,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request merged; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Merged");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
     }
 
@@ -16579,6 +17338,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request approved; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Approved");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
     }
 
@@ -16603,6 +17364,64 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_finished_shows_success_output() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Ok(PrCheckoutResult {
+                command: "gh pr checkout 1 --repo rust-lang/rust".to_string(),
+                directory: PathBuf::from("/tmp/rust"),
+                output: "Switched to branch 'diagnostics'".to_string(),
+            }),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checked out locally");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Checked Out");
+        assert!(
+            dialog
+                .body
+                .contains("gh pr checkout 1 --repo rust-lang/rust")
+        );
+        assert!(dialog.body.contains("Checkout runs from /tmp/rust."));
+        assert!(dialog.body.contains("Switched to branch"));
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Err(
+                "gh pr checkout 1 --repo rust-lang/rust failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
+                    .to_string(),
+            ),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checkout failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Checkout Failed");
+        assert!(dialog.body.contains("Checkout runs from /tmp."));
+        assert!(dialog.body.contains("fatal: not a git repository"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -16633,6 +17452,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.message_dialog = Some(MessageDialog {
             title: "Comment Posted".to_string(),
             body: "ok".to_string(),
+            kind: MessageDialogKind::Success,
             auto_close_at: Some(deadline),
         });
 
@@ -16654,6 +17474,14 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("blocking dialog");
         assert_eq!(dialog.title, "Comment Failed");
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pending_message_dialog_is_not_error_colored() {
+        let dialog = comment_pending_dialog(&PendingCommentMode::Post);
+
+        assert_eq!(dialog.kind, MessageDialogKind::Info);
+        assert_ne!(message_dialog_accent(&dialog), Color::LightRed);
     }
 
     #[test]
@@ -17432,12 +18260,14 @@ diff --git a/src/github.rs b/src/github.rs
         config.repos.push(crate::config::RepoConfig {
             name: "runnel".to_string(),
             repo: "chenyukang/runnel".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         });
         config.repos.push(crate::config::RepoConfig {
             name: "Fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         });
@@ -18701,6 +19531,81 @@ diff --git a/d.rs b/d.rs
             refreshed_at: None,
             error: None,
         }
+    }
+
+    fn checkout_test_section() -> SectionSnapshot {
+        SectionSnapshot {
+            key: "pull_requests:checkout".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Checkout".to_string(),
+            filters: String::new(),
+            items: vec![work_item(
+                "checkout-pr",
+                "chenyukang/ghr",
+                19,
+                "Add local PR checkout",
+                None,
+            )],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }
+    }
+
+    fn checkout_test_config() -> Config {
+        let local_dir = checkout_test_repo_dir();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+        });
+        config
+    }
+
+    fn checkout_test_repo_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ghr-checkout-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create checkout test dir");
+
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("run git init");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            command_output_text(&init.stdout, &init.stderr)
+        );
+
+        let remote = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/chenyukang/ghr.git",
+            ])
+            .output()
+            .expect("run git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {}",
+            command_output_text(&remote.stdout, &remote.stderr)
+        );
+
+        dir
     }
 
     fn many_items_section(count: u64) -> SectionSnapshot {

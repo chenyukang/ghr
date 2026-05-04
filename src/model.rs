@@ -127,6 +127,13 @@ pub struct ActionHints {
     pub checks: Option<CheckSummary>,
     pub commits: Option<usize>,
     pub note: Option<String>,
+    pub head: Option<PullRequestBranch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestBranch {
+    pub repository: String,
+    pub branch: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -440,6 +447,7 @@ mod tests {
         config.repos.push(crate::config::RepoConfig {
             name: "fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
         });

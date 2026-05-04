@@ -36,14 +36,15 @@ use crate::github::{
     PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
     approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
-    convert_pull_request_to_draft, create_issue, create_pending_pull_request_review,
-    disable_pull_request_auto_merge, discard_pending_pull_request_review, edit_issue_comment,
-    edit_item_metadata, edit_pull_request_review_comment, enable_pull_request_auto_merge,
-    fetch_comments, fetch_open_milestones, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, fetch_repository_assignees, fetch_repository_labels,
-    mark_notification_thread_read, mark_pull_request_ready_for_review, merge_pull_request,
-    post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
-    refresh_dashboard, refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
+    convert_pull_request_to_draft, create_issue, create_milestone,
+    create_pending_pull_request_review, disable_pull_request_auto_merge,
+    discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
+    edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
+    fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
+    fetch_repository_assignees, fetch_repository_labels, mark_notification_thread_read,
+    mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
+    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
+    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
     remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
     request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
     submit_pending_pull_request_review, submit_pull_request_review, update_issue_assignees,
@@ -602,6 +603,7 @@ enum MilestoneDialogState {
 enum MilestoneChoice {
     Clear,
     Set(Milestone),
+    Create(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1799,11 +1801,6 @@ fn start_filtered_section_load(
     tx: &UnboundedSender<AppMsg>,
     filter: Option<QuickFilter>,
 ) {
-    if app.refreshing {
-        app.status = "refresh already running".to_string();
-        return;
-    }
-
     let Some(section) = app.current_section() else {
         app.status = "no section selected".to_string();
         return;
@@ -1900,6 +1897,7 @@ fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
                 .map_err(|error| error.to_string()),
             None => Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: Vec::new(),
             }),
         };
@@ -2659,25 +2657,30 @@ fn start_milestones_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
 
 fn start_milestone_change(
     item: WorkItem,
-    milestone: Option<Milestone>,
+    choice: MilestoneChoice,
     config: Config,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        let mut changed_milestone = None;
         let result = match item.number {
-            Some(number) => {
-                change_issue_milestone(&item.repo, number, milestone.as_ref().map(|m| m.number))
-                    .await
-                    .map_err(|error| error.to_string())
-            }
+            Some(number) => match resolve_milestone_choice(&item.repo, choice).await {
+                Ok(milestone) => {
+                    changed_milestone = milestone.clone();
+                    change_issue_milestone(&item.repo, number, milestone.as_ref().map(|m| m.number))
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error),
+            },
             None => Err("selected item has no issue or pull request number".to_string()),
         };
         let should_refresh = result.is_ok();
         let _ = tx.send(AppMsg::MilestoneChanged {
             item_id,
-            milestone,
+            milestone: changed_milestone,
             result,
         });
 
@@ -2702,6 +2705,20 @@ fn start_milestone_change(
             });
         }
     });
+}
+
+async fn resolve_milestone_choice(
+    repository: &str,
+    choice: MilestoneChoice,
+) -> std::result::Result<Option<Milestone>, String> {
+    match choice {
+        MilestoneChoice::Clear => Ok(None),
+        MilestoneChoice::Set(milestone) => Ok(Some(milestone)),
+        MilestoneChoice::Create(title) => create_milestone(repository, &title)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn start_reviewer_action(
@@ -2946,6 +2963,10 @@ fn handle_key_in_area(
         app.show_diff();
         return false;
     }
+    if is_ctrl_d_key(key) {
+        app.discard_pending_review(tx);
+        return false;
+    }
 
     match key.code {
         KeyCode::Char('q') if app.details_mode == DetailsMode::Diff => {
@@ -3020,7 +3041,7 @@ fn handle_key_in_area(
             KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
-            KeyCode::Char('D') => app.discard_pending_review(tx),
+            KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
             KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
             KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
@@ -3067,7 +3088,7 @@ fn handle_key_in_area(
             KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
             KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
-            KeyCode::Char('D') => app.discard_pending_review(tx),
+            KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
             KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
             KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
@@ -3242,7 +3263,7 @@ fn handle_diff_file_list_key(
         KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
         KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
         KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
-        KeyCode::Char('D') => app.discard_pending_review(tx),
+        KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
         KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
         KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
         KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
@@ -4713,8 +4734,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/D/U/E/O/F/X", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4732,8 +4753,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/D/U/E/O/F/X", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -4760,8 +4781,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/D/U/E/O/F/X", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, assignee_keys, "assign", Color::LightBlue);
@@ -4781,8 +4802,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 if footer_selected_comment_is_editable(app) {
                     push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 }
-                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/U/E/O/F/X/Z", "actions", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/D/U/E/O/F/X", "actions", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "P/Y", "reviewers", Color::LightMagenta);
@@ -6022,7 +6043,7 @@ fn draw_milestone_dialog(
     let status = if running {
         "working..."
     } else {
-        "type prefix, Up/Down choose, Enter set, Esc cancel"
+        "type prefix, Up/Down choose, Enter set/create, Esc cancel"
     };
     lines.push(Line::from(vec![Span::styled(
         status,
@@ -6348,13 +6369,21 @@ fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDialog, area: R
 fn milestone_choices(dialog: &MilestoneDialog) -> Vec<MilestoneChoice> {
     let mut choices = vec![MilestoneChoice::Clear];
     if let MilestoneDialogState::Loaded(milestones) = &dialog.state {
-        choices.extend(
-            milestones
-                .iter()
-                .filter(|milestone| milestone_matches_prefix(milestone, &dialog.input))
-                .cloned()
-                .map(MilestoneChoice::Set),
-        );
+        let matches = milestones
+            .iter()
+            .filter(|milestone| milestone_matches_prefix(milestone, &dialog.input))
+            .cloned()
+            .map(MilestoneChoice::Set)
+            .collect::<Vec<_>>();
+        choices.extend(matches);
+
+        let title = dialog.input.trim();
+        let has_exact = milestones
+            .iter()
+            .any(|milestone| milestone.title.eq_ignore_ascii_case(title));
+        if !title.is_empty() && !has_exact {
+            choices.push(MilestoneChoice::Create(title.to_string()));
+        }
     }
     choices
 }
@@ -6368,6 +6397,7 @@ fn milestone_choice_label(choice: &MilestoneChoice) -> String {
     match choice {
         MilestoneChoice::Clear => "Clear milestone".to_string(),
         MilestoneChoice::Set(milestone) => format!("{} (#{})", milestone.title, milestone.number),
+        MilestoneChoice::Create(title) => format!("Create milestone \"{title}\""),
     }
 }
 
@@ -6719,6 +6749,13 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             palette_key(KeyCode::Char('L')),
         ),
         palette_command(
+            "Change Milestone",
+            "t",
+            "Issue/PR",
+            "Change or clear the selected issue or PR milestone",
+            palette_key(KeyCode::Char('t')),
+        ),
+        palette_command(
             "Create Issue",
             "N",
             "Issue",
@@ -6958,16 +6995,113 @@ fn command_palette_filtered_indices(commands: &[PaletteCommand], query: &str) ->
 }
 
 fn command_palette_score(command: &PaletteCommand, query: &str) -> Option<i64> {
-    let haystack = format!(
+    let raw_query = query.trim();
+    let query = command_palette_normalized_text(raw_query);
+    if query.is_empty() {
+        return raw_query.is_empty().then_some(0);
+    }
+
+    let fields = [
+        (command.title, 40_000),
+        (command.keys.as_str(), 30_000),
+        (command.scope, 20_000),
+        (command.detail, 10_000),
+    ];
+    let mut best = None;
+    for (field, base) in fields {
+        if let Some(score) = command_palette_text_score(field, &query) {
+            best = Some(best.unwrap_or(i64::MIN).max(base + score));
+        }
+    }
+
+    let combined = format!(
         "{} {} {} {}",
         command.title, command.keys, command.scope, command.detail
-    )
-    .to_lowercase();
+    );
+    if let Some(score) = command_palette_text_score(&combined, &query) {
+        best = Some(best.unwrap_or(i64::MIN).max(score));
+    }
+
+    best
+}
+
+fn command_palette_text_score(text: &str, query: &str) -> Option<i64> {
+    let text = command_palette_normalized_text(text);
+    if text.is_empty() {
+        return None;
+    }
+    if text == query {
+        return Some(30_000);
+    }
+    if text.starts_with(query) {
+        return Some(25_000);
+    }
+    if let Some(index) = text.find(query) {
+        return Some(22_000 - index.min(500) as i64);
+    }
+
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let initials = words
+        .iter()
+        .filter_map(|word| word.chars().next())
+        .collect::<String>();
     let mut total = 0;
     for token in query.split_whitespace() {
-        total += fuzzy_score(token, &haystack)?;
+        total += command_palette_token_score(token, &words, &initials)?;
     }
     Some(total)
+}
+
+fn command_palette_token_score(token: &str, words: &[&str], initials: &str) -> Option<i64> {
+    let mut best = None;
+    for (index, word) in words.iter().enumerate() {
+        let score = if *word == token {
+            Some(8_000)
+        } else if word.starts_with(token) {
+            Some(7_000)
+        } else {
+            word.find(token)
+                .map(|offset| 5_000 - offset.min(300) as i64)
+        };
+
+        if let Some(score) = score {
+            best = Some(best.unwrap_or(i64::MIN).max(score - index.min(200) as i64));
+        }
+    }
+
+    if token.chars().count() <= 4 && initials.starts_with(token) {
+        best = Some(best.unwrap_or(i64::MIN).max(6_500));
+    }
+
+    best
+}
+
+fn command_palette_normalized_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        for lower in ch.to_lowercase() {
+            if lower.is_alphanumeric() {
+                normalized.push(lower);
+                last_was_space = false;
+            } else if command_palette_search_symbol(lower) {
+                if !last_was_space {
+                    normalized.push(' ');
+                }
+                normalized.push(lower);
+                normalized.push(' ');
+                last_was_space = true;
+            } else if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn command_palette_search_symbol(ch: char) -> bool {
+    matches!(ch, ':' | '/' | '?' | '+' | '-' | '@' | '[' | ']')
 }
 
 fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
@@ -7508,10 +7642,10 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
-        help_key_line("D", "discard a pending PR review"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
-        help_key_line("Z", "toggle PR draft / ready for review"),
+        help_key_line("D", "toggle PR draft / ready for review"),
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
@@ -7528,7 +7662,8 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("a", "add a normal PR comment"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
-        help_key_line("D", "discard a pending PR review"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("D", "toggle PR draft / ready for review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
         help_key_line("@ / -", "assign or unassign PR assignees"),
@@ -7568,10 +7703,10 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
-        help_key_line("D", "discard a pending PR review"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
         help_key_line("E", "open PR enable auto-merge confirmation"),
         help_key_line("O", "open PR disable auto-merge confirmation"),
-        help_key_line("Z", "toggle PR draft / ready for review"),
+        help_key_line("D", "toggle PR draft / ready for review"),
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("P", "request or re-request PR reviewers"),
         help_key_line("Y", "remove pending PR review requests"),
@@ -8714,10 +8849,15 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
             commit_count_segments(app.action_hints.get(&item.id), item),
         ));
     }
-    if let Some(milestone) = item.milestone.as_ref() {
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         secondary_meta.push((
             "milestone",
-            vec![DetailSegment::raw(milestone.title.clone())],
+            vec![DetailSegment::raw(
+                item.milestone
+                    .as_ref()
+                    .map(|milestone| milestone.title.clone())
+                    .unwrap_or_else(|| "-".to_string()),
+            )],
         ));
     }
     if let Some(reason) = useful_meta_value(item.reason.as_deref()) {
@@ -11456,6 +11596,11 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'c'))
 }
 
+fn is_ctrl_d_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'d'))
+}
+
 fn normalized_command_palette_key(value: &str) -> String {
     command_palette_key_binding(value).label
 }
@@ -12034,7 +12179,7 @@ impl AppState {
                 Ok(result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -12106,7 +12251,7 @@ impl AppState {
                     self.selected_comment_index = result.comments.len().saturating_sub(1);
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -12145,7 +12290,7 @@ impl AppState {
                         comment_index.min(result.comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -12215,7 +12360,7 @@ impl AppState {
                     }
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -13353,6 +13498,11 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn apply_comment_fetch_result_metadata(&mut self, item_id: &str, result: &CommentFetchResult) {
+        self.update_item_reactions(item_id, result.item_reactions.clone());
+        self.mark_item_milestone(item_id, result.item_milestone.as_ref());
     }
 
     fn replace_section_page(&mut self, section_key: &str, refreshed: SectionSnapshot) {
@@ -15486,14 +15636,14 @@ impl AppState {
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        self.handle_milestone_dialog_key_with_submit(key, |item, milestone| {
-            start_milestone_change(item, milestone, config.clone(), store.clone(), tx.clone());
+        self.handle_milestone_dialog_key_with_submit(key, |item, choice| {
+            start_milestone_change(item, choice, config.clone(), store.clone(), tx.clone());
         });
     }
 
     fn handle_milestone_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
     where
-        F: FnMut(WorkItem, Option<Milestone>),
+        F: FnMut(WorkItem, MilestoneChoice),
     {
         if self.milestone_action_running {
             self.status = "milestone change already running".to_string();
@@ -15538,7 +15688,7 @@ impl AppState {
 
     fn submit_milestone_choice<F>(&mut self, submit: &mut F)
     where
-        F: FnMut(WorkItem, Option<Milestone>),
+        F: FnMut(WorkItem, MilestoneChoice),
     {
         let Some(dialog) = self.milestone_dialog.as_ref() else {
             return;
@@ -15557,16 +15707,13 @@ impl AppState {
                     return;
                 };
                 let item = dialog.item.clone();
-                let milestone = match choice {
-                    MilestoneChoice::Clear => None,
-                    MilestoneChoice::Set(milestone) => Some(milestone),
-                };
                 self.milestone_action_running = true;
-                self.status = match milestone {
-                    Some(_) => "changing milestone".to_string(),
-                    None => "clearing milestone".to_string(),
+                self.status = match &choice {
+                    MilestoneChoice::Clear => "clearing milestone".to_string(),
+                    MilestoneChoice::Set(_) => "changing milestone".to_string(),
+                    MilestoneChoice::Create(_) => "creating milestone".to_string(),
                 };
-                submit(item, milestone);
+                submit(item, choice);
             }
         }
     }
@@ -19147,6 +19294,7 @@ diff --git a/src/github.rs b/src/github.rs
             item_id: "1".to_string(),
             comments: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
             }),
         });
@@ -19847,6 +19995,11 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(
             commands
                 .iter()
+                .any(|command| command.title == "Change Milestone")
+        );
+        assert!(
+            commands
+                .iter()
                 .any(|command| command.scope == "Reaction Dialog")
         );
 
@@ -19862,6 +20015,25 @@ diff --git a/src/github.rs b/src/github.rs
                 .iter()
                 .any(|index| commands[*index].title == "Create Issue from Dialog")
         );
+
+        let milestone_matches = command_palette_filtered_indices(&commands, "milestone");
+        let milestone_titles = milestone_matches
+            .iter()
+            .map(|index| commands[*index].title)
+            .collect::<Vec<_>>();
+        assert!(milestone_titles.contains(&"Change Milestone"));
+        assert!(!milestone_titles.contains(&"Open PR Merge Confirmation"));
+        assert!(!milestone_titles.contains(&"Open PR Close Confirmation"));
+        assert!(!milestone_titles.contains(&"Open PR Approve Confirmation"));
+        assert!(!milestone_titles.contains(&"Toggle Mouse Text Selection"));
+
+        let reaction_matches = command_palette_filtered_indices(&commands, "+");
+        assert!(
+            reaction_matches
+                .iter()
+                .any(|index| commands[*index].title == "Add Reaction")
+        );
+        assert!(command_palette_filtered_indices(&commands, ".").is_empty());
     }
 
     #[test]
@@ -20062,8 +20234,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
         assert!(text.contains("T edit item"));
-        assert!(text.contains("s/A/D review"));
-        assert!(text.contains("M/C/U/E/O/F/X/Z actions"));
+        assert!(text.contains("s/A/Ctrl+D review"));
+        assert!(text.contains("M/C/D/U/E/O/F/X actions"));
         assert!(text.contains("t milestone"));
         assert!(text.contains("@ assign"));
         assert!(text.contains(
@@ -20096,7 +20268,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/U/E/O/F/X/Z actions"));
+        assert!(!ghr.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
@@ -20144,8 +20316,8 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
-        assert!(diff.contains("M/C/U/E/O/F/X/Z actions"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/Ctrl+D review"));
+        assert!(diff.contains("M/C/D/U/E/O/F/X actions"));
         assert!(diff.contains("t milestone"));
         assert!(diff.contains("T edit item"));
         assert!(diff.contains("@/- assign"));
@@ -21019,6 +21191,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains(&format!("created: {}", local_datetime(Some(created_at)))));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
+        assert!(rendered.contains("milestone: -"));
         assert!(rendered.contains("labels: T-compiler ×  +"));
         assert!(!rendered.contains("reason: -"));
 
@@ -21036,6 +21209,61 @@ diff --git a/src/github.rs b/src/github.rs
             "×",
             DetailAction::RemoveLabel("T-compiler".to_string()),
         );
+    }
+
+    #[test]
+    fn pr_details_meta_shows_milestone_title() {
+        let mut item = work_item("1", "chenyukang/ghr", 1, "More on tui", Some("chenyukang"));
+        item.milestone = Some(Milestone {
+            number: 9,
+            title: "next-release".to_string(),
+        });
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("milestone: next-release"));
+    }
+
+    #[test]
+    fn comments_loaded_updates_details_milestone_metadata() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                item_milestone: Some(Milestone {
+                    number: 9,
+                    title: "next-release".to_string(),
+                }),
+                comments: Vec::new(),
+            }),
+        });
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("milestone: next-release"));
     }
 
     #[test]
@@ -23734,7 +23962,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn capital_z_key_opens_convert_to_draft_confirmation_for_ready_pr() {
+    fn capital_d_key_opens_convert_to_draft_confirmation_for_ready_pr() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -23742,7 +23970,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('Z')),
+            key(KeyCode::Char('D')),
             &config,
             &store,
             &tx
@@ -23766,7 +23994,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn capital_z_key_opens_ready_confirmation_for_draft_pr_details() {
+    fn capital_d_key_opens_ready_confirmation_for_draft_pr_details() {
         let mut section = test_section();
         section.items[0].extra = Some("draft".to_string());
         let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
@@ -23777,7 +24005,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('Z')),
+            key(KeyCode::Char('D')),
             &config,
             &store,
             &tx
@@ -24554,7 +24782,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(!handle_key(
             &mut app,
-            key(KeyCode::Char('Z')),
+            key(KeyCode::Char('D')),
             &config,
             &store,
             &tx
@@ -24970,7 +25198,7 @@ diff --git a/src/github.rs b/src/github.rs
             submitted,
             Some((
                 "1".to_string(),
-                Some(Milestone {
+                MilestoneChoice::Set(Milestone {
                     number: 2,
                     title: "beta".to_string(),
                 })
@@ -24996,8 +25224,54 @@ diff --git a/src/github.rs b/src/github.rs
             submitted = Some((item.id, milestone));
         });
 
-        assert_eq!(submitted, Some(("1".to_string(), None)));
+        assert_eq!(submitted, Some(("1".to_string(), MilestoneChoice::Clear)));
         assert_eq!(app.status, "clearing milestone");
+    }
+
+    #[test]
+    fn milestone_dialog_can_create_missing_prefix_milestone() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_milestone_dialog(&tx);
+        app.handle_msg(AppMsg::MilestonesLoaded {
+            item_id: "1".to_string(),
+            result: Ok(vec![Milestone {
+                number: 1,
+                title: "alpha".to_string(),
+            }]),
+        });
+
+        let mut submitted = None;
+        for value in "next-release".chars() {
+            app.handle_milestone_dialog_key_with_submit(
+                key(KeyCode::Char(value)),
+                |item, choice| {
+                    submitted = Some((item.id, choice));
+                },
+            );
+        }
+        let choices = milestone_choices(app.milestone_dialog.as_ref().expect("milestone dialog"));
+        assert_eq!(
+            choices,
+            vec![
+                MilestoneChoice::Clear,
+                MilestoneChoice::Create("next-release".to_string())
+            ]
+        );
+
+        app.handle_milestone_dialog_key_with_submit(key(KeyCode::Enter), |item, choice| {
+            submitted = Some((item.id, choice));
+        });
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                MilestoneChoice::Create("next-release".to_string())
+            ))
+        );
+        assert!(app.milestone_action_running);
+        assert_eq!(app.status, "creating milestone");
     }
 
     #[test]
@@ -25488,6 +25762,7 @@ diff --git a/src/github.rs b/src/github.rs
             item_id: "1".to_string(),
             result: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![comment("alice", "posted", None)],
             }),
         });
@@ -25546,6 +25821,7 @@ diff --git a/src/github.rs b/src/github.rs
             comment_index: 0,
             result: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![own_comment(42, "chenyukang", "updated", None)],
             }),
         });

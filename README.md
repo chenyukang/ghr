@@ -90,10 +90,10 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `Tab` in merge confirmation | Cycle merge method |
 | `s` | Submit a PR review summary as comment, request changes, or approve |
 | `A` | Approve through the PR review summary flow |
-| `D` | Discard a pending PR review created in this session |
+| `Ctrl+D` | Discard a pending PR review created in this session |
 | `E` | Open an enable auto-merge confirmation for the selected PR |
 | `O` | Open a disable auto-merge confirmation for the selected PR |
-| `Z` | Toggle the selected open PR between draft and ready for review |
+| `D` | Toggle the selected open PR between draft and ready for review |
 | `P` | Request or re-request PR reviewers with comma-separated logins |
 | `Y` | Remove pending PR review requests with comma-separated logins |
 | `t` | Change or clear the selected issue/PR milestone |

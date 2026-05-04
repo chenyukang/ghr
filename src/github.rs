@@ -64,6 +64,7 @@ impl MergeMethod {
 
 pub struct CommentFetchResult {
     pub item_reactions: ReactionSummary,
+    pub item_milestone: Option<Milestone>,
     pub comments: Vec<CommentPreview>,
 }
 
@@ -185,6 +186,12 @@ struct SearchApiIssueRaw {
 #[derive(Debug, Deserialize)]
 struct IssueDetailsRaw {
     reactions: Option<ReactionSummaryRaw>,
+    milestone: Option<MilestoneRaw>,
+}
+
+struct IssueDetails {
+    reactions: ReactionSummary,
+    milestone: Option<Milestone>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -990,6 +997,7 @@ pub async fn fetch_comments(
         ItemKind::Issue => fetch_issue_comments(repository, number).await,
         ItemKind::Notification => Ok(CommentFetchResult {
             item_reactions: ReactionSummary::default(),
+            item_milestone: None,
             comments: Vec::new(),
         }),
     }
@@ -1001,8 +1009,10 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
     let viewer_login = comment_viewer_login("comment ownership");
     let (issue_output, comments_output, viewer_login) =
         tokio::join!(issue_output, comments_output, viewer_login);
+    let issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
     Ok(CommentFetchResult {
-        item_reactions: parse_issue_details_output(&issue_output?, repository, number)?,
+        item_reactions: issue_details.reactions,
+        item_milestone: issue_details.milestone,
         comments: parse_issue_comments_output(
             &comments_output?,
             repository,
@@ -1056,8 +1066,10 @@ pub async fn fetch_pull_request_comments(
         viewer_login,
     )?);
     comments.sort_by_key(|comment| comment.created_at);
+    let issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
     Ok(CommentFetchResult {
-        item_reactions: parse_issue_details_output(&issue_details?, repository, number)?,
+        item_reactions: issue_details.reactions,
+        item_milestone: issue_details.milestone,
         comments,
     })
 }
@@ -1361,6 +1373,13 @@ pub async fn create_issue(
 pub async fn fetch_open_milestones(repository: &str) -> Result<Vec<Milestone>> {
     let output = run_gh_json(&open_milestones_args(repository)).await?;
     parse_open_milestones_output(&output, repository)
+}
+
+pub async fn create_milestone(repository: &str, title: &str) -> Result<Milestone> {
+    let output = run_gh_json(&create_milestone_args(repository, title))
+        .await
+        .with_context(|| format!("failed to create milestone in {repository}"))?;
+    parse_milestone_output(&output, repository)
 }
 
 pub async fn change_issue_milestone(
@@ -2173,17 +2192,19 @@ fn parse_issue_comments_output(
     Ok(comments)
 }
 
-fn parse_issue_details_output(
-    output: &str,
-    repository: &str,
-    number: u64,
-) -> Result<ReactionSummary> {
+fn parse_issue_details_output(output: &str, repository: &str, number: u64) -> Result<IssueDetails> {
     let issue = serde_json::from_str::<IssueDetailsRaw>(output)
         .with_context(|| format!("failed to parse issue details for {repository}#{number}"))?;
-    Ok(issue
-        .reactions
-        .map(ReactionSummary::from)
-        .unwrap_or_default())
+    Ok(IssueDetails {
+        reactions: issue
+            .reactions
+            .map(ReactionSummary::from)
+            .unwrap_or_default(),
+        milestone: issue.milestone.map(|milestone| Milestone {
+            number: milestone.number,
+            title: milestone.title,
+        }),
+    })
 }
 
 fn parse_pull_request_review_comments_output(
@@ -2952,6 +2973,17 @@ fn open_milestones_args(repository: &str) -> Vec<String> {
     ]
 }
 
+fn create_milestone_args(repository: &str, title: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        format!("repos/{repository}/milestones"),
+        "-F".to_string(),
+        format!("title={}", title.trim()),
+    ]
+}
+
 fn change_issue_milestone_args(
     repository: &str,
     issue_number: u64,
@@ -2982,6 +3014,15 @@ fn parse_open_milestones_output(output: &str, repository: &str) -> Result<Vec<Mi
             title: milestone.title,
         })
         .collect())
+}
+
+fn parse_milestone_output(output: &str, repository: &str) -> Result<Milestone> {
+    let milestone = serde_json::from_str::<MilestoneRaw>(output)
+        .with_context(|| format!("failed to parse milestone for {repository}"))?;
+    Ok(Milestone {
+        number: milestone.number,
+        title: milestone.title,
+    })
 }
 
 fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
@@ -3493,6 +3534,21 @@ mod tests {
     }
 
     #[test]
+    fn create_milestone_args_post_repository_milestone() {
+        assert_eq!(
+            create_milestone_args("owner/repo", " next-release "),
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/milestones",
+                "-F",
+                "title=next-release"
+            ]
+        );
+    }
+
+    #[test]
     fn change_issue_milestone_args_patch_issue_metadata() {
         assert_eq!(
             change_issue_milestone_args("owner/repo", 42, Some(7)),
@@ -3545,6 +3601,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_milestone_output_reads_created_milestone() {
+        let milestone =
+            parse_milestone_output(r#"{"number": 9, "title": "next-release"}"#, "owner/repo")
+                .unwrap();
+
+        assert_eq!(
+            milestone,
+            Milestone {
+                number: 9,
+                title: "next-release".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn label_path_segments_are_percent_encoded() {
         assert_eq!(percent_encode_path_segment("T-compiler"), "T-compiler");
         assert_eq!(
@@ -3581,9 +3652,16 @@ mod tests {
 
     #[test]
     fn issue_details_and_comments_parse_reactions() {
-        let issue = r#"{"reactions": {"+1": 0, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 1, "rocket": 0, "eyes": 0}}"#;
-        let reactions = parse_issue_details_output(issue, "owner/repo", 1).unwrap();
-        assert_eq!(reactions.heart, 1);
+        let issue = r#"{"reactions": {"+1": 0, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 1, "rocket": 0, "eyes": 0}, "milestone": {"number": 9, "title": "next-release"}}"#;
+        let details = parse_issue_details_output(issue, "owner/repo", 1).unwrap();
+        assert_eq!(details.reactions.heart, 1);
+        assert_eq!(
+            details.milestone,
+            Some(Milestone {
+                number: 9,
+                title: "next-release".to_string(),
+            })
+        );
 
         let output = r##"[
           [{

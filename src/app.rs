@@ -30,12 +30,14 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    PullRequestReviewCommentTarget, PullRequestReviewEvent, approve_pull_request,
+    close_pull_request, create_pending_pull_request_review, discard_pending_pull_request_review,
+    edit_issue_comment, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, search_global, submit_pending_pull_request_review,
+    submit_pull_request_review, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -104,6 +106,26 @@ enum AppMsg {
     },
     ReviewCommentPosted {
         item_id: String,
+        result: std::result::Result<(), String>,
+    },
+    ReviewDraftCreated {
+        item_id: String,
+        result: std::result::Result<PendingReviewState, String>,
+    },
+    ReviewSubmitted {
+        item_id: String,
+        event: PullRequestReviewEvent,
+        result: std::result::Result<(), String>,
+    },
+    PendingReviewSubmitted {
+        item_id: String,
+        review_id: u64,
+        event: PullRequestReviewEvent,
+        result: std::result::Result<(), String>,
+    },
+    PendingReviewDiscarded {
+        item_id: String,
+        review_id: u64,
         result: std::result::Result<(), String>,
     },
     PrActionFinished {
@@ -242,10 +264,39 @@ struct PendingCommentSubmit {
     mode: PendingCommentMode,
 }
 
+#[derive(Debug, Clone)]
+struct ReviewSubmitDialog {
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    scroll: u16,
+    mode: ReviewSubmitMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSubmitMode {
+    New,
+    Pending { review_id: u64 },
+}
+
+struct PendingReviewSubmit {
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    mode: ReviewSubmitMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReviewState {
+    review_id: u64,
+    body: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrAction {
     Merge,
     Close,
+    #[allow(dead_code)]
     Approve,
 }
 
@@ -352,6 +403,9 @@ struct AppState {
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
+    review_submit_dialog: Option<ReviewSubmitDialog>,
+    review_submit_running: bool,
+    pending_reviews: HashMap<String, PendingReviewState>,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
     setup_dialog: Option<SetupDialog>,
@@ -1057,6 +1111,85 @@ fn start_review_comment_submit(
     });
 }
 
+fn start_review_draft_create(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => create_pending_pull_request_review(&item.repo, number, &body)
+                .await
+                .map(|review_id| PendingReviewState { review_id, body })
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewDraftCreated { item_id, result });
+    });
+}
+
+fn start_review_submit(
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => submit_pull_request_review(&item.repo, number, event, &body)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewSubmitted {
+            item_id,
+            event,
+            result,
+        });
+    });
+}
+
+fn start_pending_review_submit(
+    item: WorkItem,
+    review_id: u64,
+    event: PullRequestReviewEvent,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                submit_pending_pull_request_review(&item.repo, number, review_id, event, &body)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::PendingReviewSubmitted {
+            item_id,
+            review_id,
+            event,
+            result,
+        });
+    });
+}
+
+fn start_pending_review_discard(item: WorkItem, review_id: u64, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => discard_pending_pull_request_review(&item.repo, number, review_id)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::PendingReviewDiscarded {
+            item_id,
+            review_id,
+            result,
+        });
+    });
+}
+
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
@@ -1170,6 +1303,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.review_submit_dialog.is_some() {
+        app.handle_review_submit_dialog_key(key, tx, area);
+        return false;
+    }
+
     if app.pr_action_dialog.is_some() {
         app.handle_pr_action_dialog_key(key, config, store, tx);
         return false;
@@ -1249,7 +1387,7 @@ fn handle_key_in_area(
             _ => {}
         },
         FocusTarget::List if app.details_mode == DetailsMode::Diff => {
-            handle_diff_file_list_key(app, key, area)
+            handle_diff_file_list_key(app, key, area, tx)
         }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
@@ -1286,7 +1424,9 @@ fn handle_key_in_area(
             KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-            KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+            KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+            KeyCode::Char('D') => app.discard_pending_review(tx),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1307,7 +1447,9 @@ fn handle_key_in_area(
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-            KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+            KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+            KeyCode::Char('D') => app.discard_pending_review(tx),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1400,7 +1542,12 @@ fn handle_mouse_or_mark_key(app: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
-fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rect>) {
+fn handle_diff_file_list_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    area: Option<Rect>,
+    tx: &UnboundedSender<AppMsg>,
+) {
     match key.code {
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
@@ -1439,7 +1586,9 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char(']') => app.move_diff_file(1),
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
         KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-        KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+        KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+        KeyCode::Char('D') => app.discard_pending_review(tx),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -1979,6 +2128,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_help_dialog(frame, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
+    } else if let Some(dialog) = &app.review_submit_dialog {
+        draw_review_submit_dialog(frame, dialog, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
@@ -2679,7 +2830,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C", "pr action", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2693,7 +2845,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C", "pr action", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2717,7 +2870,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2726,7 +2880,8 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
+                push_footer_pair(spans, "M/C", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3186,6 +3341,103 @@ fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect
     draw_comment_editor(frame, &title, dialog, area);
 }
 
+fn draw_review_submit_dialog(frame: &mut Frame<'_>, dialog: &ReviewSubmitDialog, area: Rect) {
+    let title = match dialog.mode {
+        ReviewSubmitMode::New => "Submit Review",
+        ReviewSubmitMode::Pending { .. } => "Submit Pending Review",
+    };
+    let dialog_area = review_submit_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    let header_height = 3.min(inner.height);
+    let footer_height = 2.min(inner.height.saturating_sub(header_height));
+    let editor_height = inner
+        .height
+        .saturating_sub(header_height)
+        .saturating_sub(footer_height)
+        .max(1);
+    let editor_width = inner.width.max(1);
+    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let scroll = dialog.scroll.min(max_scroll);
+    let mut lines = vec![
+        key_value_line("event", review_event_selector_label(dialog.event)),
+        key_value_line("pull request", review_dialog_pr_label(dialog)),
+        Line::from(""),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(header_height.saturating_add(editor_height)) {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Tab/1/2/3", Style::default().fg(Color::Yellow)),
+        Span::raw(" event  "),
+        Span::styled("Ctrl+Enter", Style::default().fg(Color::Yellow)),
+        Span::raw(" submit  "),
+        Span::styled("Ctrl+P", Style::default().fg(Color::Yellow)),
+        Span::raw(" pending  "),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(" cancel"),
+    ]));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style());
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    if let Some(position) = review_submit_cursor_position(
+        &dialog.body,
+        scroll,
+        dialog_area,
+        editor_width,
+        editor_height,
+    ) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn review_event_selector_label(selected: PullRequestReviewEvent) -> String {
+    [
+        PullRequestReviewEvent::Comment,
+        PullRequestReviewEvent::RequestChanges,
+        PullRequestReviewEvent::Approve,
+    ]
+    .into_iter()
+    .map(|event| {
+        if event == selected {
+            format!("[{}]", event.label())
+        } else {
+            event.label().to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("  ")
+}
+
+fn review_dialog_pr_label(dialog: &ReviewSubmitDialog) -> String {
+    dialog
+        .item
+        .number
+        .map(|number| format!("{}#{number}", dialog.item.repo))
+        .unwrap_or_else(|| dialog.item.repo.clone())
+}
+
 fn draw_reply_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, author: &str, area: Rect) {
     draw_comment_editor(frame, &format!("Reply to @{author}"), dialog, area);
 }
@@ -3283,6 +3535,46 @@ fn comment_dialog_area(dialog: &CommentDialog, area: Rect) -> Rect {
     centered_rect_with_size(width, height, area)
 }
 
+fn review_submit_dialog_area(dialog: &ReviewSubmitDialog, area: Rect) -> Rect {
+    let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
+    let editor_width = width.saturating_sub(2).max(1);
+    let editor_height = comment_dialog_desired_editor_height(&dialog.body, editor_width);
+    let desired_height = editor_height
+        .saturating_add(COMMENT_DIALOG_FOOTER_HEIGHT)
+        .saturating_add(5);
+    let min_height = comment_dialog_min_height(area).saturating_add(3);
+    let max_height = comment_dialog_max_height(area);
+    let height = desired_height.max(min_height).min(max_height);
+    centered_rect_with_size(width, height, area)
+}
+
+fn review_submit_cursor_position(
+    body: &str,
+    scroll: u16,
+    area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(area);
+    let header_height = 3_u16.min(inner.height);
+    let (line, column) = comment_dialog_cursor_offset(body, editor_width.max(1));
+    let visible_end = scroll.saturating_add(editor_height.max(1));
+    if line < scroll || line >= visible_end {
+        return None;
+    }
+
+    let visible_line = line.saturating_sub(scroll);
+    Some(Position::new(
+        inner
+            .x
+            .saturating_add(column.min(editor_width.max(1).saturating_sub(1))),
+        inner
+            .y
+            .saturating_add(header_height)
+            .saturating_add(visible_line),
+    ))
+}
+
 fn comment_dialog_min_height(area: Rect) -> u16 {
     if area.height == 0 {
         0
@@ -3320,6 +3612,29 @@ fn comment_dialog_editor_size(dialog: &CommentDialog, area: Option<Rect>) -> (u1
         return (
             inner.width.max(1),
             inner.height.saturating_sub(footer_height).max(1),
+        );
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+fn review_submit_editor_size(dialog: &ReviewSubmitDialog, area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = review_submit_dialog_area(dialog, area);
+        let inner = block_inner(dialog_area);
+        let header_height = 3_u16.min(inner.height);
+        let footer_height =
+            COMMENT_DIALOG_FOOTER_HEIGHT.min(inner.height.saturating_sub(header_height));
+        return (
+            inner.width.max(1),
+            inner
+                .height
+                .saturating_sub(header_height)
+                .saturating_sub(footer_height)
+                .max(1),
         );
     }
 
@@ -3504,7 +3819,9 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("v", "show pull request diff"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
-        help_key_line("A", "open PR approve confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("D", "discard a pending PR review"),
         help_key_line("a", "add a new issue or PR comment"),
         Line::from(""),
         help_heading("Diff Files"),
@@ -3515,6 +3832,8 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
         help_key_line("a", "add a normal PR comment"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("D", "discard a pending PR review"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
@@ -3541,12 +3860,24 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
-        help_key_line("A", "open PR approve confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("D", "discard a pending PR review"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
         help_key_line("Esc", "cancel PR action"),
+        Line::from(""),
+        help_heading("Review Summary Editor"),
+        help_key_line(
+            "Tab or 1 / 2 / 3",
+            "choose comment / request changes / approve",
+        ),
+        help_key_line("Ctrl+Enter", "submit the selected review event"),
+        help_key_line("Ctrl+P", "create a pending PR review draft"),
+        help_key_line("Enter", "insert newline"),
+        help_key_line("Esc", "cancel review editing"),
         Line::from(""),
         help_heading("Repo Search"),
         help_key_line("S", "open search input"),
@@ -7168,6 +7499,9 @@ impl AppState {
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             posting_comment: false,
+            review_submit_dialog: None,
+            review_submit_running: false,
+            pending_reviews: HashMap::new(),
             pr_action_dialog: None,
             pr_action_running: false,
             setup_dialog: None,
@@ -7580,6 +7914,139 @@ impl AppState {
                     self.status = "review comment failed".to_string();
                 }
             },
+            AppMsg::ReviewDraftCreated { item_id, result } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(pending) => {
+                        self.pending_reviews
+                            .insert(item_id.clone(), pending.clone());
+                        self.action_hints.remove(&item_id);
+                        self.details_stale.insert(item_id);
+                        self.status = "pending review created".to_string();
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Created",
+                            "GitHub created a pending review. Press s to submit it or D to discard it.",
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pending Review Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review create failed".to_string();
+                    }
+                }
+            }
+            AppMsg::ReviewSubmitted {
+                item_id,
+                event,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.action_hints.remove(&item_id);
+                        self.details_stale.insert(item_id.clone());
+                        self.status = format!("{}; refreshing", event.success_label());
+                        self.message_dialog = Some(success_message_dialog(
+                            "Review Submitted",
+                            format!("GitHub accepted the {} review.", event.label()),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Review Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "review submit failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PendingReviewSubmitted {
+                item_id,
+                review_id,
+                event,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.pending_reviews.remove(&item_id);
+                        self.action_hints.remove(&item_id);
+                        self.details_stale.insert(item_id);
+                        self.status = format!("{}; refreshing", event.success_label());
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Submitted",
+                            format!("GitHub submitted pending review {review_id}."),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pending Review Submit Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review submit failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PendingReviewDiscarded {
+                item_id,
+                review_id,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.pending_reviews.remove(&item_id);
+                        self.action_hints.remove(&item_id);
+                        self.details_stale.insert(item_id);
+                        self.status = "pending review discarded; refreshing".to_string();
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Discarded",
+                            format!("GitHub discarded pending review {review_id}."),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pending Review Discard Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review discard failed".to_string();
+                    }
+                }
+            }
             AppMsg::PrActionFinished {
                 item_id,
                 action,
@@ -9142,6 +9609,281 @@ impl AppState {
         submit(item, action);
     }
 
+    fn start_review_submit_dialog(&mut self, event: PullRequestReviewEvent) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+
+        let (mode, body) = self
+            .pending_reviews
+            .get(&item.id)
+            .map(|pending| {
+                (
+                    ReviewSubmitMode::Pending {
+                        review_id: pending.review_id,
+                    },
+                    pending.body.clone(),
+                )
+            })
+            .unwrap_or((ReviewSubmitMode::New, String::new()));
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.pr_action_dialog = None;
+        self.comment_dialog = None;
+        self.review_submit_dialog = Some(ReviewSubmitDialog {
+            item,
+            event,
+            body,
+            scroll: 0,
+            mode,
+        });
+        self.scroll_review_submit_dialog_to_cursor();
+        self.status = match mode {
+            ReviewSubmitMode::New => format!("review summary: {}", event.label()),
+            ReviewSubmitMode::Pending { .. } => {
+                format!("pending review summary: {}", event.label())
+            }
+        };
+    }
+
+    fn handle_review_submit_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        let tx = tx.clone();
+        self.handle_review_submit_dialog_key_with_submit(
+            key,
+            area,
+            {
+                let tx = tx.clone();
+                move |pending| match pending.mode {
+                    ReviewSubmitMode::New => {
+                        start_review_submit(pending.item, pending.event, pending.body, tx.clone());
+                    }
+                    ReviewSubmitMode::Pending { review_id } => {
+                        start_pending_review_submit(
+                            pending.item,
+                            review_id,
+                            pending.event,
+                            pending.body,
+                            tx.clone(),
+                        );
+                    }
+                }
+            },
+            move |item, body| {
+                start_review_draft_create(item, body, tx.clone());
+            },
+        );
+    }
+
+    fn handle_review_submit_dialog_key_with_submit<F, G>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+        mut create_pending: G,
+    ) where
+        F: FnMut(PendingReviewSubmit),
+        G: FnMut(WorkItem, String),
+    {
+        if self.review_submit_running {
+            self.status = "review action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.review_submit_dialog = None;
+                self.status = "review cancelled".to_string();
+            }
+            KeyCode::Tab => self.cycle_review_submit_event(),
+            KeyCode::Char('1') => self.set_review_submit_event(PullRequestReviewEvent::Comment),
+            KeyCode::Char('2') => {
+                self.set_review_submit_event(PullRequestReviewEvent::RequestChanges)
+            }
+            KeyCode::Char('3') => self.set_review_submit_event(PullRequestReviewEvent::Approve),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.create_pending_review_from_dialog(area, &mut create_pending)
+            }
+            KeyCode::PageDown => self.scroll_review_submit_dialog(6, area),
+            KeyCode::PageUp => self.scroll_review_submit_dialog(-6, area),
+            _ if is_comment_submit_key(key) => {
+                if let Some(pending) = self.prepare_review_submit() {
+                    submit(pending);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.push('\n');
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.pop();
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.push(value);
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_review_submit_event(&mut self) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        dialog.event = dialog.event.next();
+        self.status = format!("review event: {}", dialog.event.label());
+    }
+
+    fn set_review_submit_event(&mut self, event: PullRequestReviewEvent) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        dialog.event = event;
+        self.status = format!("review event: {}", event.label());
+    }
+
+    fn create_pending_review_from_dialog<G>(&mut self, area: Option<Rect>, create_pending: &mut G)
+    where
+        G: FnMut(WorkItem, String),
+    {
+        let Some(dialog) = self.review_submit_dialog.take() else {
+            return;
+        };
+        let body = dialog.body.trim().to_string();
+        let item = dialog.item.clone();
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.review_submit_dialog = Some(dialog);
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Creating Pending Review",
+            "Waiting for GitHub to create the pending review...",
+        ));
+        self.status = "creating pending review".to_string();
+        create_pending(item, body);
+        self.scroll_review_submit_dialog_to_cursor_in_area(area);
+    }
+
+    fn prepare_review_submit(&mut self) -> Option<PendingReviewSubmit> {
+        let dialog = self.review_submit_dialog.take()?;
+        let body = dialog.body.trim().to_string();
+        if dialog.event.requires_body() && body.is_empty() {
+            let event = dialog.event;
+            self.review_submit_dialog = Some(dialog);
+            self.status = format!("{} review needs a summary", event.label());
+            return None;
+        }
+        if dialog.item.kind != ItemKind::PullRequest || dialog.item.number.is_none() {
+            self.review_submit_dialog = Some(dialog);
+            self.status = "selected item is not a pull request".to_string();
+            return None;
+        }
+        let event = dialog.event;
+        let mode = dialog.mode;
+        let item = dialog.item;
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Submitting Review",
+            format!("Waiting for GitHub to {}...", event.label()),
+        ));
+        self.status = match mode {
+            ReviewSubmitMode::New => format!("submitting review: {}", event.label()),
+            ReviewSubmitMode::Pending { .. } => {
+                format!("submitting pending review: {}", event.label())
+            }
+        };
+        Some(PendingReviewSubmit {
+            item,
+            event,
+            body,
+            mode,
+        })
+    }
+
+    fn discard_pending_review(&mut self, tx: &UnboundedSender<AppMsg>) {
+        self.discard_pending_review_with_submit(|item, review_id| {
+            start_pending_review_discard(item, review_id, tx.clone());
+        });
+    }
+
+    fn discard_pending_review_with_submit<F>(&mut self, mut submit: F)
+    where
+        F: FnMut(WorkItem, u64),
+    {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        let Some(pending) = self.pending_reviews.get(&item.id).cloned() else {
+            self.status = "no pending review to discard".to_string();
+            return;
+        };
+        if self.review_submit_running {
+            self.status = "review action already running".to_string();
+            return;
+        }
+        self.review_submit_dialog = None;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Discarding Pending Review",
+            "Waiting for GitHub to discard the pending review...",
+        ));
+        self.status = "discarding pending review".to_string();
+        submit(item, pending.review_id);
+    }
+
+    fn scroll_review_submit_dialog(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        let (width, height) = review_submit_editor_size(dialog, area);
+        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        if delta < 0 {
+            dialog.scroll = dialog.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.scroll = dialog.scroll.saturating_add(delta as u16);
+        }
+        dialog.scroll = dialog.scroll.min(max_scroll);
+    }
+
+    fn scroll_review_submit_dialog_to_cursor(&mut self) {
+        self.scroll_review_submit_dialog_to_cursor_in_area(None);
+    }
+
+    fn scroll_review_submit_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.review_submit_dialog {
+            let (width, height) = review_submit_editor_size(dialog, area);
+            dialog.scroll =
+                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.scroll);
+        }
+    }
+
     fn start_new_comment_dialog(&mut self) {
         if !self.current_item_supports_comments() {
             self.status = "selected item cannot be commented on".to_string();
@@ -9152,6 +9894,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -9177,6 +9920,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -9213,6 +9957,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -9256,6 +10001,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -9428,6 +10174,7 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
@@ -12261,7 +13008,8 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
+        assert!(text.contains("s/A/D review"));
+        assert!(text.contains("M/C pr action"));
         assert!(
             text.contains(
                 "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
@@ -12280,7 +13028,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(!ghr.contains("M/C pr action"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
@@ -12298,7 +13046,8 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
+        assert!(diff.contains("M/C pr action"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14124,7 +14873,7 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn capital_a_key_opens_approve_confirmation_for_pull_request_details() {
+    fn capital_a_key_opens_approve_review_summary_for_pull_request_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -14139,10 +14888,13 @@ diff --git a/src/github.rs b/src/github.rs
             &tx
         ));
 
-        let dialog = app.pr_action_dialog.as_ref().expect("approve dialog");
-        assert_eq!(dialog.action, PrAction::Approve);
+        let dialog = app
+            .review_submit_dialog
+            .as_ref()
+            .expect("approve review dialog");
+        assert_eq!(dialog.event, PullRequestReviewEvent::Approve);
         assert_eq!(dialog.item.id, "1");
-        assert_eq!(app.status, "confirm pull request approval");
+        assert_eq!(app.status, "review summary: approve");
     }
 
     #[test]
@@ -14172,6 +14924,177 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
         assert_eq!(app.status, "pull request action cancelled");
+    }
+
+    #[test]
+    fn review_submit_dialog_selects_event_and_edits_summary() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('2')),
+            None,
+            |_pending| panic!("event selection should not submit"),
+            |_item, _body| panic!("event selection should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('o')),
+            None,
+            |_pending| panic!("typing should not submit"),
+            |_item, _body| panic!("typing should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('k')),
+            None,
+            |_pending| panic!("typing should not submit"),
+            |_item, _body| panic!("typing should not create a draft"),
+        );
+
+        let dialog = app.review_submit_dialog.as_ref().expect("review dialog");
+        assert_eq!(dialog.event, PullRequestReviewEvent::RequestChanges);
+        assert_eq!(dialog.body, "ok");
+        assert_eq!(app.status, "review event: request changes");
+    }
+
+    #[test]
+    fn review_submit_dialog_submits_selected_event() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        app.review_submit_dialog.as_mut().unwrap().body = "looks good overall".to_string();
+        let mut submitted = None;
+
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('3')),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+
+        assert!(app.review_submit_dialog.is_none());
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "submitting review: approve");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::Approve,
+                "looks good overall".to_string(),
+                ReviewSubmitMode::New
+            ))
+        );
+    }
+
+    #[test]
+    fn approve_shortcut_submits_empty_approve_review() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('A')),
+            &config,
+            &store,
+            &tx
+        ));
+        let mut submitted = None;
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.event, pending.body)),
+            |_item, _body| panic!("approve should submit, not create a draft"),
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::Approve,
+                String::new()
+            ))
+        );
+    }
+
+    #[test]
+    fn pending_review_submit_and_discard_use_local_pending_review() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.pending_reviews.insert(
+            "1".to_string(),
+            PendingReviewState {
+                review_id: 77,
+                body: "draft summary".to_string(),
+            },
+        );
+
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        let dialog = app.review_submit_dialog.as_ref().expect("pending dialog");
+        assert_eq!(dialog.body, "draft summary");
+        assert_eq!(dialog.mode, ReviewSubmitMode::Pending { review_id: 77 });
+        app.review_submit_dialog.as_mut().unwrap().event = PullRequestReviewEvent::RequestChanges;
+        let mut submitted = None;
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::RequestChanges,
+                "draft summary".to_string(),
+                ReviewSubmitMode::Pending { review_id: 77 }
+            ))
+        );
+
+        app.review_submit_running = false;
+        app.review_submit_dialog = None;
+        let mut discarded = None;
+        app.discard_pending_review_with_submit(|item, review_id| {
+            discarded = Some((item.id, review_id));
+        });
+
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "discarding pending review");
+        assert_eq!(discarded, Some(("1".to_string(), 77)));
+    }
+
+    #[test]
+    fn ctrl_p_creates_pending_review_draft_from_summary() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        app.review_submit_dialog.as_mut().unwrap().body = "hold these notes".to_string();
+        let mut created = None;
+
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            None,
+            |_pending| panic!("draft create should not submit a review"),
+            |item, body| created = Some((item.id, body)),
+        );
+
+        assert!(app.review_submit_dialog.is_none());
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "creating pending review");
+        assert_eq!(
+            created,
+            Some(("1".to_string(), "hold these notes".to_string()))
+        );
     }
 
     #[test]
@@ -14568,11 +15491,11 @@ diff --git a/src/github.rs b/src/github.rs
         ));
         assert!(app.comment_dialog.is_none());
         assert!(matches!(
-            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
-            Some(PrAction::Approve)
+            app.review_submit_dialog.as_ref().map(|dialog| dialog.event),
+            Some(PullRequestReviewEvent::Approve)
         ));
 
-        app.pr_action_dialog = None;
+        app.review_submit_dialog = None;
         assert!(!handle_key(
             &mut app,
             key(KeyCode::Char('M')),

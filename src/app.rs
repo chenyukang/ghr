@@ -43,7 +43,7 @@ use crate::github::{
     merge_pull_request, post_issue_comment, post_pull_request_review_comment,
     post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
     refresh_section_page, remove_issue_label, rerun_failed_pull_request_checks, search_global,
-    submit_pending_pull_request_review, submit_pull_request_review,
+    submit_pending_pull_request_review, submit_pull_request_review, update_pull_request_branch,
     with_background_github_priority,
 };
 use crate::model::{
@@ -528,6 +528,7 @@ enum PrAction {
     DisableAutoMerge,
     Checkout,
     RerunFailedChecks,
+    UpdateBranch,
 }
 
 type PrActionDialogSummary = Vec<(&'static str, String)>;
@@ -1923,6 +1924,9 @@ fn start_pr_action(
                 PrAction::RerunFailedChecks => rerun_failed_pull_request_checks(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
+                PrAction::UpdateBranch => update_pull_request_branch(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string()),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -2460,6 +2464,7 @@ fn handle_key_in_area(
             KeyCode::Char('D') => app.discard_pending_review(tx),
             KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
             KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
@@ -2491,6 +2496,7 @@ fn handle_key_in_area(
             KeyCode::Char('D') => app.discard_pending_review(tx),
             KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
             KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
                 app.start_add_label_dialog(Some(tx))
@@ -2643,6 +2649,7 @@ fn handle_diff_file_list_key(
         KeyCode::Char('D') => app.discard_pending_review(tx),
         KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
         KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+        KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
         KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
         KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
         KeyCode::Char('t') => app.start_milestone_dialog(tx),
@@ -3992,7 +3999,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
@@ -4009,7 +4016,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
             }
         }
@@ -4035,7 +4042,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
             } else {
@@ -4047,7 +4054,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "s/A/D", "review", Color::LightMagenta);
-                push_footer_pair(spans, "M/C/E/O/F/X", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "M/C/U/E/O/F/X", "pr action", Color::LightMagenta);
                 push_footer_pair(spans, "t", "milestone", Color::LightMagenta);
                 push_footer_pair(spans, "T", "edit item", Color::LightBlue);
             }
@@ -4364,6 +4371,7 @@ fn draw_pr_action_dialog(
         PrAction::DisableAutoMerge => "disable auto-merge for",
         PrAction::Checkout => "checkout",
         PrAction::RerunFailedChecks => "rerun failed checks for",
+        PrAction::UpdateBranch => "update",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
@@ -4373,6 +4381,7 @@ fn draw_pr_action_dialog(
         PrAction::DisableAutoMerge => "Disable auto-merge for this pull request on GitHub?",
         PrAction::Checkout => "Checkout this pull request locally?",
         PrAction::RerunFailedChecks => "Rerun failed GitHub Actions jobs for this pull request?",
+        PrAction::UpdateBranch => "Update this pull request branch from its base branch?",
     };
     let status = if running {
         match dialog.action {
@@ -4444,6 +4453,7 @@ fn draw_pr_action_dialog(
                 PrAction::DisableAutoMerge => "Disable Auto-Merge",
                 PrAction::Checkout => "Checkout Pull Request Locally",
                 PrAction::RerunFailedChecks => "Rerun Failed Checks",
+                PrAction::UpdateBranch => "Update Pull Request Branch",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -5812,6 +5822,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("C", "open PR close confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
         help_key_line("D", "discard a pending PR review"),
@@ -5868,6 +5879,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("C", "open PR close confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),
         help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
         help_key_line("D", "discard a pending PR review"),
@@ -10541,6 +10553,7 @@ impl AppState {
                     Ok(()) => {
                         self.details_stale.insert(item_id.clone());
                         self.action_hints.remove(&item_id);
+                        self.diffs.remove(&item_id);
                         self.mark_item_after_pr_action(&item_id, action);
                         self.status = match action {
                             PrAction::Merge => format!(
@@ -10558,6 +10571,9 @@ impl AppState {
                             PrAction::Checkout => "pull request checked out locally".to_string(),
                             PrAction::RerunFailedChecks => {
                                 "failed checks rerun; refreshing".to_string()
+                            }
+                            PrAction::UpdateBranch => {
+                                "pull request branch update accepted; refreshing".to_string()
                             }
                         };
                         self.message_dialog = Some(success_message_dialog(
@@ -10894,6 +10910,7 @@ impl AppState {
                     PrAction::DisableAutoMerge => {}
                     PrAction::Checkout => {}
                     PrAction::RerunFailedChecks => {}
+                    PrAction::UpdateBranch => {}
                 }
             }
         }
@@ -12519,6 +12536,15 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        if action == PrAction::UpdateBranch
+            && item
+                .state
+                .as_deref()
+                .is_some_and(|state| !state.eq_ignore_ascii_case("open"))
+        {
+            self.status = "selected pull request is not open".to_string();
+            return;
+        }
         let summary = match self.pr_action_dialog_summary(&item, action) {
             Ok(summary) => summary,
             Err((title, body, status)) => {
@@ -12554,6 +12580,7 @@ impl AppState {
             PrAction::DisableAutoMerge => "confirm pull request auto-merge disable".to_string(),
             PrAction::Checkout => "confirm local pull request checkout".to_string(),
             PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
+            PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
         };
     }
 
@@ -12786,6 +12813,7 @@ impl AppState {
             PrAction::DisableAutoMerge => "disabling pull request auto-merge".to_string(),
             PrAction::Checkout => "checking out pull request locally".to_string(),
             PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
+            PrAction::UpdateBranch => "updating pull request branch".to_string(),
         };
         submit(item, action, checkout, merge_method);
     }
@@ -16850,6 +16878,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("choose merge, squash, or rebase merge method"));
         assert!(text.contains("open PR enable auto-merge confirmation"));
         assert!(text.contains("open PR disable auto-merge confirmation"));
+        assert!(text.contains("open PR update-branch confirmation"));
         assert!(text.contains("run the confirmed PR action"));
         assert!(text.contains("change issue or PR milestone"));
         assert!(text.contains("filter open milestones by prefix"));
@@ -16966,7 +16995,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(text.contains("v diff"));
         assert!(text.contains("T edit item"));
         assert!(text.contains("s/A/D review"));
-        assert!(text.contains("M/C/E/O/F/X pr action"));
+        assert!(text.contains("M/C/U/E/O/F/X pr action"));
         assert!(text.contains("t milestone"));
         assert!(text.contains(
             "| 1-4 focus  ? help  S repo  f filter  r refresh  o open  m text-select  q quit |"
@@ -16998,7 +17027,7 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/E/O/F/X pr action"));
+        assert!(!ghr.contains("M/C/U/E/O/F/X pr action"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
@@ -17019,7 +17048,7 @@ diff --git a/src/github.rs b/src/github.rs
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
         assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  s/A/D review"));
-        assert!(diff.contains("M/C/E/O/F/X pr action"));
+        assert!(diff.contains("M/C/U/E/O/F/X pr action"));
         assert!(diff.contains("t milestone"));
         assert!(diff.contains("T edit item"));
         assert!(!diff.contains("m text-select"));
@@ -19738,6 +19767,51 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_u_key_opens_update_branch_confirmation_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('U')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("update branch dialog");
+        assert_eq!(dialog.action, PrAction::UpdateBranch);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request branch update");
+    }
+
+    #[test]
+    fn update_branch_dialog_prompt_names_base_branch_update() {
+        let mut section = test_section();
+        let item = section.items.remove(0);
+        let dialog = PrActionDialog {
+            item,
+            action: PrAction::UpdateBranch,
+            checkout: None,
+            summary: Vec::new(),
+            merge_method: MergeMethod::default(),
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_pr_action_dialog(frame, &dialog, false, frame.area()))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Update Pull Request Branch"));
+        assert!(rendered.contains("Update this pull request branch from its base branch?"));
+        assert!(rendered.contains("y/Enter: yes, update PR"));
+    }
+
+    #[test]
     fn pr_action_confirmation_submits_selected_action() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Approve);
@@ -19795,6 +19869,27 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             submitted,
             Some(("1".to_string(), PrAction::Merge, Some(MergeMethod::Merge)))
+        );
+    }
+
+    #[test]
+    fn update_branch_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Char('y')),
+            |item, action, _checkout, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "updating pull request branch");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::UpdateBranch, None))
         );
     }
 
@@ -20388,6 +20483,18 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn update_branch_rejects_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected pull request is not open");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -20467,6 +20574,51 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request auto-merge enabled; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Auto-Merge Enabled");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn update_branch_finished_keeps_item_open_and_refreshes_details_and_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Update branch".to_string()],
+                checks: None,
+                note: None,
+                ..ActionHints::default()
+            }),
+        );
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(PullRequestDiff {
+                files: Vec::new(),
+                additions: 0,
+                deletions: 0,
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            action: PrAction::UpdateBranch,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert!(!app.action_hints.contains_key("1"));
+        assert!(!app.diffs.contains_key("1"));
+        assert_eq!(
+            app.status,
+            "pull request branch update accepted; refreshing"
+        );
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Branch Updated");
         assert!(dialog.auto_close_at.is_some());
     }
 

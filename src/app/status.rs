@@ -111,6 +111,7 @@ pub(super) fn pr_action_success_title(action: PrAction) -> &'static str {
         PrAction::DisableAutoMerge => "Auto-Merge Disabled",
         PrAction::Checkout => "Pull Request Checked Out",
         PrAction::RerunFailedChecks => "Failed Checks Rerun",
+        PrAction::UpdateBranch => "Pull Request Branch Updated",
     }
 }
 
@@ -125,6 +126,7 @@ pub(super) fn pr_action_success_body(action: PrAction) -> &'static str {
         PrAction::RerunFailedChecks => {
             "GitHub accepted the failed-check rerun request. Refreshing details."
         }
+        PrAction::UpdateBranch => "GitHub accepted the branch update. Refreshing details.",
     }
 }
 
@@ -137,6 +139,7 @@ pub(super) fn pr_action_error_title(action: PrAction) -> &'static str {
         PrAction::DisableAutoMerge => "Disable Auto-Merge Failed",
         PrAction::Checkout => "Checkout Failed",
         PrAction::RerunFailedChecks => "Rerun Failed",
+        PrAction::UpdateBranch => "Update Branch Failed",
     }
 }
 
@@ -149,6 +152,7 @@ pub(super) fn pr_action_error_status(action: PrAction) -> &'static str {
         PrAction::DisableAutoMerge => "pull request auto-merge disable failed",
         PrAction::Checkout => "pull request checkout failed",
         PrAction::RerunFailedChecks => "failed check rerun failed",
+        PrAction::UpdateBranch => "pull request branch update failed",
     }
 }
 

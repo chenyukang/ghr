@@ -1733,6 +1733,21 @@ pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+pub async fn update_pull_request_branch(repository: &str, number: u64) -> Result<()> {
+    run_gh_json(&update_pull_request_branch_args(repository, number)).await?;
+    Ok(())
+}
+
+fn update_pull_request_branch_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "update-branch".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ]
+}
+
 pub async fn enable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_auto_merge_can_enable(repository, number).await?;
     let method = auto_merge_method_flag(repository).await?;
@@ -3864,6 +3879,20 @@ mod tests {
         assert_eq!(
             rerun_failed_check_run_args("owner/repo", 1001),
             vec!["run", "rerun", "1001", "--failed", "--repo", "owner/repo"]
+        );
+    }
+
+    #[test]
+    fn update_pull_request_branch_uses_gh_update_branch_command() {
+        assert_eq!(
+            update_pull_request_branch_args("owner/repo", 42),
+            vec![
+                "pr".to_string(),
+                "update-branch".to_string(),
+                "42".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+            ]
         );
     }
 

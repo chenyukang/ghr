@@ -27,6 +27,40 @@ const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MergeMethod {
+    #[default]
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Merge => "--merge",
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Merge => Self::Squash,
+            Self::Squash => Self::Rebase,
+            Self::Rebase => Self::Merge,
+        }
+    }
+}
+
 pub struct CommentFetchResult {
     pub item_reactions: ReactionSummary,
     pub comments: Vec<CommentPreview>,
@@ -1377,18 +1411,21 @@ pub async fn edit_pull_request_review_comment(
     Ok(())
 }
 
-pub async fn merge_pull_request(repository: &str, number: u64) -> Result<()> {
+pub async fn merge_pull_request(repository: &str, number: u64, method: MergeMethod) -> Result<()> {
     ensure_pull_request_can_merge(repository, number).await?;
-    run_gh_json(&[
+    run_gh_json(&merge_pull_request_args(repository, number, method)).await?;
+    Ok(())
+}
+
+fn merge_pull_request_args(repository: &str, number: u64, method: MergeMethod) -> Vec<String> {
+    vec![
         "pr".to_string(),
         "merge".to_string(),
         number.to_string(),
         "--repo".to_string(),
         repository.to_string(),
-        "--merge".to_string(),
-    ])
-    .await?;
-    Ok(())
+        method.gh_flag().to_string(),
+    ]
 }
 
 async fn ensure_pull_request_can_merge(repository: &str, number: u64) -> Result<()> {
@@ -2816,6 +2853,33 @@ mod tests {
 
         assert!(message.contains("not authenticated"));
         assert!(message.contains("Run `gh auth login`"));
+    }
+
+    #[test]
+    fn merge_pull_request_args_default_to_merge_flag() {
+        assert_eq!(
+            merge_pull_request_args("owner/repo", 42, MergeMethod::default()),
+            vec![
+                "pr".to_string(),
+                "merge".to_string(),
+                "42".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+                "--merge".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_pull_request_args_use_selected_method_flag() {
+        assert_eq!(
+            merge_pull_request_args("owner/repo", 42, MergeMethod::Squash).last(),
+            Some(&"--squash".to_string())
+        );
+        assert_eq!(
+            merge_pull_request_args("owner/repo", 42, MergeMethod::Rebase).last(),
+            Some(&"--rebase".to_string())
+        );
     }
 
     #[test]

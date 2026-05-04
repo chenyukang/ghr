@@ -271,6 +271,7 @@ struct PullRequestActionRepositoryRaw {
 struct PullRequestActionRaw {
     commits: Option<PullRequestCommitConnectionRaw>,
     is_draft: Option<bool>,
+    mergeable: Option<String>,
     merge_state_status: Option<String>,
     review_decision: Option<String>,
     state: Option<String>,
@@ -961,6 +962,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       state
       isDraft
+      mergeable
       mergeStateStatus
       reviewDecision
       viewerCanUpdate
@@ -1772,23 +1774,27 @@ fn pull_request_action_blockers(pr: &PullRequestActionRaw) -> Vec<String> {
         _ => {}
     }
 
-    match merge_state(pr) {
-        "CLEAN" | "HAS_HOOKS" | "UNSTABLE" => {}
-        "BEHIND" => push_unique_blocker(&mut blockers, "branch must be updated".to_string()),
-        "BLOCKED" => push_unique_blocker(
-            &mut blockers,
-            "branch protection is blocking merge".to_string(),
-        ),
-        "DIRTY" => push_unique_blocker(
+    match (merge_state(pr), pr.mergeable.as_deref()) {
+        (_, Some("CONFLICTING")) => push_unique_blocker(
             &mut blockers,
             "merge conflicts must be resolved".to_string(),
         ),
-        "DRAFT" => push_unique_blocker(&mut blockers, "draft".to_string()),
-        "UNKNOWN" => push_unique_blocker(
+        ("CLEAN" | "HAS_HOOKS" | "UNSTABLE", _) => {}
+        ("BEHIND", _) => push_unique_blocker(&mut blockers, "branch must be updated".to_string()),
+        ("BLOCKED", _) => push_unique_blocker(
+            &mut blockers,
+            "branch protection is blocking merge".to_string(),
+        ),
+        ("DIRTY", _) => push_unique_blocker(
+            &mut blockers,
+            "merge conflicts must be resolved".to_string(),
+        ),
+        ("DRAFT", _) => push_unique_blocker(&mut blockers, "draft".to_string()),
+        ("UNKNOWN", _) => push_unique_blocker(
             &mut blockers,
             "GitHub is still computing mergeability".to_string(),
         ),
-        other => push_unique_blocker(&mut blockers, format!("merge state is {other}")),
+        (other, _) => push_unique_blocker(&mut blockers, format!("merge state is {other}")),
     }
 
     match pr
@@ -2603,6 +2609,7 @@ mod tests {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 5 }),
             is_draft: Some(false),
+            mergeable: Some("MERGEABLE".to_string()),
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: Some("REVIEW_REQUIRED".to_string()),
             state: Some("OPEN".to_string()),
@@ -2656,6 +2663,7 @@ mod tests {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
             is_draft: Some(false),
+            mergeable: Some("MERGEABLE".to_string()),
             merge_state_status: Some("CLEAN".to_string()),
             review_decision: Some("APPROVED".to_string()),
             state: Some("OPEN".to_string()),
@@ -2693,6 +2701,30 @@ mod tests {
             })
         );
         assert!(hints.note.is_none());
+    }
+
+    #[test]
+    fn action_hints_show_conflicts_when_mergeable_is_conflicting() {
+        let hints = pull_request_action_hints(&PullRequestActionRaw {
+            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            is_draft: Some(true),
+            mergeable: Some("CONFLICTING".to_string()),
+            merge_state_status: Some("UNKNOWN".to_string()),
+            review_decision: None,
+            state: Some("OPEN".to_string()),
+            status_check_rollup: None,
+            viewer_can_enable_auto_merge: Some(false),
+            viewer_can_merge_as_admin: Some(false),
+            viewer_can_update: Some(true),
+            viewer_can_update_branch: Some(false),
+            viewer_did_author: Some(true),
+            viewer_latest_review: None,
+        });
+
+        let note = hints.note.expect("conflicting PR should explain why");
+        assert!(note.contains("draft"));
+        assert!(note.contains("merge conflicts must be resolved"));
+        assert!(!note.contains("GitHub is still computing mergeability"));
     }
 
     #[test]

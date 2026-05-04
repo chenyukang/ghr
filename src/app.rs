@@ -8356,6 +8356,7 @@ impl AppState {
         let section_error = section.error.clone();
         let setup_dialog = section_error.as_deref().and_then(setup_dialog_from_error);
 
+        self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
 
@@ -8419,6 +8420,7 @@ impl AppState {
                     .find_map(|section| section.error.as_deref())
                     .map(str::to_string);
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
+                self.invalidate_action_hints_for_sections(&sections);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 let restored_item = self.restore_refresh_anchor(&anchor);
@@ -8824,6 +8826,7 @@ impl AppState {
                 if self.setup_dialog.is_none() {
                     self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
                 }
+                self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
                 self.replace_section_page(&section_key, section);
                 self.refreshing = false;
                 self.status = match (error.as_deref(), save_error) {
@@ -8851,6 +8854,7 @@ impl AppState {
                     .iter()
                     .map(|section| section.items.len())
                     .sum::<usize>();
+                self.invalidate_action_hints_for_sections(&sections);
                 self.replace_global_search_sections(sections);
                 self.global_search_running = false;
                 self.global_search_started_at = None;
@@ -8960,6 +8964,18 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
+        for item_id in sections.iter().flat_map(|section| {
+            section
+                .items
+                .iter()
+                .filter(|item| item.kind == ItemKind::PullRequest)
+                .map(|item| item.id.as_str())
+        }) {
+            self.action_hints.remove(item_id);
         }
     }
 
@@ -13293,6 +13309,29 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert_eq!(app.startup_dialog, None);
         assert_eq!(app.status, "refresh complete");
+    }
+
+    #[test]
+    fn refresh_finished_invalidates_pr_action_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                note: Some("Merge blocked: GitHub is still computing mergeability".to_string()),
+            }),
+        );
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert!(!app.action_hints.contains_key("1"));
+        let item = app.current_item().expect("current PR item").clone();
+        assert!(app.action_hints_load_needed(&item));
     }
 
     #[test]

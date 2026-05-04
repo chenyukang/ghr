@@ -1113,6 +1113,56 @@ pub async fn approve_pull_request(repository: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+pub async fn request_pull_request_reviewers(
+    repository: &str,
+    number: u64,
+    reviewers: &[String],
+) -> Result<()> {
+    let args = pull_request_reviewers_api_args("POST", repository, number, reviewers)?;
+    run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to request reviewers for {repository}#{number}"))?;
+    Ok(())
+}
+
+pub async fn remove_pull_request_reviewers(
+    repository: &str,
+    number: u64,
+    reviewers: &[String],
+) -> Result<()> {
+    let args = pull_request_reviewers_api_args("DELETE", repository, number, reviewers)?;
+    run_gh_json(&args).await.with_context(|| {
+        format!("failed to remove requested reviewers from {repository}#{number}")
+    })?;
+    Ok(())
+}
+
+fn pull_request_reviewers_api_args(
+    method: &str,
+    repository: &str,
+    number: u64,
+    reviewers: &[String],
+) -> Result<Vec<String>> {
+    if reviewers.is_empty() {
+        bail!("at least one reviewer login is required");
+    }
+
+    // GitHub uses the same review-request endpoint for both first-time requests
+    // and re-requesting review from a user who already reviewed the PR.
+    let path = format!("repos/{repository}/pulls/{number}/requested_reviewers");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        method.to_string(),
+        path,
+    ];
+    for reviewer in reviewers {
+        args.push("-f".to_string());
+        args.push(format!("reviewers[]={reviewer}"));
+    }
+    Ok(args)
+}
+
 fn parse_issue_comments_output(
     output: &str,
     repository: &str,
@@ -2230,6 +2280,40 @@ mod tests {
 
         assert!(message.contains("not authenticated"));
         assert!(message.contains("Run `gh auth login`"));
+    }
+
+    #[test]
+    fn pull_request_reviewers_api_args_builds_request_and_remove_commands() {
+        let reviewers = vec!["alice".to_string(), "bob".to_string()];
+
+        let request = pull_request_reviewers_api_args("POST", "owner/repo", 42, &reviewers)
+            .expect("request args");
+        assert_eq!(
+            request,
+            vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/pulls/42/requested_reviewers",
+                "-f",
+                "reviewers[]=alice",
+                "-f",
+                "reviewers[]=bob",
+            ]
+        );
+
+        let remove = pull_request_reviewers_api_args("DELETE", "owner/repo", 42, &reviewers)
+            .expect("remove args");
+        assert_eq!(remove[2], "DELETE");
+        assert_eq!(remove[3], "repos/owner/repo/pulls/42/requested_reviewers");
+    }
+
+    #[test]
+    fn pull_request_reviewers_api_args_rejects_empty_reviewers() {
+        let error = pull_request_reviewers_api_args("POST", "owner/repo", 42, &[])
+            .expect_err("empty reviewers should fail");
+
+        assert!(error.to_string().contains("at least one reviewer"));
     }
 
     #[test]

@@ -77,7 +77,10 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `M` | Open a merge confirmation for the selected PR |
 | `C` | Open a close confirmation for the selected PR |
 | `A` | Open an approve confirmation for the selected PR |
+| `P` | Request or re-request PR reviewers with comma-separated logins |
+| `X` | Remove pending PR review requests with comma-separated logins |
 | `y` / `Enter` | Confirm the current PR action in the confirmation dialog |
+| `Enter` in Reviewer Action | Submit the reviewer login list |
 | `Ctrl+Enter` | Send or update a comment from the comment dialog |
 | `r` | Refresh from GitHub |
 | `q` / `Ctrl+C` | Save UI state and quit |

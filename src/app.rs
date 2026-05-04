@@ -34,8 +34,8 @@ use crate::github::{
     edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
     fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
     post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    refresh_dashboard_with_progress, refresh_section_page, remove_pull_request_reviewers,
+    request_pull_request_reviewers, search_global, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -67,7 +67,9 @@ use search::{filtered_indices, fuzzy_score};
 use status::{
     comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
     pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
-    pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
+    pr_action_success_title, refresh_error_status, reviewer_action_error_status,
+    reviewer_action_error_title, reviewer_action_success_body, reviewer_action_success_title,
+    setup_dialog_from_error, success_message_dialog,
 };
 use text::{display_width, normalize_text, truncate_inline, truncate_text};
 
@@ -109,6 +111,12 @@ enum AppMsg {
     PrActionFinished {
         item_id: String,
         action: PrAction,
+        result: std::result::Result<(), String>,
+    },
+    ReviewerActionFinished {
+        item_id: String,
+        action: ReviewerAction,
+        reviewers: Vec<String>,
         result: std::result::Result<(), String>,
     },
     NotificationReadFinished {
@@ -255,6 +263,19 @@ struct PrActionDialog {
     action: PrAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerAction {
+    Request,
+    Remove,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewerDialog {
+    item: WorkItem,
+    action: ReviewerAction,
+    input: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialog {
     title: String,
@@ -354,6 +375,8 @@ struct AppState {
     posting_comment: bool,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
+    reviewer_dialog: Option<ReviewerDialog>,
+    reviewer_action_running: bool,
     setup_dialog: Option<SetupDialog>,
     startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
@@ -743,6 +766,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.pr_action_dialog.is_some()
+        || app.reviewer_dialog.is_some()
     {
         return None;
     }
@@ -1110,6 +1134,62 @@ fn start_pr_action(
     });
 }
 
+fn start_reviewer_action(
+    item: WorkItem,
+    action: ReviewerAction,
+    reviewers: Vec<String>,
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => match action {
+                ReviewerAction::Request => {
+                    request_pull_request_reviewers(&item.repo, number, &reviewers)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                ReviewerAction::Remove => {
+                    remove_pull_request_reviewers(&item.repo, number, &reviewers)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let should_refresh = result.is_ok();
+        let _ = tx.send(AppMsg::ReviewerActionFinished {
+            item_id,
+            action,
+            reviewers,
+            result,
+        });
+
+        if should_refresh {
+            let _ = tx.send(AppMsg::RefreshStarted);
+            let sections = with_background_github_priority(refresh_dashboard(&config)).await;
+            let mut save_error = None;
+            for section in &sections {
+                if section.error.is_some() {
+                    continue;
+                }
+                if let Err(error) = store.save_section(section) {
+                    let message = error.to_string();
+                    warn!(error = %message, "failed to save refreshed snapshot after reviewer action");
+                    save_error = Some(message);
+                    break;
+                }
+            }
+            let _ = tx.send(AppMsg::RefreshFinished {
+                sections,
+                save_error,
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 fn handle_key(
     app: &mut AppState,
@@ -1172,6 +1252,11 @@ fn handle_key_in_area(
 
     if app.pr_action_dialog.is_some() {
         app.handle_pr_action_dialog_key(key, config, store, tx);
+        return false;
+    }
+
+    if app.reviewer_dialog.is_some() {
+        app.handle_reviewer_dialog_key(key, config, store, tx);
         return false;
     }
 
@@ -1287,6 +1372,8 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
+            KeyCode::Char('X') => app.start_reviewer_dialog(ReviewerAction::Remove),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1308,6 +1395,8 @@ fn handle_key_in_area(
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
             KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
+            KeyCode::Char('X') => app.start_reviewer_dialog(ReviewerAction::Remove),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1405,6 +1494,8 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
         KeyCode::Char('a') => app.start_new_comment_dialog(),
+        KeyCode::Char('P') => app.start_reviewer_dialog(ReviewerAction::Request),
+        KeyCode::Char('X') => app.start_reviewer_dialog(ReviewerAction::Remove),
         KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
@@ -1979,6 +2070,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_help_dialog(frame, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
+    } else if let Some(dialog) = &app.reviewer_dialog {
+        draw_reviewer_dialog(frame, dialog, app.reviewer_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
@@ -2556,6 +2649,22 @@ fn pull_request_changes_url(item: &WorkItem) -> String {
     }
 }
 
+fn parse_reviewer_logins(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut reviewers = Vec::new();
+    for login in input
+        .split(',')
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+    {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            reviewers.push(login.to_string());
+        }
+    }
+    reviewers
+}
+
 fn same_view_key(left: &str, right: &str) -> bool {
     left == right
         || (left.starts_with("repo:")
@@ -2680,6 +2789,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "P/X", "reviewers", Color::LightMagenta);
             } else {
                 push_footer_context(spans, "List", "items");
                 push_footer_pair(spans, "j/k", "move", Color::Cyan);
@@ -2694,6 +2804,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "P/X", "reviewers", Color::LightMagenta);
             }
         }
         FocusTarget::Details => {
@@ -2718,6 +2829,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "P/X", "reviewers", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(spans, "/", "search", Color::Yellow);
@@ -2727,6 +2839,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(spans, "P/X", "reviewers", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
         }
@@ -3068,6 +3181,66 @@ fn draw_pr_action_dialog(
                 PrAction::Close => "Close Pull Request",
                 PrAction::Approve => "Approve Pull Request",
             },
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(70, 13, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let prompt = match dialog.action {
+        ReviewerAction::Request => "Request or re-request review from GitHub users.",
+        ReviewerAction::Remove => "Remove pending review requests from GitHub users.",
+    };
+    let status = if running {
+        "working...".to_string()
+    } else {
+        "Enter: submit    comma separates logins    Esc: cancel".to_string()
+    };
+    let input = if dialog.input.is_empty() {
+        "<reviewer logins>".to_string()
+    } else {
+        dialog.input.clone()
+    };
+    let lines = vec![
+        Line::from(prompt),
+        Line::from(""),
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("pull request", number),
+        key_value_line("title", dialog.item.title.clone()),
+        Line::from(""),
+        key_value_line("reviewers", input),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            status,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+    ];
+    let title = match dialog.action {
+        ReviewerAction::Request => "Request Reviewers",
+        ReviewerAction::Remove => "Remove Review Requests",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3542,11 +3715,18 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
+        help_key_line("P", "request or re-request PR reviewers"),
+        help_key_line("X", "remove pending PR review requests"),
         help_key_line("o", "open selected item in browser"),
         Line::from(""),
         help_heading("Pull Request Confirmation"),
         help_key_line("y / Enter", "run the confirmed PR action"),
         help_key_line("Esc", "cancel PR action"),
+        Line::from(""),
+        help_heading("Reviewer Actions"),
+        help_key_line("Enter", "submit comma-separated reviewer logins"),
+        help_key_line("Backspace", "delete previous character"),
+        help_key_line("Esc", "cancel reviewer action"),
         Line::from(""),
         help_heading("Repo Search"),
         help_key_line("S", "open search input"),
@@ -7170,6 +7350,8 @@ impl AppState {
             posting_comment: false,
             pr_action_dialog: None,
             pr_action_running: false,
+            reviewer_dialog: None,
+            reviewer_action_running: false,
             setup_dialog: None,
             startup_dialog: None,
             message_dialog: None,
@@ -7615,6 +7797,54 @@ impl AppState {
                             self.message_dialog = None;
                         }
                         self.status = pr_action_error_status(action).to_string();
+                    }
+                }
+            }
+            AppMsg::ReviewerActionFinished {
+                item_id,
+                action,
+                reviewers,
+                result,
+            } => {
+                self.reviewer_action_running = false;
+                self.reviewer_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.action_hints.remove(&item_id);
+                        self.status = match action {
+                            ReviewerAction::Request => {
+                                format!(
+                                    "requested review from {}; refreshing",
+                                    reviewers.join(", ")
+                                )
+                            }
+                            ReviewerAction::Remove => {
+                                format!(
+                                    "removed review requests for {}; refreshing",
+                                    reviewers.join(", ")
+                                )
+                            }
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            reviewer_action_success_title(action),
+                            reviewer_action_success_body(action),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                reviewer_action_error_title(action),
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = reviewer_action_error_status(action).to_string();
                     }
                 }
             }
@@ -9082,6 +9312,7 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.reviewer_dialog = None;
         self.pr_action_running = false;
         self.status = match action {
             PrAction::Merge => "confirm pull request merge".to_string(),
@@ -9142,6 +9373,105 @@ impl AppState {
         submit(item, action);
     }
 
+    fn start_reviewer_dialog(&mut self, action: ReviewerAction) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.reviewer_dialog = Some(ReviewerDialog {
+            item,
+            action,
+            input: String::new(),
+        });
+        self.reviewer_action_running = false;
+        self.status = match action {
+            ReviewerAction::Request => "enter reviewer logins to request".to_string(),
+            ReviewerAction::Remove => "enter reviewer logins to remove".to_string(),
+        };
+    }
+
+    fn handle_reviewer_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        self.handle_reviewer_dialog_key_with_submit(key, |item, action, reviewers| {
+            start_reviewer_action(
+                item,
+                action,
+                reviewers,
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+            );
+        });
+    }
+
+    fn handle_reviewer_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, ReviewerAction, Vec<String>),
+    {
+        if self.reviewer_action_running {
+            self.status = "reviewer action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.reviewer_dialog = None;
+                self.status = "reviewer action cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                if let Some((item, action, reviewers)) = self.prepare_reviewer_submit() {
+                    submit(item, action, reviewers);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.reviewer_dialog {
+                    dialog.input.pop();
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.reviewer_dialog {
+                    dialog.input.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn prepare_reviewer_submit(&mut self) -> Option<(WorkItem, ReviewerAction, Vec<String>)> {
+        let Some(dialog) = &self.reviewer_dialog else {
+            return None;
+        };
+        let reviewers = parse_reviewer_logins(&dialog.input);
+        if reviewers.is_empty() {
+            self.status = "enter at least one reviewer login".to_string();
+            return None;
+        }
+        let item = dialog.item.clone();
+        let action = dialog.action;
+        self.reviewer_action_running = true;
+        self.status = match action {
+            ReviewerAction::Request => format!("requesting review from {}", reviewers.join(", ")),
+            ReviewerAction::Remove => {
+                format!("removing review requests for {}", reviewers.join(", "))
+            }
+        };
+        Some((item, action, reviewers))
+    }
+
     fn start_new_comment_dialog(&mut self) {
         if !self.current_item_supports_comments() {
             self.status = "selected item cannot be commented on".to_string();
@@ -9152,6 +9482,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.reviewer_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -9428,6 +9759,7 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
+        self.reviewer_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
@@ -14143,6 +14475,159 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(dialog.action, PrAction::Approve);
         assert_eq!(dialog.item.id, "1");
         assert_eq!(app.status, "confirm pull request approval");
+    }
+
+    #[test]
+    fn p_key_opens_request_reviewers_dialog_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('P')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app
+            .reviewer_dialog
+            .as_ref()
+            .expect("request reviewers dialog");
+        assert_eq!(dialog.action, ReviewerAction::Request);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "enter reviewer logins to request");
+    }
+
+    #[test]
+    fn x_key_opens_remove_reviewers_dialog_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app
+            .reviewer_dialog
+            .as_ref()
+            .expect("remove reviewers dialog");
+        assert_eq!(dialog.action, ReviewerAction::Remove);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "enter reviewer logins to remove");
+    }
+
+    #[test]
+    fn reviewer_dialog_submission_parses_comma_separated_logins() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_dialog.as_mut().unwrap().input = " alice, bob, Alice ,, ".to_string();
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert!(app.reviewer_action_running);
+        assert_eq!(app.status, "requesting review from alice, bob");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_dialog_empty_input_stays_open() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Remove);
+        let mut submitted = false;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |_item, _action, _reviewers| {
+                submitted = true;
+            },
+        );
+
+        assert!(!submitted);
+        assert!(!app.reviewer_action_running);
+        assert!(app.reviewer_dialog.is_some());
+        assert_eq!(app.status, "enter at least one reviewer login");
+    }
+
+    #[test]
+    fn reviewer_action_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('P')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.reviewer_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn reviewer_action_finished_refreshes_details_and_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_action_running = true;
+        app.action_hints
+            .insert("1".to_string(), ActionHintState::Loading);
+
+        app.handle_msg(AppMsg::ReviewerActionFinished {
+            item_id: "1".to_string(),
+            action: ReviewerAction::Request,
+            reviewers: vec!["alice".to_string()],
+            result: Ok(()),
+        });
+
+        assert!(app.reviewer_dialog.is_none());
+        assert!(!app.reviewer_action_running);
+        assert!(app.details_stale.contains("1"));
+        assert!(!app.action_hints.contains_key("1"));
+        assert_eq!(app.status, "requested review from alice; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Reviewers Requested");
+        assert!(dialog.auto_close_at.is_some());
     }
 
     #[test]

@@ -126,6 +126,13 @@ struct SearchApiIssueRaw {
     user: Option<SearchAuthorRaw>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemMetadataUpdate {
+    pub title: String,
+    pub body: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct NotificationRaw {
     id: String,
@@ -1053,6 +1060,44 @@ pub async fn edit_pull_request_review_comment(
     .await
     .with_context(|| format!("failed to edit review comment {comment_id} in {repository}"))?;
     Ok(())
+}
+
+pub async fn edit_item_metadata(
+    repository: &str,
+    number: u64,
+    title: Option<&str>,
+    body: Option<&str>,
+) -> Result<ItemMetadataUpdate> {
+    if title.is_none() && body.is_none() {
+        bail!("no metadata field selected");
+    }
+
+    let path = format!("repos/{repository}/issues/{number}");
+    let mut args = vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        path,
+    ];
+    if let Some(title) = title {
+        args.push("-f".to_string());
+        args.push(format!("title={title}"));
+    }
+    if let Some(body) = body {
+        args.push("-f".to_string());
+        args.push(format!("body={body}"));
+    }
+
+    let output = run_gh_json(&args)
+        .await
+        .with_context(|| format!("failed to edit item metadata for {repository}#{number}"))?;
+    let raw = serde_json::from_str::<SearchApiIssueRaw>(&output)
+        .with_context(|| format!("failed to parse updated item for {repository}#{number}"))?;
+    Ok(ItemMetadataUpdate {
+        title: raw.title,
+        body: raw.body.filter(|body| !body.trim().is_empty()),
+        updated_at: raw.updated_at,
+    })
 }
 
 pub async fn merge_pull_request(repository: &str, number: u64) -> Result<()> {

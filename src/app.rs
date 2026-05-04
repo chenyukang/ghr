@@ -30,12 +30,12 @@ use tracing::warn;
 use crate::config::Config;
 use crate::dirs::Paths;
 use crate::github::{
-    PullRequestReviewCommentTarget, approve_pull_request, close_pull_request, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, mark_notification_thread_read, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, search_global,
-    with_background_github_priority,
+    ItemMetadataUpdate, PullRequestReviewCommentTarget, approve_pull_request, close_pull_request,
+    edit_issue_comment, edit_item_metadata, edit_pull_request_review_comment, fetch_comments,
+    fetch_pull_request_action_hints, fetch_pull_request_diff, mark_notification_thread_read,
+    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, search_global, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, ItemKind, SectionKind, SectionSnapshot, WorkItem,
@@ -110,6 +110,11 @@ enum AppMsg {
         item_id: String,
         action: PrAction,
         result: std::result::Result<(), String>,
+    },
+    ItemMetadataUpdated {
+        item_id: String,
+        field: ItemEditField,
+        result: std::result::Result<ItemMetadataUpdate, String>,
     },
     NotificationReadFinished {
         thread_id: String,
@@ -227,6 +232,9 @@ enum CommentDialogMode {
     Review {
         target: DiffReviewTarget,
     },
+    ItemMetadata {
+        field: ItemEditField,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +248,33 @@ struct PendingCommentSubmit {
     item: WorkItem,
     body: String,
     mode: PendingCommentMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemEditField {
+    Title,
+    Body,
+}
+
+impl ItemEditField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Body => "body",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Body => "Body",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ItemEditDialog {
+    item: WorkItem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +310,9 @@ enum PendingCommentMode {
     },
     Review {
         target: DiffReviewTarget,
+    },
+    ItemMetadata {
+        field: ItemEditField,
     },
 }
 
@@ -352,6 +390,7 @@ struct AppState {
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     posting_comment: bool,
+    item_edit_dialog: Option<ItemEditDialog>,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
     setup_dialog: Option<SetupDialog>,
@@ -742,6 +781,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.startup_dialog.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
+        || app.item_edit_dialog.is_some()
         || app.pr_action_dialog.is_some()
     {
         return None;
@@ -1028,6 +1068,32 @@ fn start_comment_edit(
     });
 }
 
+fn start_item_metadata_edit(
+    item: WorkItem,
+    field: ItemEditField,
+    value: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                let title = (field == ItemEditField::Title).then_some(value.as_str());
+                let body = (field == ItemEditField::Body).then_some(value.as_str());
+                edit_item_metadata(&item.repo, number, title, body)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ItemMetadataUpdated {
+            item_id,
+            field,
+            result,
+        });
+    });
+}
+
 fn start_review_comment_submit(
     item: WorkItem,
     target: DiffReviewTarget,
@@ -1170,6 +1236,11 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.item_edit_dialog.is_some() {
+        app.handle_item_edit_dialog_key(key);
+        return false;
+    }
+
     if app.pr_action_dialog.is_some() {
         app.handle_pr_action_dialog_key(key, config, store, tx);
         return false;
@@ -1229,6 +1300,7 @@ fn handle_key_in_area(
         KeyCode::Tab => app.move_focused_tab_group(1),
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
+        KeyCode::Char('E') => app.start_item_edit_dialog(),
         _ => {}
     }
 
@@ -1496,6 +1568,9 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.message_dialog.is_some() {
+        return false;
+    }
+    if app.item_edit_dialog.is_some() {
         return false;
     }
     if app.pr_action_dialog.is_some() {
@@ -1977,6 +2052,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_message_dialog(frame, dialog, area);
     } else if app.help_dialog {
         draw_help_dialog(frame, area);
+    } else if let Some(dialog) = &app.item_edit_dialog {
+        draw_item_edit_dialog(frame, dialog, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
@@ -2692,6 +2769,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                     push_footer_pair(spans, "esc", "back", Color::Cyan);
                 }
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(spans, "E", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             }
@@ -2717,6 +2795,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "e", "end", Color::Yellow);
                 push_footer_pair(spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(spans, "a", "comment", Color::LightBlue);
+                push_footer_pair(spans, "E", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             } else {
                 push_footer_pair(spans, "v", "diff", Color::LightMagenta);
@@ -2726,6 +2805,7 @@ fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
                 push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
                 push_footer_pair(spans, "R", "reply", Color::LightBlue);
                 push_footer_pair(spans, "e", "edit", Color::LightBlue);
+                push_footer_pair(spans, "E", "edit item", Color::LightBlue);
                 push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
             }
             push_footer_pair(spans, "esc", "List", Color::Cyan);
@@ -2796,6 +2876,10 @@ fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
         .last()
         .map(|span| span.content.as_ref() == " | ")
         .unwrap_or(false)
+}
+
+fn item_supports_metadata_edit(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
 
 fn modal_surface_style() -> Style {
@@ -3081,6 +3165,68 @@ fn draw_pr_action_dialog(
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDialog, area: Rect) {
+    let dialog_area = centered_rect(66, 12, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let item_kind = match dialog.item.kind {
+        ItemKind::PullRequest => "pull request",
+        ItemKind::Issue => "issue",
+        ItemKind::Notification => "item",
+    };
+    let lines = vec![
+        Line::from("Choose the field to edit on GitHub."),
+        Line::from(""),
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line(item_kind, number),
+        key_value_line("title", dialog.item.title.clone()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "t",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" title    "),
+            Span::styled(
+                "b",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" body    "),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Edit Item",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
     let dialog_area = centered_rect(78, 14, area);
     let footer = if dialog.auto_close_at.is_some() {
@@ -3182,6 +3328,7 @@ fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect
         CommentDialogMode::Review { target } => {
             format!("Review {}", target.location_label())
         }
+        CommentDialogMode::ItemMetadata { field } => format!("Edit {}", field.title()),
     };
     draw_comment_editor(frame, &title, dialog, area);
 }
@@ -3210,7 +3357,13 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     }
     let footer_line = Line::from(vec![
         Span::styled("Ctrl+Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" send  "),
+        Span::raw(
+            if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
+                " update  "
+            } else {
+                " send  "
+            },
+        ),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
         Span::raw(" newline  "),
         Span::styled("Pg/Wheel", Style::default().fg(Color::Yellow)),
@@ -3502,6 +3655,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("o", "open selected item in browser"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("v", "show pull request diff"),
+        help_key_line("E", "edit selected issue or PR title/body"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
         help_key_line("A", "open PR approve confirmation"),
@@ -3538,6 +3692,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("c / a", "add a new comment"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("e", "edit focused comment when it is yours"),
+        help_key_line("E", "edit selected issue or PR title/body"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open PR close confirmation"),
@@ -3555,7 +3710,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("Comment Editor"),
         help_key_line("Enter", "insert newline"),
-        help_key_line("Ctrl+Enter", "send or update comment"),
+        help_key_line("Ctrl+Enter", "send or update comment/title/body"),
         help_key_line("Backspace", "delete previous character"),
         help_key_line("PgDown/PgUp or mouse wheel", "scroll long drafts"),
         help_key_line("Esc", "cancel editing"),
@@ -7176,6 +7331,7 @@ impl AppState {
             mouse_capture_enabled: true,
             help_dialog: false,
             diff_return_state: None,
+            item_edit_dialog: None,
         };
         state.clamp_positions();
         state.focus = if matches!(focus, FocusTarget::Details) && state.current_item().is_none() {
@@ -7618,6 +7774,39 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::ItemMetadataUpdated {
+                item_id,
+                field,
+                result,
+            } => {
+                self.posting_comment = false;
+                match result {
+                    Ok(update) => {
+                        self.apply_item_metadata_update(&item_id, update);
+                        self.details_stale.insert(item_id);
+                        self.status = format!("{} updated", field.label());
+                        self.message_dialog = Some(success_message_dialog(
+                            format!("{} Updated", field.title()),
+                            "GitHub accepted the update and the current item was refreshed.",
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                format!("{} Update Failed", field.title()),
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = format!("{} update failed", field.label());
+                    }
+                }
+            }
             AppMsg::NotificationReadFinished { thread_id, result } => {
                 self.notification_read_pending.remove(&thread_id);
                 match result {
@@ -7747,6 +7936,7 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.item_edit_dialog = None;
         self.status = "help".to_string();
     }
 
@@ -7768,6 +7958,22 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn apply_item_metadata_update(&mut self, item_id: &str, update: ItemMetadataUpdate) -> bool {
+        let mut changed = false;
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                item.title = update.title.clone();
+                item.body = update.body.clone();
+                item.updated_at = update.updated_at;
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn mark_current_notification_read(
@@ -7839,6 +8045,7 @@ impl AppState {
                 self.selected_comment_index = 0;
                 self.comment_dialog = None;
                 self.pr_action_dialog = None;
+                self.item_edit_dialog = None;
             }
         } else {
             self.sections[index].error = refreshed.error;
@@ -9082,12 +9289,65 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.pr_action_dialog = Some(PrActionDialog { item, action });
+        self.item_edit_dialog = None;
         self.pr_action_running = false;
         self.status = match action {
             PrAction::Merge => "confirm pull request merge".to_string(),
             PrAction::Close => "confirm pull request close".to_string(),
             PrAction::Approve => "confirm pull request approval".to_string(),
         };
+    }
+
+    fn start_item_edit_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !item_supports_metadata_edit(&item) {
+            self.status = "selected item is not an issue or pull request".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.item_edit_dialog = Some(ItemEditDialog { item });
+        self.status = "choose title or body to edit".to_string();
+    }
+
+    fn handle_item_edit_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.item_edit_dialog = None;
+                self.status = "edit cancelled".to_string();
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                self.start_item_metadata_editor(ItemEditField::Title);
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.start_item_metadata_editor(ItemEditField::Body);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_item_metadata_editor(&mut self, field: ItemEditField) {
+        let Some(dialog) = self.item_edit_dialog.take() else {
+            return;
+        };
+        let value = match field {
+            ItemEditField::Title => dialog.item.title,
+            ItemEditField::Body => dialog.item.body.unwrap_or_default(),
+        };
+        self.focus = FocusTarget::Details;
+        self.comment_dialog = Some(CommentDialog {
+            mode: CommentDialogMode::ItemMetadata { field },
+            body: value,
+            scroll: 0,
+        });
+        self.scroll_comment_dialog_to_cursor();
+        self.status = format!("editing {}", field.label());
     }
 
     fn handle_pr_action_dialog_key(
@@ -9152,6 +9412,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -9177,6 +9438,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -9213,6 +9475,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -9256,6 +9519,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -9297,6 +9561,9 @@ impl AppState {
             }
             PendingCommentMode::Review { target } => {
                 start_review_comment_submit(submit.item, target, submit.body, tx.clone());
+            }
+            PendingCommentMode::ItemMetadata { field } => {
+                start_item_metadata_edit(submit.item, field, submit.body, tx.clone());
             }
         });
     }
@@ -9376,14 +9643,25 @@ impl AppState {
     fn prepare_comment_submit(&mut self) -> Option<PendingCommentSubmit> {
         let dialog = self.comment_dialog.take()?;
         let body = dialog.body.trim().to_string();
-        if body.is_empty() {
+        let empty_status = match dialog.mode {
+            CommentDialogMode::ItemMetadata {
+                field: ItemEditField::Title,
+            } => Some("title is empty"),
+            CommentDialogMode::ItemMetadata {
+                field: ItemEditField::Body,
+            } => None,
+            _ => Some("comment is empty"),
+        };
+        if body.is_empty()
+            && let Some(status) = empty_status
+        {
             self.comment_dialog = Some(dialog);
-            self.status = "comment is empty".to_string();
+            self.status = status.to_string();
             return None;
         }
         let Some(item) = self.current_item().cloned() else {
             self.comment_dialog = Some(dialog);
-            self.status = "nothing to comment on".to_string();
+            self.status = "nothing selected".to_string();
             return None;
         };
         let mode = match dialog.mode {
@@ -9403,6 +9681,7 @@ impl AppState {
                 is_review,
             },
             CommentDialogMode::Review { target } => PendingCommentMode::Review { target },
+            CommentDialogMode::ItemMetadata { field } => PendingCommentMode::ItemMetadata { field },
         };
         self.posting_comment = true;
         self.message_dialog = Some(comment_pending_dialog(&mode));
@@ -9411,6 +9690,7 @@ impl AppState {
             PendingCommentMode::ReviewReply { .. } => "posting review reply".to_string(),
             PendingCommentMode::Edit { .. } => "updating comment".to_string(),
             PendingCommentMode::Review { .. } => "posting review comment".to_string(),
+            PendingCommentMode::ItemMetadata { field } => format!("updating {}", field.label()),
         };
         Some(PendingCommentSubmit { item, body, mode })
     }
@@ -9428,6 +9708,7 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
@@ -9651,10 +9932,7 @@ impl AppState {
 
     fn current_item_supports_comments(&self) -> bool {
         self.current_item()
-            .map(|item| {
-                matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
-                    && item.number.is_some()
-            })
+            .map(item_supports_metadata_edit)
             .unwrap_or(false)
     }
 
@@ -12261,6 +12539,7 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
+        assert!(text.contains("E edit item"));
         assert!(text.contains("M/C/A pr action"));
         assert!(
             text.contains(
@@ -12291,6 +12570,7 @@ diff --git a/src/github.rs b/src/github.rs
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("Details content  j/k scroll"));
         assert!(details.contains("n/p comment  enter expand  c/a comment  R reply  e edit"));
+        assert!(details.contains("E edit item"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
 
@@ -12298,7 +12578,9 @@ diff --git a/src/github.rs b/src/github.rs
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains(
+            "[ ] file  m begin  e end  c inline  a comment  E edit item  M/C/A pr action"
+        ));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14206,6 +14488,241 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.pr_action_dialog.is_none());
         assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn item_edit_key_opens_choice_from_list_and_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_some());
+        assert_eq!(app.status, "choose title or body to edit");
+
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_some());
+        assert_eq!(app.status, "choose title or body to edit");
+    }
+
+    #[test]
+    fn item_edit_choice_opens_title_or_body_editor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
+
+        assert!(app.item_edit_dialog.is_none());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (&dialog.mode, dialog.body.as_str())),
+            Some((
+                &CommentDialogMode::ItemMetadata {
+                    field: ItemEditField::Title,
+                },
+                "Compiler diagnostics"
+            ))
+        );
+        assert_eq!(app.status, "editing title");
+
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (&dialog.mode, dialog.body.as_str())),
+            Some((
+                &CommentDialogMode::ItemMetadata {
+                    field: ItemEditField::Body,
+                },
+                "A body with useful context"
+            ))
+        );
+        assert_eq!(app.status, "editing body");
+    }
+
+    #[test]
+    fn item_title_edit_submit_updates_title() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
+        app.comment_dialog.as_mut().unwrap().body = "New title".to_string();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "updating title");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Updating Title",
+                "Waiting for GitHub to accept the title update..."
+            ))
+        );
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                "New title".to_string(),
+                PendingCommentMode::ItemMetadata {
+                    field: ItemEditField::Title,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn item_body_edit_submit_allows_empty_body() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
+        app.comment_dialog.as_mut().unwrap().body.clear();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "updating body");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                String::new(),
+                PendingCommentMode::ItemMetadata {
+                    field: ItemEditField::Body,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn item_metadata_update_success_refreshes_cached_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.posting_comment = true;
+
+        app.handle_msg(AppMsg::ItemMetadataUpdated {
+            item_id: "1".to_string(),
+            field: ItemEditField::Title,
+            result: Ok(ItemMetadataUpdate {
+                title: "New title".to_string(),
+                body: Some("New body".to_string()),
+                updated_at: None,
+            }),
+        });
+
+        assert!(!app.posting_comment);
+        assert_eq!(app.sections[0].items[0].title, "New title");
+        assert_eq!(app.sections[0].items[0].body.as_deref(), Some("New body"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "title updated");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Title Updated",
+                "GitHub accepted the update and the current item was refreshed."
+            ))
+        );
+    }
+
+    #[test]
+    fn item_metadata_update_failure_reports_status() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.posting_comment = true;
+
+        app.handle_msg(AppMsg::ItemMetadataUpdated {
+            item_id: "1".to_string(),
+            field: ItemEditField::Body,
+            result: Err("gh api repos/owner/repo/issues/1 failed: validation failed".to_string()),
+        });
+
+        assert!(!app.posting_comment);
+        assert_eq!(app.status, "body update failed");
+        let dialog = app.message_dialog.as_ref().expect("failure dialog");
+        assert_eq!(dialog.title, "Body Update Failed");
+        assert_eq!(dialog.body, "validation failed");
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn item_edit_rejects_non_issue_or_pull_request_items() {
+        let section = SectionSnapshot {
+            key: "notifications:test".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![WorkItem {
+                id: "thread-1".to_string(),
+                kind: ItemKind::Notification,
+                repo: "rust-lang/rust".to_string(),
+                number: None,
+                title: "Notification only".to_string(),
+                body: None,
+                author: None,
+                state: None,
+                url: "https://github.com/rust-lang/rust".to_string(),
+                updated_at: None,
+                labels: Vec::new(),
+                comments: None,
+                unread: Some(true),
+                reason: Some("mention".to_string()),
+                extra: Some("Commit".to_string()),
+            }],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_none());
+        assert_eq!(app.status, "selected item is not an issue or pull request");
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub struct WorkItem {
     pub labels: Vec<String>,
     #[serde(default)]
     pub reactions: ReactionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<Milestone>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,
@@ -81,6 +83,12 @@ impl ReactionSummary {
             && self.rocket == 0
             && self.eyes == 0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub number: u64,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

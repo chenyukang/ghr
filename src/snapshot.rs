@@ -262,6 +262,7 @@ mod tests {
             updated_at: None,
             labels: Vec::new(),
             reactions: Default::default(),
+            milestone: None,
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

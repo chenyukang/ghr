@@ -8659,7 +8659,12 @@ fn push_diff_inline_comment(
     }
 
     let prefix = diff_inline_comment_prefix(selected, depth);
-    builder.push_prefixed_wrapped_limited(header, prefix.clone(), COMMENT_RIGHT_PADDING, 2);
+    builder.push_prefixed_wrapped_limited(
+        header,
+        prefix.clone(),
+        comment_right_padding(selected),
+        2,
+    );
     let collapsed_body;
     let body = if collapse.collapsed {
         collapsed_body = collapsed_comment_body(&comment.body);
@@ -8674,7 +8679,7 @@ fn push_diff_inline_comment(
         usize::MAX,
         MarkdownRenderOptions {
             prefix,
-            right_padding: COMMENT_RIGHT_PADDING,
+            right_padding: comment_right_padding(selected),
         },
     );
     if collapse.collapsed {
@@ -8697,7 +8702,7 @@ fn push_diff_inline_comment_separator(builder: &mut DetailsBuilder, selected: bo
     let prefix_width = segments_width(&segments);
     let width = builder
         .width
-        .saturating_sub(prefix_width + COMMENT_RIGHT_PADDING)
+        .saturating_sub(prefix_width + comment_right_padding(selected))
         .max(12);
     let line = if selected { "━" } else { "─" };
     segments.push(DetailSegment::styled(
@@ -8730,7 +8735,7 @@ fn push_diff_inline_comment_expand_line(
             ),
         ],
         diff_inline_comment_prefix(selected, depth),
-        COMMENT_RIGHT_PADDING,
+        comment_right_padding(selected),
         2,
     );
 }
@@ -16718,6 +16723,22 @@ deleted file mode 100644
         );
         assert_document_link_for_text(&document, "alice", "https://github.com/alice");
         assert_document_link_for_text(&document, "bob", "https://github.com/bob");
+        let right_border_column = comment_right_border_column(120);
+        let selected_right_border_columns = rendered
+            .iter()
+            .filter(|line| line.ends_with('┃'))
+            .map(|line| display_width(line).saturating_sub(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !selected_right_border_columns.is_empty(),
+            "selected inline comment should render a right border: {rendered:?}"
+        );
+        assert!(
+            selected_right_border_columns
+                .iter()
+                .all(|column| *column == right_border_column),
+            "selected inline comment right border should align: {rendered:?}"
+        );
 
         let body_line = rendered
             .iter()

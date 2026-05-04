@@ -27,7 +27,7 @@ review.
 | Feature | Branch | Owner | Status | PR | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Assign / unassign assignees | `codex/assignee-actions` | Harvey | In progress | - | Support issues and PRs through GitHub issue assignee APIs. |
-| Request / remove reviewers, including re-request review | `codex/reviewer-actions` | Huygens | In progress | - | PR-only review request management. |
+| Request / remove reviewers, including re-request review | `codex/reviewer-actions` | Huygens | In review | [#16](https://github.com/chenyukang/ghr/pull/16) | PR-only reviewer management; user reviewers only. |
 | Close / reopen issue and PR reopen | `codex/state-actions` | Russell | In review | [#14](https://github.com/chenyukang/ghr/pull/14) | Existing PR close flow expanded to issue close/reopen and PR reopen. |
 | Edit title / body | `codex/edit-title-body` | Later wave | Todo | - | Needs a focused editor flow for current issue/PR metadata. |
 | Change milestone | `codex/milestone-actions` | Later wave | Todo | - | Needs milestone list/prefix selection plus clear/remove. |
@@ -50,6 +50,6 @@ review.
 | Agent | Scope | Worktree | Branch | Status |
 | --- | --- | --- | --- | --- |
 | Harvey | Assign / unassign assignees | `~/.codex/worktrees/ghr-assignee-actions` | `codex/assignee-actions` | In progress |
-| Huygens | Request / remove / re-request reviewers | `~/.codex/worktrees/ghr-reviewer-actions` | `codex/reviewer-actions` | In progress |
+| Huygens | Request / remove / re-request reviewers | `~/.codex/worktrees/ghr-reviewer-actions` | `codex/reviewer-actions` | In review: [#16](https://github.com/chenyukang/ghr/pull/16) |
 | Russell | Close / reopen issue and PR reopen | `~/.codex/worktrees/ghr-state-actions` | `codex/state-actions` | In review: [#14](https://github.com/chenyukang/ghr/pull/14) |
 | Chandrasekhar | Mark draft / ready for review | `~/.codex/worktrees/ghr-pr-draft-ready-actions` | `codex/pr-draft-ready-actions` | In review: [#15](https://github.com/chenyukang/ghr/pull/15) |

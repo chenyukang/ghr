@@ -41,7 +41,7 @@ review.
 | Update branch | `codex/pr-update-branch` | Boyle | In review | [#18](https://github.com/chenyukang/ghr/pull/18) | Use GitHub branch update API/CLI where available. |
 | Enable / disable auto-merge | `codex/pr-auto-merge-actions` | Ramanujan | In review | [#24](https://github.com/chenyukang/ghr/pull/24) | Uses repo allowed merge policy preference: merge, squash, then rebase. |
 | Merge method selection: merge / squash / rebase | `codex/pr-merge-methods` | Newton | In review | [#23](https://github.com/chenyukang/ghr/pull/23) | Existing merge confirmation exposes merge/squash/rebase selection. |
-| Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Kierkegaard | In progress | - | Existing approve and inline comment flows are a starting point. |
+| Full review submit flow: comment / request changes / approve, pending submit/discard | `codex/pr-review-submit-flow` | Kierkegaard | In review | [#26](https://github.com/chenyukang/ghr/pull/26) | Inline review comments still post immediately; pending review tracking is local to the current session. |
 | Rerun failed checks | `codex/pr-rerun-checks` | James | In review | [#25](https://github.com/chenyukang/ghr/pull/25) | Reruns failed GitHub Actions runs; external/status-only checks are reported as not rerunnable. |
 | Checkout PR locally | `codex/pr-checkout-local` | Cicero | In review | [#19](https://github.com/chenyukang/ghr/pull/19) | Should run a local checkout command with a clear confirmation/status. |
 
@@ -60,5 +60,5 @@ review.
 | Cicero | Checkout PR locally | `~/.codex/worktrees/ghr-pr-checkout-local` | `codex/pr-checkout-local` | In review: [#19](https://github.com/chenyukang/ghr/pull/19) |
 | Ramanujan | Enable / disable auto-merge | `~/.codex/worktrees/ghr-pr-auto-merge-actions` | `codex/pr-auto-merge-actions` | In review: [#24](https://github.com/chenyukang/ghr/pull/24) |
 | Newton | Merge method selection | `~/.codex/worktrees/ghr-pr-merge-methods` | `codex/pr-merge-methods` | In review: [#23](https://github.com/chenyukang/ghr/pull/23) |
-| Kierkegaard | Full PR review submit flow | `~/.codex/worktrees/ghr-pr-review-submit-flow` | `codex/pr-review-submit-flow` | In progress |
+| Kierkegaard | Full PR review submit flow | `~/.codex/worktrees/ghr-pr-review-submit-flow` | `codex/pr-review-submit-flow` | In review: [#26](https://github.com/chenyukang/ghr/pull/26) |
 | James | Rerun failed checks | `~/.codex/worktrees/ghr-pr-rerun-checks` | `codex/pr-rerun-checks` | In review: [#25](https://github.com/chenyukang/ghr/pull/25) |

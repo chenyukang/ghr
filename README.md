@@ -62,7 +62,7 @@ gh auth login
 ghr
 ```
 
-The installers detect your OS and CPU architecture, download the matching GitHub release asset, verify its `.sha256`, and install `ghr` into `~/.local/bin` by default. Use `GHR_INSTALL_DIR` to choose another install directory, or `GHR_VERSION` to pin a release tag:
+The installers detect your OS and CPU architecture, download the matching GitHub release asset with visible progress, verify its `.sha256`, and install `ghr` into `~/.local/bin` by default. Use `GHR_INSTALL_DIR` to choose another install directory, or `GHR_VERSION` to pin a release tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.3.0 GHR_INSTALL_DIR=/usr/local/bin sh
@@ -177,6 +177,7 @@ Mouse behavior:
 
 - Click ghr or Sections tabs to switch views or sections.
 - Click list rows to select them and focus Details. Mouse hover and mouse wheel do not change PR/issue selection.
+- Click descriptions, comments, links, and visible actions in Details to focus or open them.
 - Scroll Details with the mouse wheel.
 - Drag the split between list and Details to resize panes; the ratio is saved.
 - Press `m` outside diff mode to temporarily disable TUI mouse capture for terminal text selection; press `m` again to restore mouse controls.

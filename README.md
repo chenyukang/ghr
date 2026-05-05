@@ -84,12 +84,12 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | Key | Action |
 | --- | --- |
 | `:` | Open the command palette and fuzzy search every shortcut |
-| `:` then `Project Switch` | Filter configured repos by prefix and activate a project tab |
-| `:` then `Project Add` | Add a repo project to the menu and save it to `config.toml` |
-| `:` then `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
-| `:` then `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
-| `:` then `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
-| `:` then `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
+| `Project Switch` | Filter configured repos by prefix and activate a project tab |
+| `Project Add` | Add a repo project to the menu and save it to `config.toml` |
+| `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
+| `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
+| `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |

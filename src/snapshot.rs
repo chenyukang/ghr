@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::model::{SectionKind, SectionSnapshot, mark_notification_read_in_section};
+use crate::model::{
+    SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
+    mark_notification_read_in_section,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoCandidateCache {
@@ -215,6 +218,44 @@ impl SnapshotStore {
         Ok(changed)
     }
 
+    pub fn mark_all_notifications_read(&self) -> Result<bool> {
+        let mut changed = false;
+        let last_read_at = Utc::now();
+        for mut section in self.load_all()?.into_values() {
+            if mark_all_notifications_read_in_section(&mut section, last_read_at) {
+                self.save_section(&section)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn clear_snapshots(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM snapshots", [])
+            .context("failed to clear snapshot cache")
+    }
+
+    pub fn clear_snapshots_by_keys(&self, keys: &[String]) -> Result<usize> {
+        let conn = self.connect()?;
+        let mut keys = keys.to_vec();
+        keys.sort();
+        keys.dedup();
+        let mut changed = 0;
+        for key in keys {
+            changed += conn
+                .execute("DELETE FROM snapshots WHERE key = ?1", params![key])
+                .with_context(|| format!("failed to clear snapshot {key}"))?;
+        }
+        Ok(changed)
+    }
+
+    pub fn clear_repo_candidate_cache(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM repo_candidate_cache", [])
+            .context("failed to clear repo candidate cache")
+    }
+
     fn save_repo_candidates(&self, repo: &str, kind: &str, values: &[String]) -> Result<()> {
         let conn = self.connect()?;
         let values_json = serde_json::to_string(values)
@@ -331,6 +372,60 @@ mod tests {
     }
 
     #[test]
+    fn mark_all_notifications_read_updates_cached_notification_sections() {
+        let path = temp_db_path("snapshot-mark-all-notifications-read");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        let unread_item = notification_item("thread-1", true);
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![unread_item.clone(), notification_item("thread-2", true)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save unread snapshot");
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![unread_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save all snapshot");
+
+        assert!(
+            store
+                .mark_all_notifications_read()
+                .expect("mark all notifications read")
+        );
+
+        let cached = store.load_all().expect("load cached snapshots");
+        let unread = cached.get("notifications:unread").expect("unread section");
+        assert!(unread.items.is_empty());
+        let all = cached.get("notifications:all").expect("all section");
+        assert_eq!(all.items[0].unread, Some(false));
+        assert!(all.items[0].last_read_at.is_some());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("db-wal"));
+        let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
     fn repo_candidate_cache_round_trips_and_updates() {
         let path = temp_db_path("repo-candidate-cache");
         let store = SnapshotStore::new(path.clone());
@@ -385,6 +480,73 @@ mod tests {
         remove_db_files(&path);
     }
 
+    #[test]
+    fn clear_cache_methods_remove_selected_snapshot_and_candidate_rows() {
+        let path = temp_db_path("clear-cache");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        store
+            .save_section(&SectionSnapshot {
+                key: "pull_requests:mine".to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Mine".to_string(),
+                filters: "is:open author:@me".to_string(),
+                items: vec![notification_item("item-1", false)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save first snapshot");
+        store
+            .save_section(&SectionSnapshot {
+                key: "issues:mine".to_string(),
+                kind: SectionKind::Issues,
+                title: "Mine".to_string(),
+                filters: "is:open assignee:@me".to_string(),
+                items: vec![notification_item("item-2", false)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save second snapshot");
+        store
+            .save_label_candidates("rust-lang/rust", &["T-compiler".to_string()])
+            .expect("save candidate cache");
+
+        assert_eq!(
+            store
+                .clear_snapshots_by_keys(&["pull_requests:mine".to_string()])
+                .expect("clear selected snapshot"),
+            1
+        );
+        let snapshots = store.load_all().expect("load snapshots");
+        assert!(!snapshots.contains_key("pull_requests:mine"));
+        assert!(snapshots.contains_key("issues:mine"));
+
+        assert_eq!(
+            store
+                .clear_repo_candidate_cache()
+                .expect("clear candidate cache"),
+            1
+        );
+        assert!(
+            store
+                .load_repo_candidate_cache()
+                .expect("load candidate cache")
+                .labels
+                .is_empty()
+        );
+        assert_eq!(store.clear_snapshots().expect("clear all snapshots"), 1);
+        assert!(store.load_all().expect("reload snapshots").is_empty());
+
+        remove_db_files(&path);
+    }
+
     fn temp_db_path(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ghr-{prefix}-{}-{}.db",
@@ -415,6 +577,7 @@ mod tests {
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
             created_at: None,
             updated_at: None,
+            last_read_at: None,
             labels: Vec::new(),
             reactions: Default::default(),
             milestone: None,

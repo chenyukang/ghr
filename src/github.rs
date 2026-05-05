@@ -347,6 +347,8 @@ struct NotificationRaw {
     unread: bool,
     reason: String,
     updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_read_at: Option<DateTime<Utc>>,
     subject: NotificationSubjectRaw,
     repository: NotificationRepositoryRaw,
 }
@@ -2654,6 +2656,62 @@ pub async fn mark_notification_thread_read(thread_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn mark_all_notifications_read() -> Result<()> {
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PUT".to_string(),
+        "notifications".to_string(),
+        "-F".to_string(),
+        "read=true".to_string(),
+    ])
+    .await
+    .context("failed to mark all notifications as read")?;
+    Ok(())
+}
+
+pub async fn mute_notification_thread(thread_id: &str) -> Result<()> {
+    set_notification_thread_subscription(thread_id, true).await
+}
+
+pub async fn subscribe_notification_thread(thread_id: &str) -> Result<()> {
+    set_notification_thread_subscription(thread_id, false).await
+}
+
+pub async fn unsubscribe_notification_thread(thread_id: &str) -> Result<()> {
+    let path = format!("notifications/threads/{thread_id}/subscription");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "DELETE".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to unsubscribe from notification {thread_id}"))?;
+    Ok(())
+}
+
+async fn set_notification_thread_subscription(thread_id: &str, ignored: bool) -> Result<()> {
+    let path = format!("notifications/threads/{thread_id}/subscription");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PUT".to_string(),
+        path,
+        "-F".to_string(),
+        format!("ignored={ignored}"),
+    ])
+    .await
+    .with_context(|| {
+        if ignored {
+            format!("failed to mute notification {thread_id}")
+        } else {
+            format!("failed to subscribe to notification {thread_id}")
+        }
+    })?;
+    Ok(())
+}
+
 async fn fetch_viewer_login() -> Result<String> {
     let output = run_gh_json(&["api".to_string(), "user".to_string()]).await?;
     let viewer =
@@ -3264,6 +3322,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
         url: item.url,
         created_at: item.created_at,
         updated_at: item.updated_at,
+        last_read_at: None,
         labels,
         reactions: ReactionSummary::default(),
         milestone: None,
@@ -3305,6 +3364,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         url: item.html_url,
         created_at: item.created_at,
         updated_at: item.updated_at,
+        last_read_at: None,
         labels,
         reactions: item
             .reactions
@@ -3408,6 +3468,7 @@ fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
         url: item.html_url,
         created_at: None,
         updated_at: item.updated_at,
+        last_read_at: None,
         labels,
         reactions: ReactionSummary::default(),
         milestone: None,
@@ -3496,6 +3557,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         url,
         created_at: None,
         updated_at: notification.updated_at,
+        last_read_at: notification.last_read_at,
         labels: Vec::new(),
         reactions: ReactionSummary::default(),
         milestone: None,
@@ -4047,6 +4109,7 @@ mod tests {
             unread: true,
             reason: "review_requested".to_string(),
             updated_at: None,
+            last_read_at: None,
             subject: NotificationSubjectRaw {
                 title: "Add fee support".to_string(),
                 url: Some("https://api.github.com/repos/owner/repo/pulls/42".to_string()),

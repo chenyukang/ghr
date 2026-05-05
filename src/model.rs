@@ -10,7 +10,7 @@ use crate::config::Config;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SectionKind {
     #[default]
-    #[serde(rename = "notifications")]
+    #[serde(rename = "notifications", alias = "notification", alias = "inbox")]
     Notifications,
     #[serde(rename = "pull_requests", alias = "pullrequests", alias = "prs")]
     PullRequests,
@@ -41,6 +41,8 @@ pub struct WorkItem {
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read_at: Option<DateTime<Utc>>,
     pub labels: Vec<String>,
     #[serde(default)]
     pub reactions: ReactionSummary,
@@ -196,7 +198,7 @@ impl SectionKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Notifications => "Notification",
+            Self::Notifications => "Inbox",
             Self::PullRequests => "Pull Requests",
             Self::Issues => "Issues",
         }
@@ -214,7 +216,7 @@ impl FromStr for SectionKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "notifications" => Ok(Self::Notifications),
+            "notifications" | "notification" | "inbox" => Ok(Self::Notifications),
             "pull_requests" | "prs" => Ok(Self::PullRequests),
             "issues" => Ok(Self::Issues),
             other => Err(format!("unknown section kind: {other}")),
@@ -444,6 +446,31 @@ pub fn mark_notification_read_in_section(section: &mut SectionSnapshot, thread_i
     for item in &mut section.items {
         if item.id == thread_id && item.unread.unwrap_or(false) {
             item.unread = Some(false);
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub fn mark_all_notifications_read_in_section(
+    section: &mut SectionSnapshot,
+    last_read_at: DateTime<Utc>,
+) -> bool {
+    if !matches!(section.kind, SectionKind::Notifications) {
+        return false;
+    }
+
+    if notification_section_requires_unread(section) {
+        let changed = !section.items.is_empty();
+        section.items.clear();
+        return changed;
+    }
+
+    let mut changed = false;
+    for item in &mut section.items {
+        if item.unread != Some(false) || item.last_read_at.as_ref() != Some(&last_read_at) {
+            item.unread = Some(false);
+            item.last_read_at = Some(last_read_at);
             changed = true;
         }
     }

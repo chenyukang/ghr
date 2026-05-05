@@ -89,9 +89,8 @@ impl Config {
         if path.exists() {
             let content = fs::read_to_string(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let config = toml::from_str(&content)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            return Ok(config);
+            return toml::from_str(&content)
+                .with_context(|| format!("failed to parse {}", path.display()));
         }
 
         let config = Self::default();
@@ -313,40 +312,38 @@ impl Default for Config {
                     limit: None,
                 },
             ],
-            notification_sections: vec![
-                SearchSection {
-                    title: "Unread".to_string(),
-                    filters: "is:unread".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "Review Requested".to_string(),
-                    filters: "reason:review-requested".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "Assigned".to_string(),
-                    filters: "reason:assign".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "Mentioned".to_string(),
-                    filters: "reason:mention".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "All".to_string(),
-                    filters: "is:all".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-            ],
+            notification_sections: default_notification_sections(),
         }
     }
+}
+
+fn default_notification_sections() -> Vec<SearchSection> {
+    vec![
+        SearchSection {
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
+        SearchSection {
+            title: "Review Requested".to_string(),
+            filters: "reason:review-requested".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
+        SearchSection {
+            title: "Assigned".to_string(),
+            filters: "reason:assign".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
+        SearchSection {
+            title: "Mentioned".to_string(),
+            filters: "reason:mention".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
+    ]
 }
 
 impl Default for RepoConfig {
@@ -420,6 +417,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_inbox_view_name_as_notifications_for_compatibility() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            view = "inbox"
+            "#,
+        )
+        .expect("inbox should be a valid default view alias");
+
+        assert_eq!(config.defaults.view, SectionKind::Notifications);
+    }
+
+    #[test]
     fn default_config_round_trips_through_toml() {
         let encoded = toml::to_string_pretty(&Config::default()).expect("encode default config");
 
@@ -439,6 +449,21 @@ mod tests {
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
         assert!(!decoded.notification_sections.is_empty());
+    }
+
+    #[test]
+    fn default_inbox_sections_start_with_all_without_unread_section() {
+        let config = Config::default();
+        let titles = config
+            .notification_sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            titles,
+            vec!["All", "Review Requested", "Assigned", "Mentioned"]
+        );
     }
 
     #[test]

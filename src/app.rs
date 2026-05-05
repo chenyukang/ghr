@@ -904,6 +904,7 @@ enum PaletteAction {
     ToggleMouseCapture,
     OpenSelected,
     ShowDiff,
+    ClearIgnoredItems,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1120,6 +1121,7 @@ struct AppState {
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
     diff_file_details_scroll: HashMap<String, u16>,
+    ignored_items: HashSet<String>,
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
@@ -3296,11 +3298,18 @@ fn handle_key_in_area_mut(
         KeyCode::Char('q') => return true,
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::ALT) => {
+            start_section_page_load(app, config, store, tx, -1)
+        }
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::ALT) => {
+            start_section_page_load(app, config, store, tx, 1)
+        }
         KeyCode::Char('S') => app.start_global_search_input(),
         KeyCode::Char('f') => app.start_filter_input(),
         KeyCode::Tab => app.move_focused_tab_group(1),
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
+        _ if is_ignore_key(key) => app.ignore_current_item(),
         KeyCode::Char('T') => app.start_item_edit_dialog(),
         _ => {}
     }
@@ -3339,11 +3348,11 @@ fn handle_key_in_area_mut(
                 app.move_selection(-1);
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageDown | KeyCode::Char('d') => {
+            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(']') => {
                 app.move_selection(list_page_delta(app, area, 1));
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageUp | KeyCode::Char('u') => {
+            KeyCode::PageUp | KeyCode::Char('u') | KeyCode::Char('[') => {
                 app.move_selection(list_page_delta(app, area, -1));
                 app.mark_current_notification_read(store, tx);
             }
@@ -3355,8 +3364,6 @@ fn handle_key_in_area_mut(
                 app.select_last();
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
-            KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
             KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
@@ -3771,6 +3778,9 @@ fn handle_mouse_with_sync(
         MouseEventKind::Moved if rect_contains(layout.table, mouse.column, mouse.row) => {
             handle_table_hover(app, mouse, layout.table, store, tx);
         }
+        MouseEventKind::Moved if rect_contains(layout.details, mouse.column, mouse.row) => {
+            handle_details_hover(app, mouse, layout.details);
+        }
         _ => {}
     }
 
@@ -4037,6 +4047,22 @@ fn handle_table_hover(
     }
 }
 
+fn handle_details_hover(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let inner = block_inner(area);
+    if !rect_contains(inner, mouse.column, mouse.row) {
+        return;
+    }
+
+    let document = build_details_document(app, inner.width);
+    let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
+    let column = mouse.column - inner.x;
+    if document.link_at(line_index, column).is_some() {
+        app.status = "link under pointer; click to open".to_string();
+    } else if document.action_at(line_index, column).is_some() {
+        app.status = "action under pointer; click to run".to_string();
+    }
+}
+
 fn mark_current_notification_read_if_possible(
     app: &mut AppState,
     store: Option<&SnapshotStore>,
@@ -4206,6 +4232,7 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     let chunks = page_areas(area);
 
     draw_view_tabs(frame, app, chunks[0]);
+    draw_top_status(frame, app, area);
     draw_section_tabs(frame, app, chunks[1]);
 
     if app.mouse_capture_enabled {
@@ -4380,7 +4407,7 @@ fn active_section_tab_style() -> Style {
 
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
     let (_, unread) = section_counts(section);
-    let count_label = section_count_label(section);
+    let count_label = section_count_label(app, section);
     let title = app
         .quick_filter_label_for_section(section)
         .map(|filter| format!("{} [{filter}]", section.title))
@@ -4390,7 +4417,10 @@ fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
             "{} ({}/{})",
             title,
             app.filtered_indices(section).len(),
-            section.items.len()
+            section
+                .items
+                .len()
+                .saturating_sub(app.ignored_count_for_section(section))
         )
     } else if unread > 0 {
         format!("{title} ({count_label}/{unread})")
@@ -4399,8 +4429,11 @@ fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
     }
 }
 
-fn section_count_label(section: &SectionSnapshot) -> String {
-    let loaded = section.items.len();
+fn section_count_label(app: &AppState, section: &SectionSnapshot) -> String {
+    let loaded = section
+        .items
+        .len()
+        .saturating_sub(app.ignored_count_for_section(section));
     match section.total_count {
         Some(total) if total > loaded => format!("{loaded}/{total}"),
         Some(total) => total.to_string(),
@@ -4525,6 +4558,10 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     if let Some(error) = &section.error {
         title.push_str(&format!(" - error: {}", compact_error_label(error)));
     };
+    let ignored_count = app.ignored_count_for_section(section);
+    if ignored_count > 0 {
+        title.push_str(&format!(" | {ignored_count} ignored"));
+    }
     let visible_rows = usize::from(table_visible_rows(area));
     let table_offset = app.current_list_scroll_offset(filtered_indices.len(), visible_rows);
     if let Some((start, end)) =
@@ -4532,7 +4569,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     {
         title.push_str(&table_visible_range_label(
             section,
-            app.search_query.is_empty(),
+            app.search_query.is_empty() && ignored_count == 0,
             start,
             end,
             filtered_indices.len(),
@@ -4685,6 +4722,13 @@ fn list_empty_state_message(
     if section.items.is_empty() {
         return Some((
             "No items found.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if app.ignored_count_for_section(section) == section.items.len() {
+        return Some((
+            "All loaded items are ignored. Use the command palette to clear ignored items."
+                .to_string(),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -5084,6 +5128,40 @@ fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect)
     frame.render_widget(footer, area);
 }
 
+fn draw_top_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let Some(status_area) = top_status_area(area) else {
+        return;
+    };
+    let line = top_status_line(app, usize::from(status_area.width));
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(line).alignment(Alignment::Right),
+        status_area,
+    );
+}
+
+fn top_status_area(area: Rect) -> Option<Rect> {
+    let max_width = area.width.saturating_sub(4).min(46);
+    if max_width < 12 || area.height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        area.x + area.width.saturating_sub(max_width).saturating_sub(1),
+        area.y,
+        max_width,
+        1,
+    ))
+}
+
+fn top_status_line(app: &AppState, width: usize) -> Line<'static> {
+    let value_width = width.saturating_sub(display_width("status: "));
+    let value = truncate_inline(&footer_status(app), value_width);
+    let mut spans = Vec::new();
+    push_status_spans(&mut spans, value);
+    Line::from(fit_footer_spans_to_width(spans, width))
+}
+
 #[cfg(test)]
 fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     footer_line_for_width(app, paths, usize::MAX)
@@ -5137,15 +5215,12 @@ fn footer_groups(app: &AppState) -> Vec<Vec<Span<'static>>> {
         groups.push(spans);
     }
 
-    groups.push(footer_status_group(app));
-    groups.push(footer_focus_secondary_shortcuts(app));
     groups.push(footer_global_primary_shortcuts(app));
     if let Some(mouse) = mouse {
         let mut spans = Vec::new();
         push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
         groups.push(spans);
     }
-    groups.push(footer_global_secondary_shortcuts());
 
     groups
         .into_iter()
@@ -5169,17 +5244,6 @@ fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'stat
         return (None, None);
     }
     (Some("text-select"), None)
-}
-
-fn assignee_footer_keys(app: &AppState) -> &'static str {
-    if app
-        .current_item()
-        .is_some_and(|item| item.assignees.is_empty())
-    {
-        "@"
-    } else {
-        "@/-"
-    }
 }
 
 fn footer_has_selected_comment(app: &AppState) -> bool {
@@ -5225,12 +5289,14 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
                 push_footer_pair(&mut spans, "j/k", "move", Color::Cyan);
+                push_footer_pair(&mut spans, "[ ]", "page", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "Details", Color::Cyan);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
                 if app.is_global_search_results_view() {
                     push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 }
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(&mut spans, "i", "ignore", Color::LightRed);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             }
         }
@@ -5263,78 +5329,6 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
     spans
 }
 
-fn footer_focus_secondary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let assignee_keys = assignee_footer_keys(app);
-    if let Some(dialog) = &app.pr_action_dialog {
-        if dialog.action == PrAction::Merge {
-            push_footer_pair(&mut spans, "tab", "next method", Color::LightMagenta);
-        }
-        return spans;
-    }
-
-    match app.focus {
-        FocusTarget::Ghr | FocusTarget::Sections => {}
-        FocusTarget::List => {
-            if app.details_mode == DetailsMode::Diff {
-                push_footer_pair(&mut spans, "pg", "page", Color::Cyan);
-                push_footer_pair(&mut spans, "g/G", "ends", Color::Cyan);
-                push_footer_pair(&mut spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
-                push_footer_pair(
-                    &mut spans,
-                    "M/C/D/U/E/O/F/X",
-                    "actions",
-                    Color::LightMagenta,
-                );
-                push_footer_pair(&mut spans, "t", "milestone", Color::LightMagenta);
-                push_footer_pair(&mut spans, assignee_keys, "assign", Color::LightBlue);
-                push_footer_pair(&mut spans, "P/Y", "reviewers", Color::LightMagenta);
-            } else {
-                push_footer_pair(&mut spans, "pg", "page", Color::Cyan);
-                push_footer_pair(&mut spans, "[ ]", "results", Color::Cyan);
-                push_footer_pair(&mut spans, "g/G", "ends", Color::Cyan);
-                push_footer_pair(&mut spans, "T", "edit item", Color::LightBlue);
-                push_footer_pair(&mut spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
-                push_footer_pair(
-                    &mut spans,
-                    "M/C/D/U/E/O/F/X",
-                    "actions",
-                    Color::LightMagenta,
-                );
-                push_footer_pair(&mut spans, "t", "milestone", Color::LightMagenta);
-                push_footer_pair(&mut spans, assignee_keys, "assign", Color::LightBlue);
-                push_footer_pair(&mut spans, "P/Y", "reviewers", Color::LightMagenta);
-            }
-        }
-        FocusTarget::Details => {
-            push_footer_pair(&mut spans, "pg", "page", Color::Cyan);
-            push_footer_pair(&mut spans, "g/G", "top/bottom", Color::Cyan);
-            if app.details_mode == DetailsMode::Diff {
-                push_footer_pair(&mut spans, "[ ]", "file", Color::LightBlue);
-                push_footer_pair(&mut spans, "m/e", "range", Color::Yellow);
-            }
-            push_footer_pair(&mut spans, "s/A/Ctrl+D", "review", Color::LightMagenta);
-            push_footer_pair(
-                &mut spans,
-                "M/C/D/U/E/O/F/X",
-                "actions",
-                Color::LightMagenta,
-            );
-            push_footer_pair(&mut spans, "t", "milestone", Color::LightMagenta);
-            push_footer_pair(&mut spans, "T", "edit item", Color::LightBlue);
-            push_footer_pair(&mut spans, assignee_keys, "assign", Color::LightBlue);
-            push_footer_pair(&mut spans, "P/Y", "reviewers", Color::LightMagenta);
-        }
-    }
-    spans
-}
-
-fn footer_status_group(app: &AppState) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    push_footer_status(&mut spans, truncate_inline(&footer_status(app), 30));
-    spans
-}
-
 fn footer_global_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     push_footer_pair(&mut spans, "?", "help", Color::Yellow);
@@ -5352,13 +5346,6 @@ fn footer_global_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
         "quit"
     };
     push_footer_pair(&mut spans, "q", q_action, Color::Yellow);
-    spans
-}
-
-fn footer_global_secondary_shortcuts() -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    push_footer_pair(&mut spans, "1-4", "focus", Color::Cyan);
-    push_footer_pair(&mut spans, "S", "repo", Color::Yellow);
     push_footer_pair(&mut spans, "o", "open", Color::Yellow);
     spans
 }
@@ -5475,7 +5462,7 @@ fn push_footer_separator(spans: &mut Vec<Span<'static>>) {
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
 }
 
-fn push_footer_status(spans: &mut Vec<Span<'static>>, value: impl Into<String>) {
+fn push_status_spans(spans: &mut Vec<Span<'static>>, value: impl Into<String>) {
     if !spans.is_empty() && !footer_ends_with_separator(spans) {
         spans.push(Span::raw("  "));
     }
@@ -7746,7 +7733,7 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "Info",
             "",
             "General",
-            "Show ghr version, paths, runtime state, and memory usage",
+            "Show ghr version, paths, runtime state, and ghr process memory",
             PaletteAction::ShowInfo,
         ),
         palette_command(
@@ -7841,6 +7828,20 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             PaletteAction::ShowDiff,
         ),
         palette_command(
+            "Ignore Selected Item",
+            "i",
+            "General",
+            "Hide the selected pull request or issue from lists",
+            palette_key(KeyCode::Char('i')),
+        ),
+        palette_command(
+            "Clear Ignored Items",
+            "",
+            "General",
+            "Show all previously ignored pull requests and issues again",
+            PaletteAction::ClearIgnoredItems,
+        ),
+        palette_command(
             "Leave Diff Mode",
             "q",
             "Diff",
@@ -7925,17 +7926,31 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             palette_key(KeyCode::Char('k')),
         ),
         palette_command(
-            "Page Down",
-            "PgDown / d",
-            "List/Details",
-            "Move by a visible page",
+            "Page List Down",
+            "] / PgDown / d",
+            "List",
+            "Move the list selection down by a visible page",
             palette_key(KeyCode::PageDown),
         ),
         palette_command(
-            "Page Up",
+            "Page List Up",
+            "[ / PgUp / u",
+            "List",
+            "Move the list selection up by a visible page",
+            palette_key(KeyCode::PageUp),
+        ),
+        palette_command(
+            "Page Details Down",
+            "PgDown / d",
+            "Details",
+            "Scroll details down by a visible page",
+            palette_key(KeyCode::PageDown),
+        ),
+        palette_command(
+            "Page Details Up",
             "PgUp / u",
-            "List/Details",
-            "Move up by a visible page",
+            "Details",
+            "Scroll details up by a visible page",
             palette_key(KeyCode::PageUp),
         ),
         palette_command(
@@ -7954,17 +7969,17 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
         ),
         palette_command(
             "Load Previous Result Page",
-            "[",
+            "Alt+[",
             "List",
-            "Load previous GitHub result page",
-            palette_key(KeyCode::Char('[')),
+            "Load previous GitHub search result page",
+            palette_alt_key(KeyCode::Char('[')),
         ),
         palette_command(
             "Load Next Result Page",
-            "]",
+            "Alt+]",
             "List",
-            "Load next GitHub result page",
-            palette_key(KeyCode::Char(']')),
+            "Load next GitHub search result page",
+            palette_alt_key(KeyCode::Char(']')),
         ),
         palette_command(
             "Open PR Merge Confirmation",
@@ -8240,6 +8255,10 @@ fn palette_ctrl_key(code: KeyCode) -> PaletteAction {
     PaletteAction::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
 }
 
+fn palette_alt_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::ALT))
+}
+
 fn runtime_info_body(app: &AppState, config: &Config, paths: &Paths) -> String {
     let cwd = std::env::current_dir()
         .map(|path| path.display().to_string())
@@ -8261,7 +8280,7 @@ fn runtime_info_body(app: &AppState, config: &Config, paths: &Paths) -> String {
     [
         format!("version: {}", env!("CARGO_PKG_VERSION")),
         format!("pid: {}", std::process::id()),
-        format!("memory: {}", process_memory_summary()),
+        format!("ghr memory: {}", process_memory_summary()),
         format!("gh: {}", github_cli_version_summary()),
         String::new(),
         format!("config: {}", paths.config_path.display()),
@@ -8289,6 +8308,7 @@ fn runtime_info_body(app: &AppState, config: &Config, paths: &Paths) -> String {
             "sections: {}, cached items: {item_count}",
             app.sections.len()
         ),
+        format!("ignored items: {}", app.ignored_items.len()),
     ]
     .join("\n")
 }
@@ -9230,11 +9250,13 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("List"),
         help_key_line("j/k or Up/Down", "move selection"),
-        help_key_line("PgDown/PgUp", "move by visible page"),
-        help_key_line("[ / ]", "load previous / next GitHub result page"),
+        help_key_line("[ / ]", "move by visible page"),
+        help_key_line("PgDown/PgUp or d/u", "also move by visible page"),
+        help_key_line("Alt+[ / Alt+]", "load previous / next GitHub result page"),
         help_key_line("g / G", "first / last item"),
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
+        help_key_line("i", "ignore selected pull request or issue"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("f", "filter with state:closed label:bug author:alice"),
         help_key_line("v", "show pull request diff"),
@@ -13701,6 +13723,13 @@ fn is_reaction_key(key: KeyEvent) -> bool {
         || (matches!(key.code, KeyCode::Char('=')) && key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+fn is_ignore_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'i'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
     let mut values = values.iter().cloned().collect::<Vec<_>>();
     values.sort();
@@ -13822,6 +13851,7 @@ impl AppState {
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
             diff_file_details_scroll: ui_state.diff_file_details_scroll.clone(),
+            ignored_items: ui_state.ignored_items.iter().cloned().collect(),
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
@@ -13950,6 +13980,7 @@ impl AppState {
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
+            ignored_items: sorted_strings(&self.ignored_items),
         }
     }
 
@@ -15471,6 +15502,10 @@ impl AppState {
             }
             PaletteAction::ShowDiff => {
                 self.show_diff();
+                false
+            }
+            PaletteAction::ClearIgnoredItems => {
+                self.clear_ignored_items();
                 false
             }
         }
@@ -20613,6 +20648,62 @@ impl AppState {
 
     fn filtered_indices(&self, section: &SectionSnapshot) -> Vec<usize> {
         filtered_indices(section, &self.search_query)
+            .into_iter()
+            .filter(|index| {
+                section
+                    .items
+                    .get(*index)
+                    .is_some_and(|item| !self.ignored_items.contains(&item.id))
+            })
+            .collect()
+    }
+
+    fn ignored_count_for_section(&self, section: &SectionSnapshot) -> usize {
+        section
+            .items
+            .iter()
+            .filter(|item| self.ignored_items.contains(&item.id))
+            .count()
+    }
+
+    fn ignore_current_item(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing to ignore".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            self.status = "only issues and pull requests can be ignored".to_string();
+            return;
+        }
+
+        let label = item_kind_label(item.kind);
+        let number = item
+            .number
+            .map(|number| format!(" #{number}"))
+            .unwrap_or_default();
+        self.ignored_items.insert(item.id.clone());
+        self.focus = FocusTarget::List;
+        self.details_mode = DetailsMode::Conversation;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
+        self.clamp_positions();
+        self.status = format!("ignored {label}{number}; use Info to inspect ignored state");
+    }
+
+    fn clear_ignored_items(&mut self) {
+        let count = self.ignored_items.len();
+        self.ignored_items.clear();
+        self.clamp_positions();
+        self.status = if count == 0 {
+            "ignored list already empty".to_string()
+        } else {
+            format!("cleared {count} ignored item(s)")
+        };
     }
 
     fn view_tabs(&self) -> Vec<ViewTab> {
@@ -22687,6 +22778,7 @@ diff --git a/src/github.rs b/src/github.rs
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
+            ignored_items: Vec::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -23714,6 +23806,16 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             commands
                 .iter()
+                .any(|command| command.title == "Ignore Selected Item" && command.keys == "i")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Load Next Result Page" && command.keys == "Alt+]")
+        );
+        assert!(
+            commands
+                .iter()
                 .any(|command| command.scope == "Reaction Dialog")
         );
 
@@ -23802,7 +23904,8 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(dialog.kind, MessageDialogKind::Info);
         assert_eq!(dialog.title, "Info");
         assert!(dialog.body.contains("version:"));
-        assert!(dialog.body.contains("memory:"));
+        assert!(dialog.body.contains("ghr memory:"));
+        assert!(dialog.body.contains("ignored items:"));
         assert!(
             dialog
                 .body
@@ -24434,23 +24537,21 @@ diff --git a/src/main.rs b/src/main.rs
         let paths = test_paths();
         let text = footer_line(&app, &paths).to_string();
 
-        assert!(text.contains(
-            "j/k move  enter Details  / search  v diff  a comment | status: list focused"
-        ));
+        assert!(
+            text.contains(
+                "j/k move  [ ] page  enter Details  / search  v diff  i ignore  a comment"
+            )
+        );
         assert!(!text.contains("List items"));
         assert!(!text.contains("Details content"));
         assert!(text.contains("/ search"));
         assert!(text.contains("v diff"));
-        assert!(text.contains("T edit item"));
-        assert!(text.contains("s/A/Ctrl+D review"));
-        assert!(text.contains("M/C/D/U/E/O/F/X actions"));
-        assert!(text.contains("t milestone"));
-        assert!(text.contains("@ assign"));
-        assert!(text.contains("? help  : cmd  f filter  r refresh  q quit"));
+        assert!(text.contains("i ignore"));
+        assert!(text.contains("? help  : cmd  f filter  r refresh  q quit  o open"));
         assert!(text.contains("m text-select"));
-        assert!(text.contains("1-4 focus  S repo  o open"));
         assert!(!text.contains("focus List"));
         assert!(!text.contains("refresh idle"));
+        assert!(!text.contains("status:"));
         assert!(!text.contains("state list focused"));
         assert!(!text.contains("1 ghr  2 Sections  3 list  4 Details"));
         assert!(!text.contains("n/p comment"));
@@ -24459,6 +24560,7 @@ diff --git a/src/main.rs b/src/main.rs
         let compact = footer_line_for_width(&app, &paths, 80).to_string();
         assert!(display_width(&compact) <= 80);
         assert!(compact.contains("j/k move"));
+        assert!(compact.contains("[ ] page"));
         assert!(compact.contains("enter Details"));
         assert!(compact.contains("/ search"));
         assert!(!compact.contains("M/C/D/U/E/O/F/X actions"));
@@ -24467,7 +24569,8 @@ diff --git a/src/main.rs b/src/main.rs
         app.refreshing = true;
         let refreshing = footer_line(&app, &paths).to_string();
         assert!(refreshing.contains("j/k move"));
-        assert!(refreshing.contains("status: refreshing"));
+        assert!(!refreshing.contains("status: refreshing"));
+        assert_eq!(top_status_line(&app, 32).to_string(), "status: refreshing");
     }
 
     #[test]
@@ -24477,12 +24580,15 @@ diff --git a/src/main.rs b/src/main.rs
         let paths = test_paths();
         let text = footer_line(&app, &paths).to_string();
 
-        assert!(text.contains("status: confirm pull request merge"));
         assert!(!text.contains("Confirm PR action"));
         assert!(text.contains("m/s/r method"));
-        assert!(text.contains("tab next method"));
         assert!(text.contains("y/enter run"));
         assert!(text.contains("esc cancel"));
+        assert!(
+            top_status_line(&app, 40)
+                .to_string()
+                .contains("confirm pull request merge")
+        );
     }
 
     #[test]
@@ -24493,27 +24599,22 @@ diff --git a/src/main.rs b/src/main.rs
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
         assert!(ghr.contains("tab/h/l switch  j/enter Sections  esc List"));
-        assert!(ghr.contains("status: ghr focused"));
         assert!(!ghr.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
         assert!(sections.contains("tab/h/l switch  k ghr  j/enter List"));
-        assert!(sections.contains("status: Sections focused"));
         assert!(!sections.contains("a comment"));
 
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("j/k scroll"));
-        assert!(details.contains("status: details focused"));
         assert!(!details.contains("Details content"));
         assert!(details.contains("v diff  / search  c/a comment"));
-        assert!(details.contains("@ assign"));
         assert!(!details.contains("R reply"));
         assert!(!details.contains("e edit"));
         assert!(!details.contains("enter expand"));
-        assert!(details.contains("T edit item"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
 
@@ -24540,21 +24641,16 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.sections[0].items[0].assignees = vec!["alice".to_string()];
         let details_with_assignee = footer_line(&app, &paths).to_string();
-        assert!(details_with_assignee.contains("@/- assign"));
+        assert!(!details_with_assignee.contains("@/- assign"));
 
         app.show_diff();
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
         assert!(diff.contains("j/k line  n/p comment  h/l page"));
-        assert!(diff.contains("g/G top/bottom"));
         assert!(!diff.contains("Details diff"));
         assert!(diff.contains("c inline  a comment"));
-        assert!(diff.contains("[ ] file  m/e range"));
-        assert!(diff.contains("s/A/Ctrl+D review"));
-        assert!(diff.contains("M/C/D/U/E/O/F/X actions"));
-        assert!(diff.contains("t milestone"));
-        assert!(diff.contains("T edit item"));
-        assert!(diff.contains("@/- assign"));
+        assert!(!diff.contains("m/e range"));
+        assert!(!diff.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -24683,12 +24779,11 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn footer_status_label_uses_active_color() {
+    fn top_status_label_uses_active_color() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        let paths = test_paths();
 
         app.focus_details();
-        let line = footer_line(&app, &paths);
+        let line = top_status_line(&app, 40);
 
         let status = line
             .spans
@@ -31217,6 +31312,26 @@ diff --git a/src/main.rs b/src/main.rs
             Some(area)
         ));
         assert_eq!(app.current_selected_position(), 0);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char(']')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), visible_rows);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('[')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), 0);
     }
 
     #[test]
@@ -32261,6 +32376,48 @@ diff --git a/d.rs b/d.rs
         assert_eq!(
             app.current_section().map(|section| section.title.as_str()),
             Some("Test")
+        );
+    }
+
+    #[test]
+    fn ignore_key_hides_selected_issue_or_pull_request_and_persists() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('i')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.ignored_items.contains("1"));
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(
+            app.filtered_indices(app.current_section().unwrap()),
+            vec![1]
+        );
+        assert_eq!(app.ui_state().ignored_items, vec!["1"]);
+        assert!(app.status.contains("ignored pull request #1"));
+    }
+
+    #[test]
+    fn ignored_items_restore_from_ui_state() {
+        let state = UiState {
+            ignored_items: vec!["1".to_string()],
+            ..UiState::default()
+        };
+
+        let app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(
+            section_count_label(&app, app.current_section().unwrap()),
+            "1"
         );
     }
 

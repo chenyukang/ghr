@@ -433,9 +433,14 @@ struct PullRequestReviewCommentRaw {
 
 #[derive(Debug, Deserialize)]
 struct PullRequestTimelineEventRaw {
+    id: Option<u64>,
     event: String,
+    user: Option<SearchAuthorRaw>,
     actor: Option<SearchAuthorRaw>,
     created_at: Option<DateTime<Utc>>,
+    submitted_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    body: Option<String>,
     sha: Option<String>,
     message: Option<String>,
     html_url: Option<String>,
@@ -1604,9 +1609,13 @@ pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<St
     .with_context(|| format!("failed to fetch diff for {repository}#{number}"))
 }
 
-pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Result<()> {
+pub async fn post_issue_comment(
+    repository: &str,
+    number: u64,
+    body: &str,
+) -> Result<CommentPreview> {
     let path = format!("repos/{repository}/issues/{number}/comments");
-    run_gh_json(&[
+    let output = run_gh_json(&[
         "api".to_string(),
         "-X".to_string(),
         "POST".to_string(),
@@ -1615,7 +1624,9 @@ pub async fn post_issue_comment(repository: &str, number: u64, body: &str) -> Re
         format!("body={body}"),
     ])
     .await?;
-    Ok(())
+    let comment = serde_json::from_str::<IssueCommentRaw>(&output)
+        .with_context(|| format!("failed to parse posted comment for {repository}#{number}"))?;
+    Ok(issue_comment_preview(comment, None, true))
 }
 
 pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
@@ -1855,7 +1866,7 @@ pub async fn post_pull_request_review_comment(
     number: u64,
     target: PullRequestReviewCommentTarget<'_>,
     body: &str,
-) -> Result<()> {
+) -> Result<CommentPreview> {
     let pr_path = format!("repos/{repository}/pulls/{number}");
     let pr_output = run_gh_json(&["api".to_string(), pr_path]).await?;
     let pr = serde_json::from_str::<PullRequestHeadRaw>(&pr_output)
@@ -1886,10 +1897,19 @@ pub async fn post_pull_request_review_comment(
         args.push(format!("start_side={start_side}"));
     }
 
-    run_gh_json(&args)
+    let output = run_gh_json(&args)
         .await
         .with_context(|| format!("failed to post review comment for {repository}#{number}"))?;
-    Ok(())
+    let comment =
+        serde_json::from_str::<PullRequestReviewCommentRaw>(&output).with_context(|| {
+            format!("failed to parse posted review comment for {repository}#{number}")
+        })?;
+    Ok(pull_request_review_comment_preview(
+        comment,
+        None,
+        ReviewThreadState::default(),
+        true,
+    ))
 }
 
 pub async fn create_pending_pull_request_review(
@@ -2011,9 +2031,9 @@ pub async fn post_pull_request_review_reply(
     number: u64,
     comment_id: u64,
     body: &str,
-) -> Result<()> {
+) -> Result<CommentPreview> {
     let path = format!("repos/{repository}/pulls/{number}/comments/{comment_id}/replies");
-    run_gh_json(&[
+    let output = run_gh_json(&[
         "api".to_string(),
         "-X".to_string(),
         "POST".to_string(),
@@ -2023,7 +2043,16 @@ pub async fn post_pull_request_review_reply(
     ])
     .await
     .with_context(|| format!("failed to reply to review comment for {repository}#{number}"))?;
-    Ok(())
+    let comment =
+        serde_json::from_str::<PullRequestReviewCommentRaw>(&output).with_context(|| {
+            format!("failed to parse posted review reply for {repository}#{number}")
+        })?;
+    Ok(pull_request_review_comment_preview(
+        comment,
+        None,
+        ReviewThreadState::default(),
+        true,
+    ))
 }
 
 pub async fn add_issue_reaction(repository: &str, number: u64, content: &str) -> Result<()> {
@@ -2557,35 +2586,43 @@ fn parse_issue_comments_output(
     let mut comments = pages
         .into_iter()
         .flatten()
-        .map(|comment| {
-            let author = comment
-                .user
-                .as_ref()
-                .map(|user| user.login.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
-            CommentPreview {
-                id: comment.id,
-                kind: CommentPreviewKind::Comment,
-                author,
-                body: comment.body.unwrap_or_default(),
-                created_at: comment.created_at,
-                updated_at: comment.updated_at,
-                url: comment.html_url,
-                parent_id: None,
-                is_mine,
-                reactions: comment
-                    .reactions
-                    .map(ReactionSummary::from)
-                    .unwrap_or_default(),
-                review: None,
-            }
-        })
+        .map(|comment| issue_comment_preview(comment, viewer_login, false))
         .collect::<Vec<_>>();
 
     comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn issue_comment_preview(
+    comment: IssueCommentRaw,
+    viewer_login: Option<&str>,
+    mine_if_viewer_unknown: bool,
+) -> CommentPreview {
+    let author = comment
+        .user
+        .as_ref()
+        .map(|user| user.login.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let is_mine = viewer_login
+        .map(|viewer| author.eq_ignore_ascii_case(viewer))
+        .unwrap_or(mine_if_viewer_unknown);
+    CommentPreview {
+        id: comment.id,
+        kind: CommentPreviewKind::Comment,
+        author,
+        body: comment.body.unwrap_or_default(),
+        created_at: comment.created_at,
+        updated_at: comment.updated_at,
+        url: comment.html_url,
+        parent_id: None,
+        is_mine,
+        reactions: comment
+            .reactions
+            .map(ReactionSummary::from)
+            .unwrap_or_default(),
+        review: None,
+    }
 }
 
 fn parse_issue_details_output(output: &str, repository: &str, number: u64) -> Result<IssueDetails> {
@@ -2655,49 +2692,60 @@ fn parse_pull_request_review_comments_output(
         .into_iter()
         .flatten()
         .map(|comment| {
-            let author = comment
-                .user
-                .as_ref()
-                .map(|user| user.login.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
             let thread_state = comment
                 .id
                 .and_then(|id| thread_states.get(&id).copied())
                 .unwrap_or_default();
-            CommentPreview {
-                id: comment.id,
-                kind: CommentPreviewKind::Comment,
-                author,
-                body: comment.body.unwrap_or_default(),
-                created_at: comment.created_at,
-                updated_at: comment.updated_at,
-                url: comment.html_url,
-                parent_id: comment.in_reply_to_id,
-                is_mine,
-                reactions: comment
-                    .reactions
-                    .map(ReactionSummary::from)
-                    .unwrap_or_default(),
-                review: Some(ReviewCommentPreview {
-                    path: comment.path.unwrap_or_else(|| "-".to_string()),
-                    line: comment.line,
-                    original_line: comment.original_line,
-                    start_line: comment.start_line,
-                    original_start_line: comment.original_start_line,
-                    side: comment.side,
-                    start_side: comment.start_side,
-                    diff_hunk: comment.diff_hunk,
-                    is_resolved: thread_state.is_resolved,
-                    is_outdated: thread_state.is_outdated,
-                }),
-            }
+            pull_request_review_comment_preview(comment, viewer_login, thread_state, false)
         })
         .collect::<Vec<_>>();
 
     comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn pull_request_review_comment_preview(
+    comment: PullRequestReviewCommentRaw,
+    viewer_login: Option<&str>,
+    thread_state: ReviewThreadState,
+    mine_if_viewer_unknown: bool,
+) -> CommentPreview {
+    let author = comment
+        .user
+        .as_ref()
+        .map(|user| user.login.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let is_mine = viewer_login
+        .map(|viewer| author.eq_ignore_ascii_case(viewer))
+        .unwrap_or(mine_if_viewer_unknown);
+    CommentPreview {
+        id: comment.id,
+        kind: CommentPreviewKind::Comment,
+        author,
+        body: comment.body.unwrap_or_default(),
+        created_at: comment.created_at,
+        updated_at: comment.updated_at,
+        url: comment.html_url,
+        parent_id: comment.in_reply_to_id,
+        is_mine,
+        reactions: comment
+            .reactions
+            .map(ReactionSummary::from)
+            .unwrap_or_default(),
+        review: Some(ReviewCommentPreview {
+            path: comment.path.unwrap_or_else(|| "-".to_string()),
+            line: comment.line,
+            original_line: comment.original_line,
+            start_line: comment.start_line,
+            original_start_line: comment.original_start_line,
+            side: comment.side,
+            start_side: comment.start_side,
+            diff_hunk: comment.diff_hunk,
+            is_resolved: thread_state.is_resolved,
+            is_outdated: thread_state.is_outdated,
+        }),
+    }
 }
 
 fn parse_pull_request_timeline_commit_activities(
@@ -2707,14 +2755,15 @@ fn parse_pull_request_timeline_commit_activities(
 ) -> Result<Vec<CommentPreview>> {
     let pages = serde_json::from_str::<Vec<Vec<PullRequestTimelineEventRaw>>>(output)
         .with_context(|| format!("failed to parse timeline for {repository}#{number}"))?;
-    let mut activities = Vec::new();
+    let mut commit_activities = Vec::new();
+    let mut comments = Vec::new();
     let mut current: Option<PullRequestCommitActivityBuilder> = None;
 
     for event in pages.into_iter().flatten() {
         match event.event.as_str() {
             "head_ref_force_pushed" | "head_ref_pushed" => {
                 push_pull_request_commit_activity(
-                    &mut activities,
+                    &mut commit_activities,
                     current.take(),
                     repository,
                     number,
@@ -2747,9 +2796,20 @@ fn parse_pull_request_timeline_commit_activities(
                     activity.commits.push(commit);
                 }
             }
+            "reviewed" => {
+                push_pull_request_commit_activity(
+                    &mut commit_activities,
+                    current.take(),
+                    repository,
+                    number,
+                );
+                if let Some(comment) = pull_request_timeline_review_summary_comment(event) {
+                    comments.push(comment);
+                }
+            }
             _ => {
                 push_pull_request_commit_activity(
-                    &mut activities,
+                    &mut commit_activities,
                     current.take(),
                     repository,
                     number,
@@ -2757,19 +2817,52 @@ fn parse_pull_request_timeline_commit_activities(
             }
         }
     }
-    push_pull_request_commit_activity(&mut activities, current.take(), repository, number);
+    push_pull_request_commit_activity(&mut commit_activities, current.take(), repository, number);
 
-    let has_explicit_push = activities.iter().any(|activity| activity.0);
-    let mut comments = activities
+    let has_explicit_push = commit_activities.iter().any(|activity| activity.0);
+    let mut commit_comments = commit_activities
         .into_iter()
         .filter(|(explicit_push, _)| !has_explicit_push || *explicit_push)
         .map(|(_, comment)| comment)
         .collect::<Vec<_>>();
-    comments.sort_by_key(|comment| comment.created_at);
-    if comments.len() > MAX_PULL_REQUEST_COMMIT_ACTIVITIES {
-        comments = comments.split_off(comments.len() - MAX_PULL_REQUEST_COMMIT_ACTIVITIES);
+    commit_comments.sort_by_key(|comment| comment.created_at);
+    if commit_comments.len() > MAX_PULL_REQUEST_COMMIT_ACTIVITIES {
+        commit_comments =
+            commit_comments.split_off(commit_comments.len() - MAX_PULL_REQUEST_COMMIT_ACTIVITIES);
     }
+    comments.append(&mut commit_comments);
+    comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn pull_request_timeline_review_summary_comment(
+    event: PullRequestTimelineEventRaw,
+) -> Option<CommentPreview> {
+    let body = event.body?.trim().to_string();
+    if body.is_empty() {
+        return None;
+    }
+    let author = event
+        .user
+        .as_ref()
+        .or(event.actor.as_ref())
+        .map(|user| user.login.as_str())
+        .unwrap_or("github")
+        .to_string();
+    let timestamp = event.submitted_at.or(event.created_at);
+    Some(CommentPreview {
+        id: event.id,
+        kind: CommentPreviewKind::Activity,
+        author,
+        body,
+        created_at: timestamp,
+        updated_at: event.updated_at.or(timestamp),
+        url: event.html_url,
+        parent_id: None,
+        is_mine: false,
+        reactions: ReactionSummary::default(),
+        review: None,
+    })
 }
 
 fn push_pull_request_commit_activity(
@@ -4767,6 +4860,47 @@ mod tests {
             )
         );
         assert!(!activity.body.contains("old commit"));
+    }
+
+    #[test]
+    fn pull_request_timeline_includes_review_summary_comments() {
+        let output = r#"
+        [
+          [
+            {
+              "event": "reviewed",
+              "id": 4229433610,
+              "user": { "login": "chenyukang" },
+              "body": "according to the blame history, maybe r? @estebank need to confirm this change.",
+              "submitted_at": "2026-05-05T15:23:48Z",
+              "updated_at": "2026-05-05T15:23:53Z",
+              "html_url": "https://github.com/rust-lang/rust/pull/156194#pullrequestreview-4229433610"
+            }
+          ]
+        ]
+        "#;
+
+        let comments =
+            parse_pull_request_timeline_commit_activities(output, "rust-lang/rust", 156194)
+                .unwrap();
+
+        assert_eq!(comments.len(), 1);
+        let comment = &comments[0];
+        assert_eq!(comment.id, Some(4229433610));
+        assert_eq!(comment.kind, CommentPreviewKind::Activity);
+        assert_eq!(comment.author, "chenyukang");
+        assert!(comment.body.contains("according to the blame history"));
+        assert_eq!(
+            comment.url.as_deref(),
+            Some("https://github.com/rust-lang/rust/pull/156194#pullrequestreview-4229433610")
+        );
+        assert_eq!(
+            comment
+                .created_at
+                .as_ref()
+                .map(|timestamp| timestamp.to_rfc3339()),
+            Some("2026-05-05T15:23:48+00:00".to_string())
+        );
     }
 
     #[test]

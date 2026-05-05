@@ -270,25 +270,26 @@ impl Default for Config {
             repos: vec![],
             pr_sections: vec![
                 SearchSection {
-                    title: "My Pull Requests".to_string(),
-                    filters: "is:open author:@me archived:false sort:created-desc".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "Assigned to Me".to_string(),
-                    filters: "is:open assignee:@me archived:false sort:created-desc".to_string(),
-                    queries: Vec::new(),
-                    limit: None,
-                },
-                SearchSection {
-                    title: "All Requests".to_string(),
+                    title: "Needs Attention".to_string(),
                     filters: String::new(),
                     queries: vec![
-                        "author:@me archived:false sort:created-desc".to_string(),
-                        "involves:@me -author:@me archived:false sort:created-desc".to_string(),
-                        "reviewed-by:@me -author:@me archived:false sort:created-desc".to_string(),
+                        "is:open review-requested:@me archived:false sort:updated-desc".to_string(),
+                        "is:open assignee:@me archived:false sort:updated-desc".to_string(),
+                        "is:open mentions:@me archived:false sort:updated-desc".to_string(),
                     ],
+                    limit: None,
+                },
+                SearchSection {
+                    title: "My Pull Requests".to_string(),
+                    filters: "is:open author:@me archived:false sort:updated-desc".to_string(),
+                    queries: Vec::new(),
+                    limit: None,
+                },
+                SearchSection {
+                    title: "Reviewed".to_string(),
+                    filters: "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
+                        .to_string(),
+                    queries: Vec::new(),
                     limit: None,
                 },
             ],
@@ -694,25 +695,39 @@ mod tests {
 
         assert_eq!(
             titles,
-            vec!["My Pull Requests", "Assigned to Me", "All Requests"]
+            vec!["Needs Attention", "My Pull Requests", "Reviewed"]
         );
-        assert_eq!(config.pr_sections[2].queries.len(), 3);
+        assert_eq!(config.pr_sections[0].queries.len(), 3);
         assert!(
-            config.pr_sections[2]
+            config.pr_sections[0]
                 .queries
                 .iter()
-                .any(|query| query.contains("reviewed-by:@me"))
+                .all(|query| query.contains("is:open") && query.contains("sort:updated-desc"))
+        );
+        assert!(
+            config.pr_sections[0]
+                .queries
+                .iter()
+                .any(|query| query.contains("review-requested:@me"))
+        );
+        assert_eq!(
+            config.pr_sections[1].filters,
+            "is:open author:@me archived:false sort:updated-desc"
+        );
+        assert_eq!(
+            config.pr_sections[2].filters,
+            "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
         );
     }
 
     #[test]
     fn query_sections_use_queries_instead_of_filter() {
         let section = SearchSection {
-            title: "All Requests".to_string(),
+            title: "Needs Attention".to_string(),
             filters: String::new(),
             queries: vec![
-                "author:@me sort:created-desc".to_string(),
-                "reviewed-by:@me sort:created-desc".to_string(),
+                "review-requested:@me sort:updated-desc".to_string(),
+                "mentions:@me sort:updated-desc".to_string(),
             ],
             limit: None,
         };
@@ -720,13 +735,13 @@ mod tests {
         assert_eq!(
             section.search_filters(),
             vec![
-                "author:@me sort:created-desc".to_string(),
-                "reviewed-by:@me sort:created-desc".to_string()
+                "review-requested:@me sort:updated-desc".to_string(),
+                "mentions:@me sort:updated-desc".to_string()
             ]
         );
         assert_eq!(
             section.display_filters(),
-            "author:@me sort:created-desc | reviewed-by:@me sort:created-desc"
+            "review-requested:@me sort:updated-desc | mentions:@me sort:updated-desc"
         );
     }
 

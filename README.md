@@ -17,7 +17,7 @@
 
 - Inbox, pull request, and issue views.
 - Snapshot-first startup: cached data is shown immediately, then refreshed in the background.
-- Configurable sections and repo tabs, including multi-query sections such as `All Requests`.
+- Configurable sections and repo tabs, including multi-query sections such as `Needs Attention`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
@@ -196,9 +196,9 @@ Inbox:
 
 Pull Requests:
 
+- `Needs Attention`: open PRs where you were requested for review, assigned, or mentioned.
 - `My Pull Requests`: open PRs authored by you.
-- `Assigned to Me`: open PRs assigned to you.
-- `All Requests`: recent PRs authored by you, involving you, or reviewed by you, including closed PRs.
+- `Reviewed`: open PRs reviewed by you and authored by someone else.
 
 Issues:
 
@@ -237,16 +237,20 @@ refetch_interval_seconds = 60
 include_read_notifications = true
 
 [[pr_sections]]
-title = "My Pull Requests"
-filters = "is:open author:@me archived:false sort:created-desc"
+title = "Needs Attention"
+queries = [
+  "is:open review-requested:@me archived:false sort:updated-desc",
+  "is:open assignee:@me archived:false sort:updated-desc",
+  "is:open mentions:@me archived:false sort:updated-desc",
+]
 
 [[pr_sections]]
-title = "All Requests"
-queries = [
-  "author:@me archived:false sort:created-desc",
-  "involves:@me -author:@me archived:false sort:created-desc",
-  "reviewed-by:@me -author:@me archived:false sort:created-desc",
-]
+title = "My Pull Requests"
+filters = "is:open author:@me archived:false sort:updated-desc"
+
+[[pr_sections]]
+title = "Reviewed"
+filters = "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
 
 exclude_repos = ["some-org/archive-*"]
 ```

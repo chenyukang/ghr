@@ -138,7 +138,7 @@ enum AppMsg {
     },
     CommentPosted {
         item_id: String,
-        result: std::result::Result<CommentFetchResult, String>,
+        result: std::result::Result<CommentPreview, String>,
     },
     CommentUpdated {
         item_id: String,
@@ -147,7 +147,7 @@ enum AppMsg {
     },
     ReviewCommentPosted {
         item_id: String,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<CommentPreview, String>,
     },
     ReactionPosted {
         item_id: String,
@@ -2009,19 +2009,24 @@ fn retryable_operation_error_body(error: &str) -> String {
 
 fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
+        let item_id = item.id.clone();
         let result = match item.number {
-            Some(number) => match post_issue_comment(&item.repo, number, &body).await {
-                Ok(()) => fetch_comments(&item.repo, number, item.kind)
-                    .await
-                    .map_err(error_chain_message),
-                Err(error) => Err(error_chain_message(error)),
-            },
+            Some(number) => post_issue_comment(&item.repo, number, &body)
+                .await
+                .map_err(error_chain_message),
             None => Err("selected item has no issue or pull request number".to_string()),
         };
+        let posted = result.is_ok();
         let _ = tx.send(AppMsg::CommentPosted {
-            item_id: item.id,
+            item_id: item_id.clone(),
             result,
         });
+        if posted && let Some(number) = item.number {
+            let comments = fetch_comments(&item.repo, number, item.kind)
+                .await
+                .map_err(error_chain_message);
+            let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
+        }
     });
 }
 
@@ -2032,21 +2037,24 @@ fn start_review_reply_submit(
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
+        let item_id = item.id.clone();
         let result = match item.number {
-            Some(number) => {
-                match post_pull_request_review_reply(&item.repo, number, comment_id, &body).await {
-                    Ok(()) => fetch_comments(&item.repo, number, item.kind)
-                        .await
-                        .map_err(error_chain_message),
-                    Err(error) => Err(error_chain_message(error)),
-                }
-            }
+            Some(number) => post_pull_request_review_reply(&item.repo, number, comment_id, &body)
+                .await
+                .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
+        let posted = result.is_ok();
         let _ = tx.send(AppMsg::CommentPosted {
-            item_id: item.id,
+            item_id: item_id.clone(),
             result,
         });
+        if posted && let Some(number) = item.number {
+            let comments = fetch_comments(&item.repo, number, item.kind)
+                .await
+                .map_err(error_chain_message);
+            let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
+        }
     });
 }
 
@@ -2131,7 +2139,17 @@ fn start_review_comment_submit(
             .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
-        let _ = tx.send(AppMsg::ReviewCommentPosted { item_id, result });
+        let posted = result.is_ok();
+        let _ = tx.send(AppMsg::ReviewCommentPosted {
+            item_id: item_id.clone(),
+            result,
+        });
+        if posted && let Some(number) = item.number {
+            let comments = fetch_comments(&item.repo, number, item.kind)
+                .await
+                .map_err(error_chain_message);
+            let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
+        }
     });
 }
 
@@ -9389,7 +9407,6 @@ impl AppState {
             return;
         }
 
-        self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
 
@@ -9397,9 +9414,6 @@ impl AppState {
         if restored_item {
             self.details_scroll = previous_details_scroll;
             self.selected_comment_index = previous_comment_index;
-            if let Some(item_id) = anchor.item_id {
-                self.details_stale.insert(item_id);
-            }
             self.clamp_selected_comment();
         } else {
             self.details_scroll = 0;
@@ -9479,6 +9493,7 @@ impl AppState {
                     self.selected_comment_index = 0;
                 }
                 self.refreshing = false;
+                self.last_refresh_request = Instant::now();
                 if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
                     self.startup_dialog = if setup_dialog.is_some() {
                         None
@@ -9506,11 +9521,18 @@ impl AppState {
                     self.mark_current_details_viewed_if_current(&item_id);
                 }
                 Err(error) => {
+                    self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
+                    if matches!(self.details.get(&item_id), Some(DetailState::Loaded(_))) {
+                        self.status = format!(
+                            "comments refresh failed; keeping cached comments: {}",
+                            compact_error_label(&error)
+                        );
+                        return;
+                    }
                     if self.setup_dialog.is_none() {
                         self.setup_dialog = setup_dialog_from_error(&error);
                     }
-                    self.details_stale.remove(&item_id);
-                    self.details_refreshing.remove(&item_id);
                     self.details
                         .insert(item_id.clone(), DetailState::Error(error));
                 }
@@ -9577,13 +9599,11 @@ impl AppState {
                 }
             },
             AppMsg::CommentPosted { item_id, result } => match result {
-                Ok(result) => {
-                    self.selected_comment_index = result.comments.len().saturating_sub(1);
+                Ok(comment) => {
+                    let index = self.append_local_comment(&item_id, comment);
+                    self.selected_comment_index = index;
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.apply_comment_fetch_result_metadata(&item_id, &result);
-                    self.details
-                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
@@ -9591,7 +9611,7 @@ impl AppState {
                     self.status = "comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
                         "Comment Posted",
-                        "GitHub accepted the comment and comments were refreshed.",
+                        "GitHub accepted the comment; comments will refresh in the background.",
                     ));
                 }
                 Err(error) => {
@@ -9656,14 +9676,19 @@ impl AppState {
                 }
             },
             AppMsg::ReviewCommentPosted { item_id, result } => match result {
-                Ok(()) => {
-                    self.details_stale.insert(item_id);
+                Ok(comment) => {
+                    let index = self.append_local_comment(&item_id, comment);
+                    self.selected_comment_index = index;
+                    self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
+                    self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
                     self.pending_comment_submit = None;
                     self.status = "review comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
                         "Review Comment Posted",
-                        "GitHub accepted the review comment.",
+                        "GitHub accepted the review comment; comments will refresh in the background.",
                     ));
                 }
                 Err(error) => {
@@ -11857,6 +11882,38 @@ impl AppState {
         }
         self.update_item_reactions(item_id, result.item_reactions.clone());
         self.mark_item_milestone(item_id, result.item_milestone.as_ref());
+    }
+
+    fn append_local_comment(&mut self, item_id: &str, comment: CommentPreview) -> usize {
+        let comments = match self.details.entry(item_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !matches!(entry.get(), DetailState::Loaded(_)) {
+                    entry.insert(DetailState::Loaded(Vec::new()));
+                }
+                match entry.into_mut() {
+                    DetailState::Loaded(comments) => comments,
+                    _ => unreachable!("detail state was normalized to Loaded"),
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                match entry.insert(DetailState::Loaded(Vec::new())) {
+                    DetailState::Loaded(comments) => comments,
+                    _ => unreachable!("inserted detail state is Loaded"),
+                }
+            }
+        };
+
+        if let Some(comment_id) = comment.id
+            && let Some(index) = comments
+                .iter()
+                .position(|existing| existing.id == Some(comment_id))
+        {
+            comments[index] = comment;
+            return index;
+        }
+
+        comments.push(comment);
+        comments.len().saturating_sub(1)
     }
 
     fn replace_section_page(&mut self, section_key: &str, refreshed: SectionSnapshot) {
@@ -16889,12 +16946,12 @@ deleted file mode 100644
         );
 
         let document = build_details_document(&app, 96);
-        let rendered = document
+        let rendered_lines = document
             .lines
             .iter()
             .map(Line::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let rendered = rendered_lines.join("\n");
 
         assert!(rendered.contains("Conversation | Diff"));
         assert!(rendered.contains("▾ src/lib.rs"));
@@ -16903,9 +16960,21 @@ deleted file mode 100644
         assert!(rendered.contains("        1 │ + new"));
         assert!(!rendered.contains("selected:"));
         assert!(!rendered.contains("selected range:"));
-        assert_eq!(document.diff_files, vec![8]);
-        assert_eq!(document.diff_line_at(10), Some(0));
-        assert_eq!(document.diff_line_at(11), Some(1));
+        let file_line = rendered_lines
+            .iter()
+            .position(|line| line.contains("▾ src/lib.rs"))
+            .expect("diff file line");
+        let removed_line = rendered_lines
+            .iter()
+            .position(|line| line.contains("   1      │ - old"))
+            .expect("removed diff line");
+        let added_line = rendered_lines
+            .iter()
+            .position(|line| line.contains("        1 │ + new"))
+            .expect("added diff line");
+        assert_eq!(document.diff_files, vec![file_line]);
+        assert_eq!(document.diff_line_at(removed_line), Some(0));
+        assert_eq!(document.diff_line_at(added_line), Some(1));
     }
 
     #[test]
@@ -18584,6 +18653,21 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn refresh_finished_resets_background_refresh_interval() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.refreshing = true;
+        app.last_refresh_request = Instant::now() - Duration::from_secs(120);
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![test_section()],
+            save_error: None,
+        });
+
+        assert!(!app.refreshing);
+        assert!(app.last_refresh_request.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn startup_refresh_finishes_with_ready_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let paths = test_paths();
@@ -18718,6 +18802,43 @@ diff --git a/src/github.rs b/src/github.rs
             Some("Compiler diagnostics")
         );
         assert_eq!(app.status, "loaded Test; still refreshing");
+    }
+
+    #[test]
+    fn progressive_refresh_does_not_force_current_details_reload() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.refreshing = true;
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 0;
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "cached", None)]),
+        );
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                failed_check_runs: Vec::new(),
+                note: None,
+                head: None,
+            }),
+        );
+
+        app.handle_msg(AppMsg::RefreshSectionLoaded {
+            section: test_section(),
+            save_error: None,
+        });
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert_eq!(app.details_scroll, 9);
+        assert!(!app.details_stale.contains("1"));
+        assert!(!app.action_hints_stale.contains("1"));
+        let item = app.current_item().expect("current item").clone();
+        assert!(!app.start_comments_load_if_needed(&item));
+        assert!(matches!(app.details.get("1"), Some(DetailState::Loaded(_))));
     }
 
     #[test]
@@ -19539,6 +19660,44 @@ diff --git a/src/main.rs b/src/main.rs
             "stale refresh should keep old comments visible while the async reload runs"
         );
         assert!(!app.details_stale.contains("1"));
+    }
+
+    #[test]
+    fn stale_details_refresh_failure_preserves_loaded_comments() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "old cached comment", None)]),
+        );
+        app.details_stale.insert("1".to_string());
+        let item = app.current_item().cloned().expect("selected item");
+
+        assert!(app.start_comments_load_if_needed(&item));
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Err("gh failed: rate limit".to_string()),
+        });
+
+        assert!(
+            matches!(
+                app.details.get("1"),
+                Some(DetailState::Loaded(comments)) if comments[0].body == "old cached comment"
+            ),
+            "background refresh failure should keep old comments visible"
+        );
+        assert!(!app.details_stale.contains("1"));
+        assert!(!app.details_refreshing.contains("1"));
+        assert!(app.setup_dialog.is_none());
+        assert!(app.status.contains("keeping cached comments"));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("old cached comment"));
+        assert!(!rendered.contains("Failed to load comments"));
     }
 
     #[test]
@@ -21943,6 +22102,98 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn details_title_and_metadata_spacing_are_ordered() {
+        let mut item = work_item(
+            "1",
+            "chenyukang/ghr",
+            1,
+            "Aligned metadata title",
+            Some("chenyukang"),
+        );
+        item.assignees = vec!["alice".to_string()];
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Approvable".to_string()],
+                checks: None,
+                commits: Some(4),
+                failed_check_runs: Vec::new(),
+                note: Some("Merge blocked: checks pending".to_string()),
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "feature/checks".to_string(),
+                }),
+            }),
+        );
+
+        let lines = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let title_line = lines
+            .iter()
+            .position(|line| line == "Aligned metadata title")
+            .expect("title line");
+        assert_eq!(lines.get(title_line + 1), Some(&String::new()));
+
+        let line_for = |key: &str| {
+            let needle = format!("{key}:");
+            lines
+                .iter()
+                .find(|line| line.contains(&needle))
+                .unwrap_or_else(|| panic!("missing metadata key {key}: {lines:?}"))
+        };
+        let key_colon = |line: &str, key: &str| {
+            let needle = format!("{key}:");
+            line.find(&needle).expect("metadata key") + key.len()
+        };
+
+        let repo_line = line_for("repo");
+        let state_line = line_for("state");
+        assert!(repo_line.starts_with("  "));
+        assert_ne!(
+            repo_line, state_line,
+            "state metadata should start on a separate line from repo/number"
+        );
+        let colon_column = key_colon(repo_line, "repo");
+        for key in [
+            "state",
+            "author",
+            "branch",
+            "action",
+            "action note",
+            "url",
+            "assignees",
+            "labels",
+        ] {
+            let line = line_for(key);
+            assert!(
+                line.starts_with("  "),
+                "metadata line should keep left padding: {line:?}"
+            );
+            assert_eq!(
+                key_colon(line, key),
+                colon_column,
+                "metadata key {key} should align with repo key"
+            );
+        }
+    }
+
+    #[test]
     fn pr_details_meta_shows_milestone_title() {
         let mut item = work_item("1", "chenyukang/ghr", 1, "More on tui", Some("chenyukang"));
         item.milestone = Some(Milestone {
@@ -22443,6 +22694,34 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn details_markdown_preserves_soft_line_breaks() {
+        let mut builder = DetailsBuilder::new(120);
+        builder.push_markdown_block(
+            "closes: https://github.com/rust-lang/rust/issues/143131\ncloses: https://github.com/rust-lang/rust/issues/155446\n\nWe don't need bounds.",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+        );
+        let rendered = builder
+            .finish()
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered[0],
+            "closes: https://github.com/rust-lang/rust/issues/143131"
+        );
+        assert_eq!(
+            rendered[1],
+            "closes: https://github.com/rust-lang/rust/issues/155446"
+        );
+        assert!(rendered[2].is_empty());
+        assert_eq!(rendered[3], "We don't need bounds.");
+    }
+
+    #[test]
     fn markdown_tables_render_as_separated_rows() {
         let mut builder = DetailsBuilder::new(100);
         builder.push_markdown_block(
@@ -22935,9 +23214,15 @@ diff --git a/src/main.rs b/src/main.rs
                 .any(|line| line.starts_with("  See https://example.com/one")),
             "comment body should be left padded: {rendered_lines:?}"
         );
+        let comment_line_indices = document
+            .comments
+            .iter()
+            .flat_map(|comment| comment.start_line..comment.end_line)
+            .collect::<Vec<_>>();
         assert!(
-            rendered_lines
+            comment_line_indices
                 .iter()
+                .filter_map(|index| rendered_lines.get(*index))
                 .filter(|line| !line.is_empty())
                 .all(|line| display_width(line) <= 96),
             "comment lines should reserve right padding: {rendered_lines:?}"
@@ -27568,12 +27853,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
-            result: Ok(CommentFetchResult {
-                item_metadata: None,
-                item_reactions: ReactionSummary::default(),
-                item_milestone: None,
-                comments: vec![comment("alice", "posted", None)],
-            }),
+            result: Ok(comment("alice", "posted", None)),
         });
 
         assert!(!app.posting_comment);
@@ -27584,7 +27864,7 @@ diff --git a/src/main.rs b/src/main.rs
                 .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
             Some((
                 "Comment Posted",
-                "GitHub accepted the comment and comments were refreshed."
+                "GitHub accepted the comment; comments will refresh in the background."
             ))
         );
         assert!(
@@ -27706,11 +27986,15 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.handle_msg(AppMsg::ReviewCommentPosted {
             item_id: "1".to_string(),
-            result: Ok(()),
+            result: Ok(comment("alice", "review comment", None)),
         });
 
         assert!(!app.posting_comment);
-        assert!(app.details_stale.contains("1"));
+        assert!(!app.details_stale.contains("1"));
+        assert!(matches!(
+            app.details.get("1"),
+            Some(DetailState::Loaded(comments)) if comments[0].body == "review comment"
+        ));
         assert_eq!(app.status, "review comment posted");
         assert_eq!(
             app.message_dialog
@@ -27718,7 +28002,7 @@ diff --git a/src/main.rs b/src/main.rs
                 .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
             Some((
                 "Review Comment Posted",
-                "GitHub accepted the review comment."
+                "GitHub accepted the review comment; comments will refresh in the background."
             ))
         );
         assert!(
@@ -27743,6 +28027,54 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
         assert!(dialog.body.contains("validation failed"));
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn posted_review_comment_is_rendered_locally_in_diff_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details_mode = DetailsMode::Diff;
+        let diff = parse_pull_request_diff(
+            r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+ fn main() {
++    println!("new");
+ }
+"#,
+        )
+        .expect("diff");
+        app.diffs.insert("1".to_string(), DiffState::Loaded(diff));
+        let mut posted = comment("alice", "please tighten this", None);
+        posted.id = Some(99);
+        posted.is_mine = true;
+        posted.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(2),
+            original_line: Some(2),
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+
+        app.handle_msg(AppMsg::ReviewCommentPosted {
+            item_id: "1".to_string(),
+            result: Ok(posted),
+        });
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("please tighten this"));
+        assert!(!rendered.contains("loading comments"));
+        assert!(!app.details_stale.contains("1"));
     }
 
     #[test]
@@ -27941,8 +28273,9 @@ diff --git a/src/main.rs b/src/main.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("line 1 line 2 line 3"));
-        assert!(rendered.contains("line 10 line 11 line 12"));
+        for index in 1..=12 {
+            assert!(rendered.contains(&format!("line {index}")));
+        }
         assert!(!rendered.contains("\n...\n"));
     }
 

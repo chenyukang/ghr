@@ -2,6 +2,9 @@ use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag
 
 use super::*;
 
+const DETAILS_METADATA_PADDING: usize = 2;
+const DETAILS_METADATA_KEY_WIDTH: usize = 11;
+
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
     pub(super) lines: Vec<Line<'static>>,
@@ -464,18 +467,25 @@ impl DetailsBuilder {
     }
 
     fn push_styled_key_value(&mut self, key: &str, value: Vec<DetailSegment>) {
-        let mut segments = vec![DetailSegment::styled(
-            format!("{key}: "),
-            Style::default().fg(Color::Gray),
-        )];
+        self.push_styled_key_value_limited(key, value, 1);
+    }
+
+    fn push_styled_key_value_limited(
+        &mut self,
+        key: &str,
+        value: Vec<DetailSegment>,
+        max_lines: usize,
+    ) {
+        let mut segments = vec![metadata_key_segment(key)];
         segments.extend(value);
-        self.push_wrapped_limited(segments, 1);
+        self.push_metadata_wrapped_limited(key, segments, max_lines);
     }
 
     fn push_link_value(&mut self, key: &str, url: &str) {
-        self.push_wrapped_limited(
+        self.push_metadata_wrapped_limited(
+            key,
             vec![
-                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
+                metadata_key_segment(key),
                 DetailSegment::link(url.to_string(), url.to_string()),
             ],
             3,
@@ -483,18 +493,33 @@ impl DetailsBuilder {
     }
 
     fn push_meta_line(&mut self, fields: Vec<(&str, Vec<DetailSegment>)>) {
+        let first_key = fields.first().map(|(key, _)| *key).unwrap_or("");
         let mut segments = Vec::new();
         for (index, (key, mut value)) in fields.into_iter().enumerate() {
             if index > 0 {
                 segments.push(DetailSegment::raw("  "));
+                if let Some(padding) = metadata_inline_key_padding(key) {
+                    segments.push(padding);
+                }
             }
-            segments.push(DetailSegment::styled(
-                format!("{key}: "),
-                Style::default().fg(Color::Gray),
-            ));
+            segments.push(metadata_key_segment(key));
             segments.append(&mut value);
         }
-        self.push_wrapped_limited(segments, 2);
+        self.push_metadata_wrapped_limited(first_key, segments, 2);
+    }
+
+    fn push_metadata_wrapped_limited(
+        &mut self,
+        first_key: &str,
+        segments: Vec<DetailSegment>,
+        max_lines: usize,
+    ) {
+        self.push_prefixed_wrapped_limited(
+            segments,
+            metadata_padding_prefix(first_key),
+            DETAILS_METADATA_PADDING,
+            max_lines,
+        );
     }
 
     pub(super) fn push_markdown_block(
@@ -1009,6 +1034,23 @@ pub(super) fn padding_prefix(width: usize) -> Vec<DetailSegment> {
     }
 }
 
+fn metadata_padding_prefix(key: &str) -> Vec<DetailSegment> {
+    padding_prefix(DETAILS_METADATA_PADDING + metadata_key_alignment_padding(key))
+}
+
+fn metadata_key_segment(key: &str) -> DetailSegment {
+    DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray))
+}
+
+fn metadata_inline_key_padding(key: &str) -> Option<DetailSegment> {
+    let padding = metadata_key_alignment_padding(key);
+    (padding > 0).then(|| DetailSegment::raw(" ".repeat(padding)))
+}
+
+fn metadata_key_alignment_padding(key: &str) -> usize {
+    DETAILS_METADATA_KEY_WIDTH.saturating_sub(display_width(key))
+}
+
 pub(super) fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
     if app.details_mode == DetailsMode::Diff {
         return build_diff_document(app, width);
@@ -1037,11 +1079,12 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         )],
         3,
     );
+    builder.push_blank();
     if notification_has_new_since_last_read(item) {
         builder.push_wrapped_limited(notification_new_since_last_read_segments(item), 2);
     }
 
-    let mut primary_meta = vec![
+    let identity_meta = vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
         (
             "number",
@@ -1051,24 +1094,26 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                     .unwrap_or_else(|| "-".to_string()),
             )],
         ),
-        (
-            "state",
-            vec![DetailSegment::raw(
-                item.state.clone().unwrap_or_else(|| "-".to_string()),
-            )],
-        ),
     ];
+    builder.push_meta_line(identity_meta);
+
+    let mut state_meta = vec![(
+        "state",
+        vec![DetailSegment::raw(
+            item.state.clone().unwrap_or_else(|| "-".to_string()),
+        )],
+    )];
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
-        primary_meta.push((
+        state_meta.push((
             "created",
             vec![DetailSegment::raw(local_datetime(item.created_at))],
         ));
     }
-    primary_meta.push((
+    state_meta.push((
         "updated",
         vec![DetailSegment::raw(relative_time(item.updated_at))],
     ));
-    builder.push_meta_line(primary_meta);
+    builder.push_meta_line(state_meta);
 
     let mut secondary_meta = Vec::new();
     let mut branch_meta = None;
@@ -1210,10 +1255,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 }
 
 pub(super) fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
-    let mut segments = vec![DetailSegment::styled(
-        "labels: ",
-        Style::default().fg(Color::Gray),
-    )];
+    let mut segments = Vec::new();
     if !labels.is_empty() {
         for (index, label) in labels.iter().enumerate() {
             if index > 0 {
@@ -1233,7 +1275,7 @@ pub(super) fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String
         "  "
     }));
     segments.push(DetailSegment::action("+", DetailAction::AddLabel));
-    builder.push_wrapped_limited(segments, 3);
+    builder.push_styled_key_value_limited("labels", segments, 3);
 }
 
 pub(super) fn push_description_block(
@@ -1317,6 +1359,7 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
         )],
         3,
     );
+    builder.push_blank();
     builder.push_meta_line(vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
         (
@@ -3499,13 +3542,13 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 text.to_string(),
                 Style::default().fg(Color::LightGreen),
             )),
-            MarkdownEvent::SoftBreak => current.push(DetailSegment::raw(" ")),
-            MarkdownEvent::HardBreak => flush_markdown_block(
-                &mut blocks,
-                &mut current,
-                quote_depth,
-                MarkdownBlockKind::Text,
-            ),
+            MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
+                if in_code_block {
+                    code_block.push('\n');
+                } else {
+                    current.push(DetailSegment::raw("\n"));
+                }
+            }
             MarkdownEvent::Rule => push_markdown_block(
                 &mut blocks,
                 quote_depth,

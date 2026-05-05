@@ -146,7 +146,7 @@ Diff review ranges:
 
 - Press `m` on a diff line to begin a range, move the highlight, then press `e` to end it.
 - Press `c` after ending a range to post an inline review comment for the selected range.
-- A single mouse click begins or moves a range; a double click ends it.
+- With the mouse, single click selects one diff line. Double click begins a range, then single click the end line to complete it.
 - Press `s` to open the review summary editor, use `Tab` or `1` / `2` / `3` to choose comment, request changes, or approve, then press `Ctrl+Enter` to submit.
 - Press `Ctrl+P` in the review summary editor to create a pending review draft, then press `s` later to submit it or `D` to discard it.
 

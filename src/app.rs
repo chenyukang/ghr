@@ -9488,8 +9488,11 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("[ / ]", "jump previous / next diff file"),
         help_key_line("m in diff", "begin a review range"),
         help_key_line("e in diff", "end the review range"),
-        help_key_line("single click in diff", "begin or move a review range"),
-        help_key_line("double click in diff", "end the review range"),
+        help_key_line(
+            "single click in diff",
+            "select line, or end a pending range",
+        ),
+        help_key_line("double click in diff", "begin a review range"),
         help_key_line("c in diff", "add review comment on selected diff line"),
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
@@ -17345,11 +17348,10 @@ impl AppState {
             .is_some_and(|mark| mark.is_pending());
         self.select_diff_line(index, area);
 
-        if is_double_click {
+        if had_pending_mark {
             self.end_diff_mark();
-        } else if had_pending_mark {
-            self.update_diff_mark_status(&item_id);
-        } else {
+            self.last_diff_click = None;
+        } else if is_double_click {
             self.begin_diff_mark();
         }
     }
@@ -17457,11 +17459,13 @@ impl AppState {
                 if mark.complete {
                     self.status = format!("selected {}", target.location_label());
                 } else if target.is_range() {
-                    self.status =
-                        format!("marking {}; press e to end mark", target.location_label());
+                    self.status = format!(
+                        "marking {}; click end line or press e",
+                        target.location_label()
+                    );
                 } else {
                     self.status = format!(
-                        "mark started at {}; move highlight, then press e",
+                        "mark started at {}; click end line or press e",
                         target.location_label()
                     );
                 }
@@ -21819,6 +21823,10 @@ deleted file mode 100644
         );
 
         assert_eq!(app.selected_diff_line.get("1"), Some(&2));
+        assert!(
+            !app.diff_mark.contains_key("1"),
+            "a plain mouse click should select one line without starting a mark"
+        );
     }
 
     #[test]
@@ -22182,7 +22190,7 @@ deleted file mode 100644
     }
 
     #[test]
-    fn single_click_begins_and_double_click_ends_diff_range() {
+    fn double_click_begins_and_single_click_ends_diff_range() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.show_diff();
         app.diffs.insert(
@@ -22216,7 +22224,7 @@ deleted file mode 100644
                 .line as u16
         };
 
-        for review_index in [0, 2] {
+        for review_index in [0, 0] {
             handle_left_click(
                 &mut app,
                 MouseEvent {
@@ -22238,7 +22246,11 @@ deleted file mode 100644
 
         let target = app.current_diff_review_target().expect("current line");
         assert_eq!(target.start_line, None);
-        assert_eq!(target.line, 3);
+        assert_eq!(target.line, 1);
+        assert!(
+            app.diff_mark.get("1").is_some_and(|mark| mark.is_pending()),
+            "double-clicking should begin a pending review range"
+        );
 
         handle_left_click(
             &mut app,

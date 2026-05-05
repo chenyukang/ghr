@@ -102,9 +102,9 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
 | `[` / `]` in List | Load previous/next GitHub result page |
 | `PgDown` / `PgUp` or `d` / `u` | Page current list/details movement |
-| `n` / `p` in Details | Focus next/previous comment in conversation or diff details |
-| `h` / `l` in diff Details | Page down/up through the file diff |
-| `g` / `G` | Jump to top/bottom in list, details, or diff |
+| `n` / `p` in Details | Focus next/previous comment in conversation or diff details; `p` from the first conversation comment returns to PR/issue details |
+| `h` / `l` in diff Details | Page down/up through the file diff; at file edges, jump to the next/previous file |
+| `g` / `G` | Jump to top/bottom in list, details, or diff; in conversation details, top clears comment focus and bottom focuses the last comment |
 | `[` / `]` in diff mode | Switch diff files |
 | `/` | Fuzzy filter the current list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
@@ -157,7 +157,7 @@ Diff review ranges:
 Local PR checkout:
 
 - Press `X` on a pull request in the list or Details pane, then confirm with `y` or `Enter`.
-- Pull request Details show the remote branch when GitHub provides it.
+- Pull request Details show the remote branch as a clickable link when GitHub provides it.
 - Checkout runs from the matching local repository directory. Set `local_dir` on a repo entry to make the target explicit:
 
 ```toml
@@ -247,7 +247,7 @@ exclude_repos = ["some-org/archive-*"]
 
 Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:updated-desc"` or `label:"good first issue"` for labels with spaces.
 
-Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_prs` and `show_issues` control whether the sections are shown as `Pull Requests` and `Issues`. Repo tabs default to open PRs and open issues. Set `labels` to filter both repo PR and issue lists, or use `pr_labels` / `issue_labels` for kind-specific filters.
+Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_issues` and `show_prs` control whether the sections are shown as `Issues` and `Pull Requests`. Repo tabs default to open issues and open PRs, with `Issues` shown first. Set `labels` to filter both repo issue and PR lists, or use `issue_labels` / `pr_labels` for kind-specific filters.
 
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 

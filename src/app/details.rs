@@ -4,6 +4,7 @@ use super::*;
 
 const DETAILS_METADATA_PADDING: usize = 2;
 const DETAILS_METADATA_KEY_WIDTH: usize = 11;
+const DESCRIPTION_BODY_PADDING: usize = 2;
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
@@ -520,53 +521,6 @@ impl DetailsBuilder {
             DETAILS_METADATA_PADDING,
             max_lines,
         );
-    }
-
-    pub(super) fn push_markdown_block(
-        &mut self,
-        text: &str,
-        empty_message: &str,
-        max_lines: usize,
-        max_chars: usize,
-    ) {
-        let text = truncate_text(&normalize_text(text), max_chars);
-        if text.trim().is_empty() {
-            self.push_plain(empty_message.to_string());
-            return;
-        }
-
-        let blocks = markdown_blocks(&text);
-        let mut emitted = 0;
-        for block in blocks {
-            let prefix = quote_prefix(block.quote_depth);
-            if block.gap_before
-                && !self.push_markdown_gap(prefix.as_slice(), &mut emitted, max_lines)
-            {
-                return;
-            }
-            match block.kind {
-                MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
-                    if !self.push_wrapped_prefixed(
-                        &block.segments,
-                        prefix.as_slice(),
-                        &mut emitted,
-                        max_lines,
-                    ) {
-                        return;
-                    }
-                }
-                MarkdownBlockKind::Code { .. } | MarkdownBlockKind::TableRow => {
-                    if !self.push_preformatted_prefixed(
-                        &block.segments,
-                        prefix.as_slice(),
-                        &mut emitted,
-                        max_lines,
-                    ) {
-                        return;
-                    }
-                }
-            }
-        }
     }
 
     #[cfg(test)]
@@ -1288,11 +1242,15 @@ pub(super) fn push_description_block(
     if !selected {
         builder.push_heading("Description");
         builder.push_blank();
-        builder.push_markdown_block(
+        builder.push_markdown_block_prefixed(
             item.body.as_deref().unwrap_or(""),
             "No description.",
             22,
             2_400,
+            MarkdownRenderOptions {
+                prefix: padding_prefix(DESCRIPTION_BODY_PADDING),
+                right_padding: DESCRIPTION_BODY_PADDING,
+            },
         );
         builder.document.description = Some(DescriptionRegion {
             start_line,
@@ -2338,7 +2296,12 @@ pub(super) fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &Reac
         "  "
     }));
     segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
-    builder.push_wrapped_limited(segments, 2);
+    builder.push_prefixed_wrapped_limited(
+        segments,
+        padding_prefix(DESCRIPTION_BODY_PADDING),
+        DESCRIPTION_BODY_PADDING,
+        2,
+    );
 }
 
 pub(super) fn notification_has_new_since_last_read(item: &WorkItem) -> bool {

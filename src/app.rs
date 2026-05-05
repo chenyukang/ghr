@@ -35,10 +35,10 @@ use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, github_repo
 use crate::dirs::Paths;
 use crate::github::{
     AssigneeAction, CommentFetchResult, ItemDetailsMetadata, ItemMetadataUpdate, MergeMethod,
-    PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
-    add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
-    approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
-    convert_pull_request_to_draft, create_issue, create_milestone,
+    PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
+    add_issue_comment_reaction, add_issue_label, add_issue_reaction,
+    add_pull_request_review_comment_reaction, approve_pull_request, change_issue_milestone,
+    close_issue, close_pull_request, convert_pull_request_to_draft, create_issue, create_milestone,
     create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
@@ -47,12 +47,12 @@ use crate::github::{
     mark_notification_thread_done, mark_notification_thread_read,
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
-    refresh_dashboard, refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
-    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
-    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
-    submit_pending_pull_request_review, submit_pull_request_review, subscribe_notification_thread,
-    unsubscribe_notification_thread, update_issue_assignees, update_pull_request_branch,
-    with_background_github_priority,
+    refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
+    refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
+    reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
+    search_global, submit_pending_pull_request_review, submit_pull_request_review,
+    subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
+    update_pull_request_branch, with_background_github_priority,
 };
 #[cfg(test)]
 use crate::model::CommentPreviewKind;
@@ -115,7 +115,9 @@ use text::{display_width, display_width_char, normalize_text, truncate_inline, t
 const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
 
 enum AppMsg {
-    RefreshStarted,
+    RefreshStarted {
+        scope: RefreshScope,
+    },
     RefreshFinished {
         sections: Vec<SectionSnapshot>,
         save_error: Option<String>,
@@ -123,6 +125,11 @@ enum AppMsg {
     RefreshSectionLoaded {
         section: SectionSnapshot,
         save_error: Option<String>,
+    },
+    IdleSweepStarted,
+    IdleSweepFinished {
+        sections: Vec<SectionSnapshot>,
+        next_cursor: usize,
     },
     CommentsLoaded {
         item_id: String,
@@ -1091,6 +1098,8 @@ const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
+const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
+const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 
 struct AppState {
     active_view: String,
@@ -1127,8 +1136,12 @@ struct AppState {
     command_palette_key: String,
     status: String,
     refreshing: bool,
+    current_refresh_scope: RefreshScope,
     section_page_loading: Option<SectionPageLoading>,
     last_refresh_request: Instant,
+    idle_sweep_refreshing: bool,
+    idle_sweep_cursor: usize,
+    last_idle_sweep_request: Instant,
     details: HashMap<String, DetailState>,
     diffs: HashMap<String, DiffState>,
     selected_diff_file: HashMap<String, usize>,
@@ -1364,6 +1377,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
             store.clone(),
             tx.clone(),
             RefreshPriority::Background,
+            RefreshScope::View(app.active_view.clone()),
         );
     }
 
@@ -1468,6 +1482,15 @@ async fn run_loop(
                 store.clone(),
                 tx.clone(),
                 RefreshPriority::Background,
+                RefreshScope::View(app.active_view.clone()),
+            );
+        } else if app.should_start_idle_sweep(config) {
+            start_idle_sweep(
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+                app.active_view.clone(),
+                app.idle_sweep_cursor,
             );
         }
 
@@ -1714,12 +1737,15 @@ fn start_refresh(
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
     priority: RefreshPriority,
+    scope: RefreshScope,
 ) {
-    let _ = tx.send(AppMsg::RefreshStarted);
+    let _ = tx.send(AppMsg::RefreshStarted {
+        scope: scope.clone(),
+    });
     tokio::spawn(async move {
         let mut save_error = None;
         let refresh = async {
-            refresh_dashboard_with_progress(&config, |section| {
+            refresh_dashboard_with_progress(&config, scope, |section| {
                 if save_error.is_none()
                     && section.error.is_none()
                     && let Err(error) = store.save_section(section)
@@ -1743,6 +1769,44 @@ fn start_refresh(
         let _ = tx.send(AppMsg::RefreshFinished {
             sections,
             save_error,
+        });
+    });
+}
+
+fn start_idle_sweep(
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+    active_view: String,
+    cursor: usize,
+) {
+    let _ = tx.send(AppMsg::IdleSweepStarted);
+    tokio::spawn(async move {
+        let refresh =
+            refresh_idle_search_sections(&config, &active_view, cursor, IDLE_SWEEP_SECTION_LIMIT);
+        let result = with_background_github_priority(refresh).await;
+        let mut sections = Vec::new();
+
+        for section in result.sections {
+            if section.error.is_some() {
+                continue;
+            }
+
+            if let Err(error) = store.save_section(&section) {
+                warn!(
+                    error = %error,
+                    section = %section.key,
+                    "failed to save idle refreshed snapshot"
+                );
+                continue;
+            }
+
+            sections.push(section);
+        }
+
+        let _ = tx.send(AppMsg::IdleSweepFinished {
+            sections,
+            next_cursor: result.next_cursor,
         });
     });
 }
@@ -2510,7 +2574,9 @@ fn start_pr_action(
                     .map_err(|error| error.to_string());
                 let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
             }
-            let _ = tx.send(AppMsg::RefreshStarted);
+            let _ = tx.send(AppMsg::RefreshStarted {
+                scope: RefreshScope::Full,
+            });
             let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
             for section in &sections {
@@ -2572,7 +2638,9 @@ fn start_milestone_change(
         });
 
         if should_refresh {
-            let _ = tx.send(AppMsg::RefreshStarted);
+            let _ = tx.send(AppMsg::RefreshStarted {
+                scope: RefreshScope::Full,
+            });
             let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
             for section in &sections {
@@ -2642,7 +2710,9 @@ fn start_reviewer_action(
         });
 
         if should_refresh {
-            let _ = tx.send(AppMsg::RefreshStarted);
+            let _ = tx.send(AppMsg::RefreshStarted {
+                scope: RefreshScope::Full,
+            });
             let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
             for section in &sections {
@@ -3299,7 +3369,32 @@ fn trigger_refresh(
             store.clone(),
             tx.clone(),
             RefreshPriority::User,
+            RefreshScope::Full,
         );
+    }
+}
+
+fn refresh_started_status(scope: &RefreshScope) -> String {
+    match scope {
+        RefreshScope::Full => "refreshing from GitHub".to_string(),
+        RefreshScope::View(view) => format!("refreshing {}", refresh_scope_view_label(view)),
+    }
+}
+
+fn refresh_finished_status(scope: &RefreshScope) -> String {
+    match scope {
+        RefreshScope::Full => "latest".to_string(),
+        RefreshScope::View(_) => "current view latest".to_string(),
+    }
+}
+
+fn refresh_scope_view_label(view: &str) -> String {
+    match view {
+        "notifications" => "inbox".to_string(),
+        "pull_requests" => "pull requests".to_string(),
+        "issues" => "issues".to_string(),
+        view if view.starts_with("repo:") => format!("repo {}", view.trim_start_matches("repo:")),
+        _ => "current view".to_string(),
     }
 }
 
@@ -9050,8 +9145,12 @@ impl AppState {
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
+            current_refresh_scope: RefreshScope::Full,
             section_page_loading: None,
             last_refresh_request: Instant::now(),
+            idle_sweep_refreshing: false,
+            idle_sweep_cursor: 0,
+            last_idle_sweep_request: Instant::now() - INITIAL_IDLE_SWEEP_DELAY,
             details: HashMap::new(),
             diffs: HashMap::new(),
             selected_diff_file: ui_state.selected_diff_file.clone(),
@@ -9373,6 +9472,37 @@ impl AppState {
         };
     }
 
+    fn should_start_idle_sweep(&self, config: &Config) -> bool {
+        !self.refreshing
+            && !self.idle_sweep_refreshing
+            && self.setup_dialog.is_none()
+            && self.section_page_loading.is_none()
+            && !self.global_search_running
+            && config.defaults.refetch_interval_seconds > 0
+            && self.last_idle_sweep_request.elapsed().as_secs()
+                >= config.defaults.refetch_interval_seconds
+    }
+
+    fn apply_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
+        let active_view = self.active_view.clone();
+        let sections = sections
+            .into_iter()
+            .filter(|section| !same_view_key(&section_view_key(section), &active_view))
+            .filter(|section| !self.quick_filters.contains_key(&section.key))
+            .collect::<Vec<_>>();
+
+        if sections.is_empty() {
+            return;
+        }
+
+        for section in &sections {
+            self.remember_base_filters(section);
+        }
+
+        let current = std::mem::take(&mut self.sections);
+        self.sections = merge_refreshed_sections(current, sections);
+    }
+
     fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
@@ -9440,11 +9570,12 @@ impl AppState {
 
     fn handle_msg(&mut self, message: AppMsg) {
         match message {
-            AppMsg::RefreshStarted => {
+            AppMsg::RefreshStarted { scope } => {
                 self.refreshing = true;
+                self.current_refresh_scope = scope;
                 self.last_refresh_request = Instant::now();
                 if self.section_page_loading.is_none() {
-                    self.status = "refreshing from GitHub".to_string();
+                    self.status = refresh_started_status(&self.current_refresh_scope);
                 }
             }
             AppMsg::RefreshSectionLoaded {
@@ -9452,6 +9583,19 @@ impl AppState {
                 save_error,
             } => {
                 self.apply_refreshed_section(section, save_error);
+            }
+            AppMsg::IdleSweepStarted => {
+                self.idle_sweep_refreshing = true;
+                self.last_idle_sweep_request = Instant::now();
+            }
+            AppMsg::IdleSweepFinished {
+                sections,
+                next_cursor,
+            } => {
+                self.idle_sweep_refreshing = false;
+                self.idle_sweep_cursor = next_cursor;
+                self.last_idle_sweep_request = Instant::now();
+                self.apply_idle_refreshed_sections(sections);
             }
             AppMsg::RefreshFinished {
                 sections,
@@ -9494,6 +9638,9 @@ impl AppState {
                 }
                 self.refreshing = false;
                 self.last_refresh_request = Instant::now();
+                if matches!(self.current_refresh_scope, RefreshScope::Full) {
+                    self.last_idle_sweep_request = Instant::now();
+                }
                 if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
                     self.startup_dialog = if setup_dialog.is_some() {
                         None
@@ -9504,7 +9651,7 @@ impl AppState {
                 self.setup_dialog = setup_dialog;
                 if self.section_page_loading.is_none() {
                     self.status = match (errors, save_error) {
-                        (0, None) => "latest".to_string(),
+                        (0, None) => refresh_finished_status(&self.current_refresh_scope),
                         (count, None) => refresh_error_status(count, first_error.as_deref()),
                         (_, Some(error)) => format!("snapshot save failed: {error}"),
                     };
@@ -18668,6 +18815,66 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn idle_sweep_merges_non_active_sections_without_changing_status() {
+        let pull_requests = test_section();
+        let mut issue_item = work_item("issue-1", "rust-lang/rust", 1, "old issue", None);
+        issue_item.kind = ItemKind::Issue;
+        let issues = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![issue_item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::PullRequests,
+            vec![pull_requests, issues.clone()],
+        );
+        app.status = "steady".to_string();
+
+        app.handle_msg(AppMsg::IdleSweepStarted);
+        let mut refreshed_issues = issues.clone();
+        refreshed_issues.items[0].title = "new issue".to_string();
+        app.handle_msg(AppMsg::IdleSweepFinished {
+            sections: vec![refreshed_issues],
+            next_cursor: 7,
+        });
+
+        assert!(!app.idle_sweep_refreshing);
+        assert_eq!(app.idle_sweep_cursor, 7);
+        assert_eq!(app.status, "steady");
+        let section = app
+            .sections
+            .iter()
+            .find(|section| section.key == "issues:test")
+            .expect("issue section should remain");
+        assert_eq!(section.items[0].title, "new issue");
+    }
+
+    #[test]
+    fn idle_sweep_does_not_merge_current_active_view() {
+        let mut pull_requests = test_section();
+        pull_requests.items[0].title = "old pr".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![pull_requests.clone()]);
+        app.status = "steady".to_string();
+
+        let mut refreshed_pull_requests = pull_requests;
+        refreshed_pull_requests.items[0].title = "new pr".to_string();
+        app.handle_msg(AppMsg::IdleSweepFinished {
+            sections: vec![refreshed_pull_requests],
+            next_cursor: 1,
+        });
+
+        assert_eq!(app.status, "steady");
+        assert_eq!(app.current_section().unwrap().items[0].title, "old pr");
+    }
+
+    #[test]
     fn startup_refresh_finishes_with_ready_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let paths = test_paths();
@@ -22482,7 +22689,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(rendered.contains("labels:  +"));
         assert!(!rendered.contains("labels: none"));
-        assert!(rendered.contains("reactions:  + react"));
+        assert!(rendered.contains("  reactions:  + react"));
         assert!(!rendered.contains("reactions: none"));
         assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
         assert_document_action_for_text_on_line(
@@ -22696,11 +22903,13 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn details_markdown_preserves_soft_line_breaks() {
         let mut builder = DetailsBuilder::new(120);
-        builder.push_markdown_block(
+        builder.push_markdown_block_indented(
             "closes: https://github.com/rust-lang/rust/issues/143131\ncloses: https://github.com/rust-lang/rust/issues/155446\n\nWe don't need bounds.",
             "empty",
             usize::MAX,
             usize::MAX,
+            0,
+            0,
         );
         let rendered = builder
             .finish()
@@ -22724,11 +22933,13 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn markdown_tables_render_as_separated_rows() {
         let mut builder = DetailsBuilder::new(100);
-        builder.push_markdown_block(
+        builder.push_markdown_block_indented(
             "| x | not const | const |\n| --- | ---- | --- |\n| not comptime | fn | const fn |\n| comptime | comptime fn | ??? |",
             "empty",
             usize::MAX,
             usize::MAX,
+            0,
+            0,
         );
         let rendered = builder
             .finish()
@@ -22781,7 +22992,7 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(rendered.get(description_index + 1), Some(&String::new()));
         assert_eq!(
             rendered.get(description_index + 2),
-            Some(&"A body with useful context".to_string())
+            Some(&"  A body with useful context".to_string())
         );
 
         let comments_index = rendered
@@ -22794,6 +23005,41 @@ diff --git a/src/main.rs b/src/main.rs
                 .get(comments_index + 2)
                 .is_some_and(|line| line.trim_start().starts_with('─')),
             "comment separator should start after the heading gap: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn description_body_reserves_left_and_right_padding() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].body =
+            Some("I had a similar experience with you, the learning curve".to_string());
+
+        let width = 31;
+        let rendered = build_details_document(&app, width)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let description_index = rendered
+            .iter()
+            .position(|line| line == "Description")
+            .expect("description heading");
+        let body_lines = &rendered[description_index + 2..description_index + 5];
+
+        assert_eq!(
+            body_lines,
+            &[
+                "  I had a similar experience".to_string(),
+                "  with you, the learning".to_string(),
+                "  curve".to_string()
+            ]
+        );
+        assert!(
+            body_lines
+                .iter()
+                .all(|line| display_width(line) <= usize::from(width - 2)),
+            "description body should reserve right padding: {body_lines:?}"
         );
     }
 
@@ -22953,11 +23199,13 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn markdown_blockquotes_render_with_quote_marker_on_wrapped_lines() {
         let mut builder = DetailsBuilder::new(12);
-        builder.push_markdown_block(
+        builder.push_markdown_block_indented(
             "> quoted reply with enough text to wrap\n\nnormal reply",
             "empty",
             usize::MAX,
             usize::MAX,
+            0,
+            0,
         );
         let document = builder.finish();
         let rendered = document
@@ -23289,11 +23537,13 @@ diff --git a/src/main.rs b/src/main.rs
     fn long_clickable_markdown_tokens_are_truncated_instead_of_hard_wrapped() {
         let url = "https://example.com/some/really/long/path/that/would/otherwise/leave/a/dangling/character";
         let mut builder = DetailsBuilder::new(24);
-        builder.push_markdown_block(
+        builder.push_markdown_block_indented(
             &format!("See {url} for details."),
             "empty",
             usize::MAX,
             usize::MAX,
+            0,
+            0,
         );
         let document = builder.finish();
         let rendered = document
@@ -23375,7 +23625,7 @@ diff --git a/src/main.rs b/src/main.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("reactions: ❤️ 1  👀 1  + react"));
+        assert!(rendered.contains("  reactions: ❤️ 1  👀 1  + react"));
         assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     }
 

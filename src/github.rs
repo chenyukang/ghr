@@ -672,11 +672,24 @@ struct PullRequestHeadRefRaw {
 }
 
 pub async fn refresh_dashboard(config: &Config) -> Vec<SectionSnapshot> {
-    refresh_dashboard_with_progress(config, |_| {}).await
+    refresh_dashboard_with_progress(config, RefreshScope::Full, |_| {}).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshScope {
+    Full,
+    View(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct IdleSearchRefresh {
+    pub sections: Vec<SectionSnapshot>,
+    pub next_cursor: usize,
 }
 
 pub async fn refresh_dashboard_with_progress<F>(
     config: &Config,
+    scope: RefreshScope,
     mut on_section: F,
 ) -> Vec<SectionSnapshot>
 where
@@ -690,20 +703,85 @@ where
             None
         }
     };
-    let mut searches =
-        refresh_search_sections(config, viewer_login.as_deref(), &mut on_section).await;
-    pace_search_refresh().await;
+    let mut searches = refresh_search_sections(
+        config,
+        viewer_login.as_deref(),
+        refresh_scope_view(&scope),
+        &mut on_section,
+    )
+    .await;
+    if !searches.is_empty() {
+        pace_search_refresh().await;
+    }
     let mut notifications = refresh_notification_sections(config).await;
     for section in &notifications {
         on_section(section);
     }
     searches.append(&mut notifications);
     info!(
+        scope = ?scope,
         sections = searches.len(),
         elapsed_ms = started.elapsed().as_millis(),
         "dashboard refresh finished"
     );
     searches
+}
+
+pub async fn refresh_idle_search_sections(
+    config: &Config,
+    active_view: &str,
+    cursor: usize,
+    limit: usize,
+) -> IdleSearchRefresh {
+    let started = Instant::now();
+    let viewer_login = match cached_viewer_login().await {
+        Ok(login) => Some(login),
+        Err(error) => {
+            warn!(error = %error, "failed to resolve @me for idle search filters");
+            None
+        }
+    };
+    let excludes = config.exclude_repos.clone();
+    let (jobs, next_cursor) =
+        idle_search_refresh_jobs(config, viewer_login.as_deref(), active_view, cursor, limit);
+
+    let mut sections = Vec::new();
+    for job in jobs {
+        if !sections.is_empty() {
+            pace_search_refresh().await;
+        }
+        sections.push(
+            refresh_search_section(
+                job.view,
+                job.kind,
+                job.section,
+                job.limit,
+                1,
+                excludes.as_slice(),
+            )
+            .await,
+        );
+    }
+
+    info!(
+        active_view = %active_view,
+        sections = sections.len(),
+        next_cursor,
+        elapsed_ms = started.elapsed().as_millis(),
+        "idle search refresh finished"
+    );
+
+    IdleSearchRefresh {
+        sections,
+        next_cursor,
+    }
+}
+
+fn refresh_scope_view(scope: &RefreshScope) -> Option<&str> {
+    match scope {
+        RefreshScope::Full => None,
+        RefreshScope::View(view) => Some(view.as_str()),
+    }
 }
 
 pub async fn search_global(
@@ -767,9 +845,36 @@ pub async fn search_global(
 async fn refresh_search_sections(
     config: &Config,
     viewer_login: Option<&str>,
+    view: Option<&str>,
     on_section: &mut impl FnMut(&SectionSnapshot),
 ) -> Vec<SectionSnapshot> {
     let excludes = config.exclude_repos.clone();
+    let jobs = search_refresh_jobs(config, viewer_login)
+        .into_iter()
+        .filter(|job| view.is_none_or(|view| same_refresh_view_key(&job.view, view)))
+        .collect::<Vec<_>>();
+
+    let mut sections = Vec::new();
+    for job in jobs {
+        if !sections.is_empty() {
+            pace_search_refresh().await;
+        }
+        let section = refresh_search_section(
+            job.view,
+            job.kind,
+            job.section,
+            job.limit,
+            1,
+            excludes.as_slice(),
+        )
+        .await;
+        on_section(&section);
+        sections.push(section);
+    }
+    sections
+}
+
+fn search_refresh_jobs(config: &Config, viewer_login: Option<&str>) -> Vec<SearchRefreshJob> {
     let mut jobs = Vec::new();
 
     for section in config.pr_sections.clone() {
@@ -833,26 +938,43 @@ async fn refresh_search_sections(
         }
     }
 
-    let mut sections = Vec::new();
-    for job in jobs {
-        if !sections.is_empty() {
-            pace_search_refresh().await;
-        }
-        let section = refresh_search_section(
-            job.view,
-            job.kind,
-            job.section,
-            job.limit,
-            1,
-            excludes.as_slice(),
-        )
-        .await;
-        on_section(&section);
-        sections.push(section);
-    }
-    sections
+    jobs
 }
 
+fn idle_search_refresh_jobs(
+    config: &Config,
+    viewer_login: Option<&str>,
+    active_view: &str,
+    cursor: usize,
+    limit: usize,
+) -> (Vec<SearchRefreshJob>, usize) {
+    let jobs = search_refresh_jobs(config, viewer_login)
+        .into_iter()
+        .filter(|job| !same_refresh_view_key(&job.view, active_view))
+        .collect::<Vec<_>>();
+
+    if jobs.is_empty() || limit == 0 {
+        return (Vec::new(), cursor);
+    }
+
+    let start = cursor % jobs.len();
+    let take = limit.min(jobs.len());
+    let selected = (0..take)
+        .map(|offset| jobs[(start + offset) % jobs.len()].clone())
+        .collect::<Vec<_>>();
+    let next_cursor = (start + take) % jobs.len();
+
+    (selected, next_cursor)
+}
+
+fn same_refresh_view_key(left: &str, right: &str) -> bool {
+    left == right
+        || (left.starts_with("repo:")
+            && right.starts_with("repo:")
+            && left.eq_ignore_ascii_case(right))
+}
+
+#[derive(Debug, Clone)]
 struct SearchRefreshJob {
     view: String,
     kind: SectionKind,
@@ -4165,6 +4287,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RepoConfig;
 
     #[test]
     fn gh_request_priority_defaults_to_user() {
@@ -4236,6 +4359,102 @@ mod tests {
         assert_eq!(search_command_limit(50), 50);
         assert_eq!(search_command_limit(101), 101);
         assert_eq!(search_command_limit(5_000), 1_000);
+    }
+
+    #[test]
+    fn visible_refresh_jobs_only_include_active_builtin_view() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "Rust".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            ..RepoConfig::default()
+        });
+
+        let jobs = search_refresh_jobs(&config, Some("chenyukang"))
+            .into_iter()
+            .filter(|job| same_refresh_view_key(&job.view, "pull_requests"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(jobs.len(), config.pr_sections.len());
+        assert!(
+            jobs.iter()
+                .all(|job| job.view == "pull_requests" && job.kind == SectionKind::PullRequests)
+        );
+    }
+
+    #[test]
+    fn visible_refresh_jobs_only_include_active_repo_view_case_insensitively() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "Rust".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            ..RepoConfig::default()
+        });
+        config.repos.push(RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            ..RepoConfig::default()
+        });
+
+        let jobs = search_refresh_jobs(&config, Some("chenyukang"))
+            .into_iter()
+            .filter(|job| same_refresh_view_key(&job.view, "repo:fiber"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.view == "repo:Fiber"));
+        assert_eq!(jobs[0].kind, SectionKind::Issues);
+        assert_eq!(jobs[1].kind, SectionKind::PullRequests);
+    }
+
+    #[test]
+    fn idle_refresh_jobs_skip_active_view_and_advance_cursor() {
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "Rust".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            ..RepoConfig::default()
+        });
+        config.repos.push(RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            ..RepoConfig::default()
+        });
+
+        let all_idle_jobs = search_refresh_jobs(&config, Some("chenyukang"))
+            .into_iter()
+            .filter(|job| !same_refresh_view_key(&job.view, "repo:fiber"))
+            .collect::<Vec<_>>();
+        let cursor = all_idle_jobs.len() - 1;
+        let (jobs, next_cursor) =
+            idle_search_refresh_jobs(&config, Some("chenyukang"), "repo:fiber", cursor, 2);
+
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|job| !same_refresh_view_key(&job.view, "repo:fiber"))
+        );
+        assert_eq!(jobs[0].view, all_idle_jobs[cursor].view);
+        assert_eq!(jobs[1].view, all_idle_jobs[0].view);
+        assert_eq!(next_cursor, 1);
+    }
+
+    #[test]
+    fn idle_refresh_jobs_do_nothing_without_non_active_sections() {
+        let mut config = Config::default();
+        config.pr_sections.clear();
+        config.issue_sections.clear();
+        config.repos.push(RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            ..RepoConfig::default()
+        });
+
+        let (jobs, next_cursor) =
+            idle_search_refresh_jobs(&config, Some("chenyukang"), "repo:Fiber", 5, 2);
+
+        assert!(jobs.is_empty());
+        assert_eq!(next_cursor, 5);
     }
 
     #[test]

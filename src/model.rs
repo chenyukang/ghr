@@ -327,21 +327,21 @@ pub fn configured_sections(config: &Config) -> Vec<SectionSnapshot> {
         }
 
         let view = repo_view_key(&repo.name);
-        if repo.show_prs {
-            let labels = repo.label_filters(SectionKind::PullRequests);
-            sections.push(SectionSnapshot::empty_for_view(
-                &view,
-                SectionKind::PullRequests,
-                "Pull Requests",
-                repo_section_filters_with_labels(&repo.repo, &labels),
-            ));
-        }
         if repo.show_issues {
             let labels = repo.label_filters(SectionKind::Issues);
             sections.push(SectionSnapshot::empty_for_view(
                 &view,
                 SectionKind::Issues,
                 "Issues",
+                repo_section_filters_with_labels(&repo.repo, &labels),
+            ));
+        }
+        if repo.show_prs {
+            let labels = repo.label_filters(SectionKind::PullRequests);
+            sections.push(SectionSnapshot::empty_for_view(
+                &view,
+                SectionKind::PullRequests,
+                "Pull Requests",
                 repo_section_filters_with_labels(&repo.repo, &labels),
             ));
         }
@@ -502,8 +502,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(repo_sections.len(), 2);
-        assert_eq!(repo_sections[0].title, "Pull Requests");
-        assert_eq!(repo_sections[1].title, "Issues");
+        assert_eq!(repo_sections[0].title, "Issues");
+        assert_eq!(repo_sections[1].title, "Pull Requests");
         assert!(repo_sections[0].key.starts_with("repo:fiber:"));
         assert_eq!(
             repo_sections[0].filters,
@@ -533,11 +533,11 @@ mod tests {
 
         assert_eq!(
             repo_sections[0].filters,
-            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"S-waiting-on-review\" sort:created-desc"
+            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"E-easy\" sort:created-desc"
         );
         assert_eq!(
             repo_sections[1].filters,
-            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"E-easy\" sort:created-desc"
+            "repo:rust-lang/rust is:open archived:false label:\"T-compiler\" label:\"S-waiting-on-review\" sort:created-desc"
         );
     }
 

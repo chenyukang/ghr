@@ -101,6 +101,8 @@ use status::{
 };
 use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
+const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
+
 enum AppMsg {
     RefreshStarted,
     RefreshFinished {
@@ -3007,8 +3009,8 @@ fn handle_key_in_area_mut(
             KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
             KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
             KeyCode::PageUp | KeyCode::Char('u') => app.scroll_details(-8),
-            KeyCode::Char('g') => app.details_scroll = 0,
-            KeyCode::Char('G') => app.scroll_details_to_bottom(area),
+            KeyCode::Char('g') => app.scroll_conversation_details_to_top(),
+            KeyCode::Char('G') => app.scroll_conversation_details_to_bottom(area),
             _ => {}
         },
     }
@@ -7616,14 +7618,14 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "Jump to First",
             "g",
             "List/Details",
-            "Jump to top or first item",
+            "Jump list to first item, or details to top and clear comment focus",
             palette_key(KeyCode::Char('g')),
         ),
         palette_command(
             "Jump to Last",
             "G",
             "List/Details",
-            "Jump to bottom or last item",
+            "Jump list to last item, or details to bottom and focus the last comment",
             palette_key(KeyCode::Char('G')),
         ),
         palette_command(
@@ -7728,7 +7730,7 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "Previous Comment",
             "p",
             "Details",
-            "Focus previous visible comment",
+            "Focus previous visible comment, or the PR/issue details body before the first comment",
             palette_key(KeyCode::Char('p')),
         ),
         palette_command(
@@ -7763,14 +7765,14 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "Page Diff Details Down",
             "h",
             "Diff Details",
-            "Page down through the current file diff",
+            "Page down through the current file diff, then jump to the next file",
             palette_key(KeyCode::Char('h')),
         ),
         palette_command(
             "Page Diff Details Up",
             "l",
             "Diff Details",
-            "Page up through the current file diff",
+            "Page up through the current file diff, then jump to the previous file",
             palette_key(KeyCode::Char('l')),
         ),
         palette_command(
@@ -8959,14 +8961,20 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("Tab / Shift+Tab in diff", "focus changed-file list"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
         help_key_line("/", "search loaded comments by keyword"),
-        help_key_line("n / p", "focus next / previous comment"),
-        help_key_line("h / l in diff", "page down / page up"),
+        help_key_line(
+            "n / p",
+            "focus comments; p from first returns to PR/issue details",
+        ),
+        help_key_line("h / l in diff", "page down/up; cross files at edges"),
         help_key_line(
             "Enter in conversation",
             "expand or collapse a long focused comment",
         ),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
-        help_key_line("g / G", "scroll details to top / bottom"),
+        help_key_line(
+            "g / G",
+            "top clears comment focus / bottom focuses last comment",
+        ),
         help_key_line("v", "show PR diff"),
         help_key_line("[ / ]", "jump previous / next diff file"),
         help_key_line("m in diff", "begin a review range"),
@@ -10316,6 +10324,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     builder.push_meta_line(primary_meta);
 
     let mut secondary_meta = Vec::new();
+    let mut branch_meta = None;
     let mut action_meta = Vec::new();
     let mut action_note = None;
     if let Some(author) = useful_meta_value(item.author.as_deref()) {
@@ -10352,10 +10361,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
     if matches!(item.kind, ItemKind::PullRequest) {
         let (action_segments, note) = action_hint_segments(app.action_hints.get(&item.id));
-        secondary_meta.push((
-            "branch",
-            branch_hint_segments(app.action_hints.get(&item.id)),
-        ));
+        branch_meta = Some(branch_hint_segments(app.action_hints.get(&item.id)));
         action_meta.push(("action", action_segments));
         action_meta.push((
             "checks",
@@ -10365,6 +10371,9 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
     if !secondary_meta.is_empty() {
         builder.push_meta_line(secondary_meta);
+    }
+    if let Some(branch_segments) = branch_meta {
+        builder.push_styled_key_value("branch", branch_segments);
     }
     if !action_meta.is_empty() {
         builder.push_meta_line(action_meta);
@@ -10386,14 +10395,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     }
 
     builder.push_blank();
-    builder.push_heading("Description");
-    builder.push_blank();
-    builder.push_markdown_block(
-        item.body.as_deref().unwrap_or(""),
-        "No description.",
-        22,
-        2_400,
-    );
+    push_description_block(&mut builder, app, item);
     push_reactions_line(&mut builder, &item.reactions);
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
@@ -10458,12 +10460,7 @@ fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
         "labels: ",
         Style::default().fg(Color::Gray),
     )];
-    if labels.is_empty() {
-        segments.push(DetailSegment::styled(
-            "none",
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else {
+    if !labels.is_empty() {
         for (index, label) in labels.iter().enumerate() {
             if index > 0 {
                 segments.push(DetailSegment::raw("  "));
@@ -10476,9 +10473,58 @@ fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
             ));
         }
     }
-    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::raw(if labels.is_empty() {
+        " "
+    } else {
+        "  "
+    }));
     segments.push(DetailSegment::action("+", DetailAction::AddLabel));
     builder.push_wrapped_limited(segments, 3);
+}
+
+fn push_description_block(builder: &mut DetailsBuilder, app: &AppState, item: &WorkItem) {
+    let selected = app.focus == FocusTarget::Details && app.comment_selection_cleared();
+    if !selected {
+        builder.push_heading("Description");
+        builder.push_blank();
+        builder.push_markdown_block(
+            item.body.as_deref().unwrap_or(""),
+            "No description.",
+            22,
+            2_400,
+        );
+        return;
+    }
+
+    push_selected_description_box_edge(builder, CommentBoxEdge::Top);
+    let content_start_line = builder.document.lines.len();
+    builder.push_prefixed_wrapped_limited(
+        vec![DetailSegment::styled(
+            "Description",
+            description_selected_heading_style(),
+        )],
+        selected_description_prefix(),
+        comment_right_padding(true),
+        1,
+    );
+    builder.push_line(selected_description_prefix());
+    builder.push_markdown_block_prefixed(
+        item.body.as_deref().unwrap_or(""),
+        "No description.",
+        22,
+        2_400,
+        MarkdownRenderOptions {
+            prefix: selected_description_prefix(),
+            right_padding: comment_right_padding(true),
+        },
+    );
+    add_selected_description_text_weight(builder, content_start_line, builder.document.lines.len());
+    push_selected_description_box_edge(builder, CommentBoxEdge::Bottom);
+    add_description_right_border(
+        builder,
+        content_start_line,
+        builder.document.lines.len() - 1,
+    );
 }
 
 fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
@@ -11448,12 +11494,7 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
         "reactions: ",
         Style::default().fg(Color::Gray),
     )];
-    if reactions.is_empty() {
-        segments.push(DetailSegment::styled(
-            "none",
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else {
+    if !reactions.is_empty() {
         for (index, segment) in reaction_segments(reactions).into_iter().enumerate() {
             if index > 0 {
                 segments.push(DetailSegment::raw("  "));
@@ -11461,7 +11502,11 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
             segments.push(segment);
         }
     }
-    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::raw(if reactions.is_empty() {
+        " "
+    } else {
+        "  "
+    }));
     segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
     builder.push_wrapped_limited(segments, 2);
 }
@@ -11626,6 +11671,41 @@ fn add_selected_comment_text_weight(
             }
         }
     }
+}
+
+fn add_selected_description_text_weight(
+    builder: &mut DetailsBuilder,
+    start_line: usize,
+    end_line: usize,
+) {
+    for line in builder
+        .document
+        .lines
+        .iter_mut()
+        .take(end_line)
+        .skip(start_line)
+    {
+        for span in &mut line.spans {
+            if !span.content.trim().is_empty() {
+                span.style = span.style.add_modifier(Modifier::BOLD);
+            }
+        }
+    }
+}
+
+fn push_selected_description_box_edge(builder: &mut DetailsBuilder, edge: CommentBoxEdge) {
+    let (left_corner, right_corner) = match edge {
+        CommentBoxEdge::Top => ("┏", "┓"),
+        CommentBoxEdge::Bottom => ("┗", "┛"),
+    };
+    let border_column = comment_right_border_column(builder.width);
+    let horizontal_width = border_column.saturating_sub(1).max(1);
+    let style = description_selected_separator_style();
+    builder.push_line(vec![
+        DetailSegment::styled(left_corner, style),
+        DetailSegment::styled("━".repeat(horizontal_width), style),
+        DetailSegment::styled(right_corner, style),
+    ]);
 }
 
 fn long_comment_metrics(comment: &CommentPreview) -> (usize, usize) {
@@ -12093,6 +12173,13 @@ fn comment_line_prefix(selected: bool, depth: usize) -> Vec<DetailSegment> {
     }
 }
 
+fn selected_description_prefix() -> Vec<DetailSegment> {
+    vec![DetailSegment::styled(
+        "┃ ".to_string(),
+        description_selected_rail_style(),
+    )]
+}
+
 fn add_comment_right_border(builder: &mut DetailsBuilder, start_line: usize, end_line: usize) {
     let border_column = comment_right_border_column(builder.width);
     for line in builder
@@ -12109,6 +12196,25 @@ fn add_comment_right_border(builder: &mut DetailsBuilder, start_line: usize, end
         }
         line.spans
             .push(Span::styled("┃", comment_selected_rail_style()));
+    }
+}
+
+fn add_description_right_border(builder: &mut DetailsBuilder, start_line: usize, end_line: usize) {
+    let border_column = comment_right_border_column(builder.width);
+    for line in builder
+        .document
+        .lines
+        .iter_mut()
+        .take(end_line)
+        .skip(start_line)
+    {
+        let width = display_width(&line.to_string());
+        if width < border_column {
+            line.spans
+                .push(Span::raw(" ".repeat(border_column - width)));
+        }
+        line.spans
+            .push(Span::styled("┃", description_selected_rail_style()));
     }
 }
 
@@ -12184,7 +12290,12 @@ fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
         Some(ActionHintState::Loaded(hints)) => hints
             .head
             .as_ref()
-            .map(|branch| vec![DetailSegment::raw(pull_request_branch_label(branch))])
+            .map(|branch| {
+                vec![DetailSegment::link(
+                    pull_request_branch_label(branch),
+                    pull_request_branch_url(branch),
+                )]
+            })
             .unwrap_or_else(|| vec![DetailSegment::raw("unavailable")]),
         Some(ActionHintState::Loading) | None => vec![DetailSegment::raw("loading...")],
         Some(ActionHintState::Error(_)) => vec![DetailSegment::raw("unavailable")],
@@ -13314,6 +13425,24 @@ fn comment_separator_style(selected: bool) -> Style {
 fn comment_search_match_style() -> Style {
     Style::default()
         .fg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn description_selected_heading_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn description_selected_separator_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn description_selected_rail_style() -> Style {
+    Style::default()
+        .fg(Color::LightCyan)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -16877,7 +17006,15 @@ impl AppState {
     }
 
     fn page_diff_lines(&mut self, direction: isize, area: Option<Rect>) {
+        if direction == 0 {
+            return;
+        }
+
         let Some(area) = area else {
+            if self.diff_line_page_would_cross_file(direction) {
+                self.move_diff_file_from_page_boundary(direction, None);
+                return;
+            }
             self.move_diff_line(diff_line_page_delta(self, None, direction), None);
             return;
         };
@@ -16886,7 +17023,15 @@ impl AppState {
         let inner = block_inner(details_area);
         let page_height = usize::from(inner.height.max(1));
         let max_scroll = usize::from(max_details_scroll(self, details_area));
-        let current_scroll = usize::from(self.details_scroll);
+        let current_scroll = usize::from(self.details_scroll).min(max_scroll);
+        if direction > 0 && current_scroll >= max_scroll {
+            self.move_diff_file_from_page_boundary(direction, Some(area));
+            return;
+        }
+        if direction < 0 && current_scroll == 0 {
+            self.move_diff_file_from_page_boundary(direction, Some(area));
+            return;
+        }
         let next_scroll = if direction < 0 {
             current_scroll.saturating_sub(page_height)
         } else {
@@ -16894,6 +17039,39 @@ impl AppState {
         };
         self.details_scroll = next_scroll.min(usize::from(u16::MAX)) as u16;
         self.select_first_visible_diff_line(area);
+    }
+
+    fn diff_line_page_would_cross_file(&self, direction: isize) -> bool {
+        let Some(item_id) = self.current_item().map(|item| item.id.as_str()) else {
+            return false;
+        };
+        let Some(targets) = self.current_diff_review_targets() else {
+            return false;
+        };
+        if targets.is_empty() {
+            return false;
+        }
+        let current = self
+            .selected_diff_line
+            .get(item_id)
+            .copied()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+        (direction > 0 && current == targets.len() - 1) || (direction < 0 && current == 0)
+    }
+
+    fn move_diff_file_from_page_boundary(&mut self, direction: isize, area: Option<Rect>) {
+        self.move_diff_file(direction.signum());
+        if direction > 0 {
+            self.details_scroll = 0;
+            if let Some(area) = area {
+                self.select_first_visible_diff_line(area);
+            } else {
+                self.select_diff_line(0, None);
+            }
+        } else {
+            self.scroll_diff_details_to_bottom(area);
+        }
     }
 
     fn scroll_diff_details_to_top(&mut self, area: Option<Rect>) {
@@ -16958,6 +17136,15 @@ impl AppState {
         };
         let details_area = details_area_for(self, area);
         self.details_scroll = max_details_scroll(self, details_area);
+    }
+
+    fn scroll_conversation_details_to_top(&mut self) {
+        self.select_details_body();
+    }
+
+    fn scroll_conversation_details_to_bottom(&mut self, area: Option<Rect>) {
+        self.scroll_details_to_bottom(area);
+        self.select_last_comment();
     }
 
     fn ensure_selected_diff_line_visible(&mut self, area: Option<Rect>) {
@@ -17250,12 +17437,50 @@ impl AppState {
         let previous = self.selected_comment_index;
         self.selected_comment_index = index;
         self.clamp_selected_comment();
-        self.status = format!("comment {} focused", self.selected_comment_index + 1);
+        self.status = if self.comment_selection_cleared() {
+            "no comment focused".to_string()
+        } else {
+            format!("comment {} focused", self.selected_comment_index + 1)
+        };
         debug!(
             from_index = previous,
             to_index = self.selected_comment_index,
             "ui comment selected"
         );
+    }
+
+    fn clear_selected_comment(&mut self) {
+        self.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+    }
+
+    fn comment_selection_cleared(&self) -> bool {
+        self.selected_comment_index == NO_SELECTED_COMMENT_INDEX
+    }
+
+    fn select_details_body(&mut self) {
+        self.details_scroll = 0;
+        self.clear_selected_comment();
+        self.status = self.details_body_focus_status();
+    }
+
+    fn details_body_focus_status(&self) -> String {
+        self.current_item()
+            .map(|item| format!("{} details focused", item_kind_label(item.kind)))
+            .unwrap_or_else(|| "details focused".to_string())
+    }
+
+    fn select_last_comment(&mut self) {
+        let Some((index, len)) = self.current_comments().and_then(|comments| {
+            let entries = comment_display_entries(comments);
+            entries.last().map(|entry| (entry.index, entries.len()))
+        }) else {
+            self.selected_comment_index = 0;
+            self.status = "details bottom; no comments".to_string();
+            return;
+        };
+
+        self.selected_comment_index = index;
+        self.status = format!("details bottom; comment {len}/{len} focused");
     }
 
     fn move_comment(&mut self, delta: isize) {
@@ -17271,16 +17496,34 @@ impl AppState {
             self.status = "no comments".to_string();
             return;
         }
-        let next_position = match order
+        if self.comment_selection_cleared() {
+            if delta > 0 {
+                self.selected_comment_index = order[0];
+                self.status = format!("comment 1/{} focused", order.len());
+            } else {
+                self.select_details_body();
+            }
+            return;
+        }
+
+        let Some(current_position) = order
             .iter()
             .position(|index| *index == self.selected_comment_index)
-        {
-            Some(position) => move_bounded(position, order.len(), delta),
-            None if delta < 0 => order.len() - 1,
-            None => 0,
+        else {
+            let next_position = if delta < 0 { order.len() - 1 } else { 0 };
+            self.selected_comment_index = order[next_position];
+            self.status = format!("comment {}/{} focused", next_position + 1, order.len());
+            return;
         };
+
+        if current_position == 0 && delta < 0 {
+            self.select_details_body();
+            return;
+        }
+
+        let next_position = move_bounded(current_position, order.len(), delta);
         self.selected_comment_index = order[next_position];
-        self.status = format!("comment {} focused", next_position + 1);
+        self.status = format!("comment {}/{} focused", next_position + 1, order.len());
     }
 
     fn move_comment_in_view(&mut self, delta: isize, area: Option<Rect>) {
@@ -17321,10 +17564,33 @@ impl AppState {
             self.status = "no comments".to_string();
             return true;
         }
-        let current_position = order
+        if self.comment_selection_cleared() {
+            if delta > 0 {
+                self.selected_comment_index = order[0];
+                self.status = format!("comment 1/{} focused", order.len());
+                self.scroll_selected_comment_into_view(Some(area));
+            } else {
+                self.select_details_body();
+            }
+            return true;
+        }
+
+        let Some(current_position) = order
             .iter()
             .position(|index| *index == self.selected_comment_index)
-            .unwrap_or(0);
+        else {
+            let next_position = if delta < 0 { order.len() - 1 } else { 0 };
+            self.selected_comment_index = order[next_position];
+            self.status = format!("comment {}/{} focused", next_position + 1, order.len());
+            self.scroll_selected_comment_into_view(Some(area));
+            return true;
+        };
+
+        if current_position == 0 && delta < 0 {
+            self.select_details_body();
+            return true;
+        }
+
         let next_position = move_bounded(current_position, order.len(), delta);
         self.selected_comment_index = order[next_position];
         self.status = format!("comment {}/{} focused", next_position + 1, order.len());
@@ -20154,6 +20420,9 @@ impl AppState {
     }
 
     fn current_selected_comment(&self) -> Option<&CommentPreview> {
+        if self.comment_selection_cleared() {
+            return None;
+        }
         self.current_comments()?.get(self.selected_comment_index)
     }
 
@@ -20341,6 +20610,9 @@ impl AppState {
     }
 
     fn clamp_selected_comment(&mut self) {
+        if self.comment_selection_cleared() {
+            return;
+        }
         let len = self.current_comments().map(Vec::len).unwrap_or(0);
         if len == 0 {
             self.selected_comment_index = 0;
@@ -21306,6 +21578,68 @@ deleted file mode 100644
     }
 
     #[test]
+    fn h_and_l_cross_diff_files_at_file_edges() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut first_file_lines = String::new();
+        let mut second_file_lines = String::new();
+        for line in 1..=50 {
+            first_file_lines.push_str(&format!(" first file line {line}\n"));
+            second_file_lines.push_str(&format!(" second file line {line}\n"));
+        }
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(&format!(
+                    "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,50 +1,50 @@\n{first_file_lines}diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1,50 +1,50 @@\n{second_file_lines}"
+                ))
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 24);
+        let details_area = details_area_for(&app, area);
+        app.details_scroll = max_details_scroll(&app, details_area);
+        assert_eq!(app.selected_diff_file.get("1").copied().unwrap_or(0), 0);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('h')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(
+            app.current_diff_review_target().map(|target| target.path),
+            Some("b.rs".to_string())
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+        assert!(app.details_scroll > 0);
+        assert_eq!(
+            app.current_diff_review_target().map(|target| target.path),
+            Some("a.rs".to_string())
+        );
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+    }
+
+    #[test]
     fn n_and_p_focus_comments_in_diff_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -21429,6 +21763,143 @@ deleted file mode 100644
             Some(area)
         ));
         assert_eq!(app.details_scroll, 0);
+    }
+
+    #[test]
+    fn g_and_upper_g_jump_conversation_details_and_update_comment_focus() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first comment", None),
+                comment(
+                    "bob",
+                    &(0..30)
+                        .map(|index| format!("middle line {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    None,
+                ),
+                comment("carol", "last comment", None),
+            ]),
+        );
+        let area = Rect::new(0, 0, 100, 18);
+        let max_scroll = max_details_scroll(&app, details_area_for(&app, area));
+        assert!(max_scroll > 0);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('G')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.details_scroll, max_scroll);
+        assert_eq!(app.selected_comment_index, 2);
+        assert_eq!(
+            app.current_selected_comment()
+                .map(|comment| comment.body.as_str()),
+            Some("last comment")
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('g')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert!(app.current_selected_comment().is_none());
+    }
+
+    #[test]
+    fn p_from_first_comment_focuses_pr_or_issue_details_body() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 100, 20);
+
+        let mut pr_app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        pr_app.focus_details();
+        pr_app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first PR comment", None),
+                comment("bob", "second PR comment", None),
+            ]),
+        );
+        pr_app.selected_comment_index = 1;
+
+        assert!(!handle_key_in_area(
+            &mut pr_app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(pr_app.selected_comment_index, 0);
+
+        assert!(!handle_key_in_area(
+            &mut pr_app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(pr_app.details_scroll, 0);
+        assert_eq!(pr_app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert!(pr_app.current_selected_comment().is_none());
+        assert_eq!(pr_app.status, "pull request details focused");
+
+        assert!(!handle_key_in_area(
+            &mut pr_app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(pr_app.selected_comment_index, 0);
+        assert_eq!(
+            pr_app
+                .current_selected_comment()
+                .map(|comment| comment.body.as_str()),
+            Some("first PR comment")
+        );
+
+        let mut issue_section = test_section();
+        issue_section.kind = SectionKind::Issues;
+        issue_section.key = "issues:test".to_string();
+        issue_section.items[0].kind = ItemKind::Issue;
+        issue_section.items[0].url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let mut issue_app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        issue_app.focus_details();
+        issue_app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "first issue comment", None)]),
+        );
+
+        assert!(!handle_key_in_area(
+            &mut issue_app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(issue_app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert!(issue_app.current_selected_comment().is_none());
+        assert_eq!(issue_app.status, "issue details focused");
     }
 
     #[test]
@@ -24008,7 +24479,7 @@ diff --git a/src/main.rs b/src/main.rs
                 .iter()
                 .map(|section| section.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Pull Requests", "Issues"]
+            vec!["Issues", "Pull Requests"]
         );
         assert_eq!(app.status, "project added: ghr");
 
@@ -24680,7 +25151,7 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn conversation_details_p_at_first_comment_scrolls_toward_metadata() {
+    fn conversation_details_p_at_first_comment_focuses_details_body() {
         let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
         item.body = Some(
             (1..=24)
@@ -24727,8 +25198,10 @@ diff --git a/src/main.rs b/src/main.rs
             Some(area)
         ));
 
-        assert_eq!(app.selected_comment_index, 0);
+        assert_eq!(app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert_eq!(app.details_scroll, 0);
         assert!(app.details_scroll < before);
+        assert_eq!(app.status, "pull request details focused");
     }
 
     #[test]
@@ -24903,7 +25376,7 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_global_search_input();
         app.global_search_query = "borrow".to_string();
-        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let backend = ratatui::backend::TestBackend::new(220, 40);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let paths = test_paths();
 
@@ -25083,7 +25556,17 @@ diff --git a/src/main.rs b/src/main.rs
         app.focus_details();
         app.start_comment_search();
         app.comment_search_query = "borrow".to_string();
-        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let area = Rect::new(0, 0, 220, 40);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let search_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("Comment search: 1/1"))
+            .expect("comment search summary line");
+        app.details_scroll = search_line.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let paths = test_paths();
 
@@ -25600,8 +26083,17 @@ diff --git a/src/main.rs b/src/main.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("labels: none  +"));
+        assert!(rendered.contains("labels:  +"));
+        assert!(!rendered.contains("labels: none"));
+        assert!(rendered.contains("reactions:  + react"));
+        assert!(!rendered.contains("reactions: none"));
         assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
+        assert_document_action_for_text_on_line(
+            &document,
+            "reactions:",
+            "+ react",
+            DetailAction::ReactItem,
+        );
     }
 
     #[test]
@@ -25664,11 +26156,28 @@ diff --git a/src/main.rs b/src/main.rs
             "https://github.com/chenyukang/ghr/pull/1/commits",
         );
         assert!(rendered.contains("branch: chenyukang/ghr:feature/checks"));
+        assert_document_link_for_text(
+            &document,
+            "chenyukang/ghr:feature/checks",
+            "https://github.com/chenyukang/ghr/tree/feature/checks",
+        );
         assert!(rendered.contains("action note: Merge blocked: checks pending"));
         let branch_line = lines
             .iter()
             .position(|line| line.contains("branch: chenyukang/ghr:feature/checks"))
             .expect("branch line");
+        let commits_line = lines
+            .iter()
+            .position(|line| line.contains("commits: 4"))
+            .expect("commits line");
+        assert!(
+            branch_line > commits_line,
+            "branch should render on its own line after compact metadata"
+        );
+        assert!(
+            !lines[branch_line].contains("commits:"),
+            "branch line should not share horizontal space with compact metadata"
+        );
         let action_line = lines
             .iter()
             .position(|line| line.contains("action: Approvable, Mergeable"))
@@ -25860,6 +26369,66 @@ diff --git a/src/main.rs b/src/main.rs
                 .get(comments_index + 2)
                 .is_some_and(|line| line.trim_start().starts_with('─')),
             "comment separator should start after the heading gap: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn selected_description_has_distinct_selection_style() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+        let document = build_details_document(&app, 100);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let description_index = rendered
+            .iter()
+            .position(|line| line.contains("Description"))
+            .expect("description heading");
+
+        assert!(
+            rendered[description_index].starts_with("┃ Description"),
+            "selected description should have a left rail: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .get(description_index.saturating_sub(1))
+                .is_some_and(|line| line.starts_with('┏')),
+            "selected description should have a top edge: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("┃ A body with useful context")),
+            "selected description body should keep the rail: {rendered:?}"
+        );
+        assert_ne!(
+            description_selected_rail_style().fg,
+            comment_selected_rail_style().fg,
+            "description selection should use a different color from comment selection"
+        );
+
+        let mut issue_section = test_section();
+        issue_section.kind = SectionKind::Issues;
+        issue_section.key = "issues:test".to_string();
+        issue_section.items[0].kind = ItemKind::Issue;
+        issue_section.items[0].url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let mut issue_app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        issue_app.focus_details();
+        issue_app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+        let issue_rendered = build_details_document(&issue_app, 100)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            issue_rendered
+                .iter()
+                .any(|line| line.starts_with("┃ Description")),
+            "issue description should use the same selected details-body treatment: {issue_rendered:?}"
         );
     }
 
@@ -31100,14 +31669,14 @@ diff --git a/src/main.rs b/src/main.rs
             test_section(),
             SectionSnapshot::empty_for_view(
                 "repo:fiber",
-                SectionKind::PullRequests,
-                "Pull Requests",
+                SectionKind::Issues,
+                "Issues",
                 "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
             SectionSnapshot::empty_for_view(
                 "repo:fiber",
-                SectionKind::Issues,
-                "Issues",
+                SectionKind::PullRequests,
+                "Pull Requests",
                 "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
         ];
@@ -31127,7 +31696,7 @@ diff --git a/src/main.rs b/src/main.rs
                 .iter()
                 .map(|section| section.title.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Pull Requests", "Issues"]
+            vec!["Issues", "Pull Requests"]
         );
     }
 
@@ -31440,6 +32009,9 @@ diff --git a/src/main.rs b/src/main.rs
             .to_string()
             .find("reply")
             .expect("reply action") as u16;
+        app.details_scroll = bob_line_index
+            .saturating_sub(usize::from(inner.height.saturating_sub(2)))
+            .min(usize::from(u16::MAX)) as u16;
         let row = inner.y + bob_line_index as u16 - app.details_scroll;
 
         handle_mouse(

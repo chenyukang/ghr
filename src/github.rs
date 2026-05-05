@@ -731,23 +731,6 @@ async fn refresh_search_sections(
         }
 
         let view = repo_view_key(&repo.name);
-        if repo.show_prs {
-            let limit = config.defaults.pr_per_page;
-            let labels = repo.label_filters(SectionKind::PullRequests);
-            let section = SearchSection {
-                title: "Pull Requests".to_string(),
-                filters: repo_section_filters_with_labels(&repo.repo, &labels),
-                queries: Vec::new(),
-                limit: None,
-            };
-            jobs.push(SearchRefreshJob {
-                view: view.clone(),
-                kind: SectionKind::PullRequests,
-                section,
-                limit,
-            });
-        }
-
         if repo.show_issues {
             let limit = config.defaults.issue_per_page;
             let labels = repo.label_filters(SectionKind::Issues);
@@ -760,6 +743,23 @@ async fn refresh_search_sections(
             jobs.push(SearchRefreshJob {
                 view: view.clone(),
                 kind: SectionKind::Issues,
+                section,
+                limit,
+            });
+        }
+
+        if repo.show_prs {
+            let limit = config.defaults.pr_per_page;
+            let labels = repo.label_filters(SectionKind::PullRequests);
+            let section = SearchSection {
+                title: "Pull Requests".to_string(),
+                filters: repo_section_filters_with_labels(&repo.repo, &labels),
+                queries: Vec::new(),
+                limit: None,
+            };
+            jobs.push(SearchRefreshJob {
+                view: view.clone(),
+                kind: SectionKind::PullRequests,
                 section,
                 limit,
             });

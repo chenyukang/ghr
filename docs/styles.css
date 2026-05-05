@@ -226,6 +226,8 @@ p {
   border: 0;
   background: transparent;
   color: var(--green);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .terminal-window span {

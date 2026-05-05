@@ -38,7 +38,16 @@
           </div>
           <div class="install-card" aria-label="Quick install" id="install">
             <div class="terminal-window" aria-label="Install commands">
-              <code><span>$</span> cargo install ghr-cli</code>
+              <code
+                ><span>$</span> curl -fsSL
+                https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh
+                | sh</code
+              >
+              <code
+                ><span>PS&gt;</span> irm
+                https://raw.githubusercontent.com/chenyukang/ghr/main/install.ps1
+                | iex</code
+              >
               <code><span>$</span> ghr</code>
             </div>
             <p>Press <kbd>:</kbd> inside ghr to fuzzy-search commands.</p>

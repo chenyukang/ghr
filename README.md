@@ -40,14 +40,42 @@
 gh auth login
 ```
 
-## Usage
+## Installation
 
-Install from crates.io:
+Install the latest release binary on macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | sh
+```
+
+Install the latest release binary on Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/chenyukang/ghr/main/install.ps1 | iex
+```
+
+Then authenticate GitHub CLI and run ghr:
+
+```bash
+gh auth login
+ghr
+```
+
+The installers detect your OS and CPU architecture, download the matching GitHub release asset, verify its `.sha256`, and install `ghr` into `~/.local/bin` by default. Use `GHR_INSTALL_DIR` to choose another install directory, or `GHR_VERSION` to pin a release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.2.0 GHR_INSTALL_DIR=/usr/local/bin sh
+```
+
+You can still install from crates.io if you prefer building locally:
 
 ```bash
 cargo install ghr-cli
-ghr
 ```
+
+## Usage
+
+Run `ghr` from any terminal after `gh auth login`. When started inside a Git checkout with a GitHub remote, ghr adds that repository as a local project tab automatically.
 
 ## Keybindings
 
@@ -63,10 +91,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `:` then `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `:` then `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
-| `Tab` / `Shift+Tab` | Move within the focused tab group |
+| `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |
-| `Esc` | Return from details to list, clear search, or leave diff details back to diff files |
+| `Esc` | Return from details to list, clear search, or leave diff mode |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
 | `[` / `]` in List | Load previous/next GitHub result page |
 | `PgDown` / `PgUp` or `d` / `u` | Page current list/details movement |

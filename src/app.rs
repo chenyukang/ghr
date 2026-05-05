@@ -25,8 +25,8 @@ use ratatui::layout::{Alignment, Constraint, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs,
-    Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
+    Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::process::Command as TokioCommand;
@@ -1294,6 +1294,7 @@ struct PendingDetailsLoad {
 
 #[derive(Debug, Clone)]
 struct SectionPageLoading {
+    section_key: String,
     title: String,
     page_label: String,
     started_at: Instant,
@@ -1943,8 +1944,8 @@ fn start_section_page_load(
     tx: &UnboundedSender<AppMsg>,
     delta: isize,
 ) {
-    if app.refreshing {
-        app.status = "refresh already running".to_string();
+    if app.section_page_loading.is_some() {
+        app.status = "result page already loading".to_string();
         return;
     }
 
@@ -1957,8 +1958,8 @@ fn start_section_page_load(
     };
     let page_label =
         section_page_status_label(request.page, request.total_pages, request.total_is_capped);
-    app.refreshing = true;
     app.section_page_loading = Some(SectionPageLoading {
+        section_key: request.section_key.clone(),
         title: request.title.clone(),
         page_label: page_label.clone(),
         started_at: Instant::now(),
@@ -3292,6 +3293,12 @@ fn handle_key_in_area_mut(
     if handle_global_focus_key(app, key) {
         return false;
     }
+    if handle_diff_focus_toggle_key(app, key) {
+        return false;
+    }
+    if handle_list_details_focus_toggle_key(app, key) {
+        return false;
+    }
     if handle_mouse_or_mark_key(app, key) {
         return false;
     }
@@ -3305,6 +3312,10 @@ fn handle_key_in_area_mut(
     }
 
     match key.code {
+        KeyCode::Esc if app.details_mode == DetailsMode::Diff => {
+            app.leave_diff();
+            return false;
+        }
         KeyCode::Char('q') if app.details_mode == DetailsMode::Diff => {
             app.leave_diff();
             return false;
@@ -3533,6 +3544,43 @@ fn handle_global_focus_key(app: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_diff_focus_toggle_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.details_mode != DetailsMode::Diff {
+        return false;
+    }
+    if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        return false;
+    }
+
+    if app.focus == FocusTarget::Details {
+        app.focus_list();
+    } else {
+        app.focus_details();
+    }
+    true
+}
+
+fn handle_list_details_focus_toggle_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.details_mode != DetailsMode::Conversation {
+        return false;
+    }
+    if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        return false;
+    }
+
+    match app.focus {
+        FocusTarget::List => {
+            app.focus_details();
+            true
+        }
+        FocusTarget::Details => {
+            app.focus_list();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_mouse_or_mark_key(app: &mut AppState, key: KeyEvent) -> bool {
     if !matches!(key.code, KeyCode::Char('m')) {
         return false;
@@ -3561,7 +3609,7 @@ fn handle_diff_file_list_key(
     tx: &UnboundedSender<AppMsg>,
 ) {
     match key.code {
-        KeyCode::Esc => app.focus_details(),
+        KeyCode::Esc => app.leave_diff(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
         KeyCode::Char('a') => app.start_new_comment_dialog(),
         KeyCode::Char('P') => {
@@ -4410,16 +4458,17 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn active_view_tab_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD)
+    active_navigation_tab_style()
 }
 
 fn active_section_tab_style() -> Style {
+    active_navigation_tab_style()
+}
+
+fn active_navigation_tab_style() -> Style {
     Style::default()
         .fg(Color::Black)
-        .bg(Color::LightYellow)
+        .bg(Color::LightCyan)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -4654,11 +4703,11 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(24),
+            Constraint::Length(20),
             Constraint::Length(8),
             Constraint::Min(20),
             Constraint::Length(8),
-            Constraint::Length(18),
+            Constraint::Length(14),
         ],
     )
     .header(header)
@@ -4829,45 +4878,82 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                     } else {
                         ("▾ ", Style::default().fg(Color::Green))
                     };
-                    Row::new(vec![
-                        format!("{indent}{marker}{}", entry.label),
-                        entry.stats,
-                    ])
-                    .style(style)
+                    let label = format!("{indent}{marker}{}", entry.label);
+                    Row::new(diff_tree_row_cells(label, entry.stats)).style(style)
                 })
                 .collect::<Vec<_>>()
         }
         Some(DiffState::Error(error)) => {
             title = "Files | error".to_string();
             vec![
-                Row::new(vec![compact_error_label(error), String::new()])
+                Row::new(diff_tree_row_cells(compact_error_label(error), None))
                     .style(Style::default().fg(Color::LightRed)),
             ]
         }
         Some(DiffState::Loading) | None => {
             title = "Files | loading".to_string();
             vec![
-                Row::new(vec!["loading diff...".to_string(), String::new()])
+                Row::new(diff_tree_row_cells("loading diff...".to_string(), None))
                     .style(Style::default().fg(Color::Gray)),
             ]
         }
     };
 
     let title = focus_panel_title("List", &title, files_focused);
-    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(14)])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .border_style(border_style)
-                .title(Span::styled(title, title_style)),
-        )
-        .row_highlight_style(highlight_style)
-        .highlight_symbol("> ");
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(1),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(8),
+        ],
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(border_type)
+            .border_style(border_style)
+            .title(Span::styled(title, title_style)),
+    )
+    .row_highlight_style(highlight_style)
+    .highlight_symbol("> ");
 
     let mut table_state = TableState::default();
     table_state.select(selected_row);
     frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn diff_tree_row_cells(label: String, stats: Option<DiffFileStats>) -> Vec<Cell<'static>> {
+    let Some(stats) = stats else {
+        return vec![
+            Cell::from(label),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ];
+    };
+
+    vec![
+        Cell::from(label),
+        Cell::from(stats.status),
+        right_aligned_cell(format!("+{}", stats.additions)),
+        right_aligned_cell(format!("-{}", stats.deletions)),
+        right_aligned_cell(if stats.comments > 0 {
+            format!("{}c", stats.comments)
+        } else {
+            String::new()
+        }),
+        Cell::from(""),
+    ]
+}
+
+fn right_aligned_cell(text: String) -> Cell<'static> {
+    Cell::new(Text::from(text).alignment(Alignment::Right))
 }
 
 fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
@@ -5303,13 +5389,16 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
         FocusTarget::List => {
             if app.details_mode == DetailsMode::Diff {
                 push_footer_pair(&mut spans, "j/k", "file", Color::Cyan);
+                push_footer_pair(&mut spans, "tab", "diff", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "diff", Color::Cyan);
+                push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 push_footer_pair(&mut spans, "[ ]", "file", Color::Cyan);
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
                 push_footer_pair(&mut spans, "j/k", "move", Color::Cyan);
                 push_footer_pair(&mut spans, "[ ]", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "tab", "Details", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "Details", Color::Cyan);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
                 if app.is_global_search_results_view() {
@@ -5323,12 +5412,14 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
         FocusTarget::Details => {
             if app.details_mode == DetailsMode::Diff {
                 push_footer_pair(&mut spans, "j/k", "line", Color::Cyan);
+                push_footer_pair(&mut spans, "tab", "files", Color::Cyan);
                 push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(&mut spans, "h/l", "page", Color::Cyan);
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
                 push_footer_pair(&mut spans, "j/k", "scroll", Color::Cyan);
+                push_footer_pair(&mut spans, "tab", "List", Color::Cyan);
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
                 push_footer_pair(&mut spans, "c/a", "comment", Color::LightBlue);
@@ -5343,7 +5434,12 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
                     push_footer_pair(&mut spans, "e", "edit", Color::LightBlue);
                 }
             }
-            push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
+            let esc_action = if app.details_mode == DetailsMode::Diff {
+                "back"
+            } else {
+                "List"
+            };
+            push_footer_pair(&mut spans, "esc", esc_action, Color::Cyan);
         }
     }
     spans
@@ -7909,10 +8005,24 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
         ),
         palette_command(
             "Leave Diff Mode",
-            "q",
+            "q / Esc",
             "Diff",
             "Return to the state before opening diff",
             palette_key(KeyCode::Char('q')),
+        ),
+        palette_command(
+            "Toggle Diff Focus",
+            "Tab / Shift+Tab",
+            "Diff",
+            "Switch focus between changed files and diff details",
+            palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Toggle List Details Focus",
+            "Tab / Shift+Tab",
+            "Focus",
+            "Switch focus between the list and details panes",
+            palette_key(KeyCode::Tab),
         ),
         palette_command(
             "Focus ghr Tabs",
@@ -7946,14 +8056,14 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "Next Focused Tab Group",
             "Tab",
             "Tabs",
-            "Move within the focused tab group",
+            "Move within focused ghr or Sections tabs",
             palette_key(KeyCode::Tab),
         ),
         palette_command(
             "Previous Focused Tab Group",
             "Shift+Tab",
             "Tabs",
-            "Move backward within the focused tab group",
+            "Move backward within focused ghr or Sections tabs",
             palette_key(KeyCode::BackTab),
         ),
         palette_command(
@@ -9290,9 +9400,9 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("? / Esc / Enter / q", "close this help"),
         help_key_line_owned(command_palette_key.to_string(), "open the command palette"),
         help_key_line("q", "quit ghr outside help"),
-        help_key_line("q in diff", "return to the state before opening diff"),
+        help_key_line("q / Esc in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
-        help_key_line("Tab / Shift+Tab", "switch the focused tab group"),
+        help_key_line("Tab / Shift+Tab", "switch list/details focus"),
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
@@ -9316,6 +9426,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("List"),
         help_key_line("j/k or Up/Down", "move selection"),
+        help_key_line("Tab / Shift+Tab", "focus Details"),
         help_key_line("[ / ]", "load previous / next GitHub result page"),
         help_key_line("PgDown/PgUp or d/u", "move by visible page"),
         help_key_line("g / G", "first / last item"),
@@ -9345,6 +9456,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
+        help_key_line("Tab / Shift+Tab", "focus the file diff"),
         help_key_line("j/k or Up/Down", "choose a changed file"),
         help_key_line("PgDown/PgUp", "move by visible file page"),
         help_key_line("[ / ]", "previous / next changed file"),
@@ -9360,6 +9472,8 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("@ / -", "assign or unassign PR assignees"),
         Line::from(""),
         help_heading("Details"),
+        help_key_line("Tab / Shift+Tab", "focus List"),
+        help_key_line("Tab / Shift+Tab in diff", "focus changed-file list"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
         help_key_line("/", "search loaded comments by keyword"),
         help_key_line("n / p", "focus next / previous comment"),
@@ -9783,8 +9897,27 @@ struct DiffLineRegion {
 struct DiffTreeEntry {
     file_index: Option<usize>,
     label: String,
-    stats: String,
+    stats: Option<DiffFileStats>,
     depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffFileStats {
+    status: &'static str,
+    additions: usize,
+    deletions: usize,
+    comments: usize,
+}
+
+impl DiffFileStats {
+    #[cfg(test)]
+    fn label(&self) -> String {
+        let mut stats = format!("{} +{} -{}", self.status, self.additions, self.deletions);
+        if self.comments > 0 {
+            stats.push_str(&format!(" {}c", self.comments));
+        }
+        stats
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10367,7 +10500,13 @@ impl DetailsBuilder {
                         wrote_content = false;
                     }
 
-                    if !self.push_hard_wrapped_token(
+                    if let Some(segments) =
+                        truncated_clickable_token_segments(&token, content_width)
+                    {
+                        append_segments(&mut current, &segments);
+                        column += segments_width(&segments);
+                        wrote_content = true;
+                    } else if !self.push_hard_wrapped_token(
                         &token,
                         prefix,
                         &mut current,
@@ -10538,6 +10677,39 @@ fn append_token_segments(current: &mut Vec<DetailSegment>, token: &WrapToken) {
     for segment in &token.segments {
         push_text_segment(current, segment, &segment.text);
     }
+}
+
+fn append_segments(current: &mut Vec<DetailSegment>, segments: &[DetailSegment]) {
+    for segment in segments {
+        push_text_segment(current, segment, &segment.text);
+    }
+}
+
+fn truncated_clickable_token_segments(
+    token: &WrapToken,
+    max_width: usize,
+) -> Option<Vec<DetailSegment>> {
+    let first = token.segments.first()?;
+    if first.link.is_none() && first.action.is_none() {
+        return None;
+    }
+    if token.segments.iter().any(|segment| {
+        segment.style != first.style || segment.link != first.link || segment.action != first.action
+    }) {
+        return None;
+    }
+
+    let text = token
+        .segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<String>();
+    Some(vec![DetailSegment {
+        text: truncate_inline(&text, max_width),
+        style: first.style,
+        link: first.link.clone(),
+        action: first.action.clone(),
+    }])
 }
 
 fn push_text_segment(current: &mut Vec<DetailSegment>, template: &DetailSegment, text: &str) {
@@ -11161,7 +11333,7 @@ fn push_diff_inline_comment(
         .or(comment.created_at.as_ref())
         .cloned();
     let start_line = builder.document.lines.len();
-    push_diff_inline_comment_separator(builder, selected, depth);
+    push_diff_inline_comment_separator(builder, selected, depth, CommentBoxEdge::Top);
     let content_start_line = builder.document.lines.len();
 
     let mut header = vec![
@@ -11238,8 +11410,8 @@ fn push_diff_inline_comment(
     }
     if selected {
         add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
-        push_diff_inline_comment_separator(builder, true, depth);
-        add_comment_right_border(builder, start_line, builder.document.lines.len());
+        push_diff_inline_comment_separator(builder, true, depth, CommentBoxEdge::Bottom);
+        add_comment_right_border(builder, start_line + 1, builder.document.lines.len() - 1);
     }
     builder.document.comments.push(CommentRegion {
         index,
@@ -11248,7 +11420,23 @@ fn push_diff_inline_comment(
     });
 }
 
-fn push_diff_inline_comment_separator(builder: &mut DetailsBuilder, selected: bool, depth: usize) {
+#[derive(Clone, Copy)]
+enum CommentBoxEdge {
+    Top,
+    Bottom,
+}
+
+fn push_diff_inline_comment_separator(
+    builder: &mut DetailsBuilder,
+    selected: bool,
+    depth: usize,
+    edge: CommentBoxEdge,
+) {
+    if selected {
+        push_selected_comment_box_edge(builder, DIFF_INLINE_COMMENT_GUTTER_WIDTH, edge);
+        return;
+    }
+
     let mut segments = diff_inline_comment_prefix(selected, depth);
     let prefix_width = segments_width(&segments);
     let width = builder
@@ -11260,6 +11448,30 @@ fn push_diff_inline_comment_separator(builder: &mut DetailsBuilder, selected: bo
         line.repeat(width),
         comment_separator_style(selected),
     ));
+    builder.push_line(segments);
+}
+
+fn push_selected_comment_box_edge(
+    builder: &mut DetailsBuilder,
+    left_padding: usize,
+    edge: CommentBoxEdge,
+) {
+    let (left_corner, right_corner) = match edge {
+        CommentBoxEdge::Top => ("┏", "┓"),
+        CommentBoxEdge::Bottom => ("┗", "┛"),
+    };
+    let border_column = comment_right_border_column(builder.width);
+    let horizontal_width = border_column.saturating_sub(left_padding + 1).max(1);
+    let style = comment_separator_style(true);
+    let mut segments = Vec::new();
+    if left_padding > 0 {
+        segments.push(DetailSegment::raw(" ".repeat(left_padding)));
+    }
+    segments.extend([
+        DetailSegment::styled(left_corner, style),
+        DetailSegment::styled("━".repeat(horizontal_width), style),
+        DetailSegment::styled(right_corner, style),
+    ]);
     builder.push_line(segments);
 }
 
@@ -11336,10 +11548,10 @@ fn diff_tree_entries_with_comment_counts(
             entries.push(DiffTreeEntry {
                 file_index: Some(file_index),
                 label: path,
-                stats: diff_file_stats(
+                stats: Some(diff_file_stats(
                     &diff.files[file_index],
                     comment_counts.get(&file_index).copied().unwrap_or(0),
-                ),
+                )),
                 depth: 0,
             });
             continue;
@@ -11355,7 +11567,7 @@ fn diff_tree_entries_with_comment_counts(
                 entries.push(DiffTreeEntry {
                     file_index: None,
                     label: (*directory).to_string(),
-                    stats: String::new(),
+                    stats: None,
                     depth,
                 });
             }
@@ -11367,10 +11579,10 @@ fn diff_tree_entries_with_comment_counts(
                 .last()
                 .map(|part| (*part).to_string())
                 .unwrap_or_else(|| path.clone()),
-            stats: diff_file_stats(
+            stats: Some(diff_file_stats(
                 &diff.files[file_index],
                 comment_counts.get(&file_index).copied().unwrap_or(0),
-            ),
+            )),
             depth: parts.len().saturating_sub(1),
         });
     }
@@ -11396,17 +11608,13 @@ fn diff_file_details_scroll_key(item_id: &str, file: &DiffFile) -> String {
     format!("{item_id}::{}", diff_display_path(file))
 }
 
-fn diff_file_stats(file: &DiffFile, comment_count: usize) -> String {
-    let mut stats = format!(
-        "{} +{} -{}",
-        diff_file_status(file),
-        file.additions,
-        file.deletions
-    );
-    if comment_count > 0 {
-        stats.push_str(&format!(" {comment_count}c"));
+fn diff_file_stats(file: &DiffFile, comment_count: usize) -> DiffFileStats {
+    DiffFileStats {
+        status: diff_file_status(file),
+        additions: file.additions,
+        deletions: file.deletions,
+        comments: comment_count,
     }
-    stats
 }
 
 fn diff_file_status(file: &DiffFile) -> &'static str {
@@ -11814,7 +12022,7 @@ fn push_comment(
         .or(comment.created_at.as_ref())
         .cloned();
     let start_line = builder.document.lines.len();
-    push_comment_separator(builder, selected, depth);
+    push_comment_separator(builder, selected, depth, CommentBoxEdge::Top);
     let content_start_line = builder.document.lines.len();
 
     let mut header = vec![
@@ -11904,8 +12112,8 @@ fn push_comment(
     }
     if selected {
         add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
-        push_comment_separator(builder, true, depth);
-        add_comment_right_border(builder, start_line, builder.document.lines.len());
+        push_comment_separator(builder, true, depth, CommentBoxEdge::Bottom);
+        add_comment_right_border(builder, start_line + 1, builder.document.lines.len() - 1);
     }
     builder.document.comments.push(CommentRegion {
         index,
@@ -12353,7 +12561,17 @@ fn review_comment_label(review: &crate::model::ReviewCommentPreview) -> String {
     format!("inline {}:{line} {side}", review.path)
 }
 
-fn push_comment_separator(builder: &mut DetailsBuilder, selected: bool, depth: usize) {
+fn push_comment_separator(
+    builder: &mut DetailsBuilder,
+    selected: bool,
+    depth: usize,
+    edge: CommentBoxEdge,
+) {
+    if selected {
+        push_selected_comment_box_edge(builder, 0, edge);
+        return;
+    }
+
     let prefix = comment_line_prefix(selected, depth);
     let prefix_width = segments_width(&prefix);
     let width = builder
@@ -14252,6 +14470,20 @@ impl AppState {
             return;
         }
 
+        if self.should_preserve_user_section_page(&section) {
+            if self.setup_dialog.is_none() {
+                self.setup_dialog = setup_dialog;
+            }
+            if self.section_page_loading.is_none() {
+                self.status = match (section_error.as_deref(), save_error) {
+                    (None, None) => format!("kept current {title} page; still refreshing"),
+                    (Some(error), None) => refresh_error_status(1, Some(error)),
+                    (_, Some(error)) => format!("snapshot save failed: {error}"),
+                };
+            }
+            return;
+        }
+
         self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
@@ -14291,9 +14523,10 @@ impl AppState {
         match message {
             AppMsg::RefreshStarted => {
                 self.refreshing = true;
-                self.section_page_loading = None;
                 self.last_refresh_request = Instant::now();
-                self.status = "refreshing from GitHub".to_string();
+                if self.section_page_loading.is_none() {
+                    self.status = "refreshing from GitHub".to_string();
+                }
             }
             AppMsg::RefreshSectionLoaded {
                 section,
@@ -14324,6 +14557,7 @@ impl AppState {
                 let sections = sections
                     .into_iter()
                     .filter(|section| !self.quick_filters.contains_key(&section.key))
+                    .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
@@ -14340,7 +14574,6 @@ impl AppState {
                     self.selected_comment_index = 0;
                 }
                 self.refreshing = false;
-                self.section_page_loading = None;
                 if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
                     self.startup_dialog = if setup_dialog.is_some() {
                         None
@@ -14349,11 +14582,13 @@ impl AppState {
                     };
                 }
                 self.setup_dialog = setup_dialog;
-                self.status = match (errors, save_error) {
-                    (0, None) => "latest".to_string(),
-                    (count, None) => refresh_error_status(count, first_error.as_deref()),
-                    (_, Some(error)) => format!("snapshot save failed: {error}"),
-                };
+                if self.section_page_loading.is_none() {
+                    self.status = match (errors, save_error) {
+                        (0, None) => "latest".to_string(),
+                        (count, None) => refresh_error_status(count, first_error.as_deref()),
+                        (_, Some(error)) => format!("snapshot save failed: {error}"),
+                    };
+                }
             }
             AppMsg::CommentsLoaded { item_id, comments } => match comments {
                 Ok(result) => {
@@ -15257,7 +15492,6 @@ impl AppState {
                 }
                 self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
                 self.replace_section_page(&section_key, section);
-                self.refreshing = false;
                 self.section_page_loading = None;
                 self.status = match (error.as_deref(), save_error) {
                     (None, None) => loaded_page_label
@@ -16393,6 +16627,25 @@ impl AppState {
             self.base_section_filters
                 .insert(section.key.clone(), section.filters.clone());
         }
+    }
+
+    fn should_preserve_user_section_page(&self, refreshed: &SectionSnapshot) -> bool {
+        if refreshed.error.is_some() {
+            return false;
+        }
+
+        if self
+            .section_page_loading
+            .as_ref()
+            .is_some_and(|loading| loading.section_key == refreshed.key)
+        {
+            return true;
+        }
+
+        self.sections
+            .iter()
+            .find(|section| section.key == refreshed.key)
+            .is_some_and(|section| section.page > 1 && refreshed.page <= 1)
     }
 
     fn effective_filters_for_section(&self, section: &SectionSnapshot) -> String {
@@ -21302,6 +21555,22 @@ deleted file mode 100644
             .filter(|line| line.ends_with('┃'))
             .map(|line| display_width(line).saturating_sub(1))
             .collect::<Vec<_>>();
+        let selected_top_border = rendered
+            .iter()
+            .find(|line| line.trim_start().starts_with('┏'))
+            .expect("selected inline comment top border");
+        let selected_bottom_border = rendered
+            .iter()
+            .find(|line| line.trim_start().starts_with('┗'))
+            .expect("selected inline comment bottom border");
+        assert!(
+            selected_top_border.ends_with('┓'),
+            "selected inline top border should close with a corner: {rendered:?}"
+        );
+        assert!(
+            selected_bottom_border.ends_with('┛'),
+            "selected inline bottom border should close with a corner: {rendered:?}"
+        );
         assert!(
             !selected_right_border_columns.is_empty(),
             "selected inline comment should render a right border: {rendered:?}"
@@ -22094,7 +22363,7 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn esc_in_diff_details_refocuses_diff_files() {
+    fn esc_in_diff_mode_returns_to_state_before_diff() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -22119,9 +22388,9 @@ diff --git a/src/main.rs b/src/main.rs
             &store,
             &tx
         ));
-        assert_eq!(app.details_mode, DetailsMode::Diff);
-        assert_eq!(app.focus, FocusTarget::List);
-        assert_eq!(app.status, "files focused");
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::Sections);
+        assert_eq!(app.status, "returned from diff");
     }
 
     #[test]
@@ -22241,15 +22510,19 @@ diff --git a/README.md b/README.md
                     entry.depth,
                     entry.file_index,
                     entry.label.as_str(),
-                    entry.stats.as_str(),
+                    entry
+                        .stats
+                        .as_ref()
+                        .map(DiffFileStats::label)
+                        .unwrap_or_default(),
                 )
             })
             .collect::<Vec<_>>();
 
-        assert!(labels.contains(&(0, None, "src", "")));
-        assert!(labels.contains(&(1, Some(0), "app.rs", "M +1 -1")));
-        assert!(labels.contains(&(1, Some(1), "github.rs", "M +1 -1")));
-        assert!(labels.contains(&(0, Some(2), "README.md", "M +1 -1")));
+        assert!(labels.contains(&(0, None, "src", String::new())));
+        assert!(labels.contains(&(1, Some(0), "app.rs", "M +1 -1".to_string())));
+        assert!(labels.contains(&(1, Some(1), "github.rs", "M +1 -1".to_string())));
+        assert!(labels.contains(&(0, Some(2), "README.md", "M +1 -1".to_string())));
     }
 
     #[test]
@@ -22305,11 +22578,85 @@ diff --git a/src/github.rs b/src/github.rs
         let entries = diff_tree_entries_with_comment_counts(&diff, &counts);
         let labels = entries
             .iter()
-            .map(|entry| (entry.label.as_str(), entry.stats.as_str()))
+            .map(|entry| {
+                (
+                    entry.label.as_str(),
+                    entry
+                        .stats
+                        .as_ref()
+                        .map(DiffFileStats::label)
+                        .unwrap_or_default(),
+                )
+            })
             .collect::<Vec<_>>();
 
-        assert!(labels.contains(&("app.rs", "M +1 -1 2c")));
-        assert!(labels.contains(&("github.rs", "M +1 -1 1c")));
+        assert!(labels.contains(&("app.rs", "M +1 -1 2c".to_string())));
+        assert!(labels.contains(&("github.rs", "M +1 -1 1c".to_string())));
+    }
+
+    #[test]
+    fn diff_file_list_aligns_stat_columns() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_list();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(PullRequestDiff {
+                files: vec![
+                    test_diff_file("src/small.rs", 3, 0),
+                    test_diff_file("src/large.rs", 268, 5),
+                ],
+                additions: 271,
+                deletions: 5,
+            }),
+        );
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                test_review_comment(1, "src/small.rs"),
+                test_review_comment(2, "src/large.rs"),
+                test_review_comment(3, "src/large.rs"),
+                test_review_comment(4, "src/large.rs"),
+                test_review_comment(5, "src/large.rs"),
+                test_review_comment(6, "src/large.rs"),
+                test_review_comment(7, "src/large.rs"),
+                test_review_comment(8, "src/large.rs"),
+                test_review_comment(9, "src/large.rs"),
+                test_review_comment(10, "src/large.rs"),
+                test_review_comment(11, "src/large.rs"),
+                test_review_comment(12, "src/large.rs"),
+            ]),
+        );
+        let backend = ratatui::backend::TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_diff_files(frame, &app, frame.area()))
+            .expect("draw");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        let small = lines
+            .iter()
+            .find(|line| line.contains("small.rs"))
+            .expect("small row");
+        let large = lines
+            .iter()
+            .find(|line| line.contains("large.rs"))
+            .expect("large row");
+
+        assert_eq!(
+            token_end_column(small, "+3"),
+            token_end_column(large, "+268")
+        );
+        assert_eq!(token_end_column(small, "-0"), token_end_column(large, "-5"));
+        assert_eq!(
+            token_end_column(small, "1c"),
+            token_end_column(large, "11c")
+        );
+        assert!(
+            token_end_column(large, "11c") <= 82,
+            "stats should keep a visible right gutter: {large:?}"
+        );
     }
 
     #[test]
@@ -22685,6 +23032,97 @@ diff --git a/src/github.rs b/src/github.rs
             Some("Compiler diagnostics")
         );
         assert_eq!(app.status, "loaded Test; still refreshing");
+    }
+
+    #[test]
+    fn progressive_refresh_does_not_overwrite_active_user_page_load() {
+        let mut current = many_items_section(1);
+        current.total_count = Some(120);
+        current.page_size = 50;
+        current.items[0].title = "Cached page one".to_string();
+        let section_key = current.key.clone();
+        let title = current.title.clone();
+        let mut background_page_one = current.clone();
+        background_page_one.items[0].title = "Background page one".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![current]);
+        app.refreshing = true;
+        app.section_page_loading = Some(SectionPageLoading {
+            section_key,
+            title,
+            page_label: "2/3".to_string(),
+            started_at: Instant::now(),
+        });
+
+        app.handle_msg(AppMsg::RefreshSectionLoaded {
+            section: background_page_one,
+            save_error: None,
+        });
+
+        assert!(app.section_page_loading.is_some());
+        assert_eq!(
+            app.current_item().map(|item| item.title.as_str()),
+            Some("Cached page one")
+        );
+    }
+
+    #[test]
+    fn section_page_loaded_keeps_background_refresh_running() {
+        let mut current = many_items_section(1);
+        current.total_count = Some(120);
+        current.page_size = 50;
+        let section_key = current.key.clone();
+        let title = current.title.clone();
+        let mut page_two = current.clone();
+        page_two.items[0].title = "User page two".to_string();
+        page_two.page = 2;
+        let mut app = AppState::new(SectionKind::PullRequests, vec![current]);
+        app.refreshing = true;
+        app.section_page_loading = Some(SectionPageLoading {
+            section_key: section_key.clone(),
+            title,
+            page_label: "2/3".to_string(),
+            started_at: Instant::now(),
+        });
+
+        app.handle_msg(AppMsg::SectionPageLoaded {
+            section_key,
+            section: page_two,
+            save_error: None,
+        });
+
+        assert!(app.refreshing);
+        assert!(app.section_page_loading.is_none());
+        assert_eq!(app.current_section().map(|section| section.page), Some(2));
+        assert_eq!(
+            app.current_item().map(|item| item.title.as_str()),
+            Some("User page two")
+        );
+    }
+
+    #[test]
+    fn refresh_finished_preserves_loaded_user_result_page() {
+        let mut page_two = many_items_section(1);
+        page_two.total_count = Some(120);
+        page_two.page = 2;
+        page_two.page_size = 50;
+        page_two.items[0].title = "User page two".to_string();
+        let mut background_page_one = page_two.clone();
+        background_page_one.page = 1;
+        background_page_one.items[0].title = "Background page one".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![page_two]);
+        app.refreshing = true;
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![background_page_one],
+            save_error: None,
+        });
+
+        assert!(!app.refreshing);
+        assert_eq!(app.current_section().map(|section| section.page), Some(2));
+        assert_eq!(
+            app.current_item().map(|item| item.title.as_str()),
+            Some("User page two")
+        );
     }
 
     #[test]
@@ -24511,7 +24949,8 @@ diff --git a/src/main.rs b/src/main.rs
     fn list_table_renders_updated_next_to_meta() {
         let mut section = test_section();
         section.items[0].updated_at = Some(Utc::now() - chrono::Duration::days(2));
-        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.list_width_percent = crate::state::MAX_LIST_WIDTH_PERCENT;
         let backend = ratatui::backend::TestBackend::new(180, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let paths = test_paths();
@@ -24525,27 +24964,39 @@ diff --git a/src/main.rs b/src/main.rs
             .iter()
             .find(|line| {
                 line.contains("Repo")
+                    && line.contains("#")
                     && line.contains("Title")
                     && line.contains("Updated")
                     && line.contains("Meta")
             })
             .expect("list header");
         let repo_pos = header.find("Repo").expect("repo column");
+        let number_pos = header.find("#").expect("number column");
         let title_pos = header.find("Title").expect("title column");
         let updated_pos = header.find("Updated").expect("updated column");
         let meta_pos = header.find("Meta").expect("meta column");
-        assert!(repo_pos < title_pos);
+        assert_eq!(number_pos.saturating_sub(repo_pos), 21);
+        assert!(repo_pos < number_pos);
+        assert!(number_pos < title_pos);
         assert!(title_pos < updated_pos);
+        assert!(
+            updated_pos.saturating_sub(title_pos) >= 74,
+            "header positions: {header:?}"
+        );
         assert!(updated_pos < meta_pos);
 
         let row = lines
             .iter()
             .find(|line| line.contains("rust-lang/rust") && line.contains("Compiler diagnostics"))
             .expect("list row");
+        let repo_pos = row.find("rust-lang/rust").expect("repo cell");
+        let number_pos = row.find("#1").expect("number cell");
         let title_pos = row.find("Compiler diagnostics").expect("title cell");
         let updated_pos = row.find("2d").expect("updated cell");
         let meta_pos = row.find("open 0c").expect("meta cell");
+        assert_eq!(number_pos.saturating_sub(repo_pos), 21);
         assert!(title_pos < updated_pos);
+        assert!(updated_pos.saturating_sub(title_pos) >= 74);
         assert!(updated_pos < meta_pos);
     }
 
@@ -24607,11 +25058,9 @@ diff --git a/src/main.rs b/src/main.rs
         let paths = test_paths();
         let text = footer_line(&app, &paths).to_string();
 
-        assert!(
-            text.contains(
-                "j/k move  [ ] page  enter Details  / search  v diff  i ignore  a comment"
-            )
-        );
+        assert!(text.contains(
+            "j/k move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  a comment"
+        ));
         assert!(!text.contains("List items"));
         assert!(!text.contains("Details content"));
         assert!(text.contains("/ search"));
@@ -24631,6 +25080,7 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(display_width(&compact) <= 80);
         assert!(compact.contains("j/k move"));
         assert!(compact.contains("[ ] page"));
+        assert!(compact.contains("tab Details"));
         assert!(compact.contains("enter Details"));
         assert!(compact.contains("/ search"));
         assert!(!compact.contains("M/C/D/U/E/O/F/X actions"));
@@ -24648,6 +25098,7 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.refreshing = true;
         app.section_page_loading = Some(SectionPageLoading {
+            section_key: "pull_requests:test".to_string(),
             title: "Pull Requests".to_string(),
             page_label: "2/20+".to_string(),
             started_at: Instant::now(),
@@ -24666,6 +25117,7 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.refreshing = true;
         app.section_page_loading = Some(SectionPageLoading {
+            section_key: "pull_requests:test".to_string(),
             title: "Pull Requests".to_string(),
             page_label: "2/20+".to_string(),
             started_at: Instant::now() - Duration::from_secs(2),
@@ -24723,7 +25175,7 @@ diff --git a/src/main.rs b/src/main.rs
         let details = footer_line(&app, &paths).to_string();
         assert!(details.contains("j/k scroll"));
         assert!(!details.contains("Details content"));
-        assert!(details.contains("v diff  / search  c/a comment"));
+        assert!(details.contains("tab List  v diff  / search  c/a comment"));
         assert!(!details.contains("R reply"));
         assert!(!details.contains("e edit"));
         assert!(!details.contains("enter expand"));
@@ -24758,7 +25210,7 @@ diff --git a/src/main.rs b/src/main.rs
         app.show_diff();
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
-        assert!(diff.contains("j/k line  n/p comment  h/l page"));
+        assert!(diff.contains("j/k line  tab files  n/p comment  h/l page"));
         assert!(!diff.contains("Details diff"));
         assert!(diff.contains("c inline  a comment"));
         assert!(!diff.contains("m/e range"));
@@ -24770,6 +25222,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.focus_list();
         let diff_list = footer_line(&app, &paths).to_string();
+        assert!(diff_list.contains("j/k file  tab diff  enter diff"));
         assert!(!diff_list.contains("m text-select"));
     }
 
@@ -25275,8 +25728,9 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(view.add_modifier.contains(Modifier::BOLD));
 
         let section = active_section_tab_style();
+        assert_eq!(section, view);
         assert_eq!(section.fg, Some(Color::Black));
-        assert_eq!(section.bg, Some(Color::LightYellow));
+        assert_eq!(section.bg, Some(Color::LightCyan));
         assert!(section.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -26307,6 +26761,42 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn long_clickable_markdown_tokens_are_truncated_instead_of_hard_wrapped() {
+        let url = "https://example.com/some/really/long/path/that/would/otherwise/leave/a/dangling/character";
+        let mut builder = DetailsBuilder::new(24);
+        builder.push_markdown_block(
+            &format!("See {url} for details."),
+            "empty",
+            usize::MAX,
+            usize::MAX,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let link_regions = document
+            .links
+            .iter()
+            .filter(|link| link.url == url)
+            .collect::<Vec<_>>();
+
+        assert_eq!(link_regions.len(), 1);
+        let link_line = &rendered[link_regions[0].line];
+        assert!(link_line.contains("..."));
+        assert!(display_width(link_line) <= 24);
+        assert_eq!(
+            document.link_at(link_regions[0].line, link_regions[0].start),
+            Some(url.to_string())
+        );
+        assert!(
+            rendered.iter().all(|line| line.trim().chars().count() != 1),
+            "long clickable token should not leave orphan single-character lines: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn pr_and_issue_detail_comment_authors_are_clickable() {
         let mut pr_app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         pr_app.details.insert(
@@ -26709,6 +27199,11 @@ diff --git a/src/main.rs b/src/main.rs
         );
 
         let document = build_details_document(&app, 100);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
         let bob_line_index = document
             .lines
             .iter()
@@ -26722,9 +27217,19 @@ diff --git a/src/main.rs b/src/main.rs
         let selected_border_count = document
             .lines
             .iter()
-            .filter(|line| line.to_string().contains("┃ ━"))
+            .filter(|line| {
+                let line = line.to_string();
+                (line.starts_with('┏') && line.ends_with('┓'))
+                    || (line.starts_with('┗') && line.ends_with('┛'))
+            })
             .count();
         assert_eq!(selected_border_count, 2);
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.starts_with("┃ ━") && !line.starts_with("┃━")),
+            "selected comment borders should use closed corners: {rendered:?}"
+        );
         assert!(
             document
                 .lines
@@ -31432,6 +31937,7 @@ diff --git a/src/main.rs b/src/main.rs
         section.total_count = Some(30);
         section.page_size = 50;
         let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.refreshing = true;
         app.set_selection(10);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -32116,6 +32622,94 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
+    fn tab_toggles_between_list_and_details_in_conversation_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_list();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 0);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 0);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::BackTab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 0);
+    }
+
+    #[test]
+    fn tab_toggles_between_diff_files_and_diff_details_in_diff_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.show_diff();
+        app.focus_list();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.status, "details focused");
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.status, "files focused");
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::BackTab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+    }
+
+    #[test]
     fn h_and_l_wrap_focused_tab_groups_at_edges() {
         let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
         issue.kind = ItemKind::Issue;
@@ -32616,6 +33210,40 @@ diff --git a/d.rs b/d.rs
             refreshed_at: None,
             error: None,
         }
+    }
+
+    fn test_diff_file(path: &str, additions: usize, deletions: usize) -> DiffFile {
+        DiffFile {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            metadata: Vec::new(),
+            hunks: Vec::new(),
+            additions,
+            deletions,
+        }
+    }
+
+    fn test_review_comment(id: u64, path: &str) -> CommentPreview {
+        let mut comment = comment("alice", "inline", None);
+        comment.id = Some(id);
+        comment.review = Some(crate::model::ReviewCommentPreview {
+            path: path.to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        comment
+    }
+
+    fn token_end_column(line: &str, token: &str) -> usize {
+        let start = line.find(token).expect("token column");
+        display_width(&line[..start]) + display_width(token)
     }
 
     fn checkout_test_section() -> SectionSnapshot {

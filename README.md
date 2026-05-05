@@ -20,6 +20,7 @@
 - Configurable sections and repo tabs, including multi-query sections such as `All Requests`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
+- Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
@@ -50,7 +51,7 @@ ghr
 
 ## Keybindings
 
-Press `?` in the TUI for the live shortcut reference. The status bar also changes by focused area.
+Press `?` in the TUI for the live shortcut reference. The top-right status shows the current app state; the footer stays focused on the most useful shortcuts for the active area.
 
 | Key | Action |
 | --- | --- |
@@ -60,21 +61,24 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `:` then `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `:` then `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `:` then `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
-| `:` then `Info` | Show version, config/db/log paths, memory usage, and current UI state |
+| `:` then `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Move within the focused tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff details back to diff files |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
+| `[` / `]` in List | Page the current list selection up/down |
 | `PgDown` / `PgUp` or `d` / `u` | Page list/details movement |
 | `n` / `p` in Details | Focus next/previous comment in conversation or diff details |
 | `h` / `l` in diff Details | Page down/up through the file diff |
 | `g` / `G` | Jump to top/bottom in list, details, or diff |
-| `[` / `]` | Load previous/next GitHub result page, or switch diff files in diff mode |
+| `Alt+[` / `Alt+]` | Load previous/next GitHub result page |
+| `[` / `]` in diff mode | Switch diff files |
 | `/` | Fuzzy filter the current list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
 | `S` | Search matching PRs and issues in the current repo |
+| `i` | Ignore the selected PR or issue and hide it from future lists |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |
@@ -221,7 +225,7 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 
 Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
 
-`pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
+`pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `Alt+[` and `Alt+]` in the list to load adjacent GitHub result pages.
 
 ## Local Data
 
@@ -230,9 +234,17 @@ Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode
 - `config.toml`: user configuration
 - `ghr.db`: SQLite snapshot cache
 - `ghr.log`: log file
-- `state.toml`: persisted UI state
+- `state.toml`: persisted UI state, including ignored PRs/issues
 
 The snapshot cache is intentionally local and disposable. Delete `~/.ghr/ghr.db` if you want to rebuild it from GitHub.
+
+## Website
+
+The landing and documentation site lives in `docs/` and is deployed by the `Pages` GitHub Actions workflow. After GitHub Pages is enabled for Actions, the project URL is:
+
+```text
+https://chenyukang.github.io/ghr/
+```
 
 ## Release
 

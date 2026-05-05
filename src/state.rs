@@ -30,6 +30,7 @@ pub struct UiState {
     pub selected_diff_file: HashMap<String, usize>,
     pub selected_diff_line: HashMap<String, usize>,
     pub diff_file_details_scroll: HashMap<String, u16>,
+    pub ignored_items: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +114,10 @@ impl UiState {
             .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
         self.diff_file_details_scroll
             .retain(|key, _| !key.trim().is_empty());
+        let mut seen_ignored = HashSet::new();
+        self.ignored_items
+            .retain(|key| !key.trim().is_empty() && seen_ignored.insert(key.clone()));
+        self.ignored_items.sort();
         self
     }
 }
@@ -137,6 +142,7 @@ impl Default for UiState {
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
+            ignored_items: Vec::new(),
         }
     }
 }
@@ -194,6 +200,7 @@ mod tests {
             selected_diff_file: HashMap::from([("issue-3".to_string(), 4)]),
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
             diff_file_details_scroll: HashMap::from([("issue-3::src/lib.rs".to_string(), 17)]),
+            ignored_items: vec!["issue-2".to_string(), "issue-2".to_string(), String::new()],
         }
         .save(&path)
         .expect("save state");
@@ -241,6 +248,7 @@ mod tests {
             state.diff_file_details_scroll.get("issue-3::src/lib.rs"),
             Some(&17)
         );
+        assert_eq!(state.ignored_items, vec!["issue-2"]);
 
         let _ = fs::remove_file(path);
     }

@@ -35,7 +35,7 @@ use tracing::{debug, warn};
 use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, github_repo_from_remote_url};
 use crate::dirs::Paths;
 use crate::github::{
-    AssigneeAction, CommentFetchResult, ItemMetadataUpdate, MergeMethod,
+    AssigneeAction, CommentFetchResult, ItemDetailsMetadata, ItemMetadataUpdate, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
     approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
@@ -54,12 +54,14 @@ use crate::github::{
     subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
     update_pull_request_branch, with_background_github_priority,
 };
+#[cfg(test)]
+use crate::model::CommentPreviewKind;
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
     PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
     configured_sections, global_search_view_key, mark_all_notifications_read_in_section,
     mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    repo_view_key, section_counts, section_view_key,
+    repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
@@ -1961,6 +1963,7 @@ fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(CommentFetchResult {
+                item_metadata: None,
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
                 comments: Vec::new(),
@@ -2964,29 +2967,23 @@ fn handle_key_in_area_mut(
             KeyCode::Char('/') => app.start_search(),
             KeyCode::Down | KeyCode::Char('j') => {
                 app.move_selection(1);
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_selection(-1);
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::PageDown | KeyCode::Char('d') => {
                 app.move_selection(list_page_delta(app, area, 1));
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::PageUp | KeyCode::Char('u') => {
                 app.move_selection(list_page_delta(app, area, -1));
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
             KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('g') => {
                 app.set_selection(0);
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::Char('G') => {
                 app.select_last();
-                app.mark_current_notification_read(store, tx);
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
@@ -3437,9 +3434,6 @@ fn handle_mouse_with_sync(
         MouseEventKind::ScrollUp if rect_contains(layout.details, mouse.column, mouse.row) => {
             handle_details_scroll(app, layout.details, -(MOUSE_DETAILS_SCROLL_LINES as i16));
         }
-        MouseEventKind::Moved if rect_contains(layout.table, mouse.column, mouse.row) => {
-            handle_table_hover(app, mouse, layout.table, store, tx);
-        }
         MouseEventKind::Moved if rect_contains(layout.details, mouse.column, mouse.row) => {
             handle_details_hover(app, mouse, layout.details);
         }
@@ -3689,26 +3683,6 @@ fn handle_table_click(
     mark_current_notification_read_if_possible(app, store, tx);
 }
 
-fn handle_table_hover(
-    app: &mut AppState,
-    mouse: MouseEvent,
-    area: Rect,
-    store: Option<&SnapshotStore>,
-    tx: Option<&UnboundedSender<AppMsg>>,
-) {
-    if app.details_mode == DetailsMode::Diff {
-        return;
-    }
-
-    let Some(position) = table_row_at(app, area, mouse.row) else {
-        return;
-    };
-
-    if let Some(thread_id) = app.notification_thread_id_at_position(position) {
-        mark_notification_read_if_possible(app, thread_id, store, tx);
-    }
-}
-
 fn handle_details_hover(app: &mut AppState, mouse: MouseEvent, area: Rect) {
     let inner = block_inner(area);
     if !rect_contains(inner, mouse.column, mouse.row) {
@@ -3732,17 +3706,6 @@ fn mark_current_notification_read_if_possible(
 ) {
     if let (Some(store), Some(tx)) = (store, tx) {
         app.mark_current_notification_read(store, tx);
-    }
-}
-
-fn mark_notification_read_if_possible(
-    app: &mut AppState,
-    thread_id: String,
-    store: Option<&SnapshotStore>,
-    tx: Option<&UnboundedSender<AppMsg>>,
-) {
-    if let (Some(store), Some(tx)) = (store, tx) {
-        app.mark_notification_read(thread_id, store, tx);
     }
 }
 
@@ -4074,13 +4037,18 @@ fn active_navigation_tab_style() -> Style {
 }
 
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
-    let (_, unread) = section_counts(section);
-    let count_label = section_count_label(app, section);
     let title = app
         .quick_filter_label_for_section(section)
         .map(|filter| format!("{} [{filter}]", section.title))
         .unwrap_or_else(|| section.title.clone());
-    if !app.search_query.is_empty() {
+    if matches!(section.kind, SectionKind::Notifications) {
+        let unread = notification_unread_count_label(app, section);
+        if unread == 0 {
+            title
+        } else {
+            format!("{title} ({unread})")
+        }
+    } else if !app.search_query.is_empty() {
         format!(
             "{} ({}/{})",
             title,
@@ -4090,11 +4058,19 @@ fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
                 .len()
                 .saturating_sub(app.ignored_count_for_section(section))
         )
-    } else if unread > 0 {
-        format!("{title} ({count_label}/{unread})")
     } else {
+        let count_label = section_count_label(app, section);
         format!("{title} ({count_label})")
     }
+}
+
+fn notification_unread_count_label(app: &AppState, section: &SectionSnapshot) -> usize {
+    section
+        .items
+        .iter()
+        .filter(|item| !app.ignored_items.contains(&item.id))
+        .filter(|item| item.unread.unwrap_or(false))
+        .count()
 }
 
 fn section_count_label(app: &AppState, section: &SectionSnapshot) -> String {
@@ -4174,16 +4150,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .filter_map(|index| section.items.get(*index))
         .map(|item| {
             let row_style = list_item_row_style(app, item);
-            Row::new(vec![
-                item.repo.clone(),
-                item.number
-                    .map(|number| format!("#{number}"))
-                    .unwrap_or_default(),
-                item.title.clone(),
-                relative_time(item.updated_at),
-                item_meta(item),
-            ])
-            .style(row_style)
+            Row::new(list_table_cells(section.kind, item)).style(row_style)
         })
         .collect::<Vec<_>>();
     let empty_state = rows
@@ -4201,7 +4168,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD)
     };
-    let header = Row::new(vec!["Repo", "#", "Title", "Updated", "Meta"])
+    let header = Row::new(list_table_header(section.kind))
         .style(header_style)
         .bottom_margin(1);
 
@@ -4297,27 +4264,18 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     }
     let title = focus_panel_title("List", &title, list_focused);
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(20),
-            Constraint::Length(8),
-            Constraint::Min(20),
-            Constraint::Length(8),
-            Constraint::Length(14),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(border_type)
-            .border_style(border_style)
-            .title(Span::styled(title, title_style)),
-    )
-    .row_highlight_style(highlight_style)
-    .highlight_spacing(HighlightSpacing::Always)
-    .highlight_symbol("> ");
+    let table = Table::new(rows, list_table_constraints(section.kind))
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(border_style)
+                .title(Span::styled(title, title_style)),
+        )
+        .row_highlight_style(highlight_style)
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_symbol("> ");
 
     let mut table_state = TableState::default().with_offset(table_offset);
     let selected = app.current_selected_position();
@@ -4330,6 +4288,48 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     frame.render_stateful_widget(table, area, &mut table_state);
     if let Some((message, style)) = empty_state {
         draw_list_empty_state_message(frame, area, &message, style);
+    }
+}
+
+fn list_table_cells(kind: SectionKind, item: &WorkItem) -> Vec<String> {
+    let mut cells = vec![
+        item.repo.clone(),
+        item.number
+            .map(|number| format!("#{number}"))
+            .unwrap_or_default(),
+        item.title.clone(),
+        relative_time(item.updated_at),
+    ];
+    if !matches!(kind, SectionKind::Notifications) {
+        cells.push(item_meta(item));
+    }
+    cells
+}
+
+fn list_table_header(kind: SectionKind) -> Vec<&'static str> {
+    if matches!(kind, SectionKind::Notifications) {
+        vec!["Repo", "#", "Title", "Updated"]
+    } else {
+        vec!["Repo", "#", "Title", "Updated", "Meta"]
+    }
+}
+
+fn list_table_constraints(kind: SectionKind) -> Vec<Constraint> {
+    if matches!(kind, SectionKind::Notifications) {
+        vec![
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(8),
+        ]
+    } else {
+        vec![
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(14),
+        ]
     }
 }
 
@@ -4961,7 +4961,10 @@ fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'stat
 }
 
 fn footer_has_selected_comment(app: &AppState) -> bool {
-    app.details_mode == DetailsMode::Conversation && app.current_selected_comment().is_some()
+    app.details_mode == DetailsMode::Conversation
+        && app
+            .current_selected_comment()
+            .is_some_and(|comment| !comment.kind.is_activity())
 }
 
 fn footer_selected_comment_is_editable(app: &AppState) -> bool {
@@ -11238,11 +11241,13 @@ fn push_diff_inline_comment(
         append_review_state_segments(&mut header, review);
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    header.push(DetailSegment::raw("  "));
-    header.push(DetailSegment::action(
-        "+ react",
-        DetailAction::ReactComment(index),
-    ));
+    if !comment.kind.is_activity() {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            "+ react",
+            DetailAction::ReactComment(index),
+        ));
+    }
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
         "reply",
@@ -11979,11 +11984,13 @@ fn push_comment(
         append_review_state_segments(&mut header, review);
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    header.push(DetailSegment::raw("  "));
-    header.push(DetailSegment::action(
-        "+ react",
-        DetailAction::ReactComment(index),
-    ));
+    if !comment.kind.is_activity() {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            "+ react",
+            DetailAction::ReactComment(index),
+        ));
+    }
     if options.search_match {
         header.push(DetailSegment::styled(
             "  match",
@@ -12007,17 +12014,19 @@ fn push_comment(
             DetailAction::ToggleCommentExpanded(index),
         ));
     }
-    header.push(DetailSegment::raw("  "));
-    header.push(DetailSegment::action(
-        "reply",
-        DetailAction::ReplyComment(index),
-    ));
-    if comment.is_mine && comment.id.is_some() {
+    if !comment.kind.is_activity() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            "edit",
-            DetailAction::EditComment(index),
+            "reply",
+            DetailAction::ReplyComment(index),
         ));
+        if comment.is_mine && comment.id.is_some() {
+            header.push(DetailSegment::raw("  "));
+            header.push(DetailSegment::action(
+                "edit",
+                DetailAction::EditComment(index),
+            ));
+        }
     }
     let prefix = comment_line_prefix(options.selected, options.depth);
     builder.push_prefixed_wrapped_limited(
@@ -16539,6 +16548,44 @@ impl AppState {
         changed
     }
 
+    fn apply_item_details_metadata(&mut self, item_id: &str, metadata: &ItemDetailsMetadata) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                if let Some(title) = &metadata.title {
+                    item.title = title.clone();
+                }
+                item.body = metadata.body.clone();
+                if let Some(author) = &metadata.author {
+                    item.author = Some(author.clone());
+                }
+                if let Some(state) = &metadata.state {
+                    item.state = Some(state.clone());
+                }
+                if let Some(url) = &metadata.url {
+                    item.url = url.clone();
+                }
+                if metadata.created_at.is_some() {
+                    item.created_at = metadata.created_at;
+                }
+                if metadata.updated_at.is_some() {
+                    item.updated_at = metadata.updated_at;
+                }
+                if let Some(labels) = &metadata.labels {
+                    item.labels = labels.clone();
+                }
+                if let Some(assignees) = &metadata.assignees {
+                    item.assignees = assignees.clone();
+                }
+                if metadata.comments.is_some() {
+                    item.comments = metadata.comments;
+                }
+            }
+        }
+    }
+
     fn mark_item_milestone(&mut self, item_id: &str, milestone: Option<&Milestone>) {
         for section in &mut self.sections {
             for item in &mut section.items {
@@ -16740,14 +16787,6 @@ impl AppState {
         self.current_item().map(|item| item.id.clone())
     }
 
-    fn notification_thread_id_at_position(&self, position: usize) -> Option<String> {
-        let section = self.current_section()?;
-        let filtered_indices = self.filtered_indices(section);
-        let item_index = filtered_indices.get(position)?;
-        let item = section.items.get(*item_index)?;
-        item.unread.unwrap_or(false).then(|| item.id.clone())
-    }
-
     fn apply_notification_read_local(&mut self, thread_id: &str) -> bool {
         let mut changed = false;
         for section in &mut self.sections {
@@ -16782,6 +16821,9 @@ impl AppState {
     }
 
     fn apply_comment_fetch_result_metadata(&mut self, item_id: &str, result: &CommentFetchResult) {
+        if let Some(metadata) = &result.item_metadata {
+            self.apply_item_details_metadata(item_id, metadata);
+        }
         self.update_item_reactions(item_id, result.item_reactions.clone());
         self.mark_item_milestone(item_id, result.item_milestone.as_ref());
     }
@@ -18546,6 +18588,10 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
+        if comment.kind.is_activity() {
+            self.status = "activity cannot be reacted to".to_string();
+            return;
+        }
         let Some(comment_id) = comment.id else {
             self.status = "comment has no GitHub id".to_string();
             return;
@@ -19737,6 +19783,10 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
+        if comment.kind.is_activity() {
+            self.status = "activity cannot be replied to".to_string();
+            return;
+        }
         let author = comment.author.clone();
         let review_comment_id = comment.review.as_ref().and(comment.id);
         self.focus = FocusTarget::Details;
@@ -24058,6 +24108,7 @@ diff --git a/src/main.rs b/src/main.rs
         app.handle_msg(AppMsg::CommentsLoaded {
             item_id: "1".to_string(),
             comments: Ok(CommentFetchResult {
+                item_metadata: None,
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
                 comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
@@ -25737,6 +25788,65 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn notification_list_table_hides_meta_and_moves_updated_right() {
+        let mut item = notification_item("thread-1", true);
+        item.title = "Notification title".to_string();
+        item.updated_at = Some(Utc::now() - chrono::Duration::days(1));
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        app.list_width_percent = crate::state::MAX_LIST_WIDTH_PERCENT;
+        let backend = ratatui::backend::TestBackend::new(180, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        let header = lines
+            .iter()
+            .find(|line| {
+                line.contains("Repo")
+                    && line.contains("#")
+                    && line.contains("Title")
+                    && line.contains("Updated")
+            })
+            .expect("notification list header");
+        assert!(!header.contains("Meta"));
+        let title_pos = header.find("Title").expect("title column");
+        let updated_pos = header.find("Updated").expect("updated column");
+        assert!(
+            updated_pos.saturating_sub(title_pos) >= 88,
+            "header positions: {header:?}"
+        );
+
+        let row = lines
+            .iter()
+            .find(|line| line.contains("rust-lang/rust") && line.contains("Notification title"))
+            .expect("notification list row");
+        assert!(!row.contains("review-requested"));
+        assert!(!row.contains("mention PullRequest"));
+        let title_pos = row.find("Notification title").expect("title cell");
+        let updated_pos = row.find("1d").expect("updated cell");
+        assert!(
+            updated_pos.saturating_sub(title_pos) >= 88,
+            "row positions: {row:?}"
+        );
+    }
+
+    #[test]
     fn inbox_rows_dim_read_items_and_bold_unread_items() {
         let app = AppState::new(SectionKind::Notifications, vec![]);
         let unread = notification_item("thread-1", true);
@@ -26484,6 +26594,54 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn notification_section_tab_label_shows_only_unread_count() {
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![
+                notification_item("thread-1", true),
+                notification_item("thread-2", false),
+                notification_item("thread-3", true),
+            ],
+            total_count: Some(50),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        assert_eq!(
+            section_tab_label(&app, app.visible_sections()[0]),
+            "All (2)"
+        );
+    }
+
+    #[test]
+    fn notification_section_tab_label_hides_zero_unread_count() {
+        let section = SectionSnapshot {
+            key: "notifications:mentioned".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Mentioned".to_string(),
+            filters: "reason:mention".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: Some(50),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        assert_eq!(
+            section_tab_label(&app, app.visible_sections()[0]),
+            "Mentioned"
+        );
+    }
+
+    #[test]
     fn top_tab_highlights_use_high_contrast_blocks() {
         let view = active_view_tab_style();
         assert_eq!(view.fg, Some(Color::Black));
@@ -26928,6 +27086,7 @@ diff --git a/src/main.rs b/src/main.rs
             "thread-1".to_string(),
             DetailState::Loaded(vec![CommentPreview {
                 id: None,
+                kind: CommentPreviewKind::Comment,
                 author: "alice".to_string(),
                 body: "new comment".to_string(),
                 created_at: Some(updated),
@@ -26958,6 +27117,7 @@ diff --git a/src/main.rs b/src/main.rs
         app.handle_msg(AppMsg::CommentsLoaded {
             item_id: "1".to_string(),
             comments: Ok(CommentFetchResult {
+                item_metadata: None,
                 item_reactions: ReactionSummary::default(),
                 item_milestone: Some(Milestone {
                     number: 9,
@@ -26974,6 +27134,133 @@ diff --git a/src/main.rs b/src/main.rs
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("milestone: next-release"));
+    }
+
+    #[test]
+    fn comments_loaded_updates_inbox_notification_description_from_lazy_metadata() {
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        assert_eq!(app.current_item().and_then(|item| item.body.as_ref()), None);
+
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "thread-1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_metadata: Some(ItemDetailsMetadata {
+                    title: Some("Loaded notification PR".to_string()),
+                    body: Some("Loaded from the linked pull request.".to_string()),
+                    author: Some("rustbot".to_string()),
+                    state: Some("open".to_string()),
+                    url: Some("https://github.com/rust-lang/rust/pull/1".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                    labels: Some(vec!["T-compiler".to_string()]),
+                    assignees: Some(vec!["alice".to_string()]),
+                    comments: Some(3),
+                }),
+                item_reactions: ReactionSummary::default(),
+                item_milestone: None,
+                comments: Vec::new(),
+            }),
+        });
+
+        let item = app.current_item().expect("current item");
+        assert_eq!(item.title, "Loaded notification PR");
+        assert_eq!(
+            item.body.as_deref(),
+            Some("Loaded from the linked pull request.")
+        );
+        assert_eq!(item.reason.as_deref(), Some("mention"));
+        assert_eq!(item.unread, Some(true));
+        assert_eq!(item.comments, Some(3));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Loaded from the linked pull request."));
+        assert!(!rendered.contains("No description."));
+    }
+
+    #[test]
+    fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
+        let mut item = notification_item("thread-1", true);
+        item.body = Some("Loaded from the linked pull request.".to_string());
+        item.author = Some("rustbot".to_string());
+        item.labels = vec!["T-compiler".to_string()];
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "cached comment", None)]),
+        );
+
+        let refreshed_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: None,
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![refreshed_section],
+            save_error: None,
+        });
+
+        let item = app.current_item().expect("current item");
+        assert_eq!(
+            item.body.as_deref(),
+            Some("Loaded from the linked pull request.")
+        );
+        assert_eq!(item.author.as_deref(), Some("rustbot"));
+        assert_eq!(item.labels, vec!["T-compiler".to_string()]);
+        assert_eq!(item.unread, Some(false));
+        assert!(app.details_stale.contains("thread-1"));
+        assert!(
+            matches!(
+                app.details.get("thread-1"),
+                Some(DetailState::Loaded(comments)) if comments[0].body == "cached comment"
+            ),
+            "refresh should keep old details visible while the async reload runs"
+        );
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Loaded from the linked pull request."));
+        assert!(!rendered.contains("No description."));
     }
 
     #[test]
@@ -27579,6 +27866,7 @@ diff --git a/src/main.rs b/src/main.rs
             DetailState::Loaded(vec![
                 CommentPreview {
                     id: None,
+                    kind: CommentPreviewKind::Comment,
                     author: "alice".to_string(),
                     body: "See https://example.com/one.".to_string(),
                     created_at: None,
@@ -27591,6 +27879,7 @@ diff --git a/src/main.rs b/src/main.rs
                 },
                 CommentPreview {
                     id: None,
+                    kind: CommentPreviewKind::Comment,
                     author: "bob".to_string(),
                     body: "Second comment".to_string(),
                     created_at: None,
@@ -27659,6 +27948,48 @@ diff --git a/src/main.rs b/src/main.rs
             document.link_at(line_index, column),
             Some("https://example.com/one".to_string())
         );
+    }
+
+    #[test]
+    fn details_activity_hides_comment_actions() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut activity = comment(
+            "doitian",
+            "pushed 3 commits\n\n- [ee8130a](https://github.com/owner/repo/commit/ee8130a) fix\n- [439a42b](https://github.com/owner/repo/commit/439a42b) feat",
+            Some("https://github.com/owner/repo/pull/1/commits"),
+        );
+        activity.kind = CommentPreviewKind::Activity;
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![activity]));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("pushed 3 commits"));
+        assert!(
+            rendered.lines().any(|line| line.contains("- ee8130a fix")),
+            "first commit should render as its own list line: {rendered:?}"
+        );
+        assert!(
+            rendered.lines().any(|line| line.contains("- 439a42b feat")),
+            "second commit should render as its own list line: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.contains("ee8130a") && line.contains("439a42b")),
+            "commit list items should not collapse into one paragraph: {rendered:?}"
+        );
+        let activity_header = rendered
+            .lines()
+            .find(|line| line.contains("doitian"))
+            .expect("activity header");
+        assert!(!activity_header.contains("+ react"));
+        assert!(!activity_header.contains("reply"));
     }
 
     #[test]
@@ -32154,6 +32485,7 @@ diff --git a/src/main.rs b/src/main.rs
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
             result: Ok(CommentFetchResult {
+                item_metadata: None,
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
                 comments: vec![comment("alice", "posted", None)],
@@ -32230,6 +32562,7 @@ diff --git a/src/main.rs b/src/main.rs
             item_id: "1".to_string(),
             comment_index: 0,
             result: Ok(CommentFetchResult {
+                item_metadata: None,
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
                 comments: vec![own_comment(42, "chenyukang", "updated", None)],
@@ -32503,6 +32836,7 @@ diff --git a/src/main.rs b/src/main.rs
             "1".to_string(),
             DetailState::Loaded(vec![CommentPreview {
                 id: None,
+                kind: CommentPreviewKind::Comment,
                 author: "alice".to_string(),
                 body,
                 created_at: None,
@@ -33910,6 +34244,87 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
+    fn inbox_keyboard_navigation_does_not_mark_notification_read() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![
+                notification_item("thread-1", true),
+                notification_item("thread-2", true),
+            ],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-2")
+        );
+        assert!(app.notification_read_pending.is_empty());
+        assert!(
+            app.sections[0]
+                .items
+                .iter()
+                .all(|item| item.unread == Some(true))
+        );
+    }
+
+    #[test]
+    fn inbox_table_hover_does_not_mark_notification_read() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 100, 40);
+        let table = body_areas(body_area(area))[0];
+        let inner = block_inner(table);
+
+        handle_mouse_with_sync(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: inner.x + 4,
+                row: inner.y + TABLE_HEADER_HEIGHT,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+            Some(&store),
+            Some(&tx),
+        );
+
+        assert!(app.notification_read_pending.is_empty());
+        assert_eq!(app.sections[0].items[0].unread, Some(true));
+    }
+
+    #[test]
     fn pull_request_notification_enter_and_v_open_diff_context() {
         let sections = vec![SectionSnapshot {
             key: "notifications:reviews".to_string(),
@@ -34410,6 +34825,7 @@ diff --git a/d.rs b/d.rs
     fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         CommentPreview {
             id: None,
+            kind: CommentPreviewKind::Comment,
             author: author.to_string(),
             body: body.to_string(),
             created_at: None,
@@ -34425,6 +34841,7 @@ diff --git a/d.rs b/d.rs
     fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         CommentPreview {
             id: Some(id),
+            kind: CommentPreviewKind::Comment,
             author: author.to_string(),
             body: body.to_string(),
             created_at: None,

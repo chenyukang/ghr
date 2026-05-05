@@ -22,10 +22,11 @@
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
-- Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
+- Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
+- Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
-- Inbox read-state handling with local cache updates, GitHub read-state sync, and dimmed read items.
+- Inbox read-state handling when opening notifications or using explicit inbox commands, with local cache updates, GitHub read-state sync, and dimmed read items.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
@@ -187,6 +188,8 @@ Inbox:
 - `Review Requested`
 - `Assigned`
 - `Mentioned`
+- `Subscribed`
+- `Others`
 
 Pull Requests:
 

@@ -99,6 +99,8 @@ pub struct Milestone {
 pub struct CommentPreview {
     #[serde(default)]
     pub id: Option<u64>,
+    #[serde(default, skip_serializing_if = "CommentPreviewKind::is_comment")]
+    pub kind: CommentPreviewKind,
     pub author: String,
     pub body: String,
     pub created_at: Option<DateTime<Utc>>,
@@ -112,6 +114,24 @@ pub struct CommentPreview {
     pub reactions: ReactionSummary,
     #[serde(default)]
     pub review: Option<ReviewCommentPreview>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentPreviewKind {
+    #[default]
+    Comment,
+    Activity,
+}
+
+impl CommentPreviewKind {
+    pub fn is_comment(kind: &Self) -> bool {
+        matches!(kind, Self::Comment)
+    }
+
+    pub fn is_activity(self) -> bool {
+        matches!(self, Self::Activity)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +423,10 @@ pub fn merge_refreshed_sections(
     current
         .into_iter()
         .map(|mut section| match refreshed_by_key.remove(&section.key) {
-            Some(refreshed) if refreshed.error.is_none() => refreshed,
+            Some(mut refreshed) if refreshed.error.is_none() => {
+                preserve_lazy_notification_item_details(&section, &mut refreshed);
+                refreshed
+            }
             Some(refreshed) => {
                 section.error = refreshed.error;
                 section
@@ -411,6 +434,62 @@ pub fn merge_refreshed_sections(
             None => section,
         })
         .collect()
+}
+
+fn preserve_lazy_notification_item_details(
+    current: &SectionSnapshot,
+    refreshed: &mut SectionSnapshot,
+) {
+    if !matches!(current.kind, SectionKind::Notifications)
+        || !matches!(refreshed.kind, SectionKind::Notifications)
+    {
+        return;
+    }
+
+    let current_by_id = current
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    for item in &mut refreshed.items {
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            continue;
+        }
+        let Some(current_item) = current_by_id.get(item.id.as_str()) else {
+            continue;
+        };
+        preserve_lazy_item_details(current_item, item);
+    }
+}
+
+fn preserve_lazy_item_details(current: &WorkItem, refreshed: &mut WorkItem) {
+    if refreshed.body.is_none() {
+        refreshed.body = current.body.clone();
+    }
+    if refreshed.author.is_none() {
+        refreshed.author = current.author.clone();
+    }
+    if refreshed.state.is_none() {
+        refreshed.state = current.state.clone();
+    }
+    if refreshed.created_at.is_none() {
+        refreshed.created_at = current.created_at;
+    }
+    if refreshed.labels.is_empty() && !current.labels.is_empty() {
+        refreshed.labels = current.labels.clone();
+    }
+    if refreshed.reactions.is_empty() && !current.reactions.is_empty() {
+        refreshed.reactions = current.reactions.clone();
+    }
+    if refreshed.milestone.is_none() {
+        refreshed.milestone = current.milestone.clone();
+    }
+    if refreshed.assignees.is_empty() && !current.assignees.is_empty() {
+        refreshed.assignees = current.assignees.clone();
+    }
+    if refreshed.comments.is_none() {
+        refreshed.comments = current.comments;
+    }
 }
 
 pub fn section_counts(section: &SectionSnapshot) -> (usize, usize) {
@@ -509,6 +588,87 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_inbox_preserves_lazy_linked_item_details() {
+        let created_at = DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let old_updated_at = DateTime::parse_from_rfc3339("2026-05-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let refreshed_updated_at = DateTime::parse_from_rfc3339("2026-05-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut current_item = test_work_item("thread-1", ItemKind::PullRequest);
+        current_item.body = Some("Lazy PR description".to_string());
+        current_item.author = Some("alice".to_string());
+        current_item.state = Some("open".to_string());
+        current_item.created_at = Some(created_at);
+        current_item.updated_at = Some(old_updated_at);
+        current_item.labels = vec!["T-compiler".to_string()];
+        current_item.reactions.heart = 2;
+        current_item.milestone = Some(Milestone {
+            number: 9,
+            title: "next".to_string(),
+        });
+        current_item.assignees = vec!["bob".to_string()];
+        current_item.comments = Some(3);
+        current_item.unread = Some(true);
+        current_item.reason = Some("subscribed".to_string());
+
+        let mut refreshed_item = test_work_item("thread-1", ItemKind::PullRequest);
+        refreshed_item.updated_at = Some(refreshed_updated_at);
+        refreshed_item.unread = Some(false);
+        refreshed_item.reason = Some("mention".to_string());
+        let merged = merge_refreshed_sections(
+            vec![test_section(SectionKind::Notifications, vec![current_item])],
+            vec![test_section(
+                SectionKind::Notifications,
+                vec![refreshed_item],
+            )],
+        );
+
+        let item = &merged[0].items[0];
+        assert_eq!(item.body.as_deref(), Some("Lazy PR description"));
+        assert_eq!(item.author.as_deref(), Some("alice"));
+        assert_eq!(item.state.as_deref(), Some("open"));
+        assert_eq!(item.created_at, Some(created_at));
+        assert_eq!(item.updated_at, Some(refreshed_updated_at));
+        assert_eq!(item.labels, vec!["T-compiler".to_string()]);
+        assert_eq!(item.reactions.heart, 2);
+        assert_eq!(
+            item.milestone,
+            Some(Milestone {
+                number: 9,
+                title: "next".to_string(),
+            })
+        );
+        assert_eq!(item.assignees, vec!["bob".to_string()]);
+        assert_eq!(item.comments, Some(3));
+        assert_eq!(item.unread, Some(false));
+        assert_eq!(item.reason.as_deref(), Some("mention"));
+    }
+
+    #[test]
+    fn refreshed_non_inbox_sections_do_not_preserve_removed_item_details() {
+        let mut current_item = test_work_item("owner/repo#1", ItemKind::PullRequest);
+        current_item.body = Some("Old description".to_string());
+        current_item.labels = vec!["old-label".to_string()];
+
+        let refreshed_item = test_work_item("owner/repo#1", ItemKind::PullRequest);
+        let merged = merge_refreshed_sections(
+            vec![test_section(SectionKind::PullRequests, vec![current_item])],
+            vec![test_section(
+                SectionKind::PullRequests,
+                vec![refreshed_item],
+            )],
+        );
+
+        let item = &merged[0].items[0];
+        assert!(item.body.is_none());
+        assert!(item.labels.is_empty());
+    }
+
+    #[test]
     fn configured_repo_sections_use_repo_view_and_generic_titles() {
         let mut config = Config::default();
         config.repos.push(crate::config::RepoConfig {
@@ -595,5 +755,45 @@ mod tests {
         );
 
         assert_eq!(section_view_key(&section), "search");
+    }
+
+    fn test_section(kind: SectionKind, items: Vec<WorkItem>) -> SectionSnapshot {
+        SectionSnapshot {
+            key: format!("{}:test", kind.as_str()),
+            kind,
+            title: kind.label().to_string(),
+            filters: String::new(),
+            items,
+            total_count: None,
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        }
+    }
+
+    fn test_work_item(id: &str, kind: ItemKind) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind,
+            repo: "owner/repo".to_string(),
+            number: Some(1),
+            title: "Example".to_string(),
+            body: None,
+            author: None,
+            state: None,
+            url: "https://github.com/owner/repo/pull/1".to_string(),
+            created_at: None,
+            updated_at: None,
+            last_read_at: None,
+            labels: Vec::new(),
+            reactions: ReactionSummary::default(),
+            milestone: None,
+            assignees: Vec::new(),
+            comments: None,
+            unread: None,
+            reason: None,
+            extra: None,
+        }
     }
 }

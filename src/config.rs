@@ -343,6 +343,18 @@ fn default_notification_sections() -> Vec<SearchSection> {
             queries: Vec::new(),
             limit: None,
         },
+        SearchSection {
+            title: "Subscribed".to_string(),
+            filters: "reason:subscribed".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
+        SearchSection {
+            title: "Others".to_string(),
+            filters: "reason:others".to_string(),
+            queries: Vec::new(),
+            limit: None,
+        },
     ]
 }
 
@@ -462,8 +474,53 @@ mod tests {
 
         assert_eq!(
             titles,
-            vec!["All", "Review Requested", "Assigned", "Mentioned"]
+            vec![
+                "All",
+                "Review Requested",
+                "Assigned",
+                "Mentioned",
+                "Subscribed",
+                "Others"
+            ]
         );
+    }
+
+    #[test]
+    fn generated_default_config_includes_current_inbox_sections() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ghr-generated-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create generated config test dir");
+        let config_path = dir.join("config.toml");
+
+        let config = Config::load_or_create(&config_path).expect("generate default config");
+        let written = fs::read_to_string(&config_path).expect("read generated default config");
+        let titles = config
+            .notification_sections
+            .iter()
+            .map(|section| section.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            titles,
+            vec![
+                "All",
+                "Review Requested",
+                "Assigned",
+                "Mentioned",
+                "Subscribed",
+                "Others"
+            ]
+        );
+        assert!(written.contains(r#"title = "Subscribed""#));
+        assert!(written.contains(r#"filters = "reason:subscribed""#));
+        assert!(written.contains(r#"title = "Others""#));
+        assert!(written.contains(r#"filters = "reason:others""#));
     }
 
     #[test]

@@ -15,10 +15,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
-    PullRequestBranch, ReactionSummary, ReviewCommentPreview, SectionKind, SectionSnapshot,
-    WorkItem, builtin_view_key, global_search_view_key, repo_section_filters_with_labels,
-    repo_view_key,
+    ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, FailedCheckRunSummary, ItemKind,
+    Milestone, PullRequestBranch, ReactionSummary, ReviewCommentPreview, SectionKind,
+    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
+    repo_section_filters_with_labels, repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -28,6 +28,8 @@ const SEARCH_API_MAX_RESULTS: usize = 1000;
 const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_PULL_REQUEST_COMMIT_ACTIVITIES: usize = 5;
+const MAX_PULL_REQUEST_ACTIVITY_COMMITS: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -64,9 +66,24 @@ impl MergeMethod {
 }
 
 pub struct CommentFetchResult {
+    pub item_metadata: Option<ItemDetailsMetadata>,
     pub item_reactions: ReactionSummary,
     pub item_milestone: Option<Milestone>,
     pub comments: Vec<CommentPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDetailsMetadata {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub author: Option<String>,
+    pub state: Option<String>,
+    pub url: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub labels: Option<Vec<String>>,
+    pub assignees: Option<Vec<String>>,
+    pub comments: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,11 +286,22 @@ struct SearchApiIssueRaw {
 
 #[derive(Debug, Deserialize)]
 struct IssueDetailsRaw {
+    title: Option<String>,
+    body: Option<String>,
+    user: Option<SearchAuthorRaw>,
+    state: Option<String>,
+    html_url: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    labels: Option<Vec<SearchLabelRaw>>,
+    assignees: Option<Vec<SearchAuthorRaw>>,
+    comments: Option<u64>,
     reactions: Option<ReactionSummaryRaw>,
     milestone: Option<MilestoneRaw>,
 }
 
 struct IssueDetails {
+    item_metadata: Option<ItemDetailsMetadata>,
     reactions: ReactionSummary,
     milestone: Option<Milestone>,
 }
@@ -401,6 +429,38 @@ struct PullRequestReviewCommentRaw {
     original_start_line: Option<u64>,
     side: Option<String>,
     start_side: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestTimelineEventRaw {
+    event: String,
+    actor: Option<SearchAuthorRaw>,
+    created_at: Option<DateTime<Utc>>,
+    sha: Option<String>,
+    message: Option<String>,
+    html_url: Option<String>,
+    author: Option<GitCommitAuthorRaw>,
+    committer: Option<GitCommitAuthorRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitAuthorRaw {
+    name: Option<String>,
+    date: Option<DateTime<Utc>>,
+}
+
+struct PullRequestCommitActivityBuilder {
+    actor: String,
+    started_at: Option<DateTime<Utc>>,
+    commits: Vec<PullRequestTimelineCommit>,
+    explicit_push_event: bool,
+}
+
+struct PullRequestTimelineCommit {
+    sha: String,
+    message: String,
+    html_url: Option<String>,
+    committed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1144,6 +1204,7 @@ pub async fn fetch_comments(
         ItemKind::PullRequest => fetch_pull_request_comments(repository, number).await,
         ItemKind::Issue => fetch_issue_comments(repository, number).await,
         ItemKind::Notification => Ok(CommentFetchResult {
+            item_metadata: None,
             item_reactions: ReactionSummary::default(),
             item_milestone: None,
             comments: Vec::new(),
@@ -1159,6 +1220,7 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
         tokio::join!(issue_output, comments_output, viewer_login);
     let issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
     Ok(CommentFetchResult {
+        item_metadata: issue_details.item_metadata,
         item_reactions: issue_details.reactions,
         item_milestone: issue_details.milestone,
         comments: parse_issue_comments_output(
@@ -1202,12 +1264,21 @@ pub async fn fetch_pull_request_comments(
     let issue_comments = fetch_issue_comments_output(repository, number);
     let review_comments = fetch_pull_request_review_comments_output(repository, number);
     let review_thread_states = fetch_pull_request_review_thread_states(repository, number);
+    let timeline = fetch_pull_request_timeline_output(repository, number);
     let viewer_login = comment_viewer_login("pull request comment ownership");
-    let (issue_details, issue_output, review_output, review_thread_states, viewer_login) = tokio::join!(
+    let (
+        issue_details,
+        issue_output,
+        review_output,
+        review_thread_states,
+        timeline_output,
+        viewer_login,
+    ) = tokio::join!(
         issue_details,
         issue_comments,
         review_comments,
         review_thread_states,
+        timeline,
         viewer_login
     );
     let viewer_login = viewer_login.as_deref();
@@ -1232,9 +1303,33 @@ pub async fn fetch_pull_request_comments(
         viewer_login,
         &review_thread_states,
     )?);
+    match timeline_output {
+        Ok(output) => {
+            match parse_pull_request_timeline_commit_activities(&output, repository, number) {
+                Ok(mut activities) => comments.append(&mut activities),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        repository,
+                        number,
+                        "failed to parse pull request timeline activity"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load pull request timeline activity"
+            );
+        }
+    }
     comments.sort_by_key(|comment| comment.created_at);
     let issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
     Ok(CommentFetchResult {
+        item_metadata: issue_details.item_metadata,
         item_reactions: issue_details.reactions,
         item_milestone: issue_details.milestone,
         comments,
@@ -1250,6 +1345,19 @@ async fn fetch_pull_request_review_comments_output(
         "api".to_string(),
         "-H".to_string(),
         "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        path,
+    ])
+    .await
+}
+
+async fn fetch_pull_request_timeline_output(repository: &str, number: u64) -> Result<String> {
+    let path = format!("repos/{repository}/issues/{number}/timeline?per_page=100");
+    run_gh_json(&[
+        "api".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github.mockingbird-preview+json".to_string(),
         "--paginate".to_string(),
         "--slurp".to_string(),
         path,
@@ -2459,6 +2567,7 @@ fn parse_issue_comments_output(
             let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
             CommentPreview {
                 id: comment.id,
+                kind: CommentPreviewKind::Comment,
                 author,
                 body: comment.body.unwrap_or_default(),
                 created_at: comment.created_at,
@@ -2480,9 +2589,11 @@ fn parse_issue_comments_output(
 }
 
 fn parse_issue_details_output(output: &str, repository: &str, number: u64) -> Result<IssueDetails> {
-    let issue = serde_json::from_str::<IssueDetailsRaw>(output)
+    let mut issue = serde_json::from_str::<IssueDetailsRaw>(output)
         .with_context(|| format!("failed to parse issue details for {repository}#{number}"))?;
+    let item_metadata = issue.item_metadata();
     Ok(IssueDetails {
+        item_metadata,
         reactions: issue
             .reactions
             .map(ReactionSummary::from)
@@ -2492,6 +2603,43 @@ fn parse_issue_details_output(output: &str, repository: &str, number: u64) -> Re
             title: milestone.title,
         }),
     })
+}
+
+impl IssueDetailsRaw {
+    fn item_metadata(&mut self) -> Option<ItemDetailsMetadata> {
+        let has_metadata = self.title.is_some()
+            || self.body.is_some()
+            || self.user.is_some()
+            || self.state.is_some()
+            || self.html_url.is_some()
+            || self.created_at.is_some()
+            || self.updated_at.is_some()
+            || self.labels.is_some()
+            || self.assignees.is_some()
+            || self.comments.is_some();
+        has_metadata.then(|| ItemDetailsMetadata {
+            title: self.title.take(),
+            body: self.body.take().filter(|body| !body.trim().is_empty()),
+            author: self.user.take().map(|author| author.login),
+            state: self.state.take(),
+            url: self.html_url.take(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            labels: self.labels.take().map(|labels| {
+                labels
+                    .into_iter()
+                    .map(|label| label.name)
+                    .collect::<Vec<_>>()
+            }),
+            assignees: self.assignees.take().map(|assignees| {
+                assignees
+                    .into_iter()
+                    .map(|assignee| assignee.login)
+                    .collect::<Vec<_>>()
+            }),
+            comments: self.comments,
+        })
+    }
 }
 
 fn parse_pull_request_review_comments_output(
@@ -2520,6 +2668,7 @@ fn parse_pull_request_review_comments_output(
                 .unwrap_or_default();
             CommentPreview {
                 id: comment.id,
+                kind: CommentPreviewKind::Comment,
                 author,
                 body: comment.body.unwrap_or_default(),
                 created_at: comment.created_at,
@@ -2549,6 +2698,196 @@ fn parse_pull_request_review_comments_output(
 
     comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn parse_pull_request_timeline_commit_activities(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<Vec<CommentPreview>> {
+    let pages = serde_json::from_str::<Vec<Vec<PullRequestTimelineEventRaw>>>(output)
+        .with_context(|| format!("failed to parse timeline for {repository}#{number}"))?;
+    let mut activities = Vec::new();
+    let mut current: Option<PullRequestCommitActivityBuilder> = None;
+
+    for event in pages.into_iter().flatten() {
+        match event.event.as_str() {
+            "head_ref_force_pushed" | "head_ref_pushed" => {
+                push_pull_request_commit_activity(
+                    &mut activities,
+                    current.take(),
+                    repository,
+                    number,
+                );
+                current = Some(PullRequestCommitActivityBuilder {
+                    actor: event
+                        .actor
+                        .as_ref()
+                        .map(|actor| actor.login.as_str())
+                        .unwrap_or("github")
+                        .to_string(),
+                    started_at: event.created_at,
+                    commits: Vec::new(),
+                    explicit_push_event: true,
+                });
+            }
+            "committed" => {
+                let Some(commit) = pull_request_timeline_commit_from_event(&event) else {
+                    continue;
+                };
+                if current.is_none() {
+                    current = Some(PullRequestCommitActivityBuilder {
+                        actor: pull_request_timeline_commit_actor(&event),
+                        started_at: None,
+                        commits: Vec::new(),
+                        explicit_push_event: false,
+                    });
+                }
+                if let Some(activity) = current.as_mut() {
+                    activity.commits.push(commit);
+                }
+            }
+            _ => {
+                push_pull_request_commit_activity(
+                    &mut activities,
+                    current.take(),
+                    repository,
+                    number,
+                );
+            }
+        }
+    }
+    push_pull_request_commit_activity(&mut activities, current.take(), repository, number);
+
+    let has_explicit_push = activities.iter().any(|activity| activity.0);
+    let mut comments = activities
+        .into_iter()
+        .filter(|(explicit_push, _)| !has_explicit_push || *explicit_push)
+        .map(|(_, comment)| comment)
+        .collect::<Vec<_>>();
+    comments.sort_by_key(|comment| comment.created_at);
+    if comments.len() > MAX_PULL_REQUEST_COMMIT_ACTIVITIES {
+        comments = comments.split_off(comments.len() - MAX_PULL_REQUEST_COMMIT_ACTIVITIES);
+    }
+    Ok(comments)
+}
+
+fn push_pull_request_commit_activity(
+    activities: &mut Vec<(bool, CommentPreview)>,
+    activity: Option<PullRequestCommitActivityBuilder>,
+    repository: &str,
+    number: u64,
+) {
+    let Some(activity) = activity else {
+        return;
+    };
+    if activity.commits.is_empty() {
+        return;
+    }
+    let explicit_push = activity.explicit_push_event;
+    activities.push((
+        explicit_push,
+        pull_request_commit_activity_comment(activity, repository, number),
+    ));
+}
+
+fn pull_request_timeline_commit_from_event(
+    event: &PullRequestTimelineEventRaw,
+) -> Option<PullRequestTimelineCommit> {
+    let sha = event.sha.as_deref()?.trim();
+    if sha.is_empty() {
+        return None;
+    }
+    let message = event.message.as_deref().unwrap_or_default().trim();
+    let committed_at = event
+        .committer
+        .as_ref()
+        .and_then(|author| author.date)
+        .or_else(|| event.author.as_ref().and_then(|author| author.date));
+    Some(PullRequestTimelineCommit {
+        sha: sha.to_string(),
+        message: message.to_string(),
+        html_url: event.html_url.clone(),
+        committed_at,
+    })
+}
+
+fn pull_request_timeline_commit_actor(event: &PullRequestTimelineEventRaw) -> String {
+    event
+        .author
+        .as_ref()
+        .and_then(|author| author.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("github")
+        .to_string()
+}
+
+fn pull_request_commit_activity_comment(
+    activity: PullRequestCommitActivityBuilder,
+    repository: &str,
+    number: u64,
+) -> CommentPreview {
+    let timestamp = activity
+        .commits
+        .iter()
+        .filter_map(|commit| commit.committed_at)
+        .max()
+        .or(activity.started_at);
+    let commit_count = activity.commits.len();
+    let mut body = vec![format!(
+        "pushed {commit_count} commit{}",
+        if commit_count == 1 { "" } else { "s" }
+    )];
+    body.push(String::new());
+    for commit in activity
+        .commits
+        .iter()
+        .take(MAX_PULL_REQUEST_ACTIVITY_COMMITS)
+    {
+        body.push(format!("- {}", commit.activity_line()));
+    }
+    if commit_count > MAX_PULL_REQUEST_ACTIVITY_COMMITS {
+        body.push(format!(
+            "... {} more commits",
+            commit_count - MAX_PULL_REQUEST_ACTIVITY_COMMITS
+        ));
+    }
+    CommentPreview {
+        id: None,
+        kind: CommentPreviewKind::Activity,
+        author: activity.actor,
+        body: body.join("\n"),
+        created_at: timestamp,
+        updated_at: timestamp,
+        url: Some(format!(
+            "https://github.com/{repository}/pull/{number}/commits"
+        )),
+        parent_id: None,
+        is_mine: false,
+        reactions: ReactionSummary::default(),
+        review: None,
+    }
+}
+
+impl PullRequestTimelineCommit {
+    fn activity_line(&self) -> String {
+        let short_sha = short_sha(&self.sha);
+        let summary = self
+            .message
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or("(no commit message)");
+        match &self.html_url {
+            Some(url) => format!("[{short_sha}]({url}) {summary}"),
+            None => format!("{short_sha} {summary}"),
+        }
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 fn parse_pull_request_review_thread_states_page(
@@ -3645,6 +3984,11 @@ fn notification_matches(
 }
 
 fn reason_matches(raw: &str, filter: &str) -> bool {
+    let filter = filter.replace('-', "_");
+    if filter == "others" || filter == "other" {
+        return !is_primary_notification_reason(raw);
+    }
+
     if filter == "participating" {
         return matches!(
             raw,
@@ -3652,7 +3996,14 @@ fn reason_matches(raw: &str, filter: &str) -> bool {
         );
     }
 
-    raw == filter.replace('-', "_")
+    raw == filter
+}
+
+fn is_primary_notification_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "review_requested" | "assign" | "mention" | "subscribed"
+    )
 }
 
 fn normalize_reason_for_display(reason: &str) -> String {
@@ -4075,8 +4426,27 @@ mod tests {
 
     #[test]
     fn issue_details_and_comments_parse_reactions() {
-        let issue = r#"{"reactions": {"+1": 0, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 1, "rocket": 0, "eyes": 0}, "milestone": {"number": 9, "title": "next-release"}}"#;
+        let issue = r#"{
+          "title": "Issue title",
+          "body": "Issue description",
+          "user": {"login": "alice"},
+          "state": "open",
+          "html_url": "https://github.com/owner/repo/issues/1",
+          "comments": 3,
+          "labels": [{"name": "bug"}],
+          "assignees": [{"login": "bob"}],
+          "reactions": {"+1": 0, "-1": 0, "laugh": 0, "hooray": 0, "confused": 0, "heart": 1, "rocket": 0, "eyes": 0},
+          "milestone": {"number": 9, "title": "next-release"}
+        }"#;
         let details = parse_issue_details_output(issue, "owner/repo", 1).unwrap();
+        let metadata = details.item_metadata.expect("issue metadata");
+        assert_eq!(metadata.title.as_deref(), Some("Issue title"));
+        assert_eq!(metadata.body.as_deref(), Some("Issue description"));
+        assert_eq!(metadata.author.as_deref(), Some("alice"));
+        assert_eq!(metadata.state.as_deref(), Some("open"));
+        assert_eq!(metadata.comments, Some(3));
+        assert_eq!(metadata.labels, Some(vec!["bug".to_string()]));
+        assert_eq!(metadata.assignees, Some(vec!["bob".to_string()]));
         assert_eq!(details.reactions.heart, 1);
         assert_eq!(
             details.milestone,
@@ -4128,6 +4498,17 @@ mod tests {
         assert_eq!(item.unread, Some(true));
         assert_eq!(item.reason.as_deref(), Some("review-requested"));
         assert_eq!(item.extra.as_deref(), Some("PullRequest"));
+    }
+
+    #[test]
+    fn notification_reason_filters_support_subscribed_and_others() {
+        assert!(reason_matches("subscribed", "subscribed"));
+        assert!(reason_matches("comment", "others"));
+        assert!(reason_matches("team_mention", "other"));
+        assert!(!reason_matches("review_requested", "others"));
+        assert!(!reason_matches("assign", "others"));
+        assert!(!reason_matches("mention", "others"));
+        assert!(!reason_matches("subscribed", "others"));
     }
 
     #[test]
@@ -4293,6 +4674,86 @@ mod tests {
         );
         assert!(review.is_resolved);
         assert!(!review.is_outdated);
+    }
+
+    #[test]
+    fn pull_request_timeline_groups_push_commits_as_activity() {
+        let output = r##"
+        [
+          [
+            {
+              "event": "committed",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "message": "old commit",
+              "html_url": "https://github.com/owner/repo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "committer": { "name": "alice", "date": "2026-01-01T00:00:00Z" }
+            },
+            {
+              "event": "head_ref_force_pushed",
+              "actor": { "login": "doitian" },
+              "created_at": "2026-05-05T07:46:18Z"
+            },
+            {
+              "event": "committed",
+              "sha": "ee8130a17152a4d7d5fe669927f3fdd0a86074d8",
+              "message": "fix(cch): correct deployer test config field name\n\nDetails",
+              "html_url": "https://github.com/nervosnetwork/fiber/commit/ee8130a17152a4d7d5fe669927f3fdd0a86074d8",
+              "committer": { "name": "ian", "date": "2026-05-05T09:50:41Z" }
+            },
+            {
+              "event": "committed",
+              "sha": "439a42b8c2b5bed311bfed1e21eed5fa6854af7e",
+              "message": "feat(cch): implement swap acceptor protocol",
+              "html_url": "https://github.com/nervosnetwork/fiber/commit/439a42b8c2b5bed311bfed1e21eed5fa6854af7e",
+              "committer": { "name": "ian", "date": "2026-05-05T09:51:09Z" }
+            },
+            {
+              "event": "committed",
+              "sha": "481f378f1533a02c3af5a3696edf6395129d9e47",
+              "message": "docs(cch): document swap acceptor protocol and design rationale",
+              "html_url": "https://github.com/nervosnetwork/fiber/commit/481f378f1533a02c3af5a3696edf6395129d9e47",
+              "committer": { "name": "ian", "date": "2026-05-05T09:51:25Z" }
+            }
+          ]
+        ]
+        "##;
+
+        let activities =
+            parse_pull_request_timeline_commit_activities(output, "nervosnetwork/fiber", 1257)
+                .unwrap();
+
+        assert_eq!(activities.len(), 1);
+        let activity = &activities[0];
+        assert_eq!(activity.kind, CommentPreviewKind::Activity);
+        assert_eq!(activity.author, "doitian");
+        assert!(activity.id.is_none());
+        assert!(activity.review.is_none());
+        assert_eq!(
+            activity.url.as_deref(),
+            Some("https://github.com/nervosnetwork/fiber/pull/1257/commits")
+        );
+        assert_eq!(
+            activity
+                .created_at
+                .as_ref()
+                .map(|timestamp| timestamp.to_rfc3339()),
+            Some("2026-05-05T09:51:25+00:00".to_string())
+        );
+        assert!(activity.body.contains("pushed 3 commits"));
+        assert!(activity.body.contains(
+            "- [ee8130a](https://github.com/nervosnetwork/fiber/commit/ee8130a17152a4d7d5fe669927f3fdd0a86074d8) fix(cch): correct deployer test config field name"
+        ));
+        assert!(
+            activity.body.contains(
+                "- [439a42b](https://github.com/nervosnetwork/fiber/commit/439a42b8c2b5bed311bfed1e21eed5fa6854af7e) feat(cch): implement swap acceptor protocol"
+            )
+        );
+        assert!(
+            activity.body.contains(
+                "- [481f378](https://github.com/nervosnetwork/fiber/commit/481f378f1533a02c3af5a3696edf6395129d9e47) docs(cch): document swap acceptor protocol"
+            )
+        );
+        assert!(!activity.body.contains("old commit"));
     }
 
     #[test]

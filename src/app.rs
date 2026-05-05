@@ -1115,6 +1115,7 @@ struct AppState {
     command_palette_key: String,
     status: String,
     refreshing: bool,
+    section_page_loading: Option<SectionPageLoading>,
     last_refresh_request: Instant,
     details: HashMap<String, DetailState>,
     diffs: HashMap<String, DiffState>,
@@ -1289,6 +1290,13 @@ struct DiffClickState {
 struct PendingDetailsLoad {
     item_id: String,
     ready_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SectionPageLoading {
+    title: String,
+    page_label: String,
+    started_at: Instant,
 }
 
 impl DiffClickState {
@@ -1950,6 +1958,11 @@ fn start_section_page_load(
     let page_label =
         section_page_status_label(request.page, request.total_pages, request.total_is_capped);
     app.refreshing = true;
+    app.section_page_loading = Some(SectionPageLoading {
+        title: request.title.clone(),
+        page_label: page_label.clone(),
+        started_at: Instant::now(),
+    });
     app.last_refresh_request = Instant::now();
     app.status = format!("loading {} page {page_label}", request.title);
 
@@ -2023,6 +2036,7 @@ fn start_filtered_section_load(
     }
 
     app.refreshing = true;
+    app.section_page_loading = None;
     app.last_refresh_request = Instant::now();
     app.set_current_selected_position(0);
     app.clear_current_list_scroll_offset();
@@ -4282,6 +4296,8 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
         draw_global_search_loading_dialog(frame, app, area);
+    } else if let Some(loading) = &app.section_page_loading {
+        draw_section_page_loading_dialog(frame, loading, area);
     }
 
     if let Some(palette) = &app.command_palette {
@@ -5231,7 +5247,9 @@ fn footer_groups(app: &AppState) -> Vec<Vec<Span<'static>>> {
 }
 
 fn footer_status(app: &AppState) -> String {
-    if app.refreshing {
+    if let Some(loading) = &app.section_page_loading {
+        section_page_loading_status(loading)
+    } else if app.refreshing {
         "refreshing".to_string()
     } else {
         app.status.clone()
@@ -7678,6 +7696,52 @@ fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+}
+
+fn draw_section_page_loading_dialog(
+    frame: &mut Frame<'_>,
+    loading: &SectionPageLoading,
+    area: Rect,
+) {
+    let dialog_area = centered_rect(58, 9, area);
+    let elapsed_secs = loading.started_at.elapsed().as_secs();
+    let lines = section_page_loading_content(loading, elapsed_secs);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Loading Page",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+fn section_page_loading_content(
+    loading: &SectionPageLoading,
+    elapsed_secs: u64,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from("Fetching GitHub result page."),
+        Line::from(""),
+        startup_loading_line(elapsed_secs),
+        startup_progress_line(elapsed_secs),
+        Line::from(""),
+        key_value_line("section", loading.title.clone()),
+        key_value_line("page", loading.page_label.clone()),
+    ]
+}
+
+fn section_page_loading_status(loading: &SectionPageLoading) -> String {
+    format!("loading {} page {}", loading.title, loading.page_label)
 }
 
 fn global_search_loading_content(app: &AppState, elapsed_secs: u64) -> Vec<Line<'static>> {
@@ -13846,6 +13910,7 @@ impl AppState {
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
+            section_page_loading: None,
             last_refresh_request: Instant::now(),
             details: HashMap::new(),
             diffs: HashMap::new(),
@@ -14226,6 +14291,7 @@ impl AppState {
         match message {
             AppMsg::RefreshStarted => {
                 self.refreshing = true;
+                self.section_page_loading = None;
                 self.last_refresh_request = Instant::now();
                 self.status = "refreshing from GitHub".to_string();
             }
@@ -14274,6 +14340,7 @@ impl AppState {
                     self.selected_comment_index = 0;
                 }
                 self.refreshing = false;
+                self.section_page_loading = None;
                 if matches!(self.startup_dialog, Some(StartupDialog::Initializing)) {
                     self.startup_dialog = if setup_dialog.is_some() {
                         None
@@ -15191,6 +15258,7 @@ impl AppState {
                 self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
                 self.replace_section_page(&section_key, section);
                 self.refreshing = false;
+                self.section_page_loading = None;
                 self.status = match (error.as_deref(), save_error) {
                     (None, None) => loaded_page_label
                         .map(|label| format!("loaded page {label}"))
@@ -15213,6 +15281,7 @@ impl AppState {
                 }
                 self.replace_section_page(&section_key, section);
                 self.refreshing = false;
+                self.section_page_loading = None;
                 self.status = match (error.as_deref(), filter_label) {
                     (None, Some(filter)) if !filter.is_empty() => {
                         format!("filter applied: {filter}")
@@ -24572,6 +24641,48 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(refreshing.contains("j/k move"));
         assert!(!refreshing.contains("status: refreshing"));
         assert_eq!(top_status_line(&app, 32).to_string(), "status: refreshing");
+    }
+
+    #[test]
+    fn section_page_loading_overrides_generic_refresh_status() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.refreshing = true;
+        app.section_page_loading = Some(SectionPageLoading {
+            title: "Pull Requests".to_string(),
+            page_label: "2/20+".to_string(),
+            started_at: Instant::now(),
+        });
+
+        assert_eq!(footer_status(&app), "loading Pull Requests page 2/20+");
+        assert!(
+            top_status_line(&app, 42)
+                .to_string()
+                .contains("loading Pull Requests")
+        );
+    }
+
+    #[test]
+    fn section_page_loading_dialog_renders_page_context() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.refreshing = true;
+        app.section_page_loading = Some(SectionPageLoading {
+            title: "Pull Requests".to_string(),
+            page_label: "2/20+".to_string(),
+            started_at: Instant::now() - Duration::from_secs(2),
+        });
+        let backend = ratatui::backend::TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Loading Page"));
+        assert!(rendered.contains("Fetching GitHub result page."));
+        assert!(rendered.contains("section: Pull Requests"));
+        assert!(rendered.contains("page: 2/20+"));
     }
 
     #[test]

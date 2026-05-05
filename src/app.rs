@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(not(test))]
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(test))]
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -24,29 +29,40 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::{Frame, Terminal};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, github_repo_from_remote_url};
 use crate::dirs::Paths;
 use crate::github::{
-    CommentFetchResult, PullRequestReviewCommentTarget, add_issue_comment_reaction,
+    AssigneeAction, CommentFetchResult, ItemMetadataUpdate, MergeMethod,
+    PullRequestReviewCommentTarget, PullRequestReviewEvent, add_issue_comment_reaction,
     add_issue_label, add_issue_reaction, add_pull_request_review_comment_reaction,
-    approve_pull_request, close_pull_request, create_issue, edit_issue_comment,
-    edit_pull_request_review_comment, fetch_comments, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, fetch_repository_labels, mark_notification_thread_read,
-    merge_pull_request, post_issue_comment, post_pull_request_review_comment,
-    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
-    refresh_section_page, remove_issue_label, search_global, with_background_github_priority,
+    approve_pull_request, change_issue_milestone, close_issue, close_pull_request,
+    convert_pull_request_to_draft, create_issue, create_milestone,
+    create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
+    discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
+    edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
+    fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
+    fetch_repository_assignees, fetch_repository_labels, mark_notification_thread_read,
+    mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
+    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
+    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
+    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
+    submit_pending_pull_request_review, submit_pull_request_review, update_issue_assignees,
+    update_pull_request_branch, with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, ItemKind, ReactionSummary, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
-    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    section_counts, section_view_key,
+    ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
+    PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
+    configured_sections, global_search_view_key, mark_notification_read_in_section,
+    merge_cached_sections, merge_refreshed_sections, repo_view_key, section_counts,
+    section_view_key,
 };
-use crate::snapshot::SnapshotStore;
-use crate::state::UiState;
+use crate::snapshot::{RepoCandidateCache, SnapshotStore};
+use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
 
 mod diff;
 mod layout;
@@ -67,9 +83,12 @@ use layout::{
 use layout::{body_area, body_areas};
 use search::{filtered_indices, fuzzy_score};
 use status::{
-    comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
-    pr_action_error_body, pr_action_error_status, pr_action_error_title, pr_action_success_body,
-    pr_action_success_title, refresh_error_status, setup_dialog_from_error, success_message_dialog,
+    comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
+    operation_error_body, persistent_success_message_dialog, pr_action_error_body,
+    pr_action_error_status, pr_action_error_title, pr_action_success_body, pr_action_success_title,
+    refresh_error_status, retryable_message_dialog, reviewer_action_error_status,
+    reviewer_action_error_title, reviewer_action_success_body, reviewer_action_success_title,
+    setup_dialog_from_error, success_message_dialog,
 };
 use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
@@ -121,12 +140,73 @@ enum AppMsg {
         repo: String,
         result: std::result::Result<Vec<String>, String>,
     },
+    AssigneeSuggestionsLoaded {
+        repo: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    ReviewerSuggestionsLoaded {
+        repo: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
     IssueCreated {
         result: std::result::Result<WorkItem, String>,
     },
+    PullRequestCreated {
+        result: std::result::Result<WorkItem, String>,
+    },
+    ReviewDraftCreated {
+        item_id: String,
+        result: std::result::Result<PendingReviewState, String>,
+    },
+    ReviewSubmitted {
+        item_id: String,
+        event: PullRequestReviewEvent,
+        result: std::result::Result<(), String>,
+    },
+    PendingReviewSubmitted {
+        item_id: String,
+        review_id: u64,
+        event: PullRequestReviewEvent,
+        result: std::result::Result<(), String>,
+    },
+    PendingReviewDiscarded {
+        item_id: String,
+        review_id: u64,
+        result: std::result::Result<(), String>,
+    },
     PrActionFinished {
         item_id: String,
+        item_kind: ItemKind,
         action: PrAction,
+        merge_method: Option<MergeMethod>,
+        result: std::result::Result<(), String>,
+    },
+    PrCheckoutFinished {
+        result: std::result::Result<PrCheckoutResult, String>,
+    },
+    MilestonesLoaded {
+        item_id: String,
+        result: std::result::Result<Vec<Milestone>, String>,
+    },
+    MilestoneChanged {
+        item_id: String,
+        milestone: Option<Milestone>,
+        result: std::result::Result<(), String>,
+    },
+    ItemMetadataUpdated {
+        item_id: String,
+        field: ItemEditField,
+        result: std::result::Result<ItemMetadataUpdate, String>,
+    },
+    AssigneesUpdated {
+        item_id: String,
+        action: AssigneeAction,
+        result: std::result::Result<WorkItem, String>,
+    },
+    ReviewerActionFinished {
+        item_id: String,
+        action: ReviewerAction,
+        reviewers: Vec<String>,
         result: std::result::Result<(), String>,
     },
     NotificationReadFinished {
@@ -137,6 +217,10 @@ enum AppMsg {
         section_key: String,
         section: SectionSnapshot,
         save_error: Option<String>,
+    },
+    FilterSectionLoaded {
+        section_key: String,
+        section: SectionSnapshot,
     },
     GlobalSearchFinished {
         query: String,
@@ -151,7 +235,7 @@ enum DetailState {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionHintState {
     Loading,
     Loaded(ActionHints),
@@ -183,15 +267,6 @@ impl FocusTarget {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ghr => "ghr",
-            Self::Sections => "Sections",
-            Self::List => "List",
-            Self::Details => "Details",
-        }
-    }
-
     fn from_state_str(value: &str) -> Self {
         match value {
             "ghr" => Self::Ghr,
@@ -213,6 +288,13 @@ impl DetailsMode {
         match self {
             Self::Conversation => "conversation",
             Self::Diff => "diff",
+        }
+    }
+
+    fn from_state_str(value: &str) -> Self {
+        match value {
+            "diff" => Self::Diff,
+            _ => Self::Conversation,
         }
     }
 }
@@ -245,6 +327,9 @@ enum CommentDialogMode {
     Review {
         target: DiffReviewTarget,
     },
+    ItemMetadata {
+        field: ItemEditField,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,10 +339,40 @@ struct CommentDialog {
     scroll: u16,
 }
 
+#[derive(Debug, Clone)]
 struct PendingCommentSubmit {
     item: WorkItem,
     body: String,
     mode: PendingCommentMode,
+    dialog: CommentDialog,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewSubmitDialog {
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    scroll: u16,
+    mode: ReviewSubmitMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSubmitMode {
+    New,
+    Pending { review_id: u64 },
+}
+
+struct PendingReviewSubmit {
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    mode: ReviewSubmitMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReviewState {
+    review_id: u64,
+    body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,31 +518,511 @@ struct IssueDialog {
     body_scroll: u16,
 }
 
+#[derive(Debug, Clone)]
 struct PendingIssueCreate {
     repo: String,
     title: String,
     body: String,
     labels: Vec<String>,
+    dialog: IssueDialog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrCreateField {
+    Title,
+    Body,
+}
+
+impl PrCreateField {
+    fn next(self, delta: isize) -> Self {
+        const FIELDS: [PrCreateField; 2] = [PrCreateField::Title, PrCreateField::Body];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        let next = move_wrapping(index, FIELDS.len(), delta);
+        FIELDS[next]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCreateDialog {
+    repo: String,
+    local_dir: PathBuf,
+    branch: String,
+    title: String,
+    body: String,
+    field: PrCreateField,
+    body_scroll: u16,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPrCreate {
+    repo: String,
+    local_dir: PathBuf,
+    branch: String,
+    title: String,
+    body: String,
+    dialog: PrCreateDialog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemEditField {
+    Title,
+    Body,
+}
+
+impl ItemEditField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Body => "body",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Body => "Body",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ItemEditDialog {
+    item: WorkItem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrAction {
     Merge,
     Close,
+    Reopen,
+    #[allow(dead_code)]
     Approve,
+    EnableAutoMerge,
+    DisableAutoMerge,
+    Checkout,
+    RerunFailedChecks,
+    UpdateBranch,
+    ConvertToDraft,
+    MarkReadyForReview,
 }
+
+type PrActionDialogSummary = Vec<(&'static str, String)>;
+type PrActionDialogSummaryError = (&'static str, String, String);
 
 #[derive(Debug, Clone)]
 struct PrActionDialog {
     item: WorkItem,
     action: PrAction,
+    checkout: Option<PrCheckoutPlan>,
+    summary: PrActionDialogSummary,
+    merge_method: MergeMethod,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCheckoutResult {
+    command: String,
+    directory: PathBuf,
+    output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrCheckoutPlan {
+    directory: PathBuf,
+    branch: Option<PullRequestBranch>,
+}
+
+#[derive(Debug, Clone)]
+struct MilestoneDialog {
+    item: WorkItem,
+    state: MilestoneDialogState,
+    input: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+enum MilestoneDialogState {
+    Loading,
+    Loaded(Vec<Milestone>),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MilestoneChoice {
+    Clear,
+    Set(Milestone),
+    Create(String),
+}
+
+#[derive(Debug, Clone)]
+struct AssigneeDialog {
+    item: WorkItem,
+    action: AssigneeAction,
+    input: String,
+    suggestions: Vec<String>,
+    suggestions_loading: bool,
+    suggestions_error: Option<String>,
+    selected_suggestion: usize,
+}
+
+fn assignee_action_label(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "assign",
+        AssigneeAction::Unassign => "unassign",
+    }
+}
+
+fn assignee_action_success_title(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "Assignee Added",
+        AssigneeAction::Unassign => "Assignee Removed",
+    }
+}
+
+fn assignee_action_success_body(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "GitHub added the assignee and refreshed the item.",
+        AssigneeAction::Unassign => "GitHub removed the assignee and refreshed the item.",
+    }
+}
+
+fn assignee_action_error_title(action: AssigneeAction) -> &'static str {
+    match action {
+        AssigneeAction::Assign => "Assign Failed",
+        AssigneeAction::Unassign => "Unassign Failed",
+    }
+}
+
+fn parse_assignee_input(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut assignees = Vec::new();
+    for raw in input.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+        let login = raw.trim().trim_start_matches('@').trim();
+        if login.is_empty() {
+            continue;
+        }
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            assignees.push(login.to_string());
+        }
+    }
+    assignees
+}
+
+fn dedupe_assignee_logins(logins: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for login in logins {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(login);
+        }
+    }
+    deduped
+}
+
+fn assignee_input_prefix(input: &str) -> String {
+    input
+        .rsplit(|ch: char| ch == ',' || ch.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+}
+
+fn assignee_dialog_suggestion_matches(dialog: &AssigneeDialog) -> Vec<String> {
+    let prefix = assignee_input_prefix(&dialog.input);
+    let candidates = match dialog.action {
+        AssigneeAction::Assign => &dialog.suggestions,
+        AssigneeAction::Unassign => &dialog.item.assignees,
+    };
+    candidates
+        .iter()
+        .filter(|login| {
+            dialog.action != AssigneeAction::Assign
+                || !dialog
+                    .item
+                    .assignees
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(login))
+        })
+        .filter(|login| prefix.is_empty() || login.to_ascii_lowercase().starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn selected_assignee_suggestion(dialog: &AssigneeDialog) -> Option<String> {
+    let matches = assignee_dialog_suggestion_matches(dialog);
+    if matches.is_empty() {
+        None
+    } else {
+        matches
+            .get(dialog.selected_suggestion.min(matches.len() - 1))
+            .cloned()
+    }
+}
+
+fn assignee_dialog_uses_default_unassign(dialog: &AssigneeDialog) -> bool {
+    dialog.action == AssigneeAction::Unassign
+        && dialog.input.trim().is_empty()
+        && dialog.item.assignees.len() == 1
+}
+
+fn assignee_dialog_submit_logins(dialog: &AssigneeDialog) -> Vec<String> {
+    let mut assignees = parse_assignee_input(&dialog.input);
+    if assignees.is_empty() && assignee_dialog_uses_default_unassign(dialog) {
+        return dialog.item.assignees.clone();
+    }
+    if !assignees.is_empty()
+        && !assignee_input_prefix(&dialog.input).is_empty()
+        && let Some(selected) = selected_assignee_suggestion(dialog)
+        && let Some(last) = assignees.last_mut()
+    {
+        *last = selected;
+    }
+    dedupe_assignee_logins(assignees)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectSwitcher {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectRemoveDialog {
+    query: String,
+    selected: usize,
+    candidates: Vec<ProjectRemoveCandidate>,
+    confirm: Option<ProjectRemoveCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectAddField {
+    Title,
+    RepoUrl,
+    LocalDir,
+}
+
+impl ProjectAddField {
+    fn next(self, delta: isize) -> Self {
+        const FIELDS: [ProjectAddField; 3] = [
+            ProjectAddField::Title,
+            ProjectAddField::RepoUrl,
+            ProjectAddField::LocalDir,
+        ];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        let next = move_wrapping(index, FIELDS.len(), delta);
+        FIELDS[next]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectAddDialog {
+    title: String,
+    repo_url: String,
+    local_dir: String,
+    field: ProjectAddField,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectRemoveCandidate {
+    index: usize,
+    name: String,
+    repo: String,
+    local_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyBinding {
+    label: String,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    fn matches(&self, key: KeyEvent) -> bool {
+        let expected_modifiers = command_palette_modifier_bits(self.modifiers);
+        let actual_modifiers = command_palette_modifier_bits(key.modifiers);
+        if expected_modifiers != actual_modifiers {
+            return false;
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return false;
+        }
+
+        match (&self.code, key.code) {
+            (KeyCode::Char(expected), KeyCode::Char(actual))
+                if expected_modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                expected.eq_ignore_ascii_case(&actual)
+            }
+            (KeyCode::Char(expected), KeyCode::Char(actual)) => *expected == actual,
+            (expected, actual) => *expected == actual,
+        }
+    }
+
+    fn is_plain_text_char(&self) -> bool {
+        matches!(self.code, KeyCode::Char(value) if !value.is_control())
+            && !self
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PaletteCommand {
+    title: &'static str,
+    keys: String,
+    scope: &'static str,
+    detail: &'static str,
+    action: PaletteAction,
+}
+
+#[derive(Debug, Clone)]
+enum PaletteAction {
+    Key(KeyEvent),
+    Quit,
+    ShowInfo,
+    ShowHelp,
+    ShowCommandPalette,
+    Refresh,
+    SearchCurrentRepo,
+    SwitchProject,
+    ProjectAdd,
+    ProjectRemove,
+    CopyGithubLink,
+    CopyContent,
+    ToggleMouseCapture,
+    OpenSelected,
+    ShowDiff,
+    ClearIgnoredItems,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerAction {
+    Request,
+    Remove,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewerDialog {
+    item: WorkItem,
+    action: ReviewerAction,
+    input: String,
+    suggestions: Vec<String>,
+    suggestions_loading: bool,
+    suggestions_error: Option<String>,
+    selected_suggestion: usize,
+}
+
+fn item_kind_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "pull request",
+        ItemKind::Notification => "notification",
+    }
+}
+
+fn item_kind_confirmation_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "PR",
+        ItemKind::Notification => "item",
+    }
+}
+
+fn pr_action_success_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "pull request merged; refreshing".to_string(),
+        PrAction::Close => format!("{label} closed; refreshing"),
+        PrAction::Reopen => format!("{label} reopened; refreshing"),
+        PrAction::Approve => "pull request approved; refreshing".to_string(),
+        PrAction::EnableAutoMerge => "pull request auto-merge enabled; refreshing".to_string(),
+        PrAction::DisableAutoMerge => "pull request auto-merge disabled; refreshing".to_string(),
+        PrAction::Checkout => "pull request checked out locally".to_string(),
+        PrAction::RerunFailedChecks => "failed checks rerun; refreshing".to_string(),
+        PrAction::UpdateBranch => "pull request branch update accepted; refreshing".to_string(),
+        PrAction::ConvertToDraft => "pull request converted to draft; refreshing".to_string(),
+        PrAction::MarkReadyForReview => "pull request marked ready; refreshing".to_string(),
+    }
+}
+
+fn pr_action_confirm_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "confirm pull request merge".to_string(),
+        PrAction::Close => format!("confirm {label} close"),
+        PrAction::Reopen => format!("confirm {label} reopen"),
+        PrAction::Approve => "confirm pull request approval".to_string(),
+        PrAction::EnableAutoMerge => "confirm pull request auto-merge enable".to_string(),
+        PrAction::DisableAutoMerge => "confirm pull request auto-merge disable".to_string(),
+        PrAction::Checkout => "confirm local pull request checkout".to_string(),
+        PrAction::RerunFailedChecks => "confirm failed check rerun".to_string(),
+        PrAction::UpdateBranch => "confirm pull request branch update".to_string(),
+        PrAction::ConvertToDraft => "confirm convert pull request to draft".to_string(),
+        PrAction::MarkReadyForReview => "confirm mark pull request ready".to_string(),
+    }
+}
+
+fn pr_action_running_status(action: PrAction, item_kind: ItemKind) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        PrAction::Merge => "merging pull request".to_string(),
+        PrAction::Close => format!("closing {label}"),
+        PrAction::Reopen => format!("reopening {label}"),
+        PrAction::Approve => "approving pull request".to_string(),
+        PrAction::EnableAutoMerge => "enabling pull request auto-merge".to_string(),
+        PrAction::DisableAutoMerge => "disabling pull request auto-merge".to_string(),
+        PrAction::Checkout => "checking out pull request locally".to_string(),
+        PrAction::RerunFailedChecks => "rerunning failed checks".to_string(),
+        PrAction::UpdateBranch => "updating pull request branch".to_string(),
+        PrAction::ConvertToDraft => "converting pull request to draft".to_string(),
+        PrAction::MarkReadyForReview => "marking pull request ready for review".to_string(),
+    }
+}
+
+fn close_or_reopen_action_for_item(item: &WorkItem) -> std::result::Result<PrAction, &'static str> {
+    if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        return Err("selected item is not an issue or pull request");
+    }
+    if item.number.is_none() {
+        return Err("selected item has no issue or pull request number");
+    }
+
+    let state = item.state.as_deref().unwrap_or("open").to_ascii_lowercase();
+    match state.as_str() {
+        "closed" => Ok(PrAction::Reopen),
+        "merged" if item.kind == ItemKind::PullRequest => {
+            Err("merged pull requests cannot be reopened")
+        }
+        _ => Ok(PrAction::Close),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageDialog {
     title: String,
     body: String,
+    kind: MessageDialogKind,
     auto_close_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageDialogKind {
+    Info,
+    Success,
+    Error,
+    RetryableError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,6 +1039,9 @@ enum PendingCommentMode {
     Review {
         target: DiffReviewTarget,
     },
+    ItemMetadata {
+        field: ItemEditField,
+    },
 }
 
 const TABLE_HEADER_HEIGHT: u16 = 2;
@@ -458,11 +1056,15 @@ const MAX_COALESCED_MOUSE_SCROLL_STEPS: i16 = 6;
 const COMMENT_DIALOG_WIDTH_PERCENT: u16 = 72;
 const COMMENT_DIALOG_MIN_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_VERTICAL_MARGIN: u16 = 4;
-const COMMENT_DIALOG_FOOTER_HEIGHT: u16 = 2;
 const COMMENT_DIALOG_MIN_EDITOR_HEIGHT: u16 = 4;
 const COMMENT_DIALOG_EDITOR_PADDING_LINES: u16 = 1;
 const COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT: u16 = 10;
 const COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH: u16 = 48;
+const HELP_DIALOG_WIDTH_PERCENT: u16 = 98;
+const HELP_DIALOG_MAX_WIDTH: u16 = 160;
+const HELP_TWO_COLUMN_MIN_WIDTH: usize = 104;
+const HELP_COLUMN_GAP: usize = 4;
+const PR_ACTION_REMOTE_BRANCH_LINE: u16 = 6;
 const COMMENT_LEFT_PADDING: usize = 2;
 const COMMENT_RIGHT_PADDING: usize = 4;
 const COMMENT_COLLAPSE_MIN_LINES: usize = 36;
@@ -476,13 +1078,18 @@ const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
+const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
+const REVIEWER_SUGGESTION_LIMIT: usize = 6;
 
 struct AppState {
     active_view: String,
     sections: Vec<SectionSnapshot>,
     section_index: HashMap<String, usize>,
+    base_section_filters: HashMap<String, String>,
+    quick_filters: HashMap<String, QuickFilter>,
     selected_index: HashMap<String, usize>,
     list_scroll_offset: HashMap<String, usize>,
+    view_snapshots: HashMap<String, ViewSnapshotState>,
     focus: FocusTarget,
     details_scroll: u16,
     details_mode: DetailsMode,
@@ -499,6 +1106,13 @@ struct AppState {
     global_search_return_view: Option<String>,
     global_search_scope: Option<String>,
     global_search_started_at: Option<Instant>,
+    filter_input_active: bool,
+    filter_input_query: String,
+    command_palette: Option<CommandPalette>,
+    project_switcher: Option<ProjectSwitcher>,
+    project_add_dialog: Option<ProjectAddDialog>,
+    project_remove_dialog: Option<ProjectRemoveDialog>,
+    command_palette_key: String,
     status: String,
     refreshing: bool,
     last_refresh_request: Instant,
@@ -506,6 +1120,8 @@ struct AppState {
     diffs: HashMap<String, DiffState>,
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
+    diff_file_details_scroll: HashMap<String, u16>,
+    ignored_items: HashSet<String>,
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
@@ -513,6 +1129,11 @@ struct AppState {
     viewed_details_snapshot: HashMap<String, String>,
     viewed_comments_snapshot: HashMap<String, String>,
     action_hints: HashMap<String, ActionHintState>,
+    action_hints_stale: HashSet<String>,
+    action_hints_refreshing: HashSet<String>,
+    label_suggestions_cache: HashMap<String, Vec<String>>,
+    assignee_suggestions_cache: HashMap<String, Vec<String>>,
+    reviewer_suggestions_cache: HashMap<String, Vec<String>>,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
@@ -523,12 +1144,27 @@ struct AppState {
     posting_comment: bool,
     reaction_dialog: Option<ReactionDialog>,
     posting_reaction: bool,
+    pending_comment_submit: Option<PendingCommentSubmit>,
     label_dialog: Option<LabelDialog>,
     label_updating: bool,
     issue_dialog: Option<IssueDialog>,
     issue_creating: bool,
+    pending_issue_create: Option<PendingIssueCreate>,
+    pr_create_dialog: Option<PrCreateDialog>,
+    pr_creating: bool,
+    pending_pr_create: Option<PendingPrCreate>,
+    review_submit_dialog: Option<ReviewSubmitDialog>,
+    review_submit_running: bool,
+    pending_reviews: HashMap<String, PendingReviewState>,
+    item_edit_dialog: Option<ItemEditDialog>,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
+    milestone_dialog: Option<MilestoneDialog>,
+    milestone_action_running: bool,
+    assignee_dialog: Option<AssigneeDialog>,
+    assignee_action_running: bool,
+    reviewer_dialog: Option<ReviewerDialog>,
+    reviewer_action_running: bool,
     setup_dialog: Option<SetupDialog>,
     startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
@@ -548,6 +1184,46 @@ struct RefreshAnchor {
     active_view: String,
     section_key: Option<String>,
     item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewSnapshotState {
+    focus: FocusTarget,
+    section_key: Option<String>,
+    item_id: Option<String>,
+    selected_index: usize,
+    list_scroll_offset: usize,
+    details_mode: DetailsMode,
+    details_scroll: u16,
+    selected_comment_index: usize,
+}
+
+impl ViewSnapshotState {
+    fn from_saved(snapshot: &SavedViewSnapshot) -> Self {
+        Self {
+            focus: FocusTarget::from_state_str(&snapshot.focus),
+            section_key: snapshot.section_key.clone(),
+            item_id: snapshot.item_id.clone(),
+            selected_index: snapshot.selected_index,
+            list_scroll_offset: snapshot.list_scroll_offset,
+            details_mode: DetailsMode::from_state_str(&snapshot.details_mode),
+            details_scroll: snapshot.details_scroll,
+            selected_comment_index: snapshot.selected_comment_index,
+        }
+    }
+
+    fn to_saved(&self) -> SavedViewSnapshot {
+        SavedViewSnapshot {
+            focus: self.focus.as_state_str().to_string(),
+            section_key: self.section_key.clone(),
+            item_id: self.item_id.clone(),
+            selected_index: self.selected_index,
+            list_scroll_offset: self.list_scroll_offset,
+            details_mode: self.details_mode.as_state_str().to_string(),
+            details_scroll: self.details_scroll,
+            selected_comment_index: self.selected_comment_index,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -638,17 +1314,224 @@ struct SectionPageRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickFilterState {
+    Open,
+    Closed,
+    Merged,
+    Draft,
+    All,
+}
+
+impl QuickFilterState {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "open" => Some(Self::Open),
+            "closed" | "close" => Some(Self::Closed),
+            "merged" => Some(Self::Merged),
+            "draft" => Some(Self::Draft),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn display(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+            Self::Draft => "draft",
+            Self::All => "all",
+        }
+    }
+
+    fn query_token(self) -> Option<&'static str> {
+        match self {
+            Self::Open => Some("is:open"),
+            Self::Closed => Some("is:closed"),
+            Self::Merged => Some("is:merged"),
+            Self::Draft => Some("is:draft"),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct QuickFilter {
+    state: Option<QuickFilterState>,
+    assignee: Option<String>,
+    author: Option<String>,
+    labels: Vec<String>,
+}
+
+impl QuickFilter {
+    fn parse(input: &str) -> std::result::Result<Option<Self>, String> {
+        let input = input.trim();
+        if input.is_empty() || matches!(input, "clear" | "reset") {
+            return Ok(None);
+        }
+
+        let mut filter = Self::default();
+        for token in input.split_whitespace() {
+            if let Some(state) = QuickFilterState::parse(token) {
+                filter.state = Some(state);
+                continue;
+            }
+            if let Some(value) = token
+                .strip_prefix("state:")
+                .or_else(|| token.strip_prefix("is:"))
+            {
+                filter.state = Some(
+                    QuickFilterState::parse(value)
+                        .ok_or_else(|| format!("unknown state filter: {value}"))?,
+                );
+                continue;
+            }
+            if let Some(value) = token.strip_prefix("assignee:") {
+                filter.assignee = Some(non_empty_filter_value("assignee", value)?);
+                continue;
+            }
+            if let Some(value) = token.strip_prefix("author:") {
+                filter.author = Some(non_empty_filter_value("author", value)?);
+                continue;
+            }
+            if let Some(value) = token
+                .strip_prefix("label:")
+                .or_else(|| token.strip_prefix("labels:"))
+            {
+                for label in comma_separated_filter_values("label", value)? {
+                    if !filter.labels.contains(&label) {
+                        filter.labels.push(label);
+                    }
+                }
+                continue;
+            }
+
+            return Err(format!("unknown filter token: {token}"));
+        }
+
+        Ok(Some(filter))
+    }
+
+    fn display(&self) -> String {
+        let mut tokens = Vec::new();
+        if let Some(state) = self.state {
+            tokens.push(format!("state:{}", state.display()));
+        }
+        if let Some(assignee) = &self.assignee {
+            tokens.push(format!("assignee:{assignee}"));
+        }
+        if let Some(author) = &self.author {
+            tokens.push(format!("author:{author}"));
+        }
+        tokens.extend(self.labels.iter().map(|label| format!("label:{label}")));
+        tokens.join(" ")
+    }
+}
+
+fn non_empty_filter_value(name: &str, value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("{name} filter is empty"))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn comma_separated_filter_values(
+    name: &str,
+    value: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        Err(format!("{name} filter is empty"))
+    } else {
+        Ok(values)
+    }
+}
+
+fn quick_filter_query(base_filters: &str, filter: &QuickFilter) -> String {
+    if base_filters.contains(" | ") {
+        return base_filters
+            .split(" | ")
+            .map(|filters| quick_filter_query(filters, filter))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+
+    let base_tokens = base_filters
+        .split_whitespace()
+        .filter(|token| !quick_filter_replaces_token(token, filter))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let overlay_tokens = quick_filter_tokens(filter);
+    insert_tokens_before_sort(base_tokens, overlay_tokens).join(" ")
+}
+
+fn quick_filter_replaces_token(token: &str, filter: &QuickFilter) -> bool {
+    (filter.state.is_some() && is_state_filter_token(token))
+        || (filter.assignee.is_some() && token.starts_with("assignee:"))
+        || (filter.author.is_some() && token.starts_with("author:"))
+        || (!filter.labels.is_empty()
+            && (token.starts_with("label:") || token.starts_with("labels:")))
+}
+
+fn quick_filter_tokens(filter: &QuickFilter) -> Vec<String> {
+    let mut tokens = Vec::new();
+    if let Some(token) = filter.state.and_then(QuickFilterState::query_token) {
+        tokens.push(token.to_string());
+    }
+    if let Some(assignee) = &filter.assignee {
+        tokens.push(format!("assignee:{assignee}"));
+    }
+    if let Some(author) = &filter.author {
+        tokens.push(format!("author:{author}"));
+    }
+    tokens.extend(filter.labels.iter().map(|label| format!("label:{label}")));
+    tokens
+}
+
+fn insert_tokens_before_sort(
+    mut base_tokens: Vec<String>,
+    overlay_tokens: Vec<String>,
+) -> Vec<String> {
+    if overlay_tokens.is_empty() {
+        return base_tokens;
+    }
+    let sort_index = base_tokens
+        .iter()
+        .position(|token| token.starts_with("sort:"))
+        .unwrap_or(base_tokens.len());
+    base_tokens.splice(sort_index..sort_index, overlay_tokens);
+    base_tokens
+}
+
+fn is_state_filter_token(token: &str) -> bool {
+    matches!(
+        token,
+        "is:open" | "is:closed" | "is:merged" | "is:draft" | "draft:true" | "draft:false"
+    ) || token.starts_with("state:")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshPriority {
     User,
     Background,
 }
 
-pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
+pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
     let cached = store.load_all()?;
     let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
+    let repo_candidate_cache = store.load_repo_candidate_cache()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    app.load_repo_candidate_cache(repo_candidate_cache);
+    app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
     let startup_setup_dialog = startup_setup_dialog();
     if let Some(dialog) = startup_setup_dialog {
         app.show_setup_dialog(dialog);
@@ -683,7 +1566,7 @@ pub async fn run(config: Config, paths: Paths, store: SnapshotStore) -> Result<(
     let result = run_loop(
         &mut terminal,
         &mut app,
-        &config,
+        &mut config,
         &paths,
         &store,
         &tx,
@@ -708,13 +1591,27 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
-    startup_setup_dialog_from_gh_probe(
-        Command::new("gh")
-            .env("GH_PROMPT_DISABLED", "1")
-            .arg("--version")
-            .output()
-            .map(|_| ()),
-    )
+    debug!(command = "gh --version", "gh request started");
+    let result = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .arg("--version")
+        .output();
+    match &result {
+        Ok(output) => debug!(
+            command = "gh --version",
+            status = %output.status,
+            success = output.status.success(),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request finished"
+        ),
+        Err(error) => debug!(
+            command = "gh --version",
+            error = %error,
+            "gh request failed to start"
+        ),
+    }
+    startup_setup_dialog_from_gh_probe(result.map(|_| ()))
 }
 
 fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {
@@ -728,7 +1625,7 @@ fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDia
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
-    config: &Config,
+    config: &mut Config,
     paths: &Paths,
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
@@ -763,7 +1660,7 @@ async fn run_loop(
             let events = read_event_batch(event::read()?)?;
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
-            should_quit = handle_event_batch(app, events, area, config, paths, store, tx);
+            should_quit = handle_event_batch_mut(app, events, area, config, paths, store, tx);
         }
         sync_mouse_capture(terminal, app, &mut mouse_capture_enabled)?;
         if should_quit {
@@ -783,11 +1680,11 @@ fn read_event_batch(first: Event) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn handle_event_batch(
+fn handle_event_batch_mut(
     app: &mut AppState,
     events: Vec<Event>,
     area: Rect,
-    config: &Config,
+    config: &mut Config,
     paths: &Paths,
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
@@ -801,7 +1698,7 @@ fn handle_event_batch(
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                if handle_key_in_area(app, key, config, store, tx, Some(area)) {
+                if handle_key_in_area_mut(app, key, config, paths, store, tx, Some(area)) {
                     save_ui_state(app, paths);
                     return true;
                 }
@@ -821,6 +1718,20 @@ fn handle_event_batch(
 
     flush_pending_mouse_scroll(app, &mut pending_scroll);
     false
+}
+
+#[cfg(test)]
+fn handle_event_batch(
+    app: &mut AppState,
+    events: Vec<Event>,
+    area: Rect,
+    config: &Config,
+    paths: &Paths,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+) -> bool {
+    let mut config = config.clone();
+    handle_event_batch_mut(app, events, area, &mut config, paths, store, tx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,11 +1826,20 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
     if !app.mouse_capture_enabled
         || app.setup_dialog.is_some()
         || app.startup_dialog.is_some()
+        || app.command_palette.is_some()
+        || app.project_switcher.is_some()
+        || app.project_add_dialog.is_some()
+        || app.project_remove_dialog.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
+        || app.item_edit_dialog.is_some()
         || app.pr_action_dialog.is_some()
         || app.label_dialog.is_some()
         || app.issue_dialog.is_some()
+        || app.pr_create_dialog.is_some()
+        || app.milestone_dialog.is_some()
+        || app.assignee_dialog.is_some()
+        || app.reviewer_dialog.is_some()
     {
         return None;
     }
@@ -1063,6 +1983,70 @@ fn start_section_page_load(
     });
 }
 
+fn start_filtered_section_load(
+    app: &mut AppState,
+    config: &Config,
+    tx: &UnboundedSender<AppMsg>,
+    filter: Option<QuickFilter>,
+) {
+    let Some(section) = app.current_section() else {
+        app.status = "no section selected".to_string();
+        return;
+    };
+    if !matches!(
+        section.kind,
+        SectionKind::PullRequests | SectionKind::Issues
+    ) {
+        app.status = "quick filters are available for PR and issue sections".to_string();
+        return;
+    }
+
+    let section_key = section.key.clone();
+    let view = section_view_key(section);
+    let kind = section.kind;
+    let title = section.title.clone();
+    let base_filters = app.base_filters_for_section(section);
+    let page_size = section_page_size(section, config);
+    let effective_filters = match &filter {
+        Some(filter) => quick_filter_query(&base_filters, filter),
+        None => base_filters.clone(),
+    };
+    let status_filter = filter.as_ref().map(QuickFilter::display);
+
+    match filter {
+        Some(filter) => {
+            app.quick_filters.insert(section_key.clone(), filter);
+        }
+        None => {
+            app.quick_filters.remove(&section_key);
+        }
+    }
+
+    app.refreshing = true;
+    app.last_refresh_request = Instant::now();
+    app.set_current_selected_position(0);
+    app.clear_current_list_scroll_offset();
+    app.details_scroll = 0;
+    app.selected_comment_index = 0;
+    app.comment_dialog = None;
+    app.pr_action_dialog = None;
+    app.status = match status_filter {
+        Some(filter) if !filter.is_empty() => format!("applying filter {filter}"),
+        _ => "clearing quick filter".to_string(),
+    };
+
+    let config = config.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let section =
+            refresh_section_page(view, kind, title, effective_filters, 1, page_size, &config).await;
+        let _ = tx.send(AppMsg::FilterSectionLoaded {
+            section_key,
+            section,
+        });
+    });
+}
+
 fn start_global_search(
     query: String,
     repo_scope: Option<String>,
@@ -1101,6 +2085,7 @@ fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
                 .map_err(|error| error.to_string()),
             None => Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: Vec::new(),
             }),
         };
@@ -1135,14 +2120,29 @@ fn start_diff_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     });
 }
 
+fn error_chain_message(error: anyhow::Error) -> String {
+    let mut messages = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if !message.trim().is_empty() && messages.last() != Some(&message) {
+            messages.push(message);
+        }
+    }
+    messages.join(": ")
+}
+
+fn retryable_operation_error_body(error: &str) -> String {
+    operation_error_body(error)
+}
+
 fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let result = match item.number {
             Some(number) => match post_issue_comment(&item.repo, number, &body).await {
                 Ok(()) => fetch_comments(&item.repo, number, item.kind)
                     .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
+                    .map_err(error_chain_message),
+                Err(error) => Err(error_chain_message(error)),
             },
             None => Err("selected item has no issue or pull request number".to_string()),
         };
@@ -1165,8 +2165,8 @@ fn start_review_reply_submit(
                 match post_pull_request_review_reply(&item.repo, number, comment_id, &body).await {
                     Ok(()) => fetch_comments(&item.repo, number, item.kind)
                         .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
+                        .map_err(error_chain_message),
+                    Err(error) => Err(error_chain_message(error)),
                 }
             }
             None => Err("selected item has no pull request number".to_string()),
@@ -1195,14 +2195,40 @@ fn start_comment_edit(
             } {
                 Ok(()) => fetch_comments(&item.repo, number, item.kind)
                     .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
+                    .map_err(error_chain_message),
+                Err(error) => Err(error_chain_message(error)),
             },
             None => Err("selected item has no issue or pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::CommentUpdated {
             item_id: item.id,
             comment_index,
+            result,
+        });
+    });
+}
+
+fn start_item_metadata_edit(
+    item: WorkItem,
+    field: ItemEditField,
+    value: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                let title = (field == ItemEditField::Title).then_some(value.as_str());
+                let body = (field == ItemEditField::Body).then_some(value.as_str());
+                edit_item_metadata(&item.repo, number, title, body)
+                    .await
+                    .map_err(error_chain_message)
+            }
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ItemMetadataUpdated {
+            item_id,
+            field,
             result,
         });
     });
@@ -1230,10 +2256,89 @@ fn start_review_comment_submit(
                 &body,
             )
             .await
-            .map_err(|error| error.to_string()),
+            .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::ReviewCommentPosted { item_id, result });
+    });
+}
+
+fn start_review_draft_create(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => create_pending_pull_request_review(&item.repo, number, &body)
+                .await
+                .map(|review_id| PendingReviewState { review_id, body })
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewDraftCreated { item_id, result });
+    });
+}
+
+fn start_review_submit(
+    item: WorkItem,
+    event: PullRequestReviewEvent,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => submit_pull_request_review(&item.repo, number, event, &body)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewSubmitted {
+            item_id,
+            event,
+            result,
+        });
+    });
+}
+
+fn start_pending_review_submit(
+    item: WorkItem,
+    review_id: u64,
+    event: PullRequestReviewEvent,
+    body: String,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                submit_pending_pull_request_review(&item.repo, number, review_id, event, &body)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::PendingReviewSubmitted {
+            item_id,
+            review_id,
+            event,
+            result,
+        });
+    });
+}
+
+fn start_pending_review_discard(item: WorkItem, review_id: u64, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => discard_pending_pull_request_review(&item.repo, number, review_id)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::PendingReviewDiscarded {
+            item_id,
+            review_id,
+            result,
+        });
     });
 }
 
@@ -1299,13 +2404,73 @@ fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<A
     });
 }
 
-fn start_label_suggestions_load(repo: String, tx: UnboundedSender<AppMsg>) {
-    tokio::spawn(async move {
+fn start_label_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
         let result = fetch_repository_labels(&repo)
             .await
             .map_err(|error| error.to_string());
+        if let Ok(labels) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_label_candidates(&repo, labels)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist label candidates");
+        }
         let _ = tx.send(AppMsg::LabelSuggestionsLoaded { repo, result });
     });
+    true
+}
+
+fn start_assignee_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
+        let result = fetch_repository_assignees(&repo)
+            .await
+            .map_err(|error| error.to_string());
+        if let Ok(assignees) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_assignee_candidates(&repo, assignees)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist assignee candidates");
+        }
+        let _ = tx.send(AppMsg::AssigneeSuggestionsLoaded { repo, result });
+    });
+    true
+}
+
+fn start_reviewer_suggestions_load(
+    repo: String,
+    store: Option<SnapshotStore>,
+    tx: UnboundedSender<AppMsg>,
+) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
+        let result = fetch_repository_assignees(&repo)
+            .await
+            .map_err(|error| error.to_string());
+        if let Ok(reviewers) = &result
+            && let Some(store) = &store
+            && let Err(error) = store.save_reviewer_candidates(&repo, reviewers)
+        {
+            warn!(error = %error, repo = %repo, "failed to persist reviewer candidates");
+        }
+        let _ = tx.send(AppMsg::ReviewerSuggestionsLoaded { repo, result });
+    });
+    true
 }
 
 fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) {
@@ -1317,42 +2482,144 @@ fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) 
             &pending.labels,
         )
         .await
-        .map_err(|error| error.to_string());
+        .map_err(error_chain_message);
         let _ = tx.send(AppMsg::IssueCreated { result });
+    });
+}
+
+fn start_pr_create(pending: PendingPrCreate, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = create_pull_request(
+            &pending.repo,
+            &pending.local_dir,
+            &pending.branch,
+            &pending.title,
+            &pending.body,
+        )
+        .await
+        .map_err(error_chain_message);
+        let _ = tx.send(AppMsg::PullRequestCreated { result });
     });
 }
 
 fn start_pr_action(
     item: WorkItem,
     action: PrAction,
+    checkout: Option<PrCheckoutPlan>,
+    merge_method: Option<MergeMethod>,
     config: Config,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
+        let item_kind = item.kind;
+        if action == PrAction::Checkout {
+            let Some(checkout) = checkout else {
+                let _ = tx.send(AppMsg::PrCheckoutFinished {
+                    result: Err("missing local checkout target".to_string()),
+                });
+                return;
+            };
+            let result = run_pr_checkout(item, checkout.directory).await;
+            let _ = tx.send(AppMsg::PrCheckoutFinished { result });
+            return;
+        }
+
         let result = match item.number {
             Some(number) => match action {
-                PrAction::Merge => merge_pull_request(&item.repo, number)
+                PrAction::Merge if item.kind == ItemKind::PullRequest => {
+                    merge_pull_request(&item.repo, number, merge_method.unwrap_or_default())
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Close if item.kind == ItemKind::PullRequest => {
+                    close_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Close if item.kind == ItemKind::Issue => close_issue(&item.repo, number)
                     .await
                     .map_err(|error| error.to_string()),
-                PrAction::Close => close_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
-                PrAction::Approve => approve_pull_request(&item.repo, number)
-                    .await
-                    .map_err(|error| error.to_string()),
+                PrAction::Reopen if item.kind == ItemKind::PullRequest => {
+                    reopen_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Reopen if item.kind == ItemKind::Issue => {
+                    reopen_issue(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Approve if item.kind == ItemKind::PullRequest => {
+                    approve_pull_request(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::EnableAutoMerge if item.kind == ItemKind::PullRequest => {
+                    enable_pull_request_auto_merge(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::DisableAutoMerge if item.kind == ItemKind::PullRequest => {
+                    disable_pull_request_auto_merge(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
+                PrAction::RerunFailedChecks if item.kind == ItemKind::PullRequest => {
+                    rerun_failed_pull_request_checks(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::UpdateBranch if item.kind == ItemKind::PullRequest => {
+                    update_pull_request_branch(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::ConvertToDraft if item.kind == ItemKind::PullRequest => {
+                    convert_pull_request_to_draft(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::MarkReadyForReview if item.kind == ItemKind::PullRequest => {
+                    mark_pull_request_ready_for_review(&item.repo, number)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                PrAction::Merge
+                | PrAction::Approve
+                | PrAction::EnableAutoMerge
+                | PrAction::DisableAutoMerge
+                | PrAction::RerunFailedChecks
+                | PrAction::UpdateBranch
+                | PrAction::ConvertToDraft
+                | PrAction::MarkReadyForReview => {
+                    Err("selected item is not a pull request".to_string())
+                }
+                PrAction::Close | PrAction::Reopen => {
+                    Err("selected item is not an issue or pull request".to_string())
+                }
             },
-            None => Err("selected item has no pull request number".to_string()),
+            None => Err("selected item has no issue or pull request number".to_string()),
         };
         let should_refresh = result.is_ok();
         let _ = tx.send(AppMsg::PrActionFinished {
             item_id,
+            item_kind,
             action,
+            merge_method,
             result,
         });
 
         if should_refresh {
+            if let Some(number) = item.number {
+                let item_id = item.id.clone();
+                let actions = fetch_pull_request_action_hints(&item.repo, number)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
+            }
             let _ = tx.send(AppMsg::RefreshStarted);
             let sections = with_background_github_priority(refresh_dashboard(&config)).await;
             let mut save_error = None;
@@ -1375,6 +2642,432 @@ fn start_pr_action(
     });
 }
 
+async fn run_pr_checkout(
+    item: WorkItem,
+    directory: PathBuf,
+) -> std::result::Result<PrCheckoutResult, String> {
+    let number = item
+        .number
+        .ok_or_else(|| "selected item has no pull request number".to_string())?;
+    let args = pr_checkout_command_args(&item.repo, number);
+    let command = pr_checkout_command_display(&args);
+    debug!(
+        command = %command,
+        cwd = %directory.display(),
+        "gh request started"
+    );
+    let output = TokioCommand::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .current_dir(&directory)
+        .args(&args)
+        .output()
+        .await
+        .map_err(|error| {
+            debug!(
+                command = %command,
+                cwd = %directory.display(),
+                error = %error,
+                "gh request failed to start"
+            );
+            if error.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
+                    checkout_directory_notice(&directory),
+                )
+            } else {
+                format!(
+                    "failed to run {command}: {error}\n\n{}",
+                    checkout_directory_notice(&directory),
+                )
+            }
+        })?;
+    debug!(
+        command = %command,
+        cwd = %directory.display(),
+        status = %output.status,
+        success = output.status.success(),
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        "gh request finished"
+    );
+
+    let output_text = command_output_text(&output.stdout, &output.stderr);
+    if !output.status.success() {
+        let detail = if output_text.is_empty() {
+            "gh did not return any output".to_string()
+        } else {
+            output_text
+        };
+        return Err(format!(
+            "{} failed.\n\n{}\n\n{}",
+            command,
+            checkout_directory_notice(&directory),
+            truncate_text(&detail, 900),
+        ));
+    }
+
+    let output = if output_text.is_empty() {
+        "gh pr checkout completed successfully.".to_string()
+    } else {
+        truncate_text(&output_text, 900)
+    };
+    Ok(PrCheckoutResult {
+        command,
+        directory,
+        output,
+    })
+}
+
+fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "checkout".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        repository.to_string(),
+    ]
+}
+
+fn pr_checkout_command_display(args: &[String]) -> String {
+    format!("gh {}", args.join(" "))
+}
+
+fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn checkout_directory_notice(directory: &Path) -> String {
+    format!("Checkout runs from {}.", directory.display())
+}
+
+fn resolve_pr_checkout_directory(
+    config: &Config,
+    repository: &str,
+) -> std::result::Result<PathBuf, String> {
+    if let Some(directory) = configured_local_dir_for_repo(config, repository) {
+        ensure_directory_tracks_repo(&directory, repository).map_err(|error| {
+            format!(
+                "Configured local_dir for {repository} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repository}."
+            )
+        })?;
+        return Ok(directory);
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| {
+        format!(
+            "Could not inspect the current working directory for {repository}: {error}\n\nSet [[repos]].local_dir for this repository."
+        )
+    })?;
+    ensure_directory_tracks_repo(&cwd, repository).map_err(|error| {
+        format!(
+            "No local checkout found for {repository}.\n\n{error}\n\nLaunch ghr inside a checkout whose git remote points at {repository}, or set [[repos]].local_dir for this repository."
+        )
+    })?;
+    Ok(cwd)
+}
+
+fn configured_local_dir_for_repo(config: &Config, repository: &str) -> Option<PathBuf> {
+    config
+        .repos
+        .iter()
+        .find(|repo| repo.repo.eq_ignore_ascii_case(repository))
+        .and_then(|repo| repo.local_dir.as_deref())
+        .map(str::trim)
+        .filter(|local_dir| !local_dir.is_empty())
+        .map(expand_user_path)
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(value)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(::dirs::home_dir)
+}
+
+fn ensure_directory_tracks_repo(
+    directory: &Path,
+    repository: &str,
+) -> std::result::Result<(), String> {
+    if !directory.is_dir() {
+        return Err(format!("{} is not a directory.", directory.display()));
+    }
+    let remotes = git_remotes_for_directory(directory)?;
+    if remotes
+        .iter()
+        .any(|(_, repo)| repo.eq_ignore_ascii_case(repository))
+    {
+        return Ok(());
+    }
+
+    let remote_list = if remotes.is_empty() {
+        "no GitHub remotes found".to_string()
+    } else {
+        remotes
+            .iter()
+            .map(|(remote, repo)| format!("{remote} -> {repo}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(format!(
+        "{} does not track {repository}; found {remote_list}.",
+        directory.display()
+    ))
+}
+
+fn current_git_branch_for_directory(directory: &Path) -> std::result::Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to inspect current git branch in {}: {error}",
+                directory.display()
+            )
+        })?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() && !branch.is_empty() {
+        return Ok(branch);
+    }
+
+    let detail = command_output_text(&output.stdout, &output.stderr);
+    let detail = if detail.is_empty() {
+        "detached HEAD or no branch is checked out".to_string()
+    } else {
+        detail
+    };
+    Err(format!(
+        "cannot create PR from {}: {detail}",
+        directory.display()
+    ))
+}
+
+fn git_remotes_for_directory(
+    directory: &Path,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .arg("remote")
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run git remote in {}: {error}",
+                directory.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} is not a usable git checkout: {}",
+            directory.display(),
+            command_output_text(&output.stdout, &output.stderr)
+        ));
+    }
+
+    let mut remotes = Vec::new();
+    let names = String::from_utf8_lossy(&output.stdout);
+    for remote in names
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+    {
+        if let Some(repo) = git_remote_repo(directory, remote) {
+            remotes.push((remote.to_string(), repo));
+        }
+    }
+    Ok(remotes)
+}
+
+fn git_remote_repo(directory: &Path, remote: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["remote", "get-url", remote])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    github_repo_from_remote_url(url.trim())
+}
+
+fn start_milestones_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = fetch_open_milestones(&item.repo)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::MilestonesLoaded { item_id, result });
+    });
+}
+
+fn start_milestone_change(
+    item: WorkItem,
+    choice: MilestoneChoice,
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let mut changed_milestone = None;
+        let result = match item.number {
+            Some(number) => match resolve_milestone_choice(&item.repo, choice).await {
+                Ok(milestone) => {
+                    changed_milestone = milestone.clone();
+                    change_issue_milestone(&item.repo, number, milestone.as_ref().map(|m| m.number))
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error),
+            },
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let should_refresh = result.is_ok();
+        let _ = tx.send(AppMsg::MilestoneChanged {
+            item_id,
+            milestone: changed_milestone,
+            result,
+        });
+
+        if should_refresh {
+            let _ = tx.send(AppMsg::RefreshStarted);
+            let sections = with_background_github_priority(refresh_dashboard(&config)).await;
+            let mut save_error = None;
+            for section in &sections {
+                if section.error.is_some() {
+                    continue;
+                }
+                if let Err(error) = store.save_section(section) {
+                    let message = error.to_string();
+                    warn!(error = %message, "failed to save refreshed snapshot after milestone change");
+                    save_error = Some(message);
+                    break;
+                }
+            }
+            let _ = tx.send(AppMsg::RefreshFinished {
+                sections,
+                save_error,
+            });
+        }
+    });
+}
+
+async fn resolve_milestone_choice(
+    repository: &str,
+    choice: MilestoneChoice,
+) -> std::result::Result<Option<Milestone>, String> {
+    match choice {
+        MilestoneChoice::Clear => Ok(None),
+        MilestoneChoice::Set(milestone) => Ok(Some(milestone)),
+        MilestoneChoice::Create(title) => create_milestone(repository, &title)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn start_reviewer_action(
+    item: WorkItem,
+    action: ReviewerAction,
+    reviewers: Vec<String>,
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => match action {
+                ReviewerAction::Request => {
+                    request_pull_request_reviewers(&item.repo, number, &reviewers)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                ReviewerAction::Remove => {
+                    remove_pull_request_reviewers(&item.repo, number, &reviewers)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let should_refresh = result.is_ok();
+        let _ = tx.send(AppMsg::ReviewerActionFinished {
+            item_id,
+            action,
+            reviewers,
+            result,
+        });
+
+        if should_refresh {
+            let _ = tx.send(AppMsg::RefreshStarted);
+            let sections = with_background_github_priority(refresh_dashboard(&config)).await;
+            let mut save_error = None;
+            for section in &sections {
+                if section.error.is_some() {
+                    continue;
+                }
+                if let Err(error) = store.save_section(section) {
+                    let message = error.to_string();
+                    warn!(error = %message, "failed to save refreshed snapshot after reviewer action");
+                    save_error = Some(message);
+                    break;
+                }
+            }
+            let _ = tx.send(AppMsg::RefreshFinished {
+                sections,
+                save_error,
+            });
+        }
+    });
+}
+
+fn start_assignee_update(
+    item: WorkItem,
+    action: AssigneeAction,
+    assignees: Vec<String>,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) => {
+                update_issue_assignees(&item.repo, number, item.kind, action, &assignees)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => Err("selected item has no issue or pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::AssigneesUpdated {
+            item_id,
+            action,
+            result,
+        });
+    });
+}
+
 #[cfg(test)]
 fn handle_key(
     app: &mut AppState,
@@ -1386,6 +3079,7 @@ fn handle_key(
     handle_key_in_area(app, key, config, store, tx, None)
 }
 
+#[cfg(test)]
 fn handle_key_in_area(
     app: &mut AppState,
     key: KeyEvent,
@@ -1394,6 +3088,34 @@ fn handle_key_in_area(
     tx: &UnboundedSender<AppMsg>,
     area: Option<Rect>,
 ) -> bool {
+    let mut config = config.clone();
+    let paths = test_key_paths();
+    handle_key_in_area_mut(app, key, &mut config, &paths, store, tx, area)
+}
+
+#[cfg(test)]
+fn test_key_paths() -> Paths {
+    let root = std::path::PathBuf::from("/tmp/ghr-test-key");
+    Paths {
+        config_path: root.join("config.toml"),
+        db_path: root.join("ghr.db"),
+        log_path: root.join("ghr.log"),
+        state_path: root.join("state.toml"),
+        root,
+    }
+}
+
+fn handle_key_in_area_mut(
+    app: &mut AppState,
+    key: KeyEvent,
+    config: &mut Config,
+    paths: &Paths,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+    area: Option<Rect>,
+) -> bool {
+    app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
+
     if is_ctrl_c_key(key) {
         return true;
     }
@@ -1423,10 +3145,42 @@ fn handle_key_in_area(
     }
 
     if app.message_dialog.is_some() {
+        let retryable = app
+            .message_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.kind == MessageDialogKind::RetryableError);
         match key.code {
+            KeyCode::Esc if retryable => app.dismiss_retryable_message_dialog(false),
+            KeyCode::Enter | KeyCode::Char('q') if retryable => {
+                app.dismiss_retryable_message_dialog(true)
+            }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.command_palette.is_some() {
+        return app.handle_command_palette_key(key, config, paths, store, tx, area);
+    }
+
+    if app.project_switcher.is_some() {
+        app.handle_project_switcher_key(key);
+        return false;
+    }
+
+    if app.project_add_dialog.is_some() {
+        app.handle_project_add_key(key, config, paths, store, tx);
+        return false;
+    }
+
+    if app.project_remove_dialog.is_some() {
+        app.handle_project_remove_key(key, config, paths);
+        return false;
+    }
+
+    if should_open_command_palette(app, key) {
+        app.show_command_palette();
         return false;
     }
 
@@ -1445,8 +3199,23 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.pr_create_dialog.is_some() {
+        app.handle_pr_create_dialog_key(key, tx, area);
+        return false;
+    }
+
     if app.reaction_dialog.is_some() {
         app.handle_reaction_dialog_key(key, tx);
+        return false;
+    }
+
+    if app.review_submit_dialog.is_some() {
+        app.handle_review_submit_dialog_key(key, tx, area);
+        return false;
+    }
+
+    if app.item_edit_dialog.is_some() {
+        app.handle_item_edit_dialog_key(key);
         return false;
     }
 
@@ -1455,8 +3224,28 @@ fn handle_key_in_area(
         return false;
     }
 
+    if app.milestone_dialog.is_some() {
+        app.handle_milestone_dialog_key(key, config, store, tx);
+        return false;
+    }
+
+    if app.assignee_dialog.is_some() {
+        app.handle_assignee_dialog_key(key, tx);
+        return false;
+    }
+
+    if app.reviewer_dialog.is_some() {
+        app.handle_reviewer_dialog_key(key, config, store, tx);
+        return false;
+    }
+
     if app.comment_search_active {
         app.handle_comment_search_key(key, area);
+        return false;
+    }
+
+    if app.filter_input_active {
+        app.handle_filter_input_key(key, config, tx);
         return false;
     }
 
@@ -1496,6 +3285,10 @@ fn handle_key_in_area(
         app.show_diff();
         return false;
     }
+    if is_ctrl_d_key(key) {
+        app.discard_pending_review(tx);
+        return false;
+    }
 
     match key.code {
         KeyCode::Char('q') if app.details_mode == DetailsMode::Diff => {
@@ -1505,10 +3298,19 @@ fn handle_key_in_area(
         KeyCode::Char('q') => return true,
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::ALT) => {
+            start_section_page_load(app, config, store, tx, -1)
+        }
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::ALT) => {
+            start_section_page_load(app, config, store, tx, 1)
+        }
         KeyCode::Char('S') => app.start_global_search_input(),
+        KeyCode::Char('f') => app.start_filter_input(),
         KeyCode::Tab => app.move_focused_tab_group(1),
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
+        _ if is_ignore_key(key) => app.ignore_current_item(),
+        KeyCode::Char('T') => app.start_item_edit_dialog(),
         _ => {}
     }
 
@@ -1529,7 +3331,7 @@ fn handle_key_in_area(
             _ => {}
         },
         FocusTarget::List if app.details_mode == DetailsMode::Diff => {
-            handle_diff_file_list_key(app, key, area)
+            handle_diff_file_list_key(app, key, config, area, store, tx)
         }
         FocusTarget::List => match key.code {
             KeyCode::Esc if !app.search_query.is_empty() => app.clear_search(),
@@ -1546,11 +3348,11 @@ fn handle_key_in_area(
                 app.move_selection(-1);
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageDown | KeyCode::Char('d') => {
+            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(']') => {
                 app.move_selection(list_page_delta(app, area, 1));
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageUp | KeyCode::Char('u') => {
+            KeyCode::PageUp | KeyCode::Char('u') | KeyCode::Char('[') => {
                 app.move_selection(list_page_delta(app, area, -1));
                 app.mark_current_notification_read(store, tx);
             }
@@ -1562,14 +3364,35 @@ fn handle_key_in_area(
                 app.select_last();
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
-            KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-            KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
+            KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+            KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+            KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
+            KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+            KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
+            KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
+            KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
+            KeyCode::Char('t') => app.start_milestone_dialog(tx),
+            KeyCode::Char('P') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+            }
+            KeyCode::Char('Y') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+            }
+            KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('a') => app.start_new_comment_dialog(),
-            KeyCode::Char('L') => app.start_add_label_dialog(Some(tx)),
-            KeyCode::Char('N') => app.start_new_issue_dialog(),
+            KeyCode::Char('L') => app.start_add_label_dialog_with_store(Some(store), Some(tx)),
+            KeyCode::Char('N') => app.start_new_issue_or_pull_request_dialog(config),
+            _ if is_assignee_assign_key(key) => {
+                app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
+            }
+            KeyCode::Char('-') => app.start_assignee_dialog_with_store(
+                AssigneeAction::Unassign,
+                Some(store),
+                Some(tx),
+            ),
             _ if is_reaction_key(key) => app.start_item_reaction_dialog(),
             KeyCode::Enter => {
                 app.focus_details();
@@ -1589,12 +3412,35 @@ fn handle_key_in_area(
                 app.start_comment_search()
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-            KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-            KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+            KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
+            KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+            KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+            KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
+            KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+            KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+            KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
+            KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('L') if app.details_mode == DetailsMode::Conversation => {
-                app.start_add_label_dialog(Some(tx))
+                app.start_add_label_dialog_with_store(Some(store), Some(tx))
             }
-            KeyCode::Char('N') => app.start_new_issue_dialog(),
+            KeyCode::Char('N') => app.start_new_issue_or_pull_request_dialog(config),
+            KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
+            KeyCode::Char('t') => app.start_milestone_dialog(tx),
+            _ if is_assignee_assign_key(key) => {
+                app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
+            }
+            KeyCode::Char('-') => app.start_assignee_dialog_with_store(
+                AssigneeAction::Unassign,
+                Some(store),
+                Some(tx),
+            ),
+            KeyCode::Char('P') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+            }
+            KeyCode::Char('Y') => {
+                app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+            }
+            KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
             KeyCode::Char('c') if app.details_mode == DetailsMode::Diff => {
                 app.start_review_comment_dialog()
             }
@@ -1615,10 +3461,12 @@ fn handle_key_in_area(
             KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
                 app.start_edit_selected_comment_dialog()
             }
-            KeyCode::Char('n') if app.details_mode == DetailsMode::Diff => {
+            KeyCode::Char('n') => app.move_comment_in_view(1, area),
+            KeyCode::Char('p') => app.move_comment_in_view(-1, area),
+            KeyCode::Char('h') if app.details_mode == DetailsMode::Diff => {
                 app.page_diff_lines(1, area)
             }
-            KeyCode::Char('p') if app.details_mode == DetailsMode::Diff => {
+            KeyCode::Char('l') if app.details_mode == DetailsMode::Diff => {
                 app.page_diff_lines(-1, area)
             }
             KeyCode::Char(']') if app.details_mode == DetailsMode::Diff => app.move_diff_file(1),
@@ -1642,8 +3490,6 @@ fn handle_key_in_area(
                 app.scroll_diff_details_to_bottom(area)
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Diff => app.end_diff_mark(),
-            KeyCode::Char('n') => app.move_comment_in_view(1, area),
-            KeyCode::Char('p') => app.move_comment_in_view(-1, area),
             KeyCode::Enter if app.details_mode == DetailsMode::Conversation => {
                 app.toggle_selected_comment_expanded()
             }
@@ -1690,11 +3536,24 @@ fn handle_mouse_or_mark_key(app: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
-fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rect>) {
+fn handle_diff_file_list_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    config: &Config,
+    area: Option<Rect>,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+) {
     match key.code {
         KeyCode::Esc => app.focus_details(),
         KeyCode::Char('c') => app.start_review_comment_dialog(),
         KeyCode::Char('a') => app.start_new_comment_dialog(),
+        KeyCode::Char('P') => {
+            app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
+        }
+        KeyCode::Char('Y') => {
+            app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
+        }
         KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
@@ -1728,8 +3587,23 @@ fn handle_diff_file_list_key(app: &mut AppState, key: KeyEvent, area: Option<Rec
         KeyCode::Char('[') => app.move_diff_file(-1),
         KeyCode::Char(']') => app.move_diff_file(1),
         KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
-        KeyCode::Char('C') => app.start_pr_action_dialog(PrAction::Close),
-        KeyCode::Char('A') => app.start_pr_action_dialog(PrAction::Approve),
+        KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
+        KeyCode::Char('A') => app.start_review_submit_dialog(PullRequestReviewEvent::Approve),
+        KeyCode::Char('s') => app.start_review_submit_dialog(PullRequestReviewEvent::Comment),
+        KeyCode::Char('D') => app.start_pr_draft_ready_dialog(),
+        KeyCode::Char('E') => app.start_pr_action_dialog(PrAction::EnableAutoMerge),
+        KeyCode::Char('O') => app.start_pr_action_dialog(PrAction::DisableAutoMerge),
+        KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
+        KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
+        KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
+        KeyCode::Char('t') => app.start_milestone_dialog(tx),
+        _ if is_assignee_assign_key(key) => {
+            app.start_assignee_dialog_with_store(AssigneeAction::Assign, Some(store), Some(tx))
+        }
+        KeyCode::Char('-') => {
+            app.start_assignee_dialog_with_store(AssigneeAction::Unassign, Some(store), Some(tx))
+        }
+        KeyCode::Char('Z') => app.start_pr_draft_ready_dialog(),
         KeyCode::Enter => app.focus_details(),
         _ => {}
     }
@@ -1788,7 +3662,19 @@ fn handle_mouse_with_sync(
     if app.message_dialog.is_some() {
         return false;
     }
-    if app.pr_action_dialog.is_some() {
+    if app.command_palette.is_some()
+        || app.project_switcher.is_some()
+        || app.project_add_dialog.is_some()
+        || app.project_remove_dialog.is_some()
+    {
+        return false;
+    }
+    if let Some(dialog) = &app.pr_action_dialog {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(url) = pr_action_dialog_link_at(dialog, area, mouse.column, mouse.row)
+        {
+            app.open_url(&url);
+        }
         return false;
     }
     if app.label_dialog.is_some() {
@@ -1797,7 +3683,22 @@ fn handle_mouse_with_sync(
     if app.issue_dialog.is_some() {
         return false;
     }
+    if app.pr_create_dialog.is_some() {
+        return false;
+    }
     if app.reaction_dialog.is_some() {
+        return false;
+    }
+    if app.item_edit_dialog.is_some() {
+        return false;
+    }
+    if app.review_submit_dialog.is_some() {
+        return false;
+    }
+    if app.milestone_dialog.is_some() {
+        return false;
+    }
+    if app.global_search_active || app.filter_input_active || app.comment_search_active {
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
@@ -1829,6 +3730,14 @@ fn handle_mouse_with_sync(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            debug!(
+                column = mouse.column,
+                row = mouse.row,
+                view = %app.active_view,
+                focus = ?app.focus,
+                mode = ?app.details_mode,
+                "mouse left click"
+            );
             if splitter_contains(
                 body_area,
                 layout.table,
@@ -1836,6 +3745,12 @@ fn handle_mouse_with_sync(
                 mouse.column,
                 mouse.row,
             ) {
+                debug!(
+                    column = mouse.column,
+                    row = mouse.row,
+                    target = "splitter",
+                    "mouse click handled"
+                );
                 app.start_split_drag();
                 return false;
             }
@@ -1862,6 +3777,9 @@ fn handle_mouse_with_sync(
         }
         MouseEventKind::Moved if rect_contains(layout.table, mouse.column, mouse.row) => {
             handle_table_hover(app, mouse, layout.table, store, tx);
+        }
+        MouseEventKind::Moved if rect_contains(layout.details, mouse.column, mouse.row) => {
+            handle_details_hover(app, mouse, layout.details);
         }
         _ => {}
     }
@@ -1906,21 +3824,46 @@ fn handle_left_click(
     tx: Option<&UnboundedSender<AppMsg>>,
 ) {
     if let Some(view) = view_tab_at(app, layout.view_tabs, mouse.column, mouse.row) {
-        app.switch_view(view);
-        app.focus = FocusTarget::Ghr;
+        let previous_view = app.active_view.clone();
+        debug!(
+            column = mouse.column,
+            row = mouse.row,
+            target = "view_tab",
+            from = %previous_view,
+            to = %view,
+            "mouse click handled"
+        );
+        let restored = app.switch_view(view);
         app.search_active = false;
         app.comment_search_active = false;
         app.global_search_active = false;
-        app.status = "ghr focused".to_string();
+        app.filter_input_active = false;
+        if !restored {
+            app.focus = FocusTarget::Ghr;
+            app.status = "ghr focused".to_string();
+        }
         return;
     }
 
     if let Some(section_index) = section_tab_at(app, layout.section_tabs, mouse.column, mouse.row) {
+        debug!(
+            column = mouse.column,
+            row = mouse.row,
+            target = "section_tab",
+            section_index,
+            "mouse click handled"
+        );
         app.select_section(section_index);
         return;
     }
 
     if rect_contains(layout.table, mouse.column, mouse.row) {
+        debug!(
+            column = mouse.column,
+            row = mouse.row,
+            target = "table",
+            "mouse click handled"
+        );
         handle_table_click(app, mouse, layout.table, store, tx);
         return;
     }
@@ -1937,17 +3880,28 @@ fn handle_left_click(
     let document = build_details_document(app, inner.width);
     let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
     let column = mouse.column - inner.x;
+    debug!(
+        column = mouse.column,
+        row = mouse.row,
+        target = "details",
+        details_line = line_index,
+        details_column = column,
+        "mouse click handled"
+    );
     app.focus = FocusTarget::Details;
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
 
     if let Some(action) = document.action_at(line_index, column) {
-        app.handle_detail_action(action, tx);
+        debug!(action = ?action, "details action clicked");
+        app.handle_detail_action(action, store, tx);
         return;
     }
     let clicked_comment = document.comment_at(line_index);
     if let Some(url) = document.link_at(line_index, column) {
+        debug!(url = %url, comment = ?clicked_comment, "details link clicked");
         if let Some(comment_index) = clicked_comment {
             app.select_comment(comment_index);
         }
@@ -1957,10 +3911,12 @@ fn handle_left_click(
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)
     {
+        debug!(line = ?diff_line, "diff line clicked");
         app.handle_diff_line_click(diff_line, None);
         return;
     }
     if let Some(comment_index) = clicked_comment {
+        debug!(comment_index, "comment clicked");
         app.select_comment(comment_index);
     }
 }
@@ -1970,6 +3926,7 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
 
     let max_scroll = max_details_scroll(app, area);
     if max_scroll == 0 {
@@ -1990,6 +3947,7 @@ fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
     app.search_active = false;
     app.comment_search_active = false;
     app.global_search_active = false;
+    app.filter_input_active = false;
     if app.details_mode == DetailsMode::Diff {
         app.move_diff_file(delta);
     } else {
@@ -2086,6 +4044,22 @@ fn handle_table_hover(
 
     if let Some(thread_id) = app.notification_thread_id_at_position(position) {
         mark_notification_read_if_possible(app, thread_id, store, tx);
+    }
+}
+
+fn handle_details_hover(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let inner = block_inner(area);
+    if !rect_contains(inner, mouse.column, mouse.row) {
+        return;
+    }
+
+    let document = build_details_document(app, inner.width);
+    let line_index = app.details_scroll as usize + (mouse.row - inner.y) as usize;
+    let column = mouse.column - inner.x;
+    if document.link_at(line_index, column).is_some() {
+        app.status = "link under pointer; click to open".to_string();
+    } else if document.action_at(line_index, column).is_some() {
+        app.status = "action under pointer; click to run".to_string();
     }
 }
 
@@ -2258,6 +4232,7 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     let chunks = page_areas(area);
 
     draw_view_tabs(frame, app, chunks[0]);
+    draw_top_status(frame, app, area);
     draw_section_tabs(frame, app, chunks[1]);
 
     if app.mouse_capture_enabled {
@@ -2280,19 +4255,44 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if let Some(dialog) = &app.message_dialog {
         draw_message_dialog(frame, dialog, area);
     } else if app.help_dialog {
-        draw_help_dialog(frame, area);
+        draw_help_dialog(frame, area, &app.command_palette_key);
+    } else if let Some(dialog) = &app.item_edit_dialog {
+        draw_item_edit_dialog(frame, dialog, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.label_dialog {
         draw_label_dialog(frame, dialog, app.label_updating, area);
     } else if let Some(dialog) = &app.issue_dialog {
         draw_issue_dialog(frame, dialog, app.issue_creating, area);
+    } else if let Some(dialog) = &app.pr_create_dialog {
+        draw_pr_create_dialog(frame, dialog, app.pr_creating, area);
     } else if let Some(dialog) = &app.reaction_dialog {
         draw_reaction_dialog(frame, dialog, app.posting_reaction, area);
+    } else if let Some(dialog) = &app.review_submit_dialog {
+        draw_review_submit_dialog(frame, dialog, area);
+    } else if let Some(dialog) = &app.milestone_dialog {
+        draw_milestone_dialog(frame, dialog, app.milestone_action_running, area);
+    } else if let Some(dialog) = &app.assignee_dialog {
+        draw_assignee_dialog(frame, dialog, app.assignee_action_running, area);
+    } else if let Some(dialog) = &app.reviewer_dialog {
+        draw_reviewer_dialog(frame, dialog, app.reviewer_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
         draw_comment_dialog(frame, dialog, area);
     } else if app.global_search_running {
         draw_global_search_loading_dialog(frame, app, area);
+    }
+
+    if let Some(palette) = &app.command_palette {
+        draw_command_palette(frame, palette, area, &app.command_palette_key);
+    }
+    if let Some(switcher) = &app.project_switcher {
+        draw_project_switcher(frame, app, switcher, area);
+    }
+    if let Some(dialog) = &app.project_add_dialog {
+        draw_project_add_dialog(frame, dialog, area);
+    }
+    if let Some(dialog) = &app.project_remove_dialog {
+        draw_project_remove_dialog(frame, dialog, area);
     }
 }
 
@@ -2320,6 +4320,7 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         BorderType::Plain
     };
     let title = if ghr_focused { "[Focus] ghr" } else { "ghr" };
+    let title_style = view_tabs_title_style(app, border_style);
 
     let tabs = Tabs::new(titles)
         .select(active)
@@ -2328,11 +4329,19 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(border_type)
                 .border_style(border_style)
-                .title(Span::styled(title, border_style)),
+                .title(Span::styled(title, title_style)),
         )
         .style(Style::default().fg(Color::Gray))
         .highlight_style(active_view_tab_style());
     frame.render_widget(tabs, area);
+}
+
+fn view_tabs_title_style(app: &AppState, base_style: Style) -> Style {
+    if app.focus == FocusTarget::Ghr || app.has_unread_notifications() {
+        base_style.add_modifier(Modifier::BOLD)
+    } else {
+        base_style
+    }
 }
 
 fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -2398,23 +4407,33 @@ fn active_section_tab_style() -> Style {
 
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
     let (_, unread) = section_counts(section);
-    let count_label = section_count_label(section);
+    let count_label = section_count_label(app, section);
+    let title = app
+        .quick_filter_label_for_section(section)
+        .map(|filter| format!("{} [{filter}]", section.title))
+        .unwrap_or_else(|| section.title.clone());
     if !app.search_query.is_empty() {
         format!(
             "{} ({}/{})",
-            section.title,
+            title,
             app.filtered_indices(section).len(),
-            section.items.len()
+            section
+                .items
+                .len()
+                .saturating_sub(app.ignored_count_for_section(section))
         )
     } else if unread > 0 {
-        format!("{} ({count_label}/{unread})", section.title)
+        format!("{title} ({count_label}/{unread})")
     } else {
-        format!("{} ({count_label})", section.title)
+        format!("{title} ({count_label})")
     }
 }
 
-fn section_count_label(section: &SectionSnapshot) -> String {
-    let loaded = section.items.len();
+fn section_count_label(app: &AppState, section: &SectionSnapshot) -> String {
+    let loaded = section
+        .items
+        .len()
+        .saturating_sub(app.ignored_count_for_section(section));
     match section.total_count {
         Some(total) if total > loaded => format!("{loaded}/{total}"),
         Some(total) => total.to_string(),
@@ -2503,6 +4522,10 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .style(row_style)
         })
         .collect::<Vec<_>>();
+    let empty_state = rows
+        .is_empty()
+        .then(|| list_empty_state_message(app, section, &filtered_indices))
+        .flatten();
 
     let list_focused = app.focus == FocusTarget::List;
     let header_style = if list_focused {
@@ -2529,9 +4552,16 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             app.search_query
         )
     };
+    if let Some(filter) = app.quick_filter_label_for_section(section) {
+        title.push_str(&format!(" | filter: {filter}"));
+    }
     if let Some(error) = &section.error {
         title.push_str(&format!(" - error: {}", compact_error_label(error)));
     };
+    let ignored_count = app.ignored_count_for_section(section);
+    if ignored_count > 0 {
+        title.push_str(&format!(" | {ignored_count} ignored"));
+    }
     let visible_rows = usize::from(table_visible_rows(area));
     let table_offset = app.current_list_scroll_offset(filtered_indices.len(), visible_rows);
     if let Some((start, end)) =
@@ -2539,7 +4569,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     {
         title.push_str(&table_visible_range_label(
             section,
-            app.search_query.is_empty(),
+            app.search_query.is_empty() && ignored_count == 0,
             start,
             end,
             filtered_indices.len(),
@@ -2634,6 +4664,81 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         table_state.select(Some(selected));
     }
     frame.render_stateful_widget(table, area, &mut table_state);
+    if let Some((message, style)) = empty_state {
+        draw_list_empty_state_message(frame, area, &message, style);
+    }
+}
+
+fn draw_list_empty_state_message(frame: &mut Frame<'_>, area: Rect, message: &str, style: Style) {
+    let inner = block_inner(area);
+    if inner.height <= 2 || inner.width <= 2 {
+        return;
+    }
+
+    let message_area = Rect::new(
+        inner.x.saturating_add(1),
+        inner.y.saturating_add(2),
+        inner.width.saturating_sub(2),
+        1,
+    );
+    let width = usize::from(message_area.width.max(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_inline(message, width),
+            style,
+        ))),
+        message_area,
+    );
+}
+
+fn list_empty_state_message(
+    app: &AppState,
+    section: &SectionSnapshot,
+    filtered_indices: &[usize],
+) -> Option<(String, Style)> {
+    if !filtered_indices.is_empty() {
+        return None;
+    }
+    if let Some(error) = &section.error {
+        return Some((
+            format!("Error: {}", compact_error_label(error)),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    if section.items.is_empty() && section.refreshed_at.is_none() {
+        if app.refreshing {
+            let message = if section_view_key(section).starts_with("repo:") {
+                "Git repo is loading ..."
+            } else {
+                "GitHub data is loading ..."
+            };
+            return Some((message.to_string(), Style::default().fg(Color::Gray)));
+        }
+        return Some((
+            "No cached data yet. Press r to refresh.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if section.items.is_empty() {
+        return Some((
+            "No items found.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if app.ignored_count_for_section(section) == section.items.len() {
+        return Some((
+            "All loaded items are ignored. Use the command palette to clear ignored items."
+                .to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !app.search_query.is_empty() {
+        return Some((
+            "No items match the current search.".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    None
 }
 
 fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -2687,7 +4792,12 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 diff.additions,
                 diff.deletions
             );
-            let entries = diff_tree_entries(diff);
+            let comment_counts = app
+                .current_item()
+                .and_then(|item| app.loaded_comments_for_item(&item.id))
+                .map(|comments| diff_file_comment_counts(diff, comments))
+                .unwrap_or_default();
+            let entries = diff_tree_entries_with_comment_counts(diff, &comment_counts);
             if let Some(item_id) = app.current_item().map(|item| item.id.as_str()) {
                 let selected_file = app.selected_diff_file_index_for(item_id, diff);
                 selected_row = diff_tree_row_index_for_file(&entries, selected_file);
@@ -2726,7 +4836,7 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     };
 
     let title = focus_panel_title("List", &title, files_focused);
-    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(12)])
+    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(14)])
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2743,6 +4853,16 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
+    if app.filter_input_active {
+        return Some((
+            format!(
+                "Filter: f{}_  Enter apply  empty/clear resets  Esc cancel",
+                app.filter_input_query
+            ),
+            Color::LightCyan,
+        ));
+    }
+
     if app.global_search_active {
         let scope = app
             .global_search_scope
@@ -2875,11 +4995,87 @@ fn pull_request_commits_url(item: &WorkItem) -> String {
     }
 }
 
+fn parse_reviewer_logins(input: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut reviewers = Vec::new();
+    for login in input
+        .split(',')
+        .map(str::trim)
+        .map(|login| login.trim_start_matches('@').trim())
+        .filter(|login| !login.is_empty())
+    {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            reviewers.push(login.to_string());
+        }
+    }
+    reviewers
+}
+
+fn reviewer_input_prefix(input: &str) -> String {
+    input
+        .rsplit(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+}
+
+fn reviewer_dialog_suggestion_matches(dialog: &ReviewerDialog) -> Vec<String> {
+    let prefix = reviewer_input_prefix(&dialog.input);
+    dialog
+        .suggestions
+        .iter()
+        .filter(|login| prefix.is_empty() || login.to_ascii_lowercase().starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+fn selected_reviewer_suggestion(dialog: &ReviewerDialog) -> Option<String> {
+    let matches = reviewer_dialog_suggestion_matches(dialog);
+    if matches.is_empty() {
+        None
+    } else {
+        matches
+            .get(dialog.selected_suggestion.min(matches.len() - 1))
+            .cloned()
+    }
+}
+
+fn reviewer_dialog_submit_logins(dialog: &ReviewerDialog) -> Vec<String> {
+    let mut reviewers = parse_reviewer_logins(&dialog.input);
+    if !reviewers.is_empty()
+        && !reviewer_input_prefix(&dialog.input).is_empty()
+        && let Some(selected) = selected_reviewer_suggestion(dialog)
+        && let Some(last) = reviewers.last_mut()
+    {
+        *last = selected;
+    }
+    dedupe_reviewer_logins(reviewers)
+}
+
+fn dedupe_reviewer_logins(logins: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for login in logins {
+        let key = login.to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(login);
+        }
+    }
+    deduped
+}
+
 fn same_view_key(left: &str, right: &str) -> bool {
     left == right
         || (left.starts_with("repo:")
             && right.starts_with("repo:")
             && left.eq_ignore_ascii_case(right))
+}
+
+fn view_supports_snapshot(view: &str) -> bool {
+    view.starts_with("repo:")
 }
 
 fn section_repo_scope(section: &SectionSnapshot) -> Option<String> {
@@ -2904,6 +5100,21 @@ fn created_issue_matches_section(
     }
 }
 
+fn created_pull_request_matches_section(
+    section: &SectionSnapshot,
+    item: &WorkItem,
+    active_view: &str,
+) -> bool {
+    if section.kind != SectionKind::PullRequests {
+        return false;
+    }
+
+    match section_repo_scope(section) {
+        Some(repo) => repo.eq_ignore_ascii_case(&item.repo),
+        None => same_view_key(&section_view_key(section), active_view),
+    }
+}
+
 fn repo_token_value(token: &str) -> Option<String> {
     token
         .strip_prefix("repo:")
@@ -2912,13 +5123,55 @@ fn repo_token_value(token: &str) -> Option<String> {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect) {
-    let footer = Paragraph::new(footer_line(app, paths)).style(Style::default().fg(Color::Gray));
+    let footer = Paragraph::new(footer_line_for_width(app, paths, usize::from(area.width)))
+        .style(Style::default().fg(Color::Gray));
     frame.render_widget(footer, area);
 }
 
+fn draw_top_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let Some(status_area) = top_status_area(area) else {
+        return;
+    };
+    let line = top_status_line(app, usize::from(status_area.width));
+    frame.render_widget(Clear, status_area);
+    frame.render_widget(
+        Paragraph::new(line).alignment(Alignment::Right),
+        status_area,
+    );
+}
+
+fn top_status_area(area: Rect) -> Option<Rect> {
+    let max_width = area.width.saturating_sub(4).min(46);
+    if max_width < 12 || area.height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        area.x + area.width.saturating_sub(max_width).saturating_sub(1),
+        area.y,
+        max_width,
+        1,
+    ))
+}
+
+fn top_status_line(app: &AppState, width: usize) -> Line<'static> {
+    let value_width = width.saturating_sub(display_width("status: "));
+    let value = truncate_inline(&footer_status(app), value_width);
+    let mut spans = Vec::new();
+    push_status_spans(&mut spans, value);
+    Line::from(fit_footer_spans_to_width(spans, width))
+}
+
+#[cfg(test)]
 fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
-    let refresh = if app.refreshing { "refreshing" } else { "idle" };
-    let focus = app.focus.label();
+    footer_line_for_width(app, paths, usize::MAX)
+}
+
+fn footer_line_for_width(app: &AppState, _paths: &Paths, width: usize) -> Line<'static> {
+    Line::from(fit_footer_groups(footer_groups(app), width))
+}
+
+fn footer_groups(app: &AppState) -> Vec<Vec<Span<'static>>> {
     let search = if app.comment_search_active {
         Some(format!("comment-search: /{}_", app.comment_search_query))
     } else if app.focus == FocusTarget::Details
@@ -2930,6 +5183,8 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
         Some(format!("repo-search: S{}_", app.global_search_query))
     } else if app.global_search_running {
         Some("repo search running".to_string())
+    } else if app.filter_input_active {
+        Some(format!("filter: f{}_", app.filter_input_query))
     } else if app.search_active {
         Some(format!("local-search: /{}_", app.search_query))
     } else if app.search_query.is_empty() {
@@ -2937,45 +5192,48 @@ fn footer_line(app: &AppState, paths: &Paths) -> Line<'static> {
     } else {
         Some(format!("local-search: /{}", app.search_query))
     };
+    let active_filter = app.current_filter_label();
     let (mouse, text_selection_state) = footer_mouse_shortcut(app);
 
-    let mut spans = Vec::new();
-    push_footer_focus_shortcuts(&mut spans, app);
+    let mut groups = Vec::new();
 
-    push_footer_separator(&mut spans);
-    push_footer_pair(&mut spans, "1-4", "focus", Color::Cyan);
-    push_footer_pair(&mut spans, "?", "help", Color::Yellow);
-    push_footer_pair(&mut spans, "S", "repo", Color::Yellow);
-    push_footer_pair(&mut spans, "r", "refresh", Color::Yellow);
-    push_footer_pair(&mut spans, "o", "open", Color::Yellow);
-    if let Some(mouse) = mouse {
-        push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
-    }
-    let q_action = if app.details_mode == DetailsMode::Diff {
-        "back"
-    } else {
-        "quit"
-    };
-    push_footer_pair(&mut spans, "q", q_action, Color::Yellow);
+    groups.push(footer_focus_primary_shortcuts(app));
 
-    push_footer_separator(&mut spans);
-    push_footer_state(&mut spans, "focus", focus, Color::Cyan);
     if let Some(search) = search {
+        let mut spans = Vec::new();
         push_footer_state(&mut spans, "search", search, Color::Yellow);
+        groups.push(spans);
+    }
+    if let Some(active_filter) = active_filter {
+        let mut spans = Vec::new();
+        push_footer_state(&mut spans, "filter", active_filter, Color::LightCyan);
+        groups.push(spans);
     }
     if let Some(text_selection_state) = text_selection_state {
+        let mut spans = Vec::new();
         push_footer_state(&mut spans, "mode", text_selection_state, Color::LightBlue);
+        groups.push(spans);
     }
-    push_footer_state(&mut spans, "refresh", refresh, Color::Green);
-    push_footer_state(&mut spans, "state", app.status.clone(), Color::Green);
-    push_footer_state(
-        &mut spans,
-        "db",
-        paths.db_path.display().to_string(),
-        Color::DarkGray,
-    );
 
-    Line::from(spans)
+    groups.push(footer_global_primary_shortcuts(app));
+    if let Some(mouse) = mouse {
+        let mut spans = Vec::new();
+        push_footer_pair(&mut spans, "m", mouse, Color::LightBlue);
+        groups.push(spans);
+    }
+
+    groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+fn footer_status(app: &AppState) -> String {
+    if app.refreshing {
+        "refreshing".to_string()
+    } else {
+        app.status.clone()
+    }
 }
 
 fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'static str>) {
@@ -2988,87 +5246,237 @@ fn footer_mouse_shortcut(app: &AppState) -> (Option<&'static str>, Option<&'stat
     (Some("text-select"), None)
 }
 
-fn push_footer_focus_shortcuts(spans: &mut Vec<Span<'static>>, app: &AppState) {
+fn footer_has_selected_comment(app: &AppState) -> bool {
+    app.details_mode == DetailsMode::Conversation && app.current_selected_comment().is_some()
+}
+
+fn footer_selected_comment_is_editable(app: &AppState) -> bool {
+    app.details_mode == DetailsMode::Conversation
+        && app
+            .current_selected_comment()
+            .is_some_and(|comment| comment.is_mine && comment.id.is_some())
+}
+
+fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(dialog) = &app.pr_action_dialog {
+        push_footer_pair(&mut spans, "y/enter", "run", Color::Yellow);
+        push_footer_pair(&mut spans, "esc", "cancel", Color::Cyan);
+        if dialog.action == PrAction::Merge {
+            push_footer_pair(&mut spans, "m/s/r", "method", Color::LightMagenta);
+        }
+        return spans;
+    }
+
     match app.focus {
         FocusTarget::Ghr => {
-            push_footer_context(spans, "ghr", "tabs");
-            push_footer_pair(spans, "tab/h/l", "switch", Color::Cyan);
-            push_footer_pair(spans, "j/enter", "Sections", Color::Cyan);
-            push_footer_pair(spans, "esc", "List", Color::Cyan);
+            push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
+            push_footer_pair(&mut spans, "j/enter", "Sections", Color::Cyan);
+            push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::Sections => {
-            push_footer_context(spans, "Sections", "tabs");
-            push_footer_pair(spans, "tab/h/l", "switch", Color::Cyan);
-            push_footer_pair(spans, "k", "ghr", Color::Cyan);
-            push_footer_pair(spans, "j/enter", "List", Color::Cyan);
-            push_footer_pair(spans, "esc", "List", Color::Cyan);
+            push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
+            push_footer_pair(&mut spans, "k", "ghr", Color::Cyan);
+            push_footer_pair(&mut spans, "j/enter", "List", Color::Cyan);
+            push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::List => {
             if app.details_mode == DetailsMode::Diff {
-                push_footer_context(spans, "List", "files");
-                push_footer_pair(spans, "j/k", "file", Color::Cyan);
-                push_footer_pair(spans, "pg", "page", Color::Cyan);
-                push_footer_pair(spans, "[ ]", "file", Color::Cyan);
-                push_footer_pair(spans, "g/G", "ends", Color::Cyan);
-                push_footer_pair(spans, "enter", "diff", Color::Cyan);
-                push_footer_pair(spans, "c", "inline", Color::LightBlue);
-                push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(&mut spans, "j/k", "file", Color::Cyan);
+                push_footer_pair(&mut spans, "enter", "diff", Color::Cyan);
+                push_footer_pair(&mut spans, "[ ]", "file", Color::Cyan);
+                push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
+                push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
-                push_footer_context(spans, "List", "items");
-                push_footer_pair(spans, "j/k", "move", Color::Cyan);
-                push_footer_pair(spans, "pg", "page", Color::Cyan);
-                push_footer_pair(spans, "[ ]", "results", Color::Cyan);
-                push_footer_pair(spans, "g/G", "ends", Color::Cyan);
-                push_footer_pair(spans, "enter", "Details", Color::Cyan);
-                push_footer_pair(spans, "/", "search", Color::Yellow);
+                push_footer_pair(&mut spans, "j/k", "move", Color::Cyan);
+                push_footer_pair(&mut spans, "[ ]", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "enter", "Details", Color::Cyan);
+                push_footer_pair(&mut spans, "/", "search", Color::Yellow);
                 if app.is_global_search_results_view() {
-                    push_footer_pair(spans, "esc", "back", Color::Cyan);
+                    push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 }
-                push_footer_pair(spans, "v", "diff", Color::LightMagenta);
-                push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
+                push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(&mut spans, "i", "ignore", Color::LightRed);
+                push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             }
         }
         FocusTarget::Details => {
-            let context = if app.details_mode == DetailsMode::Diff {
-                "diff"
-            } else {
-                "content"
-            };
-            push_footer_context(spans, "Details", context);
             if app.details_mode == DetailsMode::Diff {
-                push_footer_pair(spans, "j/k", "line", Color::Cyan);
-                push_footer_pair(spans, "n/p", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "j/k", "line", Color::Cyan);
+                push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
+                push_footer_pair(&mut spans, "h/l", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
+                push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
-                push_footer_pair(spans, "j/k", "scroll", Color::Cyan);
-                push_footer_pair(spans, "pg", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "j/k", "scroll", Color::Cyan);
+                push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
+                push_footer_pair(&mut spans, "/", "search", Color::Yellow);
+                push_footer_pair(&mut spans, "c/a", "comment", Color::LightBlue);
+                if footer_has_selected_comment(app) {
+                    push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
+                    push_footer_pair(&mut spans, "enter", "expand", Color::Yellow);
+                }
+                if footer_has_selected_comment(app) {
+                    push_footer_pair(&mut spans, "R", "reply", Color::LightBlue);
+                }
+                if footer_selected_comment_is_editable(app) {
+                    push_footer_pair(&mut spans, "e", "edit", Color::LightBlue);
+                }
             }
-            push_footer_pair(spans, "g/G", "top/bottom", Color::Cyan);
-            if app.details_mode == DetailsMode::Diff {
-                push_footer_pair(spans, "[ ]", "file", Color::LightBlue);
-                push_footer_pair(spans, "m", "begin", Color::Yellow);
-                push_footer_pair(spans, "e", "end", Color::Yellow);
-                push_footer_pair(spans, "c", "inline", Color::LightBlue);
-                push_footer_pair(spans, "a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
-            } else {
-                push_footer_pair(spans, "v", "diff", Color::LightMagenta);
-                push_footer_pair(spans, "/", "search", Color::Yellow);
-                push_footer_pair(spans, "n/p", "comment", Color::LightBlue);
-                push_footer_pair(spans, "enter", "expand", Color::Yellow);
-                push_footer_pair(spans, "c/a", "comment", Color::LightBlue);
-                push_footer_pair(spans, "R", "reply", Color::LightBlue);
-                push_footer_pair(spans, "e", "edit", Color::LightBlue);
-                push_footer_pair(spans, "M/C/A", "pr action", Color::LightMagenta);
-            }
-            push_footer_pair(spans, "esc", "List", Color::Cyan);
+            push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
     }
+    spans
+}
+
+fn footer_global_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    push_footer_pair(&mut spans, "?", "help", Color::Yellow);
+    push_footer_pair(
+        &mut spans,
+        app.command_palette_key.clone(),
+        "cmd",
+        Color::Yellow,
+    );
+    push_footer_pair(&mut spans, "f", "filter", Color::LightCyan);
+    push_footer_pair(&mut spans, "r", "refresh", Color::Yellow);
+    let q_action = if app.details_mode == DetailsMode::Diff {
+        "back"
+    } else {
+        "quit"
+    };
+    push_footer_pair(&mut spans, "q", q_action, Color::Yellow);
+    push_footer_pair(&mut spans, "o", "open", Color::Yellow);
+    spans
+}
+
+fn fit_footer_groups(groups: Vec<Vec<Span<'static>>>, width: usize) -> Vec<Span<'static>> {
+    if width == usize::MAX {
+        let mut spans = Vec::new();
+        for group in groups {
+            push_footer_group(&mut spans, group);
+        }
+        return spans;
+    }
+
+    let mut spans = Vec::new();
+    let mut omitted = false;
+    for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+
+        let separator_width = if spans.is_empty() {
+            0
+        } else {
+            display_width(" | ")
+        };
+        let group_width = footer_spans_width(&group);
+        let next_width = footer_spans_width(&spans)
+            .saturating_add(separator_width)
+            .saturating_add(group_width);
+        if next_width <= width {
+            push_footer_group(&mut spans, group);
+        } else if spans.is_empty() {
+            spans.extend(fit_footer_spans_to_width(group, width));
+            omitted = true;
+        } else {
+            omitted = true;
+        }
+    }
+
+    if omitted {
+        append_footer_more_marker(&mut spans, width);
+    }
+    spans
+}
+
+fn push_footer_group(spans: &mut Vec<Span<'static>>, group: Vec<Span<'static>>) {
+    if group.is_empty() {
+        return;
+    }
+    if !spans.is_empty() {
+        push_footer_separator(spans);
+    }
+    spans.extend(group);
+}
+
+fn append_footer_more_marker(spans: &mut Vec<Span<'static>>, width: usize) {
+    let marker = vec![
+        Span::styled("...", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled("help", Style::default().fg(Color::Gray)),
+    ];
+    let separator_width = if spans.is_empty() {
+        0
+    } else {
+        display_width(" | ")
+    };
+    let next_width = footer_spans_width(spans)
+        .saturating_add(separator_width)
+        .saturating_add(footer_spans_width(&marker));
+    if next_width <= width {
+        push_footer_group(spans, marker);
+    }
+}
+
+fn fit_footer_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut fitted = Vec::new();
+    let mut used = 0_usize;
+    for span in spans {
+        let content = span.content.as_ref();
+        let span_width = display_width(content);
+        if used.saturating_add(span_width) <= width {
+            used = used.saturating_add(span_width);
+            fitted.push(span);
+            continue;
+        }
+
+        let remaining = width.saturating_sub(used);
+        if remaining > 0 {
+            fitted.push(Span::styled(
+                truncate_inline(content, remaining),
+                span.style,
+            ));
+        }
+        break;
+    }
+    fitted
+}
+
+fn footer_spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
 }
 
 fn push_footer_separator(spans: &mut Vec<Span<'static>>) {
     spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+}
+
+fn push_status_spans(spans: &mut Vec<Span<'static>>, value: impl Into<String>) {
+    if !spans.is_empty() && !footer_ends_with_separator(spans) {
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        "status:",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        value.into(),
+        Style::default().fg(Color::Green),
+    ));
 }
 
 fn push_footer_pair(
@@ -3107,29 +5515,15 @@ fn push_footer_state(
     spans.push(Span::styled(value.into(), Style::default().fg(value_color)));
 }
 
-fn push_footer_context(
-    spans: &mut Vec<Span<'static>>,
-    key: &'static str,
-    value: impl Into<String>,
-) {
-    if !spans.is_empty() && !footer_ends_with_separator(spans) {
-        spans.push(Span::raw("  "));
-    }
-    spans.push(Span::styled(
-        key,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(value.into(), Style::default().fg(Color::Gray)));
-}
-
 fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
     spans
         .last()
         .map(|span| span.content.as_ref() == " | ")
         .unwrap_or(false)
+}
+
+fn item_supports_metadata_edit(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
 
 fn modal_surface_style() -> Style {
@@ -3138,6 +5532,40 @@ fn modal_surface_style() -> Style {
 
 fn modal_text_style() -> Style {
     Style::default().fg(Color::White)
+}
+
+fn modal_footer_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn modal_footer_line(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(text.into(), modal_footer_style()))
+}
+
+fn draw_modal_footer(frame: &mut Frame<'_>, area: Rect, dialog_area: Rect, footer: Line<'static>) {
+    let Some(footer_area) = modal_footer_area(area, dialog_area) else {
+        return;
+    };
+    let paragraph = Paragraph::new(footer)
+        .alignment(Alignment::Center)
+        .style(modal_text_style());
+    frame.render_widget(Clear, footer_area);
+    frame.render_widget(paragraph, footer_area);
+}
+
+fn modal_footer_area(area: Rect, dialog_area: Rect) -> Option<Rect> {
+    if dialog_area.width == 0 || dialog_area.height == 0 {
+        return None;
+    }
+    let y = dialog_area.y.saturating_add(dialog_area.height);
+    (y < area.y.saturating_add(area.height)).then_some(Rect::new(
+        dialog_area.x,
+        y,
+        dialog_area.width,
+        1,
+    ))
 }
 
 fn draw_startup_dialog(
@@ -3328,10 +5756,11 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
-fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
-    let lines = help_dialog_content();
+fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect, command_palette_key: &str) {
+    let width = help_dialog_width(area);
+    let lines = help_dialog_content_for_width(width.saturating_sub(2), command_palette_key);
     let height = help_dialog_height(lines.len(), area);
-    let dialog_area = centered_rect(70, height, area);
+    let dialog_area = centered_rect_with_size(width, height, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightMagenta))
@@ -3351,47 +5780,644 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
+fn help_dialog_width(area: Rect) -> u16 {
+    let preferred = area
+        .width
+        .saturating_mul(HELP_DIALOG_WIDTH_PERCENT)
+        .saturating_div(100);
+    preferred
+        .max(area.width.min(COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH))
+        .min(HELP_DIALOG_MAX_WIDTH.min(area.width))
+}
+
+fn draw_command_palette(
+    frame: &mut Frame<'_>,
+    palette: &CommandPalette,
+    area: Rect,
+    command_palette_key: &str,
+) {
+    let commands = command_palette_commands(command_palette_key);
+    let matches = command_palette_filtered_indices(&commands, &palette.query);
+    let dialog_area = command_palette_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = palette.selected.min(matches.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, matches.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(command_palette_input_line(&palette.query, width));
+    lines.push(Line::from(""));
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No commands found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, command_index) in matches.iter().enumerate().skip(start).take(result_height)
+        {
+            let command = &commands[*command_index];
+            lines.push(command_palette_result_line(
+                command,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Command Palette",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: run    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&palette.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn command_palette_area(area: Rect) -> Rect {
+    let width = centered_rect_width(76, area).max(24).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 18.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn draw_project_switcher(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    switcher: &ProjectSwitcher,
+    area: Rect,
+) {
+    let candidates = app.project_switcher_candidates_for_query(&switcher.query);
+    let dialog_area = project_switcher_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(project_switcher_input_line(&switcher.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No projects found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(project_switcher_candidate_line(
+                candidate,
+                candidate.key == app.active_view,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Project Switch",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: switch    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&switcher.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn project_switcher_area(area: Rect) -> Rect {
+    let width = centered_rect_width(52, area).max(32).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_switcher_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type a project prefix",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+    ])
+}
+
+fn project_switcher_candidate_line(
+    candidate: &ViewTab,
+    current: bool,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let current_label = if current { "  current" } else { "" };
+    let text = truncate_inline(
+        &format!("{marker}{}{current_label}", candidate.label),
+        width,
+    );
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if current {
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn draw_project_add_dialog(frame: &mut Frame<'_>, dialog: &ProjectAddDialog, area: Rect) {
+    let dialog_area = project_add_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let lines = vec![
+        project_add_dialog_field_input_line(
+            "Title",
+            &dialog.title,
+            ProjectAddField::Title,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        project_add_dialog_field_input_line(
+            "Repo url",
+            &dialog.repo_url,
+            ProjectAddField::RepoUrl,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        project_add_dialog_field_input_line(
+            "local_dir",
+            &dialog.local_dir,
+            ProjectAddField::LocalDir,
+            dialog.field,
+            editor_width,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Title and local_dir may be empty. Empty local_dir is saved as local_dir = \"\".",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightGreen))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Project Add",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Tab/Enter: field    Ctrl+Enter: save    Esc: cancel"),
+    );
+    if let Some(position) = project_add_dialog_cursor_position(dialog, dialog_area) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn project_add_dialog_area(area: Rect) -> Rect {
+    centered_rect(78, 12, area)
+}
+
+fn project_add_dialog_field_input_line(
+    label: &'static str,
+    value: &str,
+    field: ProjectAddField,
+    current: ProjectAddField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
+    Line::from(vec![
+        Span::styled(prefix, project_add_dialog_field_label_style(field, current)),
+        Span::styled(
+            issue_dialog_input_text(value, value_width),
+            Style::default().fg(Color::White),
+        ),
+    ])
+}
+
+fn project_add_dialog_field_label_style(field: ProjectAddField, current: ProjectAddField) -> Style {
+    if field == current {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn project_add_dialog_cursor_position(
+    dialog: &ProjectAddDialog,
+    dialog_area: Rect,
+) -> Option<Position> {
+    let inner = block_inner(dialog_area);
+    let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    let field_position = |label: &'static str, value: &str, y_offset: u16| {
+        let prefix_width =
+            display_width(&issue_dialog_field_prefix(label)).min(usize::from(u16::MAX)) as u16;
+        Position::new(
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(prefix_width)
+                    .saturating_add(display_width(value).min(usize::from(u16::MAX)) as u16),
+            ),
+            inner.y.saturating_add(y_offset),
+        )
+    };
+    Some(match dialog.field {
+        ProjectAddField::Title => field_position("Title", &dialog.title, 0),
+        ProjectAddField::RepoUrl => field_position("Repo url", &dialog.repo_url, 2),
+        ProjectAddField::LocalDir => field_position("local_dir", &dialog.local_dir, 4),
+    })
+}
+
+fn draw_project_remove_dialog(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialog, area: Rect) {
+    if let Some(candidate) = &dialog.confirm {
+        draw_project_remove_confirmation(frame, candidate, area);
+    } else {
+        draw_project_remove_picker(frame, dialog, area);
+    }
+}
+
+fn draw_project_remove_picker(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialog, area: Rect) {
+    let candidates = project_remove_filtered_candidates(dialog);
+    let dialog_area = project_remove_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = dialog.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(project_switcher_input_line(&dialog.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No projects found",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(project_remove_candidate_line(
+                candidate,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Project Remove",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: choose    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&dialog.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn draw_project_remove_confirmation(
+    frame: &mut Frame<'_>,
+    candidate: &ProjectRemoveCandidate,
+    area: Rect,
+) {
+    let dialog_area = project_remove_confirm_area(area);
+    let local_dir = candidate.local_dir.as_deref().unwrap_or("(none)");
+    let lines = vec![
+        Line::from("Remove this project from config.toml?"),
+        Line::from(""),
+        key_value_line("project", candidate.name.clone()),
+        key_value_line("repo", candidate.repo.clone()),
+        key_value_line("local_dir", local_dir.to_string()),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Confirm Project Remove",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("y/Enter: remove project    Esc: cancel"),
+    );
+}
+
+fn project_remove_area(area: Rect) -> Rect {
+    let width = centered_rect_width(58, area).max(36).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_remove_confirm_area(area: Rect) -> Rect {
+    let width = centered_rect_width(58, area).max(42).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 11.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn project_remove_candidate_line(
+    candidate: &ProjectRemoveCandidate,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = format!("{marker}{:<20} {}", candidate.name, candidate.repo);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(truncate_inline(&text, width), style))
+}
+
+fn command_palette_visible_start(selected: usize, len: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    selected.saturating_add(1).saturating_sub(height)
+}
+
+fn command_palette_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type to search commands",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+    ])
+}
+
+fn command_palette_result_line(
+    command: &PaletteCommand,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = format!(
+        "{marker}{:<34} {:<16} {}",
+        command.title, command.keys, command.scope
+    );
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let detail_style = if selected {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    Line::from(vec![
+        Span::styled(truncate_inline(&text, width), style),
+        Span::styled(
+            truncate_inline(
+                &format!("  {}", command.detail),
+                width.saturating_sub(display_width(&text)),
+            ),
+            detail_style,
+        ),
+    ])
+}
+
 fn draw_pr_action_dialog(
     frame: &mut Frame<'_>,
     dialog: &PrActionDialog,
     running: bool,
     area: Rect,
 ) {
-    let dialog_area = centered_rect(66, 12, area);
+    let dialog_area = pr_action_dialog_area(dialog, area);
     let number = dialog
         .item
         .number
         .map(|number| format!("#{number}"))
         .unwrap_or_else(|| "-".to_string());
+    let item_label = item_kind_label(dialog.item.kind);
+    let confirm_item_label = item_kind_confirmation_label(dialog.item.kind);
     let action_label = match dialog.action {
         PrAction::Merge => "merge",
         PrAction::Close => "close",
+        PrAction::Reopen => "reopen",
         PrAction::Approve => "approve",
+        PrAction::EnableAutoMerge => "enable auto-merge for",
+        PrAction::DisableAutoMerge => "disable auto-merge for",
+        PrAction::Checkout => "checkout",
+        PrAction::RerunFailedChecks => "rerun failed checks for",
+        PrAction::UpdateBranch => "update",
+        PrAction::ConvertToDraft => "convert",
+        PrAction::MarkReadyForReview => "mark ready",
     };
     let prompt = match dialog.action {
         PrAction::Merge => "Merge this pull request on GitHub?",
-        PrAction::Close => "Close this pull request on GitHub?",
+        PrAction::Close => match dialog.item.kind {
+            ItemKind::Issue => "Close this issue on GitHub?",
+            _ => "Close this pull request on GitHub?",
+        },
+        PrAction::Reopen => match dialog.item.kind {
+            ItemKind::Issue => "Reopen this issue on GitHub?",
+            _ => "Reopen this pull request on GitHub?",
+        },
         PrAction::Approve => "Approve this pull request on GitHub?",
+        PrAction::EnableAutoMerge => "Enable auto-merge for this pull request on GitHub?",
+        PrAction::DisableAutoMerge => "Disable auto-merge for this pull request on GitHub?",
+        PrAction::Checkout => "Checkout this pull request locally?",
+        PrAction::RerunFailedChecks => "Rerun failed GitHub Actions jobs for this pull request?",
+        PrAction::UpdateBranch => "Update this pull request branch from its base branch?",
+        PrAction::ConvertToDraft => "Convert this pull request to draft on GitHub?",
+        PrAction::MarkReadyForReview => "Mark this pull request ready for review on GitHub?",
     };
     let status = if running {
-        "working...".to_string()
+        match dialog.action {
+            PrAction::Merge => format!("working: {} merge...", dialog.merge_method.label()),
+            _ => "working...".to_string(),
+        }
+    } else if dialog.action == PrAction::Merge {
+        format!(
+            "y/Enter: {} merge    m/s/r: method    Tab: next    Esc",
+            dialog.merge_method.label()
+        )
     } else {
-        format!("y/Enter: yes, {action_label} PR    Esc: cancel")
+        format!("y/Enter: yes, {action_label} {confirm_item_label}    Esc: cancel")
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(prompt),
         Line::from(""),
         key_value_line("repo", dialog.item.repo.clone()),
-        key_value_line("pull request", number),
+        key_value_line(item_label, number),
         key_value_line("title", dialog.item.title.clone()),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            status,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]),
     ];
+    if dialog.action == PrAction::Checkout {
+        lines.push(key_value_line(
+            "local dir",
+            dialog
+                .checkout
+                .as_ref()
+                .map(|checkout| checkout.directory.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+        lines.push(remote_branch_line(
+            dialog
+                .checkout
+                .as_ref()
+                .and_then(|checkout| checkout.branch.as_ref()),
+        ));
+    }
+    for (key, value) in &dialog.summary {
+        lines.push(key_value_line(key, value.clone()));
+    }
+    if dialog.action == PrAction::Merge {
+        lines.push(key_value_line(
+            "method",
+            format!(
+                "{}  (m: merge, s: squash, r: rebase)",
+                dialog.merge_method.label()
+            ),
+        ));
+    }
+    lines.push(Line::from(""));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -3399,8 +6425,22 @@ fn draw_pr_action_dialog(
         .title(Span::styled(
             match dialog.action {
                 PrAction::Merge => "Merge Pull Request",
-                PrAction::Close => "Close Pull Request",
+                PrAction::Close => match dialog.item.kind {
+                    ItemKind::Issue => "Close Issue",
+                    _ => "Close Pull Request",
+                },
+                PrAction::Reopen => match dialog.item.kind {
+                    ItemKind::Issue => "Reopen Issue",
+                    _ => "Reopen Pull Request",
+                },
                 PrAction::Approve => "Approve Pull Request",
+                PrAction::EnableAutoMerge => "Enable Auto-Merge",
+                PrAction::DisableAutoMerge => "Disable Auto-Merge",
+                PrAction::Checkout => "Checkout Pull Request Locally",
+                PrAction::RerunFailedChecks => "Rerun Failed Checks",
+                PrAction::UpdateBranch => "Update Pull Request Branch",
+                PrAction::ConvertToDraft => "Convert to Draft",
+                PrAction::MarkReadyForReview => "Ready for Review",
             },
             Style::default()
                 .fg(Color::Yellow)
@@ -3413,6 +6453,7 @@ fn draw_pr_action_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(status));
 }
 
 fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running: bool, area: Rect) {
@@ -3445,17 +6486,11 @@ fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running:
             style,
         )]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        if running {
-            "working...".to_string()
-        } else {
-            "Enter: add reaction    Esc: cancel".to_string()
-        },
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )]));
+    let footer = if running {
+        "working...".to_string()
+    } else {
+        "Enter: add reaction    Esc: cancel".to_string()
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3474,6 +6509,7 @@ fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running:
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
 }
 
 fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool, area: Rect) {
@@ -3482,7 +6518,7 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
     } else {
         centered_rect(66, 9, area)
     };
-    let (title, lines, accent, cursor) = match &dialog.mode {
+    let (title, lines, footer, accent, cursor) = match &dialog.mode {
         LabelDialogMode::Add { repo } => {
             let status = if running {
                 "working...".to_string()
@@ -3559,17 +6595,12 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
             while lines.len() < 12 {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(vec![Span::styled(
-                status,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )]));
             (
                 "Add Label",
                 lines,
+                status,
                 Color::LightMagenta,
-                Some(dialog.input.chars().count() as u16),
+                Some(display_width(&dialog.input).min(usize::from(u16::MAX)) as u16),
             )
         }
         LabelDialogMode::Remove { label } => {
@@ -3584,14 +6615,8 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
                     Line::from("Remove this label from the selected item?"),
                     Line::from(""),
                     key_value_line("label", label.clone()),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        status,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )]),
                 ],
+                status,
                 Color::Yellow,
                 None,
             )
@@ -3612,6 +6637,7 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(column) = cursor {
         let inner = block_inner(dialog_area);
         frame.set_cursor_position(Position::new(
@@ -3669,18 +6695,11 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     while lines.len() < usize::from(7 + editor_height) {
         lines.push(Line::from(""));
     }
-    let status = if running {
+    let footer = if running {
         "working..."
     } else {
         "Tab: field  Ctrl+Enter: create  Enter: newline/next  Esc: cancel"
     };
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        status,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )]));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3699,8 +6718,78 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) =
         issue_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn draw_pr_create_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &PrCreateDialog,
+    running: bool,
+    area: Rect,
+) {
+    let dialog_area = pr_create_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = pr_create_dialog_body_editor_height(dialog_area);
+    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let scroll = dialog.body_scroll.min(max_scroll);
+    let mut lines = vec![
+        key_value_line("repo", dialog.repo.clone()),
+        key_value_line("local dir", dialog.local_dir.display().to_string()),
+        key_value_line("branch", dialog.branch.clone()),
+        issue_dialog_separator_line(editor_width),
+        pr_create_dialog_field_input_line(
+            "Title",
+            &dialog.title,
+            PrCreateField::Title,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        pr_create_dialog_field_label("Body", PrCreateField::Body, dialog.field),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(7 + editor_height) {
+        lines.push(Line::from(""));
+    }
+    let footer = if running {
+        "working..."
+    } else {
+        "Tab: field  Ctrl+Enter: create PR  Enter: newline/next  Esc: cancel"
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "New Pull Request",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+    if let Some(position) =
+        pr_create_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
     {
         frame.set_cursor_position(position);
     }
@@ -3710,9 +6799,18 @@ fn issue_dialog_area(area: Rect) -> Rect {
     centered_rect(78, 22, area)
 }
 
+fn pr_create_dialog_area(area: Rect) -> Rect {
+    centered_rect(78, 20, area)
+}
+
 fn issue_dialog_body_editor_height(dialog_area: Rect) -> u16 {
     let inner = block_inner(dialog_area);
-    inner.height.saturating_sub(9).max(1)
+    inner.height.saturating_sub(7).max(1)
+}
+
+fn pr_create_dialog_body_editor_height(dialog_area: Rect) -> u16 {
+    let inner = block_inner(dialog_area);
+    inner.height.saturating_sub(7).max(1)
 }
 
 fn issue_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
@@ -3731,6 +6829,22 @@ fn issue_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
     )
 }
 
+fn pr_create_dialog_body_editor_size(area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = pr_create_dialog_area(area);
+        let inner = block_inner(dialog_area);
+        return (
+            inner.width.max(1),
+            pr_create_dialog_body_editor_height(dialog_area),
+        );
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
 fn issue_dialog_field_input_line(
     label: &'static str,
     value: &str,
@@ -3739,9 +6853,29 @@ fn issue_dialog_field_input_line(
     width: u16,
 ) -> Line<'static> {
     let prefix = issue_dialog_field_prefix(label);
-    let value_width = width.saturating_sub(prefix.chars().count() as u16);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
     Line::from(vec![
         Span::styled(prefix, issue_dialog_field_label_style(field, current)),
+        Span::styled(
+            issue_dialog_input_text(value, value_width),
+            Style::default().fg(Color::White),
+        ),
+    ])
+}
+
+fn pr_create_dialog_field_input_line(
+    label: &'static str,
+    value: &str,
+    field: PrCreateField,
+    current: PrCreateField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
+    Line::from(vec![
+        Span::styled(prefix, pr_create_dialog_field_label_style(field, current)),
         Span::styled(
             issue_dialog_input_text(value, value_width),
             Style::default().fg(Color::White),
@@ -3760,7 +6894,28 @@ fn issue_dialog_field_label(
     ))
 }
 
+fn pr_create_dialog_field_label(
+    label: &'static str,
+    field: PrCreateField,
+    current: PrCreateField,
+) -> Line<'static> {
+    Line::from(Span::styled(
+        issue_dialog_field_label_text(label),
+        pr_create_dialog_field_label_style(field, current),
+    ))
+}
+
 fn issue_dialog_field_label_style(field: IssueDialogField, current: IssueDialogField) -> Style {
+    if field == current {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn pr_create_dialog_field_label_style(field: PrCreateField, current: PrCreateField) -> Style {
     if field == current {
         Style::default()
             .fg(Color::Cyan)
@@ -3802,16 +6957,19 @@ fn issue_dialog_cursor_position(
 ) -> Option<Position> {
     let inner = block_inner(dialog_area);
     let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
-    let repo_prefix_width = issue_dialog_field_prefix("Repo").chars().count() as u16;
-    let title_prefix_width = issue_dialog_field_prefix("Title").chars().count() as u16;
-    let labels_prefix_width = issue_dialog_field_prefix("Labels").chars().count() as u16;
+    let repo_prefix_width =
+        display_width(&issue_dialog_field_prefix("Repo")).min(usize::from(u16::MAX)) as u16;
+    let title_prefix_width =
+        display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
+    let labels_prefix_width =
+        display_width(&issue_dialog_field_prefix("Labels")).min(usize::from(u16::MAX)) as u16;
     match dialog.field {
         IssueDialogField::Repo => Some(Position::new(
             clamp_x(
                 inner
                     .x
                     .saturating_add(repo_prefix_width)
-                    .saturating_add(dialog.repo.chars().count() as u16),
+                    .saturating_add(display_width(&dialog.repo).min(usize::from(u16::MAX)) as u16),
             ),
             inner.y,
         )),
@@ -3820,20 +6978,54 @@ fn issue_dialog_cursor_position(
                 inner
                     .x
                     .saturating_add(title_prefix_width)
-                    .saturating_add(dialog.title.chars().count() as u16),
+                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
             ),
             inner.y.saturating_add(2),
         )),
-        IssueDialogField::Labels => Some(Position::new(
+        IssueDialogField::Labels => {
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(labels_prefix_width).saturating_add(
+                    display_width(&dialog.labels).min(usize::from(u16::MAX)) as u16,
+                )),
+                inner.y.saturating_add(4),
+            ))
+        }
+        IssueDialogField::Body => {
+            let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
+            let visible_end = scroll.saturating_add(editor_height.max(1));
+            if line < scroll || line >= visible_end {
+                return None;
+            }
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(column)),
+                inner.y.saturating_add(7).saturating_add(line - scroll),
+            ))
+        }
+    }
+}
+
+fn pr_create_dialog_cursor_position(
+    dialog: &PrCreateDialog,
+    scroll: u16,
+    dialog_area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(dialog_area);
+    let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    let title_prefix_width =
+        display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
+    match dialog.field {
+        PrCreateField::Title => Some(Position::new(
             clamp_x(
                 inner
                     .x
-                    .saturating_add(labels_prefix_width)
-                    .saturating_add(dialog.labels.chars().count() as u16),
+                    .saturating_add(title_prefix_width)
+                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
             ),
             inner.y.saturating_add(4),
         )),
-        IssueDialogField::Body => {
+        PrCreateField::Body => {
             let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
             let visible_end = scroll.saturating_add(editor_height.max(1));
             if line < scroll || line >= visible_end {
@@ -3921,19 +7113,512 @@ fn label_suggestion_window_start(total: usize, selected: usize) -> usize {
     }
 }
 
+fn clamp_assignee_dialog_selection(dialog: &mut AssigneeDialog) {
+    let count = assignee_dialog_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_suggestion = 0;
+    } else {
+        dialog.selected_suggestion = dialog.selected_suggestion.min(count - 1);
+    }
+}
+
+fn assignee_suggestion_window_start(total: usize, selected: usize) -> usize {
+    if total <= ASSIGNEE_SUGGESTION_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(ASSIGNEE_SUGGESTION_LIMIT)
+            .min(total.saturating_sub(ASSIGNEE_SUGGESTION_LIMIT))
+    }
+}
+
+fn clamp_reviewer_dialog_selection(dialog: &mut ReviewerDialog) {
+    let count = reviewer_dialog_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_suggestion = 0;
+    } else {
+        dialog.selected_suggestion = dialog.selected_suggestion.min(count - 1);
+    }
+}
+
+fn reviewer_suggestion_window_start(total: usize, selected: usize) -> usize {
+    if total <= REVIEWER_SUGGESTION_LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(REVIEWER_SUGGESTION_LIMIT)
+            .min(total.saturating_sub(REVIEWER_SUGGESTION_LIMIT))
+    }
+}
+
+fn pr_action_dialog_area(dialog: &PrActionDialog, area: Rect) -> Rect {
+    let dialog_height = if matches!(dialog.action, PrAction::Checkout | PrAction::Merge) {
+        14
+    } else {
+        12
+    };
+    centered_rect(66, dialog_height, area)
+}
+
+fn remote_branch_line(branch: Option<&PullRequestBranch>) -> Line<'static> {
+    let Some(branch) = branch else {
+        return key_value_line("remote branch", "unavailable".to_string());
+    };
+    Line::from(vec![
+        Span::styled("remote branch: ", Style::default().fg(Color::Gray)),
+        Span::styled(pull_request_branch_label(branch), link_style()),
+    ])
+}
+
+fn pr_action_dialog_link_at(
+    dialog: &PrActionDialog,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<String> {
+    if dialog.action != PrAction::Checkout {
+        return None;
+    }
+    let branch = dialog
+        .checkout
+        .as_ref()
+        .and_then(|checkout| checkout.branch.as_ref())?;
+    let dialog_area = pr_action_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+    let content_row = row.saturating_sub(inner.y);
+    if content_row != PR_ACTION_REMOTE_BRANCH_LINE {
+        return None;
+    }
+    let label = pull_request_branch_label(branch);
+    let start = display_width("remote branch: ") as u16;
+    let end = start.saturating_add(display_width(&label) as u16);
+    let clicked = column.saturating_sub(inner.x);
+    (clicked >= start && clicked < end).then(|| pull_request_branch_url(branch))
+}
+
+fn draw_milestone_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &MilestoneDialog,
+    running: bool,
+    area: Rect,
+) {
+    let dialog_area = centered_rect(72, 18, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let current = dialog
+        .item
+        .milestone
+        .as_ref()
+        .map(|milestone| milestone.title.clone())
+        .unwrap_or_else(|| "(none)".to_string());
+    let mut lines = vec![
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("issue/pr", number),
+        key_value_line("current", current),
+        key_value_line("prefix", format!("{}_", dialog.input)),
+        Line::from(""),
+    ];
+
+    match &dialog.state {
+        MilestoneDialogState::Loading => {
+            lines.push(Line::from("loading open milestones..."));
+        }
+        MilestoneDialogState::Error(error) => {
+            lines.push(Line::from(vec![Span::styled(
+                operation_error_body(error),
+                Style::default().fg(Color::LightRed),
+            )]));
+        }
+        MilestoneDialogState::Loaded(_) => {
+            let choices = milestone_choices(dialog);
+            if choices.is_empty() {
+                lines.push(Line::from("No open milestones."));
+            } else {
+                for (index, choice) in choices.iter().take(9).enumerate() {
+                    let marker = if index == dialog.selected { "> " } else { "  " };
+                    let style = if index == dialog.selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        modal_text_style()
+                    };
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{marker}{}", milestone_choice_label(choice)),
+                        style,
+                    )]));
+                }
+                if choices.len() > 9 {
+                    lines.push(Line::from(format!("  ... {} more", choices.len() - 9)));
+                }
+            }
+        }
+    }
+
+    let footer = if running {
+        "working..."
+    } else {
+        "type prefix, Up/Down choose, Enter set/create, Esc cancel"
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Change Milestone",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+}
+
+fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(70, 17, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let action = assignee_action_label(dialog.action);
+    let current = if dialog.item.assignees.is_empty() {
+        "-".to_string()
+    } else {
+        dialog.item.assignees.join(", ")
+    };
+    let status = if running {
+        "working...".to_string()
+    } else if assignee_dialog_uses_default_unassign(dialog) {
+        "Enter: unassign current    Esc: cancel".to_string()
+    } else {
+        format!("Up/Down: choose    Enter: {action}    Esc: cancel")
+    };
+    let matches = assignee_dialog_suggestion_matches(dialog);
+    let mut lines = vec![
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("item", number),
+        key_value_line("current", current),
+        Line::from(""),
+        key_value_line("assignee(s)", format!("{}_", dialog.input)),
+        Line::from(""),
+    ];
+    if dialog.suggestions_loading {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates: loading assignable users...",
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if let Some(error) = &dialog.suggestions_error {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates unavailable",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_text(error, 64),
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if matches.is_empty() {
+        let message = match dialog.action {
+            AssigneeAction::Assign if dialog.input.trim().is_empty() => {
+                "No assignable users loaded. Type a login manually."
+            }
+            AssigneeAction::Assign => "No prefix matches. Enter uses the typed login.",
+            AssigneeAction::Unassign => "No current assignee matches this prefix.",
+        };
+        lines.push(Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(Color::Gray),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        let start = assignee_suggestion_window_start(matches.len(), dialog.selected_suggestion);
+        for (index, login) in matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(ASSIGNEE_SUGGESTION_LIMIT)
+        {
+            let selected = index == dialog.selected_suggestion;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(login.clone(), style),
+            ]));
+        }
+    }
+    while lines.len() < 13 {
+        lines.push(Line::from(""));
+    }
+    let title = match dialog.action {
+        AssigneeAction::Assign => "Assign Assignee",
+        AssigneeAction::Unassign => "Unassign Assignee",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(status));
+}
+
+fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running: bool, area: Rect) {
+    let dialog_area = centered_rect(74, 20, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let prompt = match dialog.action {
+        ReviewerAction::Request => "Request or re-request review from GitHub users.",
+        ReviewerAction::Remove => "Remove pending review requests from GitHub users.",
+    };
+    let status = if running {
+        "working...".to_string()
+    } else {
+        "Enter: submit    comma separates logins    Esc: cancel".to_string()
+    };
+    let input = if dialog.input.is_empty() {
+        "<reviewer logins>".to_string()
+    } else {
+        dialog.input.clone()
+    };
+    let mut lines = vec![
+        Line::from(prompt),
+        Line::from(""),
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line("pull request", number),
+        key_value_line("title", dialog.item.title.clone()),
+        Line::from(""),
+        key_value_line("reviewers", input),
+        Line::from(""),
+    ];
+    let matches = reviewer_dialog_suggestion_matches(dialog);
+    if dialog.suggestions_loading {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates: loading reviewable users...",
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if let Some(error) = &dialog.suggestions_error {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates unavailable",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_text(error, 68),
+            Style::default().fg(Color::Gray),
+        )]));
+    } else if matches.is_empty() {
+        let message = if dialog.input.trim().is_empty() {
+            "No reviewer candidates loaded. Type login manually."
+        } else {
+            "No prefix matches. Enter uses the typed login."
+        };
+        lines.push(Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(Color::Gray),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "Candidates",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        let start = reviewer_suggestion_window_start(matches.len(), dialog.selected_suggestion);
+        for (index, login) in matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(REVIEWER_SUGGESTION_LIMIT)
+        {
+            let selected = index == dialog.selected_suggestion;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "> " } else { "  " }, style),
+                Span::styled(login.clone(), style),
+            ]));
+        }
+    }
+    let title = match dialog.action {
+        ReviewerAction::Request => "Request Reviewers",
+        ReviewerAction::Remove => "Remove Review Requests",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(status));
+}
+
+fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDialog, area: Rect) {
+    let dialog_area = centered_rect(66, 12, area);
+    let number = dialog
+        .item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    let item_kind = match dialog.item.kind {
+        ItemKind::PullRequest => "pull request",
+        ItemKind::Issue => "issue",
+        ItemKind::Notification => "item",
+    };
+    let lines = vec![
+        Line::from("Choose the field to edit on GitHub."),
+        Line::from(""),
+        key_value_line("repo", dialog.item.repo.clone()),
+        key_value_line(item_kind, number),
+        key_value_line("title", dialog.item.title.clone()),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Edit Item",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("t: title    b: body    Esc: cancel"),
+    );
+}
+
+fn milestone_choices(dialog: &MilestoneDialog) -> Vec<MilestoneChoice> {
+    let mut choices = vec![MilestoneChoice::Clear];
+    if let MilestoneDialogState::Loaded(milestones) = &dialog.state {
+        let matches = milestones
+            .iter()
+            .filter(|milestone| milestone_matches_prefix(milestone, &dialog.input))
+            .cloned()
+            .map(MilestoneChoice::Set)
+            .collect::<Vec<_>>();
+        choices.extend(matches);
+
+        let title = dialog.input.trim();
+        let has_exact = milestones
+            .iter()
+            .any(|milestone| milestone.title.eq_ignore_ascii_case(title));
+        if !title.is_empty() && !has_exact {
+            choices.push(MilestoneChoice::Create(title.to_string()));
+        }
+    }
+    choices
+}
+
+fn milestone_matches_prefix(milestone: &Milestone, prefix: &str) -> bool {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    prefix.is_empty() || milestone.title.to_ascii_lowercase().starts_with(&prefix)
+}
+
+fn milestone_choice_label(choice: &MilestoneChoice) -> String {
+    match choice {
+        MilestoneChoice::Clear => "Clear milestone".to_string(),
+        MilestoneChoice::Set(milestone) => format!("{} (#{})", milestone.title, milestone.number),
+        MilestoneChoice::Create(title) => format!("Create milestone \"{title}\""),
+    }
+}
+
+fn clamp_milestone_dialog_selection(dialog: &mut MilestoneDialog) {
+    let count = milestone_choices(dialog).len();
+    if count == 0 {
+        dialog.selected = 0;
+    } else {
+        dialog.selected = dialog.selected.min(count - 1);
+    }
+}
+
+fn reset_milestone_dialog_selection(dialog: &mut MilestoneDialog) {
+    let choices = milestone_choices(dialog);
+    dialog.selected = if !dialog.input.trim().is_empty() && choices.len() > 1 {
+        1
+    } else {
+        0
+    };
+    clamp_milestone_dialog_selection(dialog);
+}
+
 fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
-    let dialog_area = centered_rect(78, 14, area);
-    let footer = if dialog.auto_close_at.is_some() {
+    let dialog_area = centered_rect(78, message_dialog_height(dialog, area), area);
+    let footer = if dialog.kind == MessageDialogKind::RetryableError {
+        "Enter: cancel  Esc: edit and retry"
+    } else if dialog.auto_close_at.is_some() {
         "Auto closes shortly | Enter/Esc: close"
     } else {
         "Enter/Esc: close"
     };
-    let text = format!("{}\n\n{footer}", dialog.body);
-    let accent = if dialog.auto_close_at.is_some() {
-        Color::LightGreen
-    } else {
-        Color::LightRed
-    };
+    let accent = message_dialog_accent(dialog);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
@@ -3942,13 +7627,29 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
             dialog.title.clone(),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ));
-    let paragraph = Paragraph::new(text)
+    let paragraph = Paragraph::new(dialog.body.clone())
         .block(block)
         .style(modal_text_style())
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+}
+
+fn message_dialog_height(dialog: &MessageDialog, area: Rect) -> u16 {
+    let line_count = dialog.body.lines().count().max(1);
+    let desired = (line_count + 4).min(usize::from(u16::MAX)) as u16;
+    let max_height = area.height.saturating_sub(2).max(1);
+    desired.max(9.min(max_height)).min(max_height)
+}
+
+fn message_dialog_accent(dialog: &MessageDialog) -> Color {
+    match dialog.kind {
+        MessageDialogKind::Info => Color::Yellow,
+        MessageDialogKind::Success => Color::LightGreen,
+        MessageDialogKind::Error | MessageDialogKind::RetryableError => Color::LightRed,
+    }
 }
 
 fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4012,6 +7713,1056 @@ fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
         .min(area.height.saturating_sub(2).max(1))
 }
 
+fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
+    let mut commands = vec![
+        palette_command(
+            "Show Command Palette",
+            command_palette_key.to_string(),
+            "General",
+            "Open this searchable command list",
+            PaletteAction::ShowCommandPalette,
+        ),
+        palette_command(
+            "Show Help",
+            "?",
+            "General",
+            "Open the full shortcut reference",
+            PaletteAction::ShowHelp,
+        ),
+        palette_command(
+            "Info",
+            "",
+            "General",
+            "Show ghr version, paths, runtime state, and ghr process memory",
+            PaletteAction::ShowInfo,
+        ),
+        palette_command(
+            "Close or Cancel",
+            "Esc",
+            "General",
+            "Close the active dialog, search, or details focus",
+            palette_key(KeyCode::Esc),
+        ),
+        palette_command(
+            "Confirm or Open",
+            "Enter",
+            "General",
+            "Run the active confirmation or open the selected item area",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Quit ghr",
+            "q / Ctrl+C",
+            "General",
+            "Save UI state and quit",
+            PaletteAction::Quit,
+        ),
+        palette_command(
+            "Refresh",
+            "r",
+            "General",
+            "Refresh dashboard data from GitHub",
+            PaletteAction::Refresh,
+        ),
+        palette_command(
+            "Search Current Repo",
+            "S",
+            "General",
+            "Search matching PRs and issues in the current repo",
+            PaletteAction::SearchCurrentRepo,
+        ),
+        palette_command(
+            "Project Switch",
+            "",
+            "General",
+            "Filter configured repo projects and switch to one",
+            PaletteAction::SwitchProject,
+        ),
+        palette_command(
+            "Project Add",
+            "",
+            "General",
+            "Add a repo project to the menu and config.toml",
+            PaletteAction::ProjectAdd,
+        ),
+        palette_command(
+            "Project Remove",
+            "",
+            "General",
+            "Remove a configured repo project from config.toml",
+            PaletteAction::ProjectRemove,
+        ),
+        palette_command(
+            "Copy GitHub Link",
+            "",
+            "General",
+            "Copy the selected comment or issue/PR link to the clipboard",
+            PaletteAction::CopyGithubLink,
+        ),
+        palette_command(
+            "Copy Content",
+            "",
+            "General",
+            "Copy the selected comment body or issue/PR description to the clipboard",
+            PaletteAction::CopyContent,
+        ),
+        palette_command(
+            "Toggle Mouse Text Selection",
+            "m",
+            "General",
+            "Switch between TUI mouse controls and terminal text selection",
+            PaletteAction::ToggleMouseCapture,
+        ),
+        palette_command(
+            "Open Selected in Browser",
+            "o",
+            "General",
+            "Open the selected item or PR changes page",
+            PaletteAction::OpenSelected,
+        ),
+        palette_command(
+            "Show Pull Request Diff",
+            "v",
+            "General",
+            "Open PR diff mode",
+            PaletteAction::ShowDiff,
+        ),
+        palette_command(
+            "Ignore Selected Item",
+            "i",
+            "General",
+            "Hide the selected pull request or issue from lists",
+            palette_key(KeyCode::Char('i')),
+        ),
+        palette_command(
+            "Clear Ignored Items",
+            "",
+            "General",
+            "Show all previously ignored pull requests and issues again",
+            PaletteAction::ClearIgnoredItems,
+        ),
+        palette_command(
+            "Leave Diff Mode",
+            "q",
+            "Diff",
+            "Return to the state before opening diff",
+            palette_key(KeyCode::Char('q')),
+        ),
+        palette_command(
+            "Focus ghr Tabs",
+            "1",
+            "Focus",
+            "Focus the top ghr tab group",
+            palette_key(KeyCode::Char('1')),
+        ),
+        palette_command(
+            "Focus Sections",
+            "2",
+            "Focus",
+            "Focus the section tab group",
+            palette_key(KeyCode::Char('2')),
+        ),
+        palette_command(
+            "Focus List",
+            "3",
+            "Focus",
+            "Focus the item list or changed-file list",
+            palette_key(KeyCode::Char('3')),
+        ),
+        palette_command(
+            "Focus Details",
+            "4 / Enter",
+            "Focus",
+            "Focus Details from the list",
+            palette_key(KeyCode::Char('4')),
+        ),
+        palette_command(
+            "Next Focused Tab Group",
+            "Tab",
+            "Tabs",
+            "Move within the focused tab group",
+            palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Previous Focused Tab Group",
+            "Shift+Tab",
+            "Tabs",
+            "Move backward within the focused tab group",
+            palette_key(KeyCode::BackTab),
+        ),
+        palette_command(
+            "Move Tab Right",
+            "l / Right / ]",
+            "Tabs",
+            "Move right in ghr or Sections",
+            palette_key(KeyCode::Char('l')),
+        ),
+        palette_command(
+            "Move Tab Left",
+            "h / Left / [",
+            "Tabs",
+            "Move left in ghr or Sections",
+            palette_key(KeyCode::Char('h')),
+        ),
+        palette_command(
+            "Search Current List",
+            "/",
+            "List",
+            "Fuzzy filter the current list",
+            palette_key(KeyCode::Char('/')),
+        ),
+        palette_command(
+            "Move Selection Down",
+            "j / Down",
+            "List",
+            "Move list selection or diff cursor down",
+            palette_key(KeyCode::Char('j')),
+        ),
+        palette_command(
+            "Move Selection Up",
+            "k / Up",
+            "List",
+            "Move list selection or diff cursor up",
+            palette_key(KeyCode::Char('k')),
+        ),
+        palette_command(
+            "Page List Down",
+            "] / PgDown / d",
+            "List",
+            "Move the list selection down by a visible page",
+            palette_key(KeyCode::PageDown),
+        ),
+        palette_command(
+            "Page List Up",
+            "[ / PgUp / u",
+            "List",
+            "Move the list selection up by a visible page",
+            palette_key(KeyCode::PageUp),
+        ),
+        palette_command(
+            "Page Details Down",
+            "PgDown / d",
+            "Details",
+            "Scroll details down by a visible page",
+            palette_key(KeyCode::PageDown),
+        ),
+        palette_command(
+            "Page Details Up",
+            "PgUp / u",
+            "Details",
+            "Scroll details up by a visible page",
+            palette_key(KeyCode::PageUp),
+        ),
+        palette_command(
+            "Jump to First",
+            "g",
+            "List/Details",
+            "Jump to top or first item",
+            palette_key(KeyCode::Char('g')),
+        ),
+        palette_command(
+            "Jump to Last",
+            "G",
+            "List/Details",
+            "Jump to bottom or last item",
+            palette_key(KeyCode::Char('G')),
+        ),
+        palette_command(
+            "Load Previous Result Page",
+            "Alt+[",
+            "List",
+            "Load previous GitHub search result page",
+            palette_alt_key(KeyCode::Char('[')),
+        ),
+        palette_command(
+            "Load Next Result Page",
+            "Alt+]",
+            "List",
+            "Load next GitHub search result page",
+            palette_alt_key(KeyCode::Char(']')),
+        ),
+        palette_command(
+            "Open PR Merge Confirmation",
+            "M",
+            "Pull Request",
+            "Confirm merging the selected PR",
+            palette_key(KeyCode::Char('M')),
+        ),
+        palette_command(
+            "Open PR Close Confirmation",
+            "C",
+            "Pull Request",
+            "Confirm closing the selected PR",
+            palette_key(KeyCode::Char('C')),
+        ),
+        palette_command(
+            "Open PR Approve Confirmation",
+            "A",
+            "Pull Request",
+            "Confirm approving the selected PR",
+            palette_key(KeyCode::Char('A')),
+        ),
+        palette_command(
+            "Add Comment",
+            "a / c",
+            "Issue/PR",
+            "Add a normal issue or PR comment",
+            palette_key(KeyCode::Char('a')),
+        ),
+        palette_command(
+            "Add Label",
+            "L",
+            "Issue/PR",
+            "Add a label to the selected issue or PR",
+            palette_key(KeyCode::Char('L')),
+        ),
+        palette_command(
+            "Change Milestone",
+            "t",
+            "Issue/PR",
+            "Change or clear the selected issue or PR milestone",
+            palette_key(KeyCode::Char('t')),
+        ),
+        palette_command(
+            "Create Issue / PR",
+            "N",
+            "Issue/PR",
+            "Create an issue, or create a PR from local_dir in PR lists",
+            palette_key(KeyCode::Char('N')),
+        ),
+        palette_command(
+            "Add Reaction",
+            "+",
+            "Issue/PR",
+            "Add a reaction to the selected item or focused comment",
+            palette_key(KeyCode::Char('+')),
+        ),
+        palette_command(
+            "Assign Assignee",
+            "@",
+            "Issue/PR",
+            "Assign assignee logins to the selected issue or PR",
+            palette_key(KeyCode::Char('@')),
+        ),
+        palette_command(
+            "Unassign Assignee",
+            "-",
+            "Issue/PR",
+            "Remove assignee logins from the selected issue or PR",
+            palette_key(KeyCode::Char('-')),
+        ),
+        palette_command(
+            "Search Details Comments",
+            "/",
+            "Details",
+            "Search loaded comments by keyword",
+            palette_key(KeyCode::Char('/')),
+        ),
+        palette_command(
+            "Next Comment",
+            "n",
+            "Details",
+            "Focus next visible comment",
+            palette_key(KeyCode::Char('n')),
+        ),
+        palette_command(
+            "Previous Comment",
+            "p",
+            "Details",
+            "Focus previous visible comment",
+            palette_key(KeyCode::Char('p')),
+        ),
+        palette_command(
+            "Reply to Focused Comment",
+            "R",
+            "Details",
+            "Quote reply to the focused comment",
+            palette_key(KeyCode::Char('R')),
+        ),
+        palette_command(
+            "Edit Focused Comment",
+            "e",
+            "Details",
+            "Edit the focused comment when it is yours",
+            palette_key(KeyCode::Char('e')),
+        ),
+        palette_command(
+            "Previous Diff File",
+            "[",
+            "Diff",
+            "Jump to previous changed file",
+            palette_key(KeyCode::Char('[')),
+        ),
+        palette_command(
+            "Next Diff File",
+            "]",
+            "Diff",
+            "Jump to next changed file",
+            palette_key(KeyCode::Char(']')),
+        ),
+        palette_command(
+            "Page Diff Details Down",
+            "h",
+            "Diff Details",
+            "Page down through the current file diff",
+            palette_key(KeyCode::Char('h')),
+        ),
+        palette_command(
+            "Page Diff Details Up",
+            "l",
+            "Diff Details",
+            "Page up through the current file diff",
+            palette_key(KeyCode::Char('l')),
+        ),
+        palette_command(
+            "Begin Review Range",
+            "m",
+            "Diff",
+            "Begin a review range at the selected diff line",
+            palette_key(KeyCode::Char('m')),
+        ),
+        palette_command(
+            "End Review Range",
+            "e",
+            "Diff",
+            "End the current review range",
+            palette_key(KeyCode::Char('e')),
+        ),
+        palette_command(
+            "Add Inline Review Comment",
+            "c",
+            "Diff",
+            "Add a review comment on the selected diff line or range",
+            palette_key(KeyCode::Char('c')),
+        ),
+        palette_command(
+            "Confirm PR Action",
+            "y / Enter",
+            "Dialog",
+            "Run the active PR confirmation",
+            palette_key(KeyCode::Char('y')),
+        ),
+        palette_command(
+            "Submit Comment",
+            "Ctrl+Enter",
+            "Comment Editor",
+            "Send or update the current comment",
+            palette_ctrl_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Insert Comment Newline",
+            "Enter",
+            "Comment Editor",
+            "Insert a newline in the comment editor",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Delete Previous Character",
+            "Backspace",
+            "Editor",
+            "Delete the previous character while editing or filtering",
+            palette_key(KeyCode::Backspace),
+        ),
+        palette_command(
+            "Choose Next Suggestion",
+            "Down / Tab",
+            "Label/Reaction",
+            "Move to the next label or reaction suggestion",
+            palette_key(KeyCode::Down),
+        ),
+        palette_command(
+            "Choose Previous Suggestion",
+            "Up / Shift+Tab",
+            "Label/Reaction",
+            "Move to the previous label or reaction suggestion",
+            palette_key(KeyCode::Up),
+        ),
+        palette_command(
+            "Confirm Label or Reaction",
+            "Enter",
+            "Label/Reaction",
+            "Confirm the selected label or reaction",
+            palette_key(KeyCode::Enter),
+        ),
+        palette_command(
+            "Next Issue Field",
+            "Tab",
+            "Issue Dialog",
+            "Move to the next issue field",
+            palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Previous Issue Field",
+            "Shift+Tab",
+            "Issue Dialog",
+            "Move to the previous issue field",
+            palette_key(KeyCode::BackTab),
+        ),
+        palette_command(
+            "Create Issue from Dialog",
+            "Ctrl+Enter",
+            "Issue Dialog",
+            "Create the issue from the issue dialog",
+            palette_ctrl_key(KeyCode::Enter),
+        ),
+    ];
+
+    for (index, reaction) in ReactionContent::ALL.iter().copied().enumerate() {
+        let key = char::from_digit((index + 1) as u32, 10).unwrap_or('1');
+        let keys = match index {
+            0 => "1",
+            1 => "2",
+            2 => "3",
+            3 => "4",
+            4 => "5",
+            5 => "6",
+            6 => "7",
+            _ => "8",
+        };
+        commands.push(palette_command(
+            reaction.label(),
+            keys,
+            "Reaction Dialog",
+            "Choose and add this reaction",
+            palette_key(KeyCode::Char(key)),
+        ));
+    }
+
+    commands
+}
+
+fn palette_command(
+    title: &'static str,
+    keys: impl Into<String>,
+    scope: &'static str,
+    detail: &'static str,
+    action: PaletteAction,
+) -> PaletteCommand {
+    PaletteCommand {
+        title,
+        keys: keys.into(),
+        scope,
+        detail,
+        action,
+    }
+}
+
+fn palette_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn palette_ctrl_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
+}
+
+fn palette_alt_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::ALT))
+}
+
+fn runtime_info_body(app: &AppState, config: &Config, paths: &Paths) -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("unavailable ({error})"));
+    let repo = app
+        .current_repo_scope()
+        .unwrap_or_else(|| "(none)".to_string());
+    let section = app
+        .current_section()
+        .map(|section| section.title.as_str())
+        .unwrap_or("(none)");
+    let selected = selected_item_summary(app.current_item());
+    let item_count = app
+        .sections
+        .iter()
+        .map(|section| section.items.len())
+        .sum::<usize>();
+
+    [
+        format!("version: {}", env!("CARGO_PKG_VERSION")),
+        format!("pid: {}", std::process::id()),
+        format!("ghr memory: {}", process_memory_summary()),
+        format!("gh: {}", github_cli_version_summary()),
+        String::new(),
+        format!("config: {}", paths.config_path.display()),
+        format!("db: {}", paths.db_path.display()),
+        format!("log: {}", paths.log_path.display()),
+        format!("state: {}", paths.state_path.display()),
+        String::new(),
+        format!("cwd: {cwd}"),
+        format!("log_level: {}", config.defaults.log_level),
+        format!("view: {}", app.active_view),
+        format!("focus: {}", app.focus.as_state_str()),
+        format!("details_mode: {}", app.details_mode.as_state_str()),
+        format!("section: {section}"),
+        format!("repo: {repo}"),
+        format!("selected: {selected}"),
+        format!(
+            "mouse: {}",
+            if app.mouse_capture_enabled {
+                "tui"
+            } else {
+                "text selection"
+            }
+        ),
+        format!(
+            "sections: {}, cached items: {item_count}",
+            app.sections.len()
+        ),
+        format!("ignored items: {}", app.ignored_items.len()),
+    ]
+    .join("\n")
+}
+
+fn selected_item_summary(item: Option<&WorkItem>) -> String {
+    let Some(item) = item else {
+        return "(none)".to_string();
+    };
+    let number = item
+        .number
+        .map(|number| format!("#{number}"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{} {} {}",
+        item_kind_label(item.kind),
+        number,
+        truncate_inline(&item.title, 72)
+    )
+}
+
+fn process_memory_summary() -> String {
+    let Some((rss_kib, virtual_kib)) = process_memory_kib() else {
+        return "unavailable".to_string();
+    };
+
+    match (rss_kib, virtual_kib) {
+        (Some(rss), Some(virtual_size)) => {
+            format!(
+                "rss {}, virtual {}",
+                format_kib(rss),
+                format_kib(virtual_size)
+            )
+        }
+        (Some(rss), None) => format!("rss {}", format_kib(rss)),
+        (None, Some(virtual_size)) => format!("virtual {}", format_kib(virtual_size)),
+        (None, None) => "unavailable".to_string(),
+    }
+}
+
+fn process_memory_kib() -> Option<(Option<u64>, Option<u64>)> {
+    process_memory_kib_from_proc_status().or_else(process_memory_kib_from_ps)
+}
+
+fn process_memory_kib_from_proc_status() -> Option<(Option<u64>, Option<u64>)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let rss = proc_status_kib(&status, "VmRSS:");
+    let virtual_size = proc_status_kib(&status, "VmSize:");
+    (rss.is_some() || virtual_size.is_some()).then_some((rss, virtual_size))
+}
+
+fn proc_status_kib(status: &str, label: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix(label)?.trim();
+        value.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
+fn process_memory_kib_from_ps() -> Option<(Option<u64>, Option<u64>)> {
+    let pid = std::process::id().to_string();
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-o", "vsz=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut values = text
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok());
+    let rss = values.next();
+    let virtual_size = values.next();
+    (rss.is_some() || virtual_size.is_some()).then_some((rss, virtual_size))
+}
+
+fn format_kib(kib: u64) -> String {
+    let mib = kib as f64 / 1024.0;
+    if mib >= 1024.0 {
+        format!("{:.2} GiB", mib / 1024.0)
+    } else {
+        format!("{mib:.1} MiB")
+    }
+}
+
+#[cfg(test)]
+fn github_cli_version_summary() -> String {
+    "not checked in tests".to_string()
+}
+
+#[cfg(not(test))]
+fn github_cli_version_summary() -> String {
+    debug!(command = "gh --version", "gh request started");
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .arg("--version")
+        .output();
+    match output {
+        Ok(output) => {
+            debug!(
+                command = "gh --version",
+                status = %output.status,
+                success = output.status.success(),
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "gh request finished"
+            );
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or("installed")
+                    .to_string()
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                stderr
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or("unavailable")
+                    .to_string()
+            }
+        }
+        Err(error) => {
+            debug!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
+            format!("unavailable ({error})")
+        }
+    }
+}
+
+fn command_palette_filtered_indices(commands: &[PaletteCommand], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..commands.len()).collect();
+    }
+
+    let mut scored = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            command_palette_score(command, query).map(|score| (index, score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    scored.into_iter().map(|(index, _)| index).collect()
+}
+
+fn command_palette_score(command: &PaletteCommand, query: &str) -> Option<i64> {
+    let raw_query = query.trim();
+    let query = command_palette_normalized_text(raw_query);
+    if query.is_empty() {
+        return raw_query.is_empty().then_some(0);
+    }
+
+    let fields = [
+        (command.title, 40_000),
+        (command.keys.as_str(), 30_000),
+        (command.scope, 20_000),
+        (command.detail, 10_000),
+    ];
+    let mut best = None;
+    for (field, base) in fields {
+        if let Some(score) = command_palette_text_score(field, &query) {
+            best = Some(best.unwrap_or(i64::MIN).max(base + score));
+        }
+    }
+
+    let combined = format!(
+        "{} {} {} {}",
+        command.title, command.keys, command.scope, command.detail
+    );
+    if let Some(score) = command_palette_text_score(&combined, &query) {
+        best = Some(best.unwrap_or(i64::MIN).max(score));
+    }
+
+    best
+}
+
+fn command_palette_text_score(text: &str, query: &str) -> Option<i64> {
+    let text = command_palette_normalized_text(text);
+    if text.is_empty() {
+        return None;
+    }
+    if text == query {
+        return Some(30_000);
+    }
+    if text.starts_with(query) {
+        return Some(25_000);
+    }
+    if let Some(index) = text.find(query) {
+        return Some(22_000 - index.min(500) as i64);
+    }
+
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let initials = words
+        .iter()
+        .filter_map(|word| word.chars().next())
+        .collect::<String>();
+    let mut total = 0;
+    for token in query.split_whitespace() {
+        total += command_palette_token_score(token, &words, &initials)?;
+    }
+    Some(total)
+}
+
+fn command_palette_token_score(token: &str, words: &[&str], initials: &str) -> Option<i64> {
+    let mut best = None;
+    for (index, word) in words.iter().enumerate() {
+        let score = if *word == token {
+            Some(8_000)
+        } else if word.starts_with(token) {
+            Some(7_000)
+        } else {
+            word.find(token)
+                .map(|offset| 5_000 - offset.min(300) as i64)
+        };
+
+        if let Some(score) = score {
+            best = Some(best.unwrap_or(i64::MIN).max(score - index.min(200) as i64));
+        }
+    }
+
+    if token.chars().count() <= 4 && initials.starts_with(token) {
+        best = Some(best.unwrap_or(i64::MIN).max(6_500));
+    }
+
+    best
+}
+
+fn command_palette_normalized_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = true;
+    for ch in text.chars() {
+        for lower in ch.to_lowercase() {
+            if lower.is_alphanumeric() {
+                normalized.push(lower);
+                last_was_space = false;
+            } else if command_palette_search_symbol(lower) {
+                if !last_was_space {
+                    normalized.push(' ');
+                }
+                normalized.push(lower);
+                normalized.push(' ');
+                last_was_space = true;
+            } else if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn command_palette_search_symbol(ch: char) -> bool {
+    matches!(ch, ':' | '/' | '?' | '+' | '-' | '@' | '[' | ']')
+}
+
+fn project_switcher_candidate_matches(candidate: &ViewTab, query: &str) -> bool {
+    let query = command_palette_normalized_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let label = command_palette_normalized_text(&candidate.label);
+    let key = command_palette_normalized_text(
+        candidate
+            .key
+            .strip_prefix("repo:")
+            .unwrap_or(candidate.key.as_str()),
+    );
+    label.starts_with(&query) || key.starts_with(&query)
+}
+
+fn project_add_repo_from_input(input: &str) -> Option<String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(repo) = github_repo_from_remote_url(value) {
+        return Some(repo);
+    }
+
+    let path = value
+        .split_once("github.com/")
+        .map(|(_, path)| path)
+        .unwrap_or(value)
+        .trim()
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    if owner
+        .chars()
+        .chain(name.chars())
+        .any(|value| value.is_whitespace() || matches!(value, ':' | '\\'))
+    {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+fn project_add_title(config: &Config, title: &str, repo: &str) -> Option<String> {
+    let title = title.trim();
+    if !title.is_empty() {
+        return (!project_title_exists(config, title)).then(|| title.to_string());
+    }
+
+    let short_name = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
+    if !project_title_exists(config, short_name) {
+        return Some(short_name.to_string());
+    }
+    (!project_title_exists(config, repo)).then(|| repo.to_string())
+}
+
+fn project_title_exists(config: &Config, title: &str) -> bool {
+    config
+        .repos
+        .iter()
+        .any(|repo| repo.name.eq_ignore_ascii_case(title))
+}
+
+fn project_remove_filtered_candidates(
+    dialog: &ProjectRemoveDialog,
+) -> Vec<&ProjectRemoveCandidate> {
+    dialog
+        .candidates
+        .iter()
+        .filter(|candidate| project_remove_candidate_matches(candidate, &dialog.query))
+        .collect()
+}
+
+fn project_remove_candidate_matches(candidate: &ProjectRemoveCandidate, query: &str) -> bool {
+    let query = command_palette_normalized_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let name = command_palette_normalized_text(&candidate.name);
+    let repo = command_palette_normalized_text(&candidate.repo);
+    name.starts_with(&query) || repo.starts_with(&query)
+}
+
+fn project_remove_candidate_config_index(
+    config: &Config,
+    candidate: &ProjectRemoveCandidate,
+) -> Option<usize> {
+    if config
+        .repos
+        .get(candidate.index)
+        .is_some_and(|repo| repo.name == candidate.name && repo.repo == candidate.repo)
+    {
+        return Some(candidate.index);
+    }
+
+    config
+        .repos
+        .iter()
+        .position(|repo| repo.name == candidate.name && repo.repo == candidate.repo)
+}
+
+fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let _ = text;
+        Ok(())
+    }
+
+    #[cfg(all(not(test), target_os = "macos"))]
+    {
+        copy_text_with_command("pbcopy", &[], text)
+    }
+
+    #[cfg(all(not(test), target_os = "windows"))]
+    {
+        copy_text_with_command("cmd", &["/C", "clip"], text)
+    }
+
+    #[cfg(all(not(test), unix, not(target_os = "macos")))]
+    {
+        let mut last_error = None;
+        for (command, args) in [
+            ("wl-copy", Vec::<&str>::new()),
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+        ] {
+            match copy_text_with_command(command, &args, text) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no clipboard command found; tried wl-copy, xclip, and xsel",
+            )
+        }))
+    }
+
+    #[cfg(not(any(test, unix, target_os = "windows")))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "clipboard copy is not supported on this platform",
+        ))
+    }
+}
+
+#[cfg(not(test))]
+fn copy_text_with_command(command: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("failed to open stdin for {command}"),
+            )
+        })?;
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{command} exited with status {status}"
+        )))
+    }
+}
+
 fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
     let title = match &dialog.mode {
         CommentDialogMode::New => "New Comment".to_string(),
@@ -4022,8 +8773,98 @@ fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect
         CommentDialogMode::Review { target } => {
             format!("Review {}", target.location_label())
         }
+        CommentDialogMode::ItemMetadata { field } => format!("Edit {}", field.title()),
     };
     draw_comment_editor(frame, &title, dialog, area);
+}
+
+fn draw_review_submit_dialog(frame: &mut Frame<'_>, dialog: &ReviewSubmitDialog, area: Rect) {
+    let title = match dialog.mode {
+        ReviewSubmitMode::New => "Submit Review",
+        ReviewSubmitMode::Pending { .. } => "Submit Pending Review",
+    };
+    let dialog_area = review_submit_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    let header_height = 3.min(inner.height);
+    let editor_height = inner.height.saturating_sub(header_height).max(1);
+    let editor_width = inner.width.max(1);
+    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let scroll = dialog.scroll.min(max_scroll);
+    let mut lines = vec![
+        key_value_line("event", review_event_selector_label(dialog.event)),
+        key_value_line("pull request", review_dialog_pr_label(dialog)),
+        Line::from(""),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(header_height.saturating_add(editor_height)) {
+        lines.push(Line::from(""));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style());
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line(
+            "Tab/1/2/3: event    Ctrl+Enter: submit    Ctrl+P: pending    Esc: cancel",
+        ),
+    );
+    if let Some(position) = review_submit_cursor_position(
+        &dialog.body,
+        scroll,
+        dialog_area,
+        editor_width,
+        editor_height,
+    ) {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn review_event_selector_label(selected: PullRequestReviewEvent) -> String {
+    [
+        PullRequestReviewEvent::Comment,
+        PullRequestReviewEvent::RequestChanges,
+        PullRequestReviewEvent::Approve,
+    ]
+    .into_iter()
+    .map(|event| {
+        if event == selected {
+            format!("[{}]", event.label())
+        } else {
+            event.label().to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("  ")
+}
+
+fn review_dialog_pr_label(dialog: &ReviewSubmitDialog) -> String {
+    dialog
+        .item
+        .number
+        .map(|number| format!("{}#{number}", dialog.item.repo))
+        .unwrap_or_else(|| dialog.item.repo.clone())
 }
 
 fn draw_reply_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, author: &str, area: Rect) {
@@ -4033,8 +8874,7 @@ fn draw_reply_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, author: &str
 fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialog, area: Rect) {
     let dialog_area = comment_dialog_area(dialog, area);
     let inner = block_inner(dialog_area);
-    let footer_height = COMMENT_DIALOG_FOOTER_HEIGHT.min(inner.height);
-    let editor_height = inner.height.saturating_sub(footer_height).max(1);
+    let editor_height = inner.height.max(1);
     let editor_width = inner.width.max(1);
     let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
     let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
@@ -4048,18 +8888,11 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     while lines.len() < usize::from(editor_height) {
         lines.push(Line::from(""));
     }
-    let footer_line = Line::from(vec![
-        Span::styled("Ctrl+Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" send  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" newline  "),
-        Span::styled("Pg/Wheel", Style::default().fg(Color::Yellow)),
-        Span::raw(" scroll  "),
-        Span::styled("Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" cancel"),
-    ]);
-    lines.push(Line::from(""));
-    lines.push(footer_line);
+    let footer = if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
+        "Ctrl+Enter: update    Enter: newline    Pg/Wheel: scroll    Esc: cancel"
+    } else {
+        "Ctrl+Enter: send    Enter: newline    Pg/Wheel: scroll    Esc: cancel"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::LightMagenta))
@@ -4076,6 +8909,7 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) = comment_dialog_cursor_position(
         &dialog.body,
         scroll,
@@ -4114,13 +8948,49 @@ fn comment_dialog_area(dialog: &CommentDialog, area: Rect) -> Rect {
     let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
     let editor_width = width.saturating_sub(2).max(1);
     let editor_height = comment_dialog_desired_editor_height(&dialog.body, editor_width);
-    let desired_height = editor_height
-        .saturating_add(COMMENT_DIALOG_FOOTER_HEIGHT)
-        .saturating_add(2);
+    let desired_height = editor_height.saturating_add(2);
     let min_height = comment_dialog_min_height(area);
     let max_height = comment_dialog_max_height(area);
     let height = desired_height.max(min_height).min(max_height);
     centered_rect_with_size(width, height, area)
+}
+
+fn review_submit_dialog_area(dialog: &ReviewSubmitDialog, area: Rect) -> Rect {
+    let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
+    let editor_width = width.saturating_sub(2).max(1);
+    let editor_height = comment_dialog_desired_editor_height(&dialog.body, editor_width);
+    let desired_height = editor_height.saturating_add(5);
+    let min_height = comment_dialog_min_height(area).saturating_add(1);
+    let max_height = comment_dialog_max_height(area);
+    let height = desired_height.max(min_height).min(max_height);
+    centered_rect_with_size(width, height, area)
+}
+
+fn review_submit_cursor_position(
+    body: &str,
+    scroll: u16,
+    area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(area);
+    let header_height = 3_u16.min(inner.height);
+    let (line, column) = comment_dialog_cursor_offset(body, editor_width.max(1));
+    let visible_end = scroll.saturating_add(editor_height.max(1));
+    if line < scroll || line >= visible_end {
+        return None;
+    }
+
+    let visible_line = line.saturating_sub(scroll);
+    Some(Position::new(
+        inner
+            .x
+            .saturating_add(column.min(editor_width.max(1).saturating_sub(1))),
+        inner
+            .y
+            .saturating_add(header_height)
+            .saturating_add(visible_line),
+    ))
 }
 
 fn comment_dialog_min_height(area: Rect) -> u16 {
@@ -4156,10 +9026,23 @@ fn comment_dialog_editor_size(dialog: &CommentDialog, area: Option<Rect>) -> (u1
     if let Some(area) = area {
         let dialog_area = comment_dialog_area(dialog, area);
         let inner = block_inner(dialog_area);
-        let footer_height = COMMENT_DIALOG_FOOTER_HEIGHT.min(inner.height);
+        return (inner.width.max(1), inner.height.max(1));
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+fn review_submit_editor_size(dialog: &ReviewSubmitDialog, area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = review_submit_dialog_area(dialog, area);
+        let inner = block_inner(dialog_area);
+        let header_height = 3_u16.min(inner.height);
         return (
             inner.width.max(1),
-            inner.height.saturating_sub(footer_height).max(1),
+            inner.height.saturating_sub(header_height).max(1),
         );
     }
 
@@ -4181,12 +9064,13 @@ fn comment_dialog_body_lines(text: &str, width: u16) -> Vec<String> {
         let mut current = String::new();
         let mut column = 0_usize;
         for ch in raw_line.chars() {
-            if column >= width {
+            let char_width = display_width_char(ch);
+            if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
                 lines.push(std::mem::take(&mut current));
                 column = 0;
             }
             current.push(ch);
-            column += 1;
+            column = column.saturating_add(char_width);
         }
         lines.push(current);
     }
@@ -4237,9 +9121,8 @@ fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
     let mut parts = text.split('\n').peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
-            let len = part.chars().count();
-            line = line.saturating_add(len / width);
-            let column = len % width;
+            let (cursor_line, column) = comment_dialog_raw_line_cursor_offset(part, width);
+            line = line.saturating_add(cursor_line);
             return (
                 line.min(usize::from(u16::MAX)) as u16,
                 column.min(usize::from(u16::MAX)) as u16,
@@ -4253,8 +9136,38 @@ fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
 }
 
 fn comment_dialog_raw_line_height(text: &str, width: usize) -> usize {
-    let len = text.chars().count();
-    if len == 0 { 1 } else { len.div_ceil(width) }
+    if text.is_empty() {
+        return 1;
+    }
+    let mut lines = 1_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            lines = lines.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+    }
+    lines
+}
+
+fn comment_dialog_raw_line_cursor_offset(text: &str, width: usize) -> (usize, usize) {
+    let mut line = 0_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+        if column == width {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+    }
+    (line, column)
 }
 
 fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
@@ -4305,10 +9218,11 @@ fn command_line(command: &'static str) -> Line<'static> {
     ])
 }
 
-fn help_dialog_content() -> Vec<Line<'static>> {
+fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
     vec![
         help_heading("General"),
         help_key_line("? / Esc / Enter / q", "close this help"),
+        help_key_line_owned(command_palette_key.to_string(), "open the command palette"),
         help_key_line("q", "quit ghr outside help"),
         help_key_line("q in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
@@ -4316,6 +9230,7 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("f", "filter current PR/issue section"),
         help_key_line(
             "Esc in Search results",
             "return to the previous default list",
@@ -4335,20 +9250,33 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("List"),
         help_key_line("j/k or Up/Down", "move selection"),
-        help_key_line("PgDown/PgUp", "move by visible page"),
-        help_key_line("[ / ]", "load previous / next GitHub result page"),
+        help_key_line("[ / ]", "move by visible page"),
+        help_key_line("PgDown/PgUp or d/u", "also move by visible page"),
+        help_key_line("Alt+[ / Alt+]", "load previous / next GitHub result page"),
         help_key_line("g / G", "first / last item"),
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
+        help_key_line("i", "ignore selected pull request or issue"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("f", "filter with state:closed label:bug author:alice"),
         help_key_line("v", "show pull request diff"),
+        help_key_line("T", "edit selected issue or PR title/body"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
-        help_key_line("A", "open PR approve confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("t", "change issue or PR milestone"),
         help_key_line("a", "add a new issue or PR comment"),
         help_key_line("L", "add a label to the selected issue or PR"),
-        help_key_line("N", "create an issue in the current repo"),
-        help_key_line("+", "add a reaction to the selected issue or PR"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         Line::from(""),
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
@@ -4358,12 +9286,19 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
         help_key_line("a", "add a normal PR comment"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("@ / -", "assign or unassign PR assignees"),
         Line::from(""),
         help_heading("Details"),
         help_key_line("j/k or Up/Down", "scroll details or select diff line"),
         help_key_line("/", "search loaded comments by keyword"),
-        help_key_line("n / p in conversation", "focus next / previous comment"),
-        help_key_line("n / p in diff", "page down / page up"),
+        help_key_line("n / p", "focus next / previous comment"),
+        help_key_line("h / l in diff", "page down / page up"),
         help_key_line(
             "Enter in conversation",
             "expand or collapse a long focused comment",
@@ -4379,50 +9314,29 @@ fn help_dialog_content() -> Vec<Line<'static>> {
         help_key_line("c in diff", "add review comment on selected diff line"),
         help_key_line("a in diff", "add a normal PR comment"),
         help_key_line("c / a", "add a new comment"),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("+", "add a reaction to the visible focused comment or item"),
         help_key_line("e", "edit focused comment when it is yours"),
         help_key_line("L", "add a label to the selected issue or PR"),
-        help_key_line("N", "create an issue in the current repo"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
+        help_key_line("T", "edit selected issue or PR title/body"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
-        help_key_line("C", "open PR close confirmation"),
-        help_key_line("A", "open PR approve confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("t", "change issue or PR milestone"),
+        help_key_line("P", "request or re-request PR reviewers"),
+        help_key_line("Y", "remove pending PR review requests"),
         help_key_line("o", "open selected item in browser"),
-        Line::from(""),
-        help_heading("Pull Request Confirmation"),
-        help_key_line("y / Enter", "run the confirmed PR action"),
-        help_key_line("Esc", "cancel PR action"),
-        Line::from(""),
-        help_heading("Repo Search"),
-        help_key_line("S", "open search input"),
-        help_key_line("Enter", "run gh search prs and gh search issues"),
-        help_key_line("Esc", "cancel global search input"),
-        Line::from(""),
-        help_heading("Comment Editor"),
-        help_key_line("Enter", "insert newline"),
-        help_key_line("Ctrl+Enter", "send or update comment"),
-        help_key_line("Backspace", "delete previous character"),
-        help_key_line("PgDown/PgUp or mouse wheel", "scroll long drafts"),
-        help_key_line("Esc", "cancel editing"),
-        Line::from(""),
-        help_heading("Label Dialog"),
-        help_key_line("Up/Down or Tab", "choose a matching repo label"),
-        help_key_line("Enter", "add selected label or confirm removal"),
-        help_key_line("Backspace", "delete previous character while filtering"),
-        help_key_line("Esc", "cancel label update"),
-        Line::from(""),
-        help_heading("Reaction Dialog"),
-        help_key_line("1-8", "choose and add a reaction"),
-        help_key_line("j/k or Up/Down", "move reaction selection"),
-        help_key_line("Enter", "add selected reaction"),
-        help_key_line("Esc", "cancel reaction"),
-        Line::from(""),
-        help_heading("Issue Dialog"),
-        help_key_line("Tab / Shift+Tab", "switch issue fields"),
-        help_key_line("Enter", "move to next field or insert a body newline"),
-        help_key_line("Ctrl+Enter", "create issue"),
-        help_key_line("Esc", "cancel issue creation"),
         Line::from(""),
         help_heading("Mouse"),
         help_key_line(
@@ -4440,6 +9354,244 @@ fn help_dialog_content() -> Vec<Line<'static>> {
     ]
 }
 
+fn help_dialog_content_for_width(
+    content_width: u16,
+    command_palette_key: &str,
+) -> Vec<Line<'static>> {
+    let lines = help_dialog_content(command_palette_key);
+    let content_width = usize::from(content_width);
+    if content_width < HELP_TWO_COLUMN_MIN_WIDTH {
+        return lines;
+    }
+    help_dialog_two_column_content(lines, content_width)
+}
+
+fn help_dialog_two_column_content(
+    lines: Vec<Line<'static>>,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    if lines.len() < 8 {
+        return lines;
+    }
+    let column_width = content_width
+        .saturating_sub(HELP_COLUMN_GAP)
+        .saturating_div(2);
+    if column_width < 42 {
+        return lines;
+    }
+
+    let split = help_dialog_split_index(&lines);
+    let (left, right) = lines.split_at(split);
+    let row_count = left.len().max(right.len());
+    let mut rows = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let left_lines = left
+            .get(row)
+            .map(|line| wrapped_help_column_lines(line, column_width))
+            .unwrap_or_default();
+        let right_lines = right
+            .get(row)
+            .map(|line| wrapped_help_column_lines(line, column_width))
+            .unwrap_or_default();
+        let wrapped_rows = left_lines.len().max(right_lines.len()).max(1);
+        for wrapped_row in 0..wrapped_rows {
+            let mut spans = left_lines
+                .get(wrapped_row)
+                .map(|line| line.spans.clone())
+                .unwrap_or_default();
+            let left_width = spans_display_width(&spans);
+            spans.push(Span::raw(
+                " ".repeat(column_width.saturating_sub(left_width) + HELP_COLUMN_GAP),
+            ));
+            if let Some(line) = right_lines.get(wrapped_row) {
+                spans.extend(line.spans.clone());
+            }
+            rows.push(Line::from(spans));
+        }
+    }
+    rows
+}
+
+fn help_dialog_split_index(lines: &[Line<'static>]) -> usize {
+    if lines.len() <= 1 {
+        return lines.len();
+    }
+
+    let target = lines.len().div_ceil(2);
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index == 0 || index + 1 >= lines.len() || !line.to_string().trim().is_empty() {
+                return None;
+            }
+            let split = index + 1;
+            Some((split.abs_diff(target), split))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, split)| split)
+        .unwrap_or(target)
+        .clamp(1, lines.len() - 1)
+}
+
+fn wrapped_help_column_lines(line: &Line<'static>, max_width: usize) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![Line::default()];
+    }
+    if line.spans.is_empty() || line.to_string().is_empty() {
+        return vec![Line::default()];
+    }
+    if let Some(lines) = wrapped_help_key_line(line, max_width) {
+        return lines;
+    }
+    wrap_spans_to_width(&line.spans, max_width)
+}
+
+fn wrapped_help_key_line(line: &Line<'static>, max_width: usize) -> Option<Vec<Line<'static>>> {
+    if line.spans.len() != 3 || line.spans.first()?.content.as_ref() != "  " {
+        return None;
+    }
+
+    let prefix = vec![line.spans[0].clone(), line.spans[1].clone()];
+    let prefix_width = spans_display_width(&prefix);
+    if prefix_width >= max_width {
+        return None;
+    }
+
+    let description = line.spans[2].content.as_ref();
+    let description_width = max_width - prefix_width;
+    let description_lines = wrap_text_to_width(description, description_width);
+    let description_style = line.spans[2].style;
+    let mut lines = Vec::with_capacity(description_lines.len().max(1));
+    for (index, description_line) in description_lines.into_iter().enumerate() {
+        let mut spans = if index == 0 {
+            prefix.clone()
+        } else {
+            vec![Span::raw(" ".repeat(prefix_width))]
+        };
+        if !description_line.is_empty() {
+            spans.push(Span::styled(description_line, description_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    Some(lines)
+}
+
+fn wrap_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut current_width = 0_usize;
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.as_ref().chars() {
+            let ch_width = display_width_char(ch);
+            if current_width > 0 && current_width.saturating_add(ch_width) > max_width {
+                lines.push(Vec::new());
+                current_width = 0;
+            }
+            push_span_text(
+                lines.last_mut().expect("current line"),
+                ch.to_string(),
+                style,
+            );
+            current_width = current_width.saturating_add(ch_width);
+        }
+    }
+
+    lines.into_iter().map(Line::from).collect()
+}
+
+fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0_usize;
+    for word in text.split_whitespace() {
+        let word_width = display_width(word);
+        let separator_width = usize::from(!current.is_empty());
+        if current_width
+            .saturating_add(separator_width)
+            .saturating_add(word_width)
+            <= max_width
+        {
+            if !current.is_empty() {
+                current.push(' ');
+                current_width = current_width.saturating_add(1);
+            }
+            current.push_str(word);
+            current_width = current_width.saturating_add(word_width);
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+
+        if word_width <= max_width {
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            let mut rest = word;
+            while !rest.is_empty() {
+                let taken = take_display_width(rest, max_width);
+                if taken.is_empty() {
+                    break;
+                }
+                let taken_len = taken.len();
+                lines.push(taken);
+                rest = &rest[taken_len..];
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn take_display_width(text: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let ch_width = display_width_char(ch);
+        if width + ch_width > max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output
+}
+
+fn push_span_text(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(&text);
+        return;
+    }
+    spans.push(Span::styled(text, style));
+}
+
+fn spans_display_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
 fn help_heading(text: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         text,
@@ -4450,6 +9602,10 @@ fn help_heading(text: &'static str) -> Line<'static> {
 }
 
 fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static> {
+    help_key_line_owned(keys.to_string(), description)
+}
+
+fn help_key_line_owned(keys: String, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -4605,6 +9761,13 @@ struct DiffInlineCommentKey {
     side: DiffReviewSide,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DiffInlineCommentSummary {
+    count: usize,
+    has_resolved: bool,
+    has_outdated: bool,
+}
+
 impl From<&DiffReviewTarget> for DiffInlineCommentKey {
     fn from(target: &DiffReviewTarget) -> Self {
         Self {
@@ -4659,6 +9822,8 @@ enum DetailAction {
     ReactComment(usize),
     AddLabel,
     RemoveLabel(String),
+    AssignAssignee,
+    UnassignAssignee,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4863,13 +10028,16 @@ impl DetailsBuilder {
     }
 
     fn push_key_value(&mut self, key: &str, value: impl Into<String>) {
-        self.push_wrapped_limited(
-            vec![
-                DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
-                DetailSegment::raw(value.into()),
-            ],
-            1,
-        );
+        self.push_styled_key_value(key, vec![DetailSegment::raw(value.into())]);
+    }
+
+    fn push_styled_key_value(&mut self, key: &str, value: Vec<DetailSegment>) {
+        let mut segments = vec![DetailSegment::styled(
+            format!("{key}: "),
+            Style::default().fg(Color::Gray),
+        )];
+        segments.extend(value);
+        self.push_wrapped_limited(segments, 1);
     }
 
     fn push_link_value(&mut self, key: &str, url: &str) {
@@ -5425,6 +10593,7 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     builder.push_meta_line(primary_meta);
 
     let mut secondary_meta = Vec::new();
+    let mut action_meta = Vec::new();
     let mut action_note = None;
     if let Some(author) = useful_meta_value(item.author.as_deref()) {
         secondary_meta.push((
@@ -5444,13 +10613,28 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
             commit_count_segments(app.action_hints.get(&item.id), item),
         ));
     }
+    if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+        secondary_meta.push((
+            "milestone",
+            vec![DetailSegment::raw(
+                item.milestone
+                    .as_ref()
+                    .map(|milestone| milestone.title.clone())
+                    .unwrap_or_else(|| "-".to_string()),
+            )],
+        ));
+    }
     if let Some(reason) = useful_meta_value(item.reason.as_deref()) {
         secondary_meta.push(("reason", vec![DetailSegment::raw(reason.to_string())]));
     }
     if matches!(item.kind, ItemKind::PullRequest) {
-        let (action_text, note) = action_hint_text(app.action_hints.get(&item.id));
-        secondary_meta.push(("action", vec![DetailSegment::raw(action_text)]));
+        let (action_segments, note) = action_hint_segments(app.action_hints.get(&item.id));
         secondary_meta.push((
+            "branch",
+            branch_hint_segments(app.action_hints.get(&item.id)),
+        ));
+        action_meta.push(("action", action_segments));
+        action_meta.push((
             "checks",
             check_hint_segments(app.action_hints.get(&item.id)),
         ));
@@ -5459,13 +10643,17 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
     if !secondary_meta.is_empty() {
         builder.push_meta_line(secondary_meta);
     }
+    if !action_meta.is_empty() {
+        builder.push_meta_line(action_meta);
+    }
     if let Some(note) = action_note {
-        builder.push_key_value("action note", note);
+        builder.push_styled_key_value("action note", action_note_segments(&note));
     }
     builder.push_link_value("url", &item.url);
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
+        builder.push_meta_line(vec![("assignees", assignee_detail_segments(item))]);
         push_label_controls(&mut builder, &item.labels);
     }
 
@@ -5560,13 +10748,13 @@ fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
             segments.push(DetailSegment::styled(label.clone(), label_style()));
             segments.push(DetailSegment::raw(" "));
             segments.push(DetailSegment::action(
-                "remove",
+                "×",
                 DetailAction::RemoveLabel(label.clone()),
             ));
         }
     }
     segments.push(DetailSegment::raw("  "));
-    segments.push(DetailSegment::action("add label", DetailAction::AddLabel));
+    segments.push(DetailSegment::action("+", DetailAction::AddLabel));
     builder.push_wrapped_limited(segments, 3);
 }
 
@@ -5664,6 +10852,36 @@ fn push_details_mode_tabs(builder: &mut DetailsBuilder, active: DetailsMode) {
     ]);
 }
 
+fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    if item.assignees.is_empty() {
+        segments.push(DetailSegment::raw("-"));
+    } else {
+        for (index, assignee) in item.assignees.iter().enumerate() {
+            if index > 0 {
+                segments.push(DetailSegment::raw(", "));
+            }
+            segments.push(DetailSegment::link(
+                assignee.clone(),
+                github_profile_url(assignee),
+            ));
+        }
+    }
+    segments.push(DetailSegment::raw("  "));
+    segments.push(DetailSegment::action(
+        "@ assign",
+        DetailAction::AssignAssignee,
+    ));
+    if !item.assignees.is_empty() {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(DetailSegment::action(
+            "- unassign",
+            DetailAction::UnassignAssignee,
+        ));
+    }
+    segments
+}
+
 fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: DiffRenderContext<'_>) {
     builder.push_line(vec![
         DetailSegment::styled("Diff", heading_style()),
@@ -5687,6 +10905,7 @@ fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: Diff
         .map(diff_inline_comment_map)
         .unwrap_or_default();
     let empty_entries: Vec<CommentDisplayEntry> = Vec::new();
+    let mut rendered_inline_comment_indices = HashSet::new();
 
     builder.push_line(vec![DetailSegment::styled(
         format!("file {}/{}", selected_file + 1, diff.files.len()),
@@ -5714,11 +10933,15 @@ fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: Diff
                 .as_ref()
                 .and_then(|target| inline_comment_map.get(&DiffInlineCommentKey::from(target)))
                 .unwrap_or(&empty_entries);
+            for entry in inline_entries {
+                rendered_inline_comment_indices.insert(entry.index);
+            }
             let line_review_index = target.as_ref().map(|_| {
                 let index = review_index;
                 review_index += 1;
                 index
             });
+            let inline_summary = diff_inline_comment_summary(context.comments, inline_entries);
             push_diff_line(
                 builder,
                 line,
@@ -5726,7 +10949,7 @@ fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: Diff
                 line_review_index.is_some_and(|index| {
                     index == context.selected_line || index_in_range(index, context.selected_range)
                 }),
-                inline_entries.len(),
+                inline_summary,
             );
             if let Some(comments) = context.comments {
                 push_diff_inline_comments(
@@ -5739,6 +10962,26 @@ fn push_diff(builder: &mut DetailsBuilder, diff: &PullRequestDiff, context: Diff
                     context.selected_comment_index,
                 );
             }
+        }
+    }
+    if let Some(comments) = context.comments {
+        let unplaced_entries =
+            diff_unplaced_review_comment_entries(comments, file, &rendered_inline_comment_indices);
+        if !unplaced_entries.is_empty() {
+            builder.push_blank();
+            builder.push_line(vec![DetailSegment::styled(
+                "Resolved/outdated comments not attached to a current diff line",
+                diff_metadata_style(),
+            )]);
+            push_diff_inline_comments(
+                builder,
+                context.item_id,
+                comments,
+                &unplaced_entries,
+                context.expanded_comments,
+                context.details_focused,
+                context.selected_comment_index,
+            );
         }
     }
 }
@@ -5767,7 +11010,7 @@ fn push_diff_line(
     line: &DiffLine,
     review_index: Option<usize>,
     selected: bool,
-    inline_comment_count: usize,
+    inline_comment_summary: DiffInlineCommentSummary,
 ) {
     if let Some(review_index) = review_index {
         builder.mark_diff_line(review_index, selected);
@@ -5790,24 +11033,20 @@ fn push_diff_line(
     if selected {
         style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
     }
-    let inline_comment_marker = if inline_comment_count > 0 {
-        Some(if inline_comment_count > 9 {
-            "●* "
-        } else {
-            "● "
-        })
+    let inline_comment_marker = if inline_comment_summary.count > 0 {
+        Some(diff_inline_comment_marker(inline_comment_summary))
     } else {
         None
     };
-    let comment_marker_width = inline_comment_marker.map(display_width).unwrap_or(0);
+    let comment_marker_width = inline_comment_marker
+        .as_ref()
+        .map(|(marker, _)| display_width(marker))
+        .unwrap_or(0);
     let prefix_width = display_width(&gutter) + comment_marker_width + display_width(marker) + 1;
     let content_width = builder.width.saturating_sub(prefix_width).max(1);
     let mut segments = vec![DetailSegment::styled(gutter, gutter_style)];
-    if let Some(marker) = inline_comment_marker {
-        segments.push(DetailSegment::styled(
-            marker,
-            diff_inline_comment_marker_style(),
-        ));
+    if let Some((marker, style)) = inline_comment_marker {
+        segments.push(DetailSegment::styled(marker, style));
     }
     segments.extend([
         DetailSegment::styled(marker, style),
@@ -5862,8 +11101,8 @@ fn push_diff_inline_comment(
 
     let mut header = vec![
         DetailSegment::styled(
-            if selected { "▸ " } else { "● " },
-            comment_marker_style(selected),
+            comment_header_marker(comment, selected, true),
+            comment_status_marker_style(comment, selected),
         ),
         comment_author_link_segment(&comment.author, selected),
         DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
@@ -5872,10 +11111,13 @@ fn push_diff_inline_comment(
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::link("open", url.clone()));
     }
+    if let Some(review) = &comment.review {
+        append_review_state_segments(&mut header, review);
+    }
     append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
-        "react",
+        "+ react",
         DetailAction::ReactComment(index),
     ));
     header.push(DetailSegment::raw("  "));
@@ -5903,7 +11145,12 @@ fn push_diff_inline_comment(
     }
 
     let prefix = diff_inline_comment_prefix(selected, depth);
-    builder.push_prefixed_wrapped_limited(header, prefix.clone(), COMMENT_RIGHT_PADDING, 2);
+    builder.push_prefixed_wrapped_limited(
+        header,
+        prefix.clone(),
+        comment_right_padding(selected),
+        2,
+    );
     let collapsed_body;
     let body = if collapse.collapsed {
         collapsed_body = collapsed_comment_body(&comment.body);
@@ -5918,7 +11165,7 @@ fn push_diff_inline_comment(
         usize::MAX,
         MarkdownRenderOptions {
             prefix,
-            right_padding: COMMENT_RIGHT_PADDING,
+            right_padding: comment_right_padding(selected),
         },
     );
     if collapse.collapsed {
@@ -5941,7 +11188,7 @@ fn push_diff_inline_comment_separator(builder: &mut DetailsBuilder, selected: bo
     let prefix_width = segments_width(&segments);
     let width = builder
         .width
-        .saturating_sub(prefix_width + COMMENT_RIGHT_PADDING)
+        .saturating_sub(prefix_width + comment_right_padding(selected))
         .max(12);
     let line = if selected { "━" } else { "─" };
     segments.push(DetailSegment::styled(
@@ -5974,7 +11221,7 @@ fn push_diff_inline_comment_expand_line(
             ),
         ],
         diff_inline_comment_prefix(selected, depth),
-        COMMENT_RIGHT_PADDING,
+        comment_right_padding(selected),
         2,
     );
 }
@@ -5998,6 +11245,13 @@ fn diff_inline_comment_prefix(selected: bool, depth: usize) -> Vec<DetailSegment
 }
 
 fn diff_tree_entries(diff: &PullRequestDiff) -> Vec<DiffTreeEntry> {
+    diff_tree_entries_with_comment_counts(diff, &HashMap::new())
+}
+
+fn diff_tree_entries_with_comment_counts(
+    diff: &PullRequestDiff,
+    comment_counts: &HashMap<usize, usize>,
+) -> Vec<DiffTreeEntry> {
     let mut files = diff
         .files
         .iter()
@@ -6017,7 +11271,10 @@ fn diff_tree_entries(diff: &PullRequestDiff) -> Vec<DiffTreeEntry> {
             entries.push(DiffTreeEntry {
                 file_index: Some(file_index),
                 label: path,
-                stats: diff_file_stats(&diff.files[file_index]),
+                stats: diff_file_stats(
+                    &diff.files[file_index],
+                    comment_counts.get(&file_index).copied().unwrap_or(0),
+                ),
                 depth: 0,
             });
             continue;
@@ -6045,7 +11302,10 @@ fn diff_tree_entries(diff: &PullRequestDiff) -> Vec<DiffTreeEntry> {
                 .last()
                 .map(|part| (*part).to_string())
                 .unwrap_or_else(|| path.clone()),
-            stats: diff_file_stats(&diff.files[file_index]),
+            stats: diff_file_stats(
+                &diff.files[file_index],
+                comment_counts.get(&file_index).copied().unwrap_or(0),
+            ),
             depth: parts.len().saturating_sub(1),
         });
     }
@@ -6067,13 +11327,21 @@ fn diff_display_path(file: &DiffFile) -> String {
     }
 }
 
-fn diff_file_stats(file: &DiffFile) -> String {
-    format!(
+fn diff_file_details_scroll_key(item_id: &str, file: &DiffFile) -> String {
+    format!("{item_id}::{}", diff_display_path(file))
+}
+
+fn diff_file_stats(file: &DiffFile, comment_count: usize) -> String {
+    let mut stats = format!(
         "{} +{} -{}",
         diff_file_status(file),
         file.additions,
         file.deletions
-    )
+    );
+    if comment_count > 0 {
+        stats.push_str(&format!(" {comment_count}c"));
+    }
+    stats
 }
 
 fn diff_file_status(file: &DiffFile) -> &'static str {
@@ -6210,6 +11478,113 @@ fn diff_inline_comment_map(
     map
 }
 
+fn diff_inline_comment_summary(
+    comments: Option<&[CommentPreview]>,
+    entries: &[CommentDisplayEntry],
+) -> DiffInlineCommentSummary {
+    let Some(comments) = comments else {
+        return DiffInlineCommentSummary::default();
+    };
+    let mut summary = DiffInlineCommentSummary {
+        count: entries.len(),
+        ..DiffInlineCommentSummary::default()
+    };
+    for entry in entries {
+        let Some(review) = comments
+            .get(entry.index)
+            .and_then(|comment| comment.review.as_ref())
+        else {
+            continue;
+        };
+        summary.has_resolved |= review.is_resolved;
+        summary.has_outdated |= review.is_outdated;
+    }
+    summary
+}
+
+fn diff_inline_comment_marker(summary: DiffInlineCommentSummary) -> (&'static str, Style) {
+    if summary.has_outdated {
+        return ("◌ ", review_outdated_style());
+    }
+    if summary.has_resolved {
+        return ("✓ ", review_resolved_style());
+    }
+    if summary.count > 9 {
+        ("●* ", diff_inline_comment_marker_style())
+    } else {
+        ("● ", diff_inline_comment_marker_style())
+    }
+}
+
+fn diff_unplaced_review_comment_entries(
+    comments: &[CommentPreview],
+    file: &DiffFile,
+    rendered_indices: &HashSet<usize>,
+) -> Vec<CommentDisplayEntry> {
+    comment_display_entries(comments)
+        .into_iter()
+        .filter(|entry| !rendered_indices.contains(&entry.index))
+        .filter(|entry| {
+            comments
+                .get(entry.index)
+                .and_then(|comment| comment.review.as_ref())
+                .is_some_and(|review| {
+                    (review.is_resolved || review.is_outdated)
+                        && review_comment_path_matches_file(review, file)
+                })
+        })
+        .collect()
+}
+
+fn review_comment_path_matches_file(
+    review: &crate::model::ReviewCommentPreview,
+    file: &DiffFile,
+) -> bool {
+    review.path == file.new_path
+        || review.path == file.old_path
+        || review.path == diff_display_path(file)
+}
+
+fn diff_file_comment_counts(
+    diff: &PullRequestDiff,
+    comments: &[CommentPreview],
+) -> HashMap<usize, usize> {
+    let mut counts = HashMap::new();
+    let mut counted = HashSet::new();
+    for (key, entries) in diff_inline_comment_map(comments) {
+        let Some(file_index) = diff_file_index_for_comment_path(diff, &key.path) else {
+            continue;
+        };
+        for entry in entries {
+            if counted.insert(entry.index) {
+                *counts.entry(file_index).or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (index, comment) in comments.iter().enumerate() {
+        if counted.contains(&index) {
+            continue;
+        }
+        let Some(review) = comment.review.as_ref() else {
+            continue;
+        };
+        let Some(file_index) = diff_file_index_for_comment_path(diff, &review.path) else {
+            continue;
+        };
+        counted.insert(index);
+        *counts.entry(file_index).or_insert(0) += 1;
+    }
+
+    counts
+}
+
+fn diff_file_index_for_comment_path(diff: &PullRequestDiff, path: &str) -> Option<usize> {
+    diff.files.iter().position(|file| {
+        path == file.new_path || path == file.old_path || path == diff_display_path(file)
+    })
+}
+
 fn diff_inline_comment_key_for_comment(comment: &CommentPreview) -> Option<DiffInlineCommentKey> {
     let review = comment.review.as_ref()?;
     let line = usize::try_from(review_display_line(review)?).ok()?;
@@ -6260,6 +11635,54 @@ fn comment_author_link_segment(author: &str, selected: bool) -> DetailSegment {
     )
 }
 
+fn comment_header_marker(comment: &CommentPreview, selected: bool, inline: bool) -> &'static str {
+    if selected {
+        return "▸ ";
+    }
+    let Some(review) = &comment.review else {
+        return if inline { "● " } else { "  " };
+    };
+    if review.is_outdated {
+        "◌ "
+    } else if review.is_resolved {
+        "✓ "
+    } else if inline {
+        "● "
+    } else {
+        "  "
+    }
+}
+
+fn comment_status_marker_style(comment: &CommentPreview, selected: bool) -> Style {
+    if selected {
+        return comment_marker_style(true);
+    }
+    let Some(review) = &comment.review else {
+        return comment_marker_style(false);
+    };
+    if review.is_outdated {
+        review_outdated_style()
+    } else if review.is_resolved {
+        review_resolved_style()
+    } else {
+        diff_inline_comment_marker_style()
+    }
+}
+
+fn append_review_state_segments(
+    segments: &mut Vec<DetailSegment>,
+    review: &crate::model::ReviewCommentPreview,
+) {
+    if review.is_resolved {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(DetailSegment::styled("resolved", review_resolved_style()));
+    }
+    if review.is_outdated {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(DetailSegment::styled("outdated", review_outdated_style()));
+    }
+}
+
 fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary) {
     builder.push_blank();
     let mut segments = vec![DetailSegment::styled(
@@ -6280,7 +11703,7 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
         }
     }
     segments.push(DetailSegment::raw("  "));
-    segments.push(DetailSegment::action("react", DetailAction::ReactItem));
+    segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
     builder.push_wrapped_limited(segments, 2);
 }
 
@@ -6331,8 +11754,8 @@ fn push_comment(
 
     let mut header = vec![
         DetailSegment::styled(
-            if selected { "▸ " } else { "  " },
-            comment_marker_style(selected),
+            comment_header_marker(comment, selected, false),
+            comment_status_marker_style(comment, selected),
         ),
         comment_author_link_segment(&comment.author, selected),
         DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
@@ -6347,11 +11770,12 @@ fn push_comment(
             review_comment_label(review),
             diff_metadata_style(),
         ));
+        append_review_state_segments(&mut header, review);
     }
     append_reaction_segments(&mut header, &comment.reactions);
     header.push(DetailSegment::raw("  "));
     header.push(DetailSegment::action(
-        "react",
+        "+ react",
         DetailAction::ReactComment(index),
     ));
     if search_match {
@@ -6929,22 +12353,84 @@ fn comment_right_padding(selected: bool) -> usize {
     COMMENT_RIGHT_PADDING + usize::from(selected)
 }
 
-fn action_hint_text(state: Option<&ActionHintState>) -> (String, Option<String>) {
+fn action_hint_segments(state: Option<&ActionHintState>) -> (Vec<DetailSegment>, Option<String>) {
     match state {
         Some(ActionHintState::Loaded(hints)) => {
-            let text = if hints.labels.is_empty() {
-                "-".to_string()
+            let segments = if hints.labels.is_empty() {
+                vec![DetailSegment::raw("-")]
             } else {
-                hints.labels.join(", ")
+                action_label_segments(&hints.labels)
             };
-            (text, hints.note.clone())
+            (segments, hints.note.clone())
         }
-        Some(ActionHintState::Loading) | None => ("loading...".to_string(), None),
+        Some(ActionHintState::Loading) | None => (vec![DetailSegment::raw("loading...")], None),
         Some(ActionHintState::Error(error)) => (
-            "unavailable".to_string(),
+            vec![DetailSegment::raw("unavailable")],
             Some(format!("Failed to load action hints: {error}")),
         ),
     }
+}
+
+fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for label in labels {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw(", "));
+        }
+        let style = if label == "Mergeable" {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default()
+        };
+        segments.push(DetailSegment::styled(label, style));
+    }
+    segments
+}
+
+fn action_note_segments(note: &str) -> Vec<DetailSegment> {
+    const CONFLICTS: &str = "merge conflicts must be resolved";
+    let mut segments = Vec::new();
+    let mut rest = note;
+    while let Some(index) = rest.find(CONFLICTS) {
+        if index > 0 {
+            segments.push(DetailSegment::raw(rest[..index].to_string()));
+        }
+        segments.push(DetailSegment::styled(
+            CONFLICTS,
+            log_error_style().add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[index + CONFLICTS.len()..];
+    }
+    if !rest.is_empty() {
+        segments.push(DetailSegment::raw(rest.to_string()));
+    }
+    if segments.is_empty() {
+        segments.push(DetailSegment::raw(note.to_string()));
+    }
+    segments
+}
+
+fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
+    match state {
+        Some(ActionHintState::Loaded(hints)) => hints
+            .head
+            .as_ref()
+            .map(|branch| vec![DetailSegment::raw(pull_request_branch_label(branch))])
+            .unwrap_or_else(|| vec![DetailSegment::raw("unavailable")]),
+        Some(ActionHintState::Loading) | None => vec![DetailSegment::raw("loading...")],
+        Some(ActionHintState::Error(_)) => vec![DetailSegment::raw("unavailable")],
+    }
+}
+
+fn pull_request_branch_label(branch: &PullRequestBranch) -> String {
+    format!("{}:{}", branch.repository, branch.branch)
+}
+
+fn pull_request_branch_url(branch: &PullRequestBranch) -> String {
+    format!(
+        "https://github.com/{}/tree/{}",
+        branch.repository, branch.branch
+    )
 }
 
 fn check_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
@@ -7015,6 +12501,20 @@ fn check_summary_segments(summary: &CheckSummary) -> Vec<DetailSegment> {
         );
     }
     segments
+}
+
+fn failed_check_runs_summary(runs: &[FailedCheckRunSummary]) -> String {
+    runs.iter()
+        .map(|run| {
+            let label = run
+                .workflow
+                .as_deref()
+                .filter(|workflow| !workflow.trim().is_empty())
+                .unwrap_or("Actions run");
+            format!("{label} #{} ({})", run.run_id, run.checks.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn push_check_part(segments: &mut Vec<DetailSegment>, text: String, style: Style) {
@@ -8003,6 +13503,16 @@ fn diff_inline_comment_marker_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn review_resolved_style() -> Style {
+    Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn review_outdated_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 fn comment_author_style(selected: bool) -> Style {
     let style = if selected {
         Style::default().fg(Color::Yellow)
@@ -8061,6 +13571,149 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'c'))
 }
 
+fn is_ctrl_d_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'d'))
+}
+
+fn normalized_command_palette_key(value: &str) -> String {
+    command_palette_key_binding(value).label
+}
+
+fn command_palette_key_binding(value: &str) -> KeyBinding {
+    parse_key_binding(value).unwrap_or_else(|| {
+        parse_key_binding(DEFAULT_COMMAND_PALETTE_KEY).expect("default command palette key parses")
+    })
+}
+
+fn parse_key_binding(value: &str) -> Option<KeyBinding> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().count() == 1 {
+        let ch = value.chars().next()?;
+        return Some(KeyBinding {
+            label: value.to_string(),
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key = None;
+    for raw_part in value.split('+') {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
+            "alt" | "option" => modifiers.insert(KeyModifiers::ALT),
+            "shift" => modifiers.insert(KeyModifiers::SHIFT),
+            _ if key.is_none() => key = Some(part.to_string()),
+            _ => return None,
+        }
+    }
+
+    let key = key?;
+    let code = parse_key_code(&key)?;
+    Some(KeyBinding {
+        label: key_binding_label(modifiers, &code),
+        code,
+        modifiers,
+    })
+}
+
+fn parse_key_code(value: &str) -> Option<KeyCode> {
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "esc" | "escape" => Some(KeyCode::Esc),
+        "enter" | "return" => Some(KeyCode::Enter),
+        "tab" => Some(KeyCode::Tab),
+        "backtab" => Some(KeyCode::BackTab),
+        "backspace" => Some(KeyCode::Backspace),
+        "space" => Some(KeyCode::Char(' ')),
+        _ if value.chars().count() == 1 => Some(KeyCode::Char(value.chars().next()?)),
+        _ => None,
+    }
+}
+
+fn key_binding_label(modifiers: KeyModifiers, code: &KeyCode) -> String {
+    let mut parts = Vec::new();
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        parts.push("Alt".to_string());
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("Shift".to_string());
+    }
+    parts.push(key_code_label_with_modifiers(code, modifiers));
+    parts.join("+")
+}
+
+fn key_code_label_with_modifiers(code: &KeyCode, modifiers: KeyModifiers) -> String {
+    match code {
+        KeyCode::Char(value)
+            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && value.is_ascii_alphabetic() =>
+        {
+            value.to_ascii_uppercase().to_string()
+        }
+        _ => key_code_label(code),
+    }
+}
+
+fn key_code_label(code: &KeyCode) -> String {
+    match code {
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "Shift+Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Char(' ') => "Space".to_string(),
+        KeyCode::Char(value) => value.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn command_palette_modifier_bits(modifiers: KeyModifiers) -> KeyModifiers {
+    modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn should_open_command_palette(app: &AppState, key: KeyEvent) -> bool {
+    let binding = command_palette_key_binding(&app.command_palette_key);
+    if !binding.matches(key) {
+        return false;
+    }
+    !(binding.is_plain_text_char() && text_input_active(app))
+}
+
+fn text_input_active(app: &AppState) -> bool {
+    app.search_active
+        || app.comment_search_active
+        || app.global_search_active
+        || app.filter_input_active
+        || app.comment_dialog.is_some()
+        || app.label_dialog.is_some()
+        || app.issue_dialog.is_some()
+        || app.pr_create_dialog.is_some()
+        || app.review_submit_dialog.is_some()
+        || app.item_edit_dialog.is_some()
+        || app.milestone_dialog.is_some()
+        || app.assignee_dialog.is_some()
+        || app.reviewer_dialog.is_some()
+        || app.project_add_dialog.is_some()
+        || app.project_remove_dialog.is_some()
+}
+
+fn is_assignee_assign_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('@'))
+        || (matches!(key.code, KeyCode::Char('2')) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 fn is_diff_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'v'))
 }
@@ -8068,6 +13721,13 @@ fn is_diff_key(key: KeyEvent) -> bool {
 fn is_reaction_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('+'))
         || (matches!(key.code, KeyCode::Char('=')) && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn is_ignore_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'i'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
@@ -8142,12 +13802,24 @@ impl AppState {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let base_section_filters = sections
+            .iter()
+            .map(|section| (section.key.clone(), section.filters.clone()))
+            .collect::<HashMap<_, _>>();
+        let view_snapshots = ui_state
+            .view_snapshots
+            .iter()
+            .map(|(view, snapshot)| (view.clone(), ViewSnapshotState::from_saved(snapshot)))
+            .collect::<HashMap<_, _>>();
         let mut state = Self {
             active_view,
             sections,
             section_index: ui_state.section_index.clone(),
+            base_section_filters,
+            quick_filters: HashMap::new(),
             selected_index: ui_state.selected_index.clone(),
             list_scroll_offset: HashMap::new(),
+            view_snapshots,
             focus: FocusTarget::List,
             details_scroll,
             details_mode: DetailsMode::Conversation,
@@ -8164,6 +13836,13 @@ impl AppState {
             global_search_return_view: None,
             global_search_scope: None,
             global_search_started_at: None,
+            filter_input_active: false,
+            filter_input_query: String::new(),
+            command_palette: None,
+            project_switcher: None,
+            project_add_dialog: None,
+            project_remove_dialog: None,
+            command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             last_refresh_request: Instant::now(),
@@ -8171,6 +13850,8 @@ impl AppState {
             diffs: HashMap::new(),
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
+            diff_file_details_scroll: ui_state.diff_file_details_scroll.clone(),
+            ignored_items: ui_state.ignored_items.iter().cloned().collect(),
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
@@ -8178,6 +13859,11 @@ impl AppState {
             viewed_details_snapshot: ui_state.viewed_details_snapshot.clone(),
             viewed_comments_snapshot: ui_state.viewed_comments_snapshot.clone(),
             action_hints: HashMap::new(),
+            action_hints_stale: HashSet::new(),
+            action_hints_refreshing: HashSet::new(),
+            label_suggestions_cache: HashMap::new(),
+            assignee_suggestions_cache: HashMap::new(),
+            reviewer_suggestions_cache: HashMap::new(),
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
             pending_details_load: None,
@@ -8188,31 +13874,59 @@ impl AppState {
             posting_comment: false,
             reaction_dialog: None,
             posting_reaction: false,
+            pending_comment_submit: None,
             label_dialog: None,
             label_updating: false,
             issue_dialog: None,
             issue_creating: false,
+            pending_issue_create: None,
+            pr_create_dialog: None,
+            pr_creating: false,
+            pending_pr_create: None,
+            review_submit_dialog: None,
+            review_submit_running: false,
+            pending_reviews: HashMap::new(),
             pr_action_dialog: None,
             pr_action_running: false,
+            milestone_dialog: None,
+            milestone_action_running: false,
+            assignee_dialog: None,
+            assignee_action_running: false,
+            reviewer_dialog: None,
+            reviewer_action_running: false,
             setup_dialog: None,
             startup_dialog: None,
             message_dialog: None,
             mouse_capture_enabled: true,
             help_dialog: false,
             diff_return_state: None,
+            item_edit_dialog: None,
         };
         state.clamp_positions();
-        state.focus = if matches!(focus, FocusTarget::Details) && state.current_item().is_none() {
-            FocusTarget::List
+        if view_supports_snapshot(&state.active_view)
+            && let Some(snapshot) = state.view_snapshots.get(&state.active_view).cloned()
+        {
+            state.restore_view_snapshot(snapshot);
         } else {
-            focus
-        };
-        state.details_scroll = details_scroll;
-        state.selected_comment_index = selected_comment_index;
-        if ui_state.details_mode == "diff" {
-            state.restore_saved_details_mode();
+            state.focus = if matches!(focus, FocusTarget::Details) && state.current_item().is_none()
+            {
+                FocusTarget::List
+            } else {
+                focus
+            };
+            state.details_scroll = details_scroll;
+            state.selected_comment_index = selected_comment_index;
+            if ui_state.details_mode == "diff" {
+                state.restore_saved_details_mode();
+            }
         }
         state
+    }
+
+    fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
+        self.label_suggestions_cache = cache.labels;
+        self.assignee_suggestions_cache = cache.assignees;
+        self.reviewer_suggestions_cache = cache.reviewers;
     }
 
     fn ui_state(&self) -> UiState {
@@ -8230,12 +13944,24 @@ impl AppState {
                 },
             );
         }
+        let mut diff_file_details_scroll = self.diff_file_details_scroll.clone();
+        if let Some((key, details_scroll)) = self.current_diff_file_details_scroll_entry() {
+            diff_file_details_scroll.insert(key, details_scroll);
+        }
+        let mut view_snapshots = self.view_snapshots.clone();
+        if view_supports_snapshot(&self.active_view) {
+            view_snapshots.insert(self.active_view.clone(), self.current_view_snapshot());
+        }
 
         UiState {
             list_width_percent: self.list_width_percent,
             active_view: self.active_view.clone(),
             section_index: self.section_index.clone(),
             selected_index: self.selected_index.clone(),
+            view_snapshots: view_snapshots
+                .iter()
+                .map(|(view, snapshot)| (view.clone(), snapshot.to_saved()))
+                .collect(),
             focus: self.focus.as_state_str().to_string(),
             details_mode: self.details_mode.as_state_str().to_string(),
             details_scroll: self.details_scroll,
@@ -8253,6 +13979,98 @@ impl AppState {
             viewed_comments_snapshot: self.viewed_comments_snapshot.clone(),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
+            diff_file_details_scroll,
+            ignored_items: sorted_strings(&self.ignored_items),
+        }
+    }
+
+    fn current_view_snapshot(&self) -> ViewSnapshotState {
+        let section_key = self.current_section().map(|section| section.key.clone());
+        let list_scroll_offset = section_key
+            .as_ref()
+            .and_then(|key| self.list_scroll_offset.get(key).copied())
+            .unwrap_or(0);
+        ViewSnapshotState {
+            focus: self.focus,
+            section_key,
+            item_id: self.current_item().map(|item| item.id.clone()),
+            selected_index: self.current_selected_position(),
+            list_scroll_offset,
+            details_mode: self.details_mode,
+            details_scroll: self.details_scroll,
+            selected_comment_index: self.selected_comment_index,
+        }
+    }
+
+    fn remember_current_view_snapshot(&mut self) {
+        if !view_supports_snapshot(&self.active_view) {
+            return;
+        }
+        self.save_current_conversation_details_state();
+        self.save_current_diff_mode_state();
+        self.view_snapshots
+            .insert(self.active_view.clone(), self.current_view_snapshot());
+    }
+
+    fn restore_view_snapshot(&mut self, snapshot: ViewSnapshotState) {
+        let active_view = self.active_view.clone();
+        if let Some(section_key) = snapshot.section_key.as_deref()
+            && let Some(position) = self.section_position_by_key(&active_view, section_key)
+        {
+            self.set_current_section_position(position);
+        }
+
+        if let Some(item_id) = snapshot.item_id.as_deref() {
+            if !self.select_current_item_by_id(item_id)
+                && !self.select_item_in_view(&active_view, item_id)
+            {
+                self.set_current_selected_position(snapshot.selected_index);
+            }
+        } else {
+            self.set_current_selected_position(snapshot.selected_index);
+        }
+
+        if let Some(section_key) = snapshot.section_key {
+            self.list_scroll_offset
+                .insert(section_key, snapshot.list_scroll_offset);
+        }
+
+        self.details_mode = snapshot.details_mode;
+        self.details_scroll = snapshot.details_scroll;
+        self.selected_comment_index = snapshot.selected_comment_index;
+
+        if self.details_mode == DetailsMode::Diff {
+            let can_show_diff = self
+                .current_item()
+                .is_some_and(|item| matches!(item.kind, ItemKind::PullRequest));
+            if can_show_diff {
+                if let Some(item_id) = self.current_item().map(|item| item.id.clone()) {
+                    self.selected_diff_file.entry(item_id.clone()).or_insert(0);
+                    self.selected_diff_line.entry(item_id.clone()).or_insert(0);
+                    self.restore_selected_diff_file_details_scroll(&item_id, self.details_scroll);
+                }
+                self.diff_return_state.get_or_insert(DiffReturnState {
+                    focus: FocusTarget::Details,
+                    details_scroll: 0,
+                    selected_comment_index: 0,
+                });
+            } else {
+                self.details_mode = DetailsMode::Conversation;
+                self.diff_return_state = None;
+            }
+        }
+
+        self.focus =
+            if matches!(snapshot.focus, FocusTarget::Details) && self.current_item().is_none() {
+                FocusTarget::List
+            } else {
+                snapshot.focus
+            };
+        let selected_comment_index = self.selected_comment_index;
+        self.clamp_positions();
+        self.selected_comment_index = selected_comment_index;
+        if self.current_comments().is_some() {
+            self.clamp_selected_comment();
         }
     }
 
@@ -8355,6 +14173,18 @@ impl AppState {
         let title = section.title.clone();
         let section_error = section.error.clone();
         let setup_dialog = section_error.as_deref().and_then(setup_dialog_from_error);
+        self.remember_base_filters(&section);
+        if self.quick_filters.contains_key(&section.key) {
+            if self.setup_dialog.is_none() {
+                self.setup_dialog = setup_dialog;
+            }
+            self.status = match (section_error.as_deref(), save_error) {
+                (None, None) => format!("loaded {title}; quick filter still active"),
+                (Some(error), None) => refresh_error_status(1, Some(error)),
+                (_, Some(error)) => format!("snapshot save failed: {error}"),
+            };
+            return;
+        }
 
         self.invalidate_action_hints_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
@@ -8421,6 +14251,13 @@ impl AppState {
                     .map(str::to_string);
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
                 self.invalidate_action_hints_for_sections(&sections);
+                for section in &sections {
+                    self.remember_base_filters(section);
+                }
+                let sections = sections
+                    .into_iter()
+                    .filter(|section| !self.quick_filters.contains_key(&section.key))
+                    .collect::<Vec<_>>();
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 let restored_item = self.restore_refresh_anchor(&anchor);
@@ -8445,7 +14282,7 @@ impl AppState {
                 }
                 self.setup_dialog = setup_dialog;
                 self.status = match (errors, save_error) {
-                    (0, None) => "refresh complete".to_string(),
+                    (0, None) => "latest".to_string(),
                     (count, None) => refresh_error_status(count, first_error.as_deref()),
                     (_, Some(error)) => format!("snapshot save failed: {error}"),
                 };
@@ -8454,7 +14291,7 @@ impl AppState {
                 Ok(result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -8472,16 +14309,32 @@ impl AppState {
             },
             AppMsg::ActionHintsLoaded { item_id, actions } => match actions {
                 Ok(actions) => {
-                    self.action_hints
-                        .insert(item_id, ActionHintState::Loaded(actions));
+                    self.action_hints_refreshing.remove(&item_id);
+                    if !matches!(
+                        self.action_hints.get(&item_id),
+                        Some(ActionHintState::Loaded(current)) if current == &actions
+                    ) {
+                        self.action_hints
+                            .insert(item_id, ActionHintState::Loaded(actions));
+                    }
                 }
                 Err(error) => {
-                    self.action_hints
-                        .insert(item_id, ActionHintState::Error(error));
+                    self.action_hints_refreshing.remove(&item_id);
+                    if !matches!(
+                        self.action_hints.get(&item_id),
+                        Some(ActionHintState::Loaded(_))
+                    ) {
+                        self.action_hints
+                            .insert(item_id, ActionHintState::Error(error));
+                    }
                 }
             },
             AppMsg::DiffLoaded { item_id, diff } => match diff {
                 Ok(diff) => {
+                    let restore_current_scroll = self.details_mode == DetailsMode::Diff
+                        && self
+                            .current_item()
+                            .is_some_and(|item| item.id.as_str() == item_id);
                     let file_count = diff.files.len();
                     if file_count == 0 {
                         self.selected_diff_file.insert(item_id.clone(), 0);
@@ -8498,7 +14351,13 @@ impl AppState {
                             *selected_line = (*selected_line).min(line_count - 1);
                         }
                     }
-                    self.diffs.insert(item_id, DiffState::Loaded(diff));
+                    self.diffs.insert(item_id.clone(), DiffState::Loaded(diff));
+                    if restore_current_scroll {
+                        self.restore_selected_diff_file_details_scroll(
+                            &item_id,
+                            self.details_scroll,
+                        );
+                    }
                     self.status = format!("diff loaded: {file_count} file(s)");
                 }
                 Err(error) => {
@@ -8514,12 +14373,13 @@ impl AppState {
                     self.selected_comment_index = result.comments.len().saturating_sub(1);
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
+                    self.pending_comment_submit = None;
                     self.status = "comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
                         "Comment Posted",
@@ -8532,12 +14392,14 @@ impl AppState {
                         self.setup_dialog = setup_dialog;
                     }
                     if setup_dialog.is_none() {
-                        self.message_dialog = Some(message_dialog(
+                        self.restore_pending_comment_submit_dialog();
+                        self.message_dialog = Some(retryable_message_dialog(
                             "Comment Failed",
-                            operation_error_body(&error),
+                            retryable_operation_error_body(&error),
                         ));
                     } else {
                         self.message_dialog = None;
+                        self.restore_pending_comment_submit_dialog();
                     }
                     self.posting_comment = false;
                     self.status = "comment post failed".to_string();
@@ -8553,12 +14415,13 @@ impl AppState {
                         comment_index.min(result.comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
+                    self.pending_comment_submit = None;
                     self.status = "comment updated".to_string();
                     self.message_dialog = Some(success_message_dialog(
                         "Comment Updated",
@@ -8571,12 +14434,14 @@ impl AppState {
                         self.setup_dialog = setup_dialog;
                     }
                     if setup_dialog.is_none() {
-                        self.message_dialog = Some(message_dialog(
+                        self.restore_pending_comment_submit_dialog();
+                        self.message_dialog = Some(retryable_message_dialog(
                             "Update Failed",
-                            operation_error_body(&error),
+                            retryable_operation_error_body(&error),
                         ));
                     } else {
                         self.message_dialog = None;
+                        self.restore_pending_comment_submit_dialog();
                     }
                     self.posting_comment = false;
                     self.status = "comment update failed".to_string();
@@ -8586,6 +14451,7 @@ impl AppState {
                 Ok(()) => {
                     self.details_stale.insert(item_id);
                     self.posting_comment = false;
+                    self.pending_comment_submit = None;
                     self.status = "review comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
                         "Review Comment Posted",
@@ -8598,12 +14464,14 @@ impl AppState {
                         self.setup_dialog = setup_dialog;
                     }
                     if setup_dialog.is_none() {
-                        self.message_dialog = Some(message_dialog(
+                        self.restore_pending_comment_submit_dialog();
+                        self.message_dialog = Some(retryable_message_dialog(
                             "Review Comment Failed",
-                            operation_error_body(&error),
+                            retryable_operation_error_body(&error),
                         ));
                     } else {
                         self.message_dialog = None;
+                        self.restore_pending_comment_submit_dialog();
                     }
                     self.posting_comment = false;
                     self.status = "review comment failed".to_string();
@@ -8623,7 +14491,7 @@ impl AppState {
                     }
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
-                    self.update_item_reactions(&item_id, result.item_reactions);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -8690,32 +14558,118 @@ impl AppState {
                     }
                 }
             }
-            AppMsg::LabelSuggestionsLoaded { repo, result } => {
-                let Some(dialog) = &mut self.label_dialog else {
-                    return;
-                };
-                let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode else {
-                    return;
-                };
-                if dialog_repo != &repo {
-                    return;
-                }
-                dialog.suggestions_loading = false;
-                match result {
-                    Ok(labels) => {
-                        dialog.suggestions = labels;
+            AppMsg::LabelSuggestionsLoaded { repo, result } => match result {
+                Ok(labels) => {
+                    self.label_suggestions_cache
+                        .insert(repo.clone(), labels.clone());
+                    if let Some(dialog) = &mut self.label_dialog
+                        && let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode
+                        && dialog_repo == &repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != labels {
+                            dialog.suggestions = labels;
+                        }
                         dialog.suggestions_error = None;
                         clamp_label_dialog_selection(dialog);
                         self.status = "label suggestions loaded".to_string();
                     }
-                    Err(error) => {
-                        dialog.suggestions.clear();
-                        dialog.suggestions_error = Some(error);
-                        dialog.selected_suggestion = 0;
-                        self.status = "label suggestions unavailable".to_string();
+                }
+                Err(error) => {
+                    let has_cached_suggestions = self.label_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.label_dialog
+                        && let LabelDialogMode::Add { repo: dialog_repo } = &dialog.mode
+                        && dialog_repo == &repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "label suggestions refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "label suggestions unavailable".to_string();
+                        }
                     }
                 }
-            }
+            },
+            AppMsg::AssigneeSuggestionsLoaded { repo, result } => match result {
+                Ok(assignees) => {
+                    self.assignee_suggestions_cache
+                        .insert(repo.clone(), assignees.clone());
+                    if let Some(dialog) = &mut self.assignee_dialog
+                        && dialog.action == AssigneeAction::Assign
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != assignees {
+                            dialog.suggestions = assignees;
+                        }
+                        dialog.suggestions_error = None;
+                        clamp_assignee_dialog_selection(dialog);
+                        self.status = "assignee candidates loaded".to_string();
+                    }
+                }
+                Err(error) => {
+                    let has_cached_suggestions =
+                        self.assignee_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.assignee_dialog
+                        && dialog.action == AssigneeAction::Assign
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "assignee candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "assignee candidates unavailable".to_string();
+                        }
+                    }
+                }
+            },
+            AppMsg::ReviewerSuggestionsLoaded { repo, result } => match result {
+                Ok(reviewers) => {
+                    self.reviewer_suggestions_cache
+                        .insert(repo.clone(), reviewers.clone());
+                    if let Some(dialog) = &mut self.reviewer_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if dialog.suggestions != reviewers {
+                            dialog.suggestions = reviewers;
+                        }
+                        dialog.suggestions_error = None;
+                        clamp_reviewer_dialog_selection(dialog);
+                        self.status = "reviewer candidates loaded".to_string();
+                    }
+                }
+                Err(error) => {
+                    let has_cached_suggestions =
+                        self.reviewer_suggestions_cache.contains_key(&repo)
+                            || self.assignee_suggestions_cache.contains_key(&repo);
+                    if let Some(dialog) = &mut self.reviewer_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.suggestions_error = None;
+                            self.status =
+                                "reviewer candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.suggestions.clear();
+                            dialog.suggestions_error = Some(error);
+                            dialog.selected_suggestion = 0;
+                            self.status = "reviewer candidates unavailable".to_string();
+                        }
+                    }
+                }
+            },
             AppMsg::IssueCreated { result } => {
                 self.issue_creating = false;
                 self.issue_dialog = None;
@@ -8735,6 +14689,7 @@ impl AppState {
                             "Issue Created",
                             format!("Created {number}: {}", item.title),
                         ));
+                        self.pending_issue_create = None;
                     }
                     Err(error) => {
                         let setup_dialog = setup_dialog_from_error(&error);
@@ -8742,36 +14697,71 @@ impl AppState {
                             self.setup_dialog = setup_dialog;
                         }
                         if setup_dialog.is_none() {
-                            self.message_dialog = Some(message_dialog(
+                            self.restore_pending_issue_create_dialog();
+                            self.message_dialog = Some(retryable_message_dialog(
                                 "Issue Create Failed",
-                                operation_error_body(&error),
+                                retryable_operation_error_body(&error),
                             ));
                         } else {
                             self.message_dialog = None;
+                            self.restore_pending_issue_create_dialog();
                         }
                         self.status = "issue create failed".to_string();
                     }
                 }
             }
-            AppMsg::PrActionFinished {
-                item_id,
-                action,
-                result,
-            } => {
-                self.pr_action_running = false;
-                self.pr_action_dialog = None;
+            AppMsg::PullRequestCreated { result } => {
+                self.pr_creating = false;
+                self.pr_create_dialog = None;
                 match result {
-                    Ok(()) => {
-                        self.details_stale.insert(item_id.clone());
-                        self.mark_item_after_pr_action(&item_id, action);
-                        self.status = match action {
-                            PrAction::Merge => "pull request merged; refreshing".to_string(),
-                            PrAction::Close => "pull request closed; refreshing".to_string(),
-                            PrAction::Approve => "pull request approved; refreshing".to_string(),
+                    Ok(item) => {
+                        let number = item
+                            .number
+                            .map(|number| format!("#{number}"))
+                            .unwrap_or_else(|| item.id.clone());
+                        let inserted = self.insert_created_pull_request(item.clone());
+                        self.status = if inserted {
+                            format!("pull request created: {number}")
+                        } else {
+                            format!("pull request created: {number}; refresh to show it in a list")
                         };
                         self.message_dialog = Some(success_message_dialog(
-                            pr_action_success_title(action),
-                            pr_action_success_body(action),
+                            "Pull Request Created",
+                            format!("Created {number}: {}", item.title),
+                        ));
+                        self.pending_pr_create = None;
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.restore_pending_pr_create_dialog();
+                            self.message_dialog = Some(retryable_message_dialog(
+                                "Pull Request Create Failed",
+                                retryable_operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                            self.restore_pending_pr_create_dialog();
+                        }
+                        self.status = "pull request create failed".to_string();
+                    }
+                }
+            }
+            AppMsg::ReviewDraftCreated { item_id, result } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(pending) => {
+                        self.pending_reviews
+                            .insert(item_id.clone(), pending.clone());
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.details_stale.insert(item_id);
+                        self.status = "pending review created".to_string();
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Created",
+                            "GitHub created a pending review. Press s to submit it or D to discard it.",
                         ));
                     }
                     Err(error) => {
@@ -8781,13 +14771,384 @@ impl AppState {
                         }
                         if setup_dialog.is_none() {
                             self.message_dialog = Some(message_dialog(
-                                pr_action_error_title(action),
+                                "Pending Review Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review create failed".to_string();
+                    }
+                }
+            }
+            AppMsg::ReviewSubmitted {
+                item_id,
+                event,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.details_stale.insert(item_id.clone());
+                        self.status = format!("{}; refreshing", event.success_label());
+                        self.message_dialog = Some(success_message_dialog(
+                            "Review Submitted",
+                            format!("GitHub accepted the {} review.", event.label()),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Review Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "review submit failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PendingReviewSubmitted {
+                item_id,
+                review_id,
+                event,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.pending_reviews.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.details_stale.insert(item_id);
+                        self.status = format!("{}; refreshing", event.success_label());
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Submitted",
+                            format!("GitHub submitted pending review {review_id}."),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pending Review Submit Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review submit failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PendingReviewDiscarded {
+                item_id,
+                review_id,
+                result,
+            } => {
+                self.review_submit_running = false;
+                match result {
+                    Ok(()) => {
+                        self.pending_reviews.remove(&item_id);
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.details_stale.insert(item_id);
+                        self.status = "pending review discarded; refreshing".to_string();
+                        self.message_dialog = Some(success_message_dialog(
+                            "Pending Review Discarded",
+                            format!("GitHub discarded pending review {review_id}."),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Pending Review Discard Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "pending review discard failed".to_string();
+                    }
+                }
+            }
+            AppMsg::PrActionFinished {
+                item_id,
+                item_kind,
+                action,
+                merge_method,
+                result,
+            } => {
+                self.pr_action_running = false;
+                self.pr_action_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.diffs.remove(&item_id);
+                        self.mark_item_after_pr_action(&item_id, action);
+                        self.status = if action == PrAction::Merge {
+                            format!(
+                                "pull request merged using {}; refreshing",
+                                merge_method.unwrap_or_default().label()
+                            )
+                        } else {
+                            pr_action_success_status(action, item_kind)
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            pr_action_success_title(action, item_kind),
+                            pr_action_success_body(action, item_kind),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                pr_action_error_title(action, item_kind),
                                 pr_action_error_body(&error),
                             ));
                         } else {
                             self.message_dialog = None;
                         }
-                        self.status = pr_action_error_status(action).to_string();
+                        self.status = if action == PrAction::Merge {
+                            format!(
+                                "pull request {} merge failed",
+                                merge_method.unwrap_or_default().label()
+                            )
+                        } else {
+                            pr_action_error_status(action, item_kind)
+                        };
+                    }
+                }
+            }
+            AppMsg::PrCheckoutFinished { result } => {
+                self.pr_action_running = false;
+                self.pr_action_dialog = None;
+                match result {
+                    Ok(result) => {
+                        self.status = "pull request checked out locally".to_string();
+                        self.message_dialog = Some(persistent_success_message_dialog(
+                            pr_action_success_title(PrAction::Checkout, ItemKind::PullRequest),
+                            format!(
+                                "{}\n\n{}\n\n{}",
+                                result.command,
+                                checkout_directory_notice(&result.directory),
+                                result.output
+                            ),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                pr_action_error_title(PrAction::Checkout, ItemKind::PullRequest),
+                                pr_action_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status =
+                            pr_action_error_status(PrAction::Checkout, ItemKind::PullRequest);
+                    }
+                }
+            }
+            AppMsg::MilestonesLoaded { item_id, result } => {
+                if let Some(dialog) = self.milestone_dialog.as_mut()
+                    && dialog.item.id == item_id
+                    && !self.milestone_action_running
+                {
+                    match result {
+                        Ok(milestones) => {
+                            dialog.state = MilestoneDialogState::Loaded(milestones);
+                            reset_milestone_dialog_selection(dialog);
+                            self.status = "choose milestone".to_string();
+                        }
+                        Err(error) => {
+                            let setup_dialog = setup_dialog_from_error(&error);
+                            if self.setup_dialog.is_none() {
+                                self.setup_dialog = setup_dialog;
+                            }
+                            dialog.state = MilestoneDialogState::Error(error);
+                            self.status = "milestone load failed".to_string();
+                        }
+                    }
+                }
+            }
+            AppMsg::MilestoneChanged {
+                item_id,
+                milestone,
+                result,
+            } => {
+                self.milestone_action_running = false;
+                self.milestone_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.mark_item_milestone(&item_id, milestone.as_ref());
+                        self.status = match milestone {
+                            Some(_) => "milestone changed; refreshing".to_string(),
+                            None => "milestone cleared; refreshing".to_string(),
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            "Milestone Changed",
+                            "GitHub accepted the milestone update. Refreshing details.",
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                "Milestone Failed",
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = "milestone change failed".to_string();
+                    }
+                }
+            }
+            AppMsg::ItemMetadataUpdated {
+                item_id,
+                field,
+                result,
+            } => {
+                self.posting_comment = false;
+                match result {
+                    Ok(update) => {
+                        self.apply_item_metadata_update(&item_id, update);
+                        self.details_stale.insert(item_id);
+                        self.pending_comment_submit = None;
+                        self.status = format!("{} updated", field.label());
+                        self.message_dialog = Some(success_message_dialog(
+                            format!("{} Updated", field.title()),
+                            "GitHub accepted the update and the current item was refreshed.",
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.restore_pending_comment_submit_dialog();
+                            self.message_dialog = Some(retryable_message_dialog(
+                                format!("{} Update Failed", field.title()),
+                                retryable_operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                            self.restore_pending_comment_submit_dialog();
+                        }
+                        self.status = format!("{} update failed", field.label());
+                    }
+                }
+            }
+            AppMsg::AssigneesUpdated {
+                item_id,
+                action,
+                result,
+            } => {
+                self.assignee_action_running = false;
+                self.assignee_dialog = None;
+                match result {
+                    Ok(updated_item) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.replace_item(&item_id, updated_item);
+                        self.status = match action {
+                            AssigneeAction::Assign => "assignee added".to_string(),
+                            AssigneeAction::Unassign => "assignee removed".to_string(),
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            assignee_action_success_title(action),
+                            assignee_action_success_body(action),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                assignee_action_error_title(action),
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = match action {
+                            AssigneeAction::Assign => "assign failed".to_string(),
+                            AssigneeAction::Unassign => "unassign failed".to_string(),
+                        };
+                    }
+                }
+            }
+            AppMsg::ReviewerActionFinished {
+                item_id,
+                action,
+                reviewers,
+                result,
+            } => {
+                self.reviewer_action_running = false;
+                self.reviewer_dialog = None;
+                match result {
+                    Ok(()) => {
+                        self.details_stale.insert(item_id.clone());
+                        self.mark_action_hints_stale(item_id.clone());
+                        self.status = match action {
+                            ReviewerAction::Request => {
+                                format!(
+                                    "requested review from {}; refreshing",
+                                    reviewers.join(", ")
+                                )
+                            }
+                            ReviewerAction::Remove => {
+                                format!(
+                                    "removed review requests for {}; refreshing",
+                                    reviewers.join(", ")
+                                )
+                            }
+                        };
+                        self.message_dialog = Some(success_message_dialog(
+                            reviewer_action_success_title(action),
+                            reviewer_action_success_body(action),
+                        ));
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        if setup_dialog.is_none() {
+                            self.message_dialog = Some(message_dialog(
+                                reviewer_action_error_title(action),
+                                operation_error_body(&error),
+                            ));
+                        } else {
+                            self.message_dialog = None;
+                        }
+                        self.status = reviewer_action_error_status(action).to_string();
                     }
                 }
             }
@@ -8837,6 +15198,28 @@ impl AppState {
                     (_, Some(error)) => format!("snapshot save failed: {error}"),
                 };
             }
+            AppMsg::FilterSectionLoaded {
+                section_key,
+                section,
+            } => {
+                let error = section.error.clone();
+                let filter_label = self
+                    .quick_filters
+                    .get(&section_key)
+                    .map(QuickFilter::display);
+                if self.setup_dialog.is_none() {
+                    self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
+                }
+                self.replace_section_page(&section_key, section);
+                self.refreshing = false;
+                self.status = match (error.as_deref(), filter_label) {
+                    (None, Some(filter)) if !filter.is_empty() => {
+                        format!("filter applied: {filter}")
+                    }
+                    (None, _) => "filter cleared".to_string(),
+                    (Some(error), _) => refresh_error_status(1, Some(error)),
+                };
+            }
             AppMsg::GlobalSearchFinished { query, sections } => {
                 let errors = sections
                     .iter()
@@ -8861,6 +15244,7 @@ impl AppState {
                 self.global_search_scope = None;
                 self.global_search_active = false;
                 self.global_search_query = query.clone();
+                self.filter_input_active = false;
                 self.search_active = false;
                 self.search_query.clear();
                 self.active_view = global_search_view_key();
@@ -8895,6 +15279,21 @@ impl AppState {
         self.status = "message dismissed".to_string();
     }
 
+    fn dismiss_retryable_message_dialog(&mut self, cancel: bool) {
+        self.message_dialog = None;
+        if cancel {
+            self.comment_dialog = None;
+            self.issue_dialog = None;
+            self.pr_create_dialog = None;
+            self.pending_comment_submit = None;
+            self.pending_issue_create = None;
+            self.pending_pr_create = None;
+            self.status = "retry cancelled".to_string();
+        } else {
+            self.status = "edit and retry".to_string();
+        }
+    }
+
     fn dismiss_expired_message_dialog(&mut self, now: Instant) {
         if self
             .message_dialog
@@ -8903,6 +15302,24 @@ impl AppState {
             .is_some_and(|deadline| now >= deadline)
         {
             self.message_dialog = None;
+        }
+    }
+
+    fn restore_pending_comment_submit_dialog(&mut self) {
+        if let Some(pending) = self.pending_comment_submit.take() {
+            self.comment_dialog = Some(pending.dialog);
+        }
+    }
+
+    fn restore_pending_issue_create_dialog(&mut self) {
+        if let Some(pending) = self.pending_issue_create.take() {
+            self.issue_dialog = Some(pending.dialog);
+        }
+    }
+
+    fn restore_pending_pr_create_dialog(&mut self) {
+        if let Some(pending) = self.pending_pr_create.take() {
+            self.pr_create_dialog = Some(pending.dialog);
         }
     }
 
@@ -8923,13 +15340,622 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.command_palette = None;
         self.reaction_dialog = None;
+        self.filter_input_active = false;
+        self.item_edit_dialog = None;
         self.status = "help".to_string();
     }
 
     fn dismiss_help_dialog(&mut self) {
         self.help_dialog = false;
         self.status = "help dismissed".to_string();
+    }
+
+    fn show_command_palette(&mut self) {
+        self.command_palette = Some(CommandPalette::default());
+        self.project_switcher = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.status = "command palette".to_string();
+    }
+
+    fn show_info_dialog(&mut self, config: &Config, paths: &Paths) {
+        let body = runtime_info_body(self, config, paths);
+        self.message_dialog = Some(info_message_dialog("Info", body));
+        self.status = "info".to_string();
+        debug!("info dialog opened");
+    }
+
+    fn dismiss_command_palette(&mut self) {
+        self.command_palette = None;
+        self.status = "command palette dismissed".to_string();
+    }
+
+    fn handle_command_palette_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.dismiss_command_palette();
+                false
+            }
+            KeyCode::Enter => self.submit_command_palette_selection(config, paths, store, tx, area),
+            KeyCode::Down | KeyCode::Tab => {
+                self.move_command_palette_selection(1);
+                false
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.move_command_palette_selection(-1);
+                false
+            }
+            KeyCode::PageDown => {
+                self.move_command_palette_selection(8);
+                false
+            }
+            KeyCode::PageUp => {
+                self.move_command_palette_selection(-8);
+                false
+            }
+            KeyCode::Backspace => {
+                if let Some(palette) = &mut self.command_palette {
+                    palette.query.pop();
+                    palette.selected = 0;
+                }
+                false
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(palette) = &mut self.command_palette {
+                    palette.query.push(value);
+                    palette.selected = 0;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn move_command_palette_selection(&mut self, delta: isize) {
+        let Some(palette) = &mut self.command_palette else {
+            return;
+        };
+        let commands = command_palette_commands(&self.command_palette_key);
+        let len = command_palette_filtered_indices(&commands, &palette.query).len();
+        palette.selected = move_wrapping(palette.selected, len, delta);
+    }
+
+    fn submit_command_palette_selection(
+        &mut self,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) -> bool {
+        let Some(command) = self.selected_command_palette_command() else {
+            self.status = "no matching command".to_string();
+            return false;
+        };
+
+        self.command_palette = None;
+        match command.action {
+            PaletteAction::Key(key) => {
+                handle_key_in_area_mut(self, key, config, paths, store, tx, area)
+            }
+            PaletteAction::Quit => true,
+            PaletteAction::ShowInfo => {
+                self.show_info_dialog(config, paths);
+                false
+            }
+            PaletteAction::ShowHelp => {
+                self.show_help_dialog();
+                false
+            }
+            PaletteAction::ShowCommandPalette => {
+                self.show_command_palette();
+                false
+            }
+            PaletteAction::Refresh => {
+                trigger_refresh(self, config, store, tx);
+                false
+            }
+            PaletteAction::SearchCurrentRepo => {
+                self.start_global_search_input();
+                false
+            }
+            PaletteAction::SwitchProject => {
+                self.show_project_switcher();
+                false
+            }
+            PaletteAction::ProjectAdd => {
+                self.show_project_add_dialog();
+                false
+            }
+            PaletteAction::ProjectRemove => {
+                self.show_project_remove_dialog(config);
+                false
+            }
+            PaletteAction::CopyGithubLink => {
+                self.copy_github_link();
+                false
+            }
+            PaletteAction::CopyContent => {
+                self.copy_content();
+                false
+            }
+            PaletteAction::ToggleMouseCapture => {
+                self.toggle_mouse_capture();
+                false
+            }
+            PaletteAction::OpenSelected => {
+                self.open_selected();
+                false
+            }
+            PaletteAction::ShowDiff => {
+                self.show_diff();
+                false
+            }
+            PaletteAction::ClearIgnoredItems => {
+                self.clear_ignored_items();
+                false
+            }
+        }
+    }
+
+    fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
+        let palette = self.command_palette.as_ref()?;
+        let commands = command_palette_commands(&self.command_palette_key);
+        let matches = command_palette_filtered_indices(&commands, &palette.query);
+        let selected = palette.selected.min(matches.len().saturating_sub(1));
+        matches
+            .get(selected)
+            .and_then(|index| commands.get(*index))
+            .cloned()
+    }
+
+    fn show_project_switcher(&mut self) {
+        let candidates = self.project_switcher_candidates();
+        if candidates.is_empty() {
+            self.project_switcher = None;
+            self.status = "no configured projects".to_string();
+            return;
+        }
+
+        let selected = candidates
+            .iter()
+            .position(|candidate| candidate.key == self.active_view)
+            .unwrap_or(0);
+        self.command_palette = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.project_switcher = Some(ProjectSwitcher {
+            query: String::new(),
+            selected,
+        });
+        self.status = "project switch".to_string();
+    }
+
+    fn dismiss_project_switcher(&mut self) {
+        self.project_switcher = None;
+        self.status = "project switch cancelled".to_string();
+    }
+
+    fn handle_project_switcher_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_project_switcher(),
+            KeyCode::Enter => self.submit_project_switcher_selection(),
+            KeyCode::Down | KeyCode::Tab => self.move_project_switcher_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_project_switcher_selection(-1),
+            KeyCode::PageDown => self.move_project_switcher_selection(8),
+            KeyCode::PageUp => self.move_project_switcher_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(switcher) = &mut self.project_switcher {
+                    switcher.query.pop();
+                    switcher.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(switcher) = &mut self.project_switcher {
+                    switcher.query.push(value);
+                    switcher.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_project_switcher_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .project_switcher
+            .as_ref()
+            .map(|switcher| switcher.query.clone())
+        else {
+            return;
+        };
+        let len = self.project_switcher_candidates_for_query(&query).len();
+        if let Some(switcher) = &mut self.project_switcher {
+            switcher.selected = move_wrapping(switcher.selected, len, delta);
+        }
+    }
+
+    fn submit_project_switcher_selection(&mut self) {
+        let Some(switcher) = &self.project_switcher else {
+            return;
+        };
+        let candidates = self.project_switcher_candidates_for_query(&switcher.query);
+        let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+        let Some(candidate) = candidates.get(selected) else {
+            self.status = "no matching project".to_string();
+            return;
+        };
+
+        let key = candidate.key.clone();
+        let label = candidate.label.clone();
+        self.project_switcher = None;
+        self.switch_project_view(key);
+        self.status = format!("project switched: {label}");
+    }
+
+    fn project_switcher_candidates(&self) -> Vec<ViewTab> {
+        self.view_tabs()
+            .into_iter()
+            .filter(|view| view.key.starts_with("repo:"))
+            .collect()
+    }
+
+    fn project_switcher_candidates_for_query(&self, query: &str) -> Vec<ViewTab> {
+        self.project_switcher_candidates()
+            .into_iter()
+            .filter(|view| project_switcher_candidate_matches(view, query))
+            .collect()
+    }
+
+    fn show_project_add_dialog(&mut self) {
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.project_remove_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_create_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
+        self.project_add_dialog = Some(ProjectAddDialog {
+            title: String::new(),
+            repo_url: String::new(),
+            local_dir: String::new(),
+            field: ProjectAddField::RepoUrl,
+        });
+        self.status = "project add".to_string();
+    }
+
+    fn dismiss_project_add_dialog(&mut self) {
+        self.project_add_dialog = None;
+        self.status = "project add cancelled".to_string();
+    }
+
+    fn handle_project_add_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        if is_comment_submit_key(key) {
+            self.confirm_project_add(config, paths, store, tx);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.dismiss_project_add_dialog(),
+            KeyCode::Enter | KeyCode::Tab => self.move_project_add_field(1),
+            KeyCode::BackTab => self.move_project_add_field(-1),
+            KeyCode::Backspace => self.pop_project_add_char(),
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.push_project_add_char(value);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_project_add_field(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.project_add_dialog {
+            dialog.field = dialog.field.next(delta);
+            self.status = match dialog.field {
+                ProjectAddField::Title => "editing project title".to_string(),
+                ProjectAddField::RepoUrl => "editing project repo url".to_string(),
+                ProjectAddField::LocalDir => "editing project local_dir".to_string(),
+            };
+        }
+    }
+
+    fn push_project_add_char(&mut self, value: char) {
+        let Some(dialog) = &mut self.project_add_dialog else {
+            return;
+        };
+        match dialog.field {
+            ProjectAddField::Title => dialog.title.push(value),
+            ProjectAddField::RepoUrl => dialog.repo_url.push(value),
+            ProjectAddField::LocalDir => dialog.local_dir.push(value),
+        }
+    }
+
+    fn pop_project_add_char(&mut self) {
+        let Some(dialog) = &mut self.project_add_dialog else {
+            return;
+        };
+        match dialog.field {
+            ProjectAddField::Title => {
+                dialog.title.pop();
+            }
+            ProjectAddField::RepoUrl => {
+                dialog.repo_url.pop();
+            }
+            ProjectAddField::LocalDir => {
+                dialog.local_dir.pop();
+            }
+        }
+    }
+
+    fn confirm_project_add(
+        &mut self,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(dialog) = self.project_add_dialog.take() else {
+            return;
+        };
+        let Some(repo) = project_add_repo_from_input(&dialog.repo_url) else {
+            self.project_add_dialog = Some(dialog);
+            self.status = "repo url must be a GitHub repo".to_string();
+            return;
+        };
+        if config
+            .repos
+            .iter()
+            .any(|configured| configured.repo.eq_ignore_ascii_case(&repo))
+        {
+            self.project_add_dialog = Some(dialog);
+            self.status = format!("project already configured: {repo}");
+            return;
+        }
+        let Some(name) = project_add_title(config, &dialog.title, &repo) else {
+            self.project_add_dialog = Some(dialog);
+            self.status = "project title already exists".to_string();
+            return;
+        };
+
+        let repo_config = RepoConfig {
+            name: name.clone(),
+            repo: repo.clone(),
+            local_dir: Some(dialog.local_dir.trim().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        };
+        config.repos.push(repo_config.clone());
+        if let Err(error) = config.save(&paths.config_path) {
+            config.repos.pop();
+            self.project_add_dialog = Some(dialog);
+            self.status = format!("project add failed: {error}");
+            return;
+        }
+
+        self.add_project_view_from_config(config, &name);
+        self.switch_project_view(repo_view_key(&name));
+        self.project_add_dialog = None;
+        self.status = format!("project added: {name}");
+        #[cfg(not(test))]
+        trigger_refresh(self, config, store, tx);
+        #[cfg(test)]
+        let _ = (store, tx);
+    }
+
+    fn add_project_view_from_config(&mut self, config: &Config, name: &str) {
+        let view = repo_view_key(name);
+        let existing = self
+            .sections
+            .iter()
+            .map(|section| section.key.clone())
+            .collect::<HashSet<_>>();
+        let sections = configured_sections(config)
+            .into_iter()
+            .filter(|section| section_view_key(section) == view)
+            .filter(|section| !existing.contains(&section.key))
+            .collect::<Vec<_>>();
+        for section in sections {
+            self.remember_base_filters(&section);
+            self.sections.push(section);
+        }
+        self.clamp_positions();
+    }
+
+    fn show_project_remove_dialog(&mut self, config: &Config) {
+        let candidates = config
+            .repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| ProjectRemoveCandidate {
+                index,
+                name: repo.name.clone(),
+                repo: repo.repo.clone(),
+                local_dir: repo.local_dir.clone(),
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.project_remove_dialog = None;
+            self.status = "no configured projects".to_string();
+            return;
+        }
+
+        let active_project = self.active_view.strip_prefix("repo:");
+        let selected = active_project
+            .and_then(|active| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.name.eq_ignore_ascii_case(active))
+            })
+            .unwrap_or(0);
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = Some(ProjectRemoveDialog {
+            query: String::new(),
+            selected,
+            candidates,
+            confirm: None,
+        });
+        self.status = "project remove".to_string();
+    }
+
+    fn dismiss_project_remove_dialog(&mut self) {
+        self.project_remove_dialog = None;
+        self.status = "project remove cancelled".to_string();
+    }
+
+    fn handle_project_remove_key(&mut self, key: KeyEvent, config: &mut Config, paths: &Paths) {
+        if self
+            .project_remove_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.confirm.is_some())
+        {
+            match key.code {
+                KeyCode::Esc => self.dismiss_project_remove_dialog(),
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_project_remove(config, paths)
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.dismiss_project_remove_dialog(),
+            KeyCode::Enter => self.start_project_remove_confirmation(),
+            KeyCode::Down | KeyCode::Tab => self.move_project_remove_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_project_remove_selection(-1),
+            KeyCode::PageDown => self.move_project_remove_selection(8),
+            KeyCode::PageUp => self.move_project_remove_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.project_remove_dialog {
+                    dialog.query.pop();
+                    dialog.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(dialog) = &mut self.project_remove_dialog {
+                    dialog.query.push(value);
+                    dialog.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_project_remove_selection(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.project_remove_dialog else {
+            return;
+        };
+        let len = project_remove_filtered_candidates(dialog).len();
+        dialog.selected = move_wrapping(dialog.selected, len, delta);
+    }
+
+    fn start_project_remove_confirmation(&mut self) {
+        let Some(candidate) = self.selected_project_remove_candidate() else {
+            self.status = "no matching project".to_string();
+            return;
+        };
+        if let Some(dialog) = &mut self.project_remove_dialog {
+            dialog.confirm = Some(candidate.clone());
+        }
+        self.status = format!("confirm remove project {}", candidate.name);
+    }
+
+    fn selected_project_remove_candidate(&self) -> Option<ProjectRemoveCandidate> {
+        let dialog = self.project_remove_dialog.as_ref()?;
+        let matches = project_remove_filtered_candidates(dialog);
+        let selected = dialog.selected.min(matches.len().saturating_sub(1));
+        matches.get(selected).map(|candidate| (*candidate).clone())
+    }
+
+    fn confirm_project_remove(&mut self, config: &mut Config, paths: &Paths) {
+        let Some(candidate) = self
+            .project_remove_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.confirm.clone())
+        else {
+            return;
+        };
+        let Some(index) = project_remove_candidate_config_index(config, &candidate) else {
+            self.project_remove_dialog = None;
+            self.status = format!("project already removed: {}", candidate.name);
+            return;
+        };
+        let Some(removed) = config.remove_repo_at(index) else {
+            self.project_remove_dialog = None;
+            self.status = format!("project already removed: {}", candidate.name);
+            return;
+        };
+
+        if let Err(error) = config.save(&paths.config_path) {
+            config.repos.insert(index, removed);
+            self.project_remove_dialog = None;
+            self.status = format!("project remove failed: {error}");
+            return;
+        }
+
+        self.project_remove_dialog = None;
+        self.remove_project_view(&removed.name);
+        self.status = format!("project removed: {}", removed.name);
+    }
+
+    fn remove_project_view(&mut self, name: &str) {
+        let view = repo_view_key(name);
+        let removed_section_keys = self
+            .sections
+            .iter()
+            .filter(|section| same_view_key(&section_view_key(section), &view))
+            .map(|section| section.key.clone())
+            .collect::<Vec<_>>();
+        self.sections
+            .retain(|section| !same_view_key(&section_view_key(section), &view));
+        self.section_index.remove(&view);
+        self.selected_index.remove(&view);
+        for key in removed_section_keys {
+            self.list_scroll_offset.remove(&key);
+        }
+        self.clamp_positions();
     }
 
     fn mark_item_after_pr_action(&mut self, item_id: &str, action: PrAction) {
@@ -8941,7 +15967,15 @@ impl AppState {
                 match action {
                     PrAction::Merge => item.state = Some("merged".to_string()),
                     PrAction::Close => item.state = Some("closed".to_string()),
+                    PrAction::Reopen => item.state = Some("open".to_string()),
                     PrAction::Approve => {}
+                    PrAction::EnableAutoMerge => {}
+                    PrAction::DisableAutoMerge => {}
+                    PrAction::Checkout => {}
+                    PrAction::RerunFailedChecks => {}
+                    PrAction::UpdateBranch => {}
+                    PrAction::ConvertToDraft => mark_item_draft(item),
+                    PrAction::MarkReadyForReview => mark_item_ready_for_review(item),
                 }
             }
         }
@@ -8967,16 +16001,93 @@ impl AppState {
         }
     }
 
-    fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
-        for item_id in sections.iter().flat_map(|section| {
-            section
-                .items
-                .iter()
-                .filter(|item| item.kind == ItemKind::PullRequest)
-                .map(|item| item.id.as_str())
-        }) {
-            self.action_hints.remove(item_id);
+    fn replace_item(&mut self, item_id: &str, updated_item: WorkItem) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id == item_id {
+                    *item = updated_item.clone();
+                }
+            }
         }
+    }
+
+    fn apply_item_metadata_update(&mut self, item_id: &str, update: ItemMetadataUpdate) -> bool {
+        let mut changed = false;
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                item.title = update.title.clone();
+                item.body = update.body.clone();
+                item.updated_at = update.updated_at;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn mark_item_milestone(&mut self, item_id: &str, milestone: Option<&Milestone>) {
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id == item_id {
+                    item.milestone = milestone.cloned();
+                }
+            }
+        }
+    }
+
+    fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
+        let item_ids = sections
+            .iter()
+            .flat_map(|section| {
+                section
+                    .items
+                    .iter()
+                    .filter(|item| item.kind == ItemKind::PullRequest)
+                    .map(|item| item.id.clone())
+            })
+            .collect::<Vec<_>>();
+        for item_id in item_ids {
+            self.mark_action_hints_stale(item_id);
+        }
+    }
+
+    fn mark_action_hints_stale(&mut self, item_id: impl Into<String>) {
+        let item_id = item_id.into();
+        if self.action_hints.contains_key(&item_id) {
+            self.action_hints_stale.insert(item_id);
+        }
+    }
+
+    fn action_hints_state_is_loading(&self, item_id: &str) -> bool {
+        matches!(
+            self.action_hints.get(item_id),
+            Some(ActionHintState::Loading)
+        )
+    }
+
+    fn action_hints_state_exists(&self, item_id: &str) -> bool {
+        self.action_hints.contains_key(item_id)
+    }
+
+    fn action_hints_can_refresh_in_background(&self, item_id: &str) -> bool {
+        self.action_hints_state_exists(item_id) && !self.action_hints_state_is_loading(item_id)
+    }
+
+    fn action_hints_refresh_is_needed(&self, item_id: &str) -> bool {
+        self.action_hints_stale.contains(item_id)
+            && self.action_hints_can_refresh_in_background(item_id)
+            && !self.action_hints_refreshing.contains(item_id)
+    }
+
+    fn action_hints_first_load_is_needed(&self, item_id: &str) -> bool {
+        !self.action_hints_state_exists(item_id)
+    }
+
+    fn action_hints_load_should_start(&self, item_id: &str) -> bool {
+        self.action_hints_first_load_is_needed(item_id)
+            || self.action_hints_refresh_is_needed(item_id)
     }
 
     fn insert_created_issue(&mut self, item: WorkItem) -> bool {
@@ -8987,6 +16098,45 @@ impl AppState {
 
         for section in &mut self.sections {
             if !created_issue_matches_section(section, &item, &active_view) {
+                continue;
+            }
+
+            section.items.retain(|existing| existing.id != item_id);
+            section.items.insert(0, item.clone());
+            section.total_count = section.total_count.map(|count| count.saturating_add(1));
+            let view = section_view_key(section);
+            let key = section.key.clone();
+            if target.is_none() || same_view_key(&view, &active_view) {
+                target = Some((view, key));
+            }
+            inserted = true;
+        }
+
+        if let Some((view, section_key)) = target {
+            self.active_view = view.clone();
+            if let Some(section_position) = self.section_position_by_key(&view, &section_key) {
+                self.set_current_section_position(section_position);
+            }
+            self.set_current_selected_position(0);
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+            self.focus = FocusTarget::Details;
+            self.details
+                .insert(item_id, DetailState::Loaded(Vec::new()));
+        }
+
+        self.clamp_positions();
+        inserted
+    }
+
+    fn insert_created_pull_request(&mut self, item: WorkItem) -> bool {
+        let active_view = self.active_view.clone();
+        let item_id = item.id.clone();
+        let mut target = None;
+        let mut inserted = false;
+
+        for section in &mut self.sections {
+            if !created_pull_request_matches_section(section, &item, &active_view) {
                 continue;
             }
 
@@ -9077,6 +16227,11 @@ impl AppState {
         }
     }
 
+    fn apply_comment_fetch_result_metadata(&mut self, item_id: &str, result: &CommentFetchResult) {
+        self.update_item_reactions(item_id, result.item_reactions.clone());
+        self.mark_item_milestone(item_id, result.item_milestone.as_ref());
+    }
+
     fn replace_section_page(&mut self, section_key: &str, refreshed: SectionSnapshot) {
         let was_current = self
             .current_section()
@@ -9099,6 +16254,7 @@ impl AppState {
                 self.label_dialog = None;
                 self.issue_dialog = None;
                 self.pr_action_dialog = None;
+                self.item_edit_dialog = None;
             }
         } else {
             self.sections[index].error = refreshed.error;
@@ -9147,7 +16303,7 @@ impl AppState {
             view: section_view_key(section),
             kind: section.kind,
             title: section.title.clone(),
-            filters: section.filters.clone(),
+            filters: self.effective_filters_for_section(section),
             page: next_page,
             page_size,
             total_pages,
@@ -9155,10 +16311,52 @@ impl AppState {
         })
     }
 
+    fn base_filters_for_section(&self, section: &SectionSnapshot) -> String {
+        self.base_section_filters
+            .get(&section.key)
+            .cloned()
+            .unwrap_or_else(|| section.filters.clone())
+    }
+
+    fn remember_base_filters(&mut self, section: &SectionSnapshot) {
+        if section.error.is_none() {
+            self.base_section_filters
+                .insert(section.key.clone(), section.filters.clone());
+        }
+    }
+
+    fn effective_filters_for_section(&self, section: &SectionSnapshot) -> String {
+        let base_filters = self.base_filters_for_section(section);
+        self.quick_filters
+            .get(&section.key)
+            .map(|filter| quick_filter_query(&base_filters, filter))
+            .unwrap_or(base_filters)
+    }
+
+    fn current_filter_label(&self) -> Option<String> {
+        self.current_section()
+            .and_then(|section| self.quick_filter_label_for_section(section))
+    }
+
+    fn quick_filter_label_for_section(&self, section: &SectionSnapshot) -> Option<String> {
+        self.quick_filters
+            .get(&section.key)
+            .map(QuickFilter::display)
+            .filter(|label| !label.is_empty())
+    }
+
     fn replace_global_search_sections(&mut self, sections: Vec<SectionSnapshot>) {
         let search_view = global_search_view_key();
         self.sections
             .retain(|section| section_view_key(section) != search_view);
+        self.base_section_filters
+            .retain(|key, _| !key.starts_with("search:"));
+        self.quick_filters
+            .retain(|key, _| !key.starts_with("search:"));
+        for section in &sections {
+            self.base_section_filters
+                .insert(section.key.clone(), section.filters.clone());
+        }
         self.sections.extend(sections);
     }
 
@@ -9241,7 +16439,7 @@ impl AppState {
     }
 
     fn action_hints_load_needed(&self, item: &WorkItem) -> bool {
-        matches!(item.kind, ItemKind::PullRequest) && !self.action_hints.contains_key(&item.id)
+        matches!(item.kind, ItemKind::PullRequest) && self.action_hints_load_should_start(&item.id)
     }
 
     fn details_load_ready(&mut self, item_id: &str) -> bool {
@@ -9371,6 +16569,55 @@ impl AppState {
             })
     }
 
+    fn current_diff_file_details_scroll_entry(&self) -> Option<(String, u16)> {
+        self.current_diff_file_details_scroll_key()
+            .map(|key| (key, self.details_scroll))
+    }
+
+    fn current_diff_file_details_scroll_key(&self) -> Option<String> {
+        if self.details_mode != DetailsMode::Diff {
+            return None;
+        }
+        let item = self.current_item()?;
+        let diff = match self.diffs.get(&item.id)? {
+            DiffState::Loaded(diff) => diff,
+            _ => return None,
+        };
+        if diff.files.is_empty() {
+            return None;
+        }
+        let selected_file = self.selected_diff_file_index_for(&item.id, diff);
+        Some(diff_file_details_scroll_key(
+            &item.id,
+            &diff.files[selected_file],
+        ))
+    }
+
+    fn save_current_diff_file_details_scroll(&mut self) {
+        if let Some((key, details_scroll)) = self.current_diff_file_details_scroll_entry() {
+            self.diff_file_details_scroll.insert(key, details_scroll);
+        }
+    }
+
+    fn selected_diff_file_details_scroll(&self, item_id: &str) -> Option<u16> {
+        let diff = match self.diffs.get(item_id)? {
+            DiffState::Loaded(diff) => diff,
+            _ => return None,
+        };
+        if diff.files.is_empty() {
+            return None;
+        }
+        let selected_file = self.selected_diff_file_index_for(item_id, diff);
+        let key = diff_file_details_scroll_key(item_id, &diff.files[selected_file]);
+        self.diff_file_details_scroll.get(&key).copied()
+    }
+
+    fn restore_selected_diff_file_details_scroll(&mut self, item_id: &str, fallback: u16) {
+        self.details_scroll = self
+            .selected_diff_file_details_scroll(item_id)
+            .unwrap_or(fallback);
+    }
+
     fn current_diff_file_order(&self) -> Option<Vec<usize>> {
         self.current_item()
             .and_then(|item| match self.diffs.get(&item.id) {
@@ -9402,16 +16649,43 @@ impl AppState {
         if !self.action_hints_load_needed(item) {
             return false;
         }
-        self.action_hints
-            .insert(item.id.clone(), ActionHintState::Loading);
+        if self.action_hints_state_exists(&item.id) {
+            self.action_hints_stale.remove(&item.id);
+            self.action_hints_refreshing.insert(item.id.clone());
+        } else {
+            self.action_hints
+                .insert(item.id.clone(), ActionHintState::Loading);
+        }
         true
     }
 
-    fn switch_view(&mut self, view: impl Into<String>) {
-        self.save_current_conversation_details_state();
-        let view = view.into();
-        let focus = self.focus;
-        self.active_view = view;
+    fn switch_view(&mut self, view: impl Into<String>) -> bool {
+        self.switch_view_with_fallback(view, self.focus)
+    }
+
+    fn switch_project_view(&mut self, view: impl Into<String>) -> bool {
+        self.switch_view_with_fallback(view, FocusTarget::Ghr)
+    }
+
+    fn switch_view_with_fallback(
+        &mut self,
+        view: impl Into<String>,
+        fallback_focus: FocusTarget,
+    ) -> bool {
+        self.remember_current_view_snapshot();
+        let requested_view = view.into();
+        let previous_view = self.active_view.clone();
+        let previous_focus = self.focus;
+        let target_snapshot = self
+            .canonical_view_key(&requested_view)
+            .or_else(|| view_supports_snapshot(&requested_view).then_some(requested_view.clone()))
+            .and_then(|view| {
+                self.view_snapshots
+                    .iter()
+                    .find(|(saved_view, _)| same_view_key(saved_view, &view))
+                    .map(|(_, snapshot)| snapshot.clone())
+            });
+        self.active_view = requested_view;
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
@@ -9420,11 +16694,30 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_search_query.clear();
         self.clamp_positions();
-        self.focus = if matches!(focus, FocusTarget::Details) && self.current_item().is_none() {
-            FocusTarget::List
+        let restored = if let Some(snapshot) = target_snapshot {
+            self.restore_view_snapshot(snapshot);
+            true
         } else {
-            focus
+            self.details_mode = DetailsMode::Conversation;
+            self.diff_return_state = None;
+            self.focus = if matches!(fallback_focus, FocusTarget::Details)
+                && self.current_item().is_none()
+            {
+                FocusTarget::List
+            } else {
+                fallback_focus
+            };
+            false
         };
+        debug!(
+            from = %previous_view,
+            to = %self.active_view,
+            from_focus = ?previous_focus,
+            to_focus = ?self.focus,
+            restored,
+            "ui view switched"
+        );
+        restored
     }
 
     fn move_view(&mut self, delta: isize) {
@@ -9438,6 +16731,14 @@ impl AppState {
             .unwrap_or(0);
         let next = move_wrapping(current, views.len(), delta);
         if let Some(view) = views.get(next) {
+            debug!(
+                from_index = current,
+                to_index = next,
+                delta,
+                from = %self.active_view,
+                to = %view.key,
+                "ui view tab moved"
+            );
             self.switch_view(view.key.clone());
         }
     }
@@ -9451,6 +16752,7 @@ impl AppState {
     }
 
     fn focus_primary_list(&mut self) {
+        let previous_focus = self.focus;
         self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         if self.details_mode != DetailsMode::Diff {
@@ -9468,9 +16770,16 @@ impl AppState {
             "list focused".to_string()
         };
         self.clamp_positions();
+        debug!(
+            from = ?previous_focus,
+            to = ?self.focus,
+            mode = ?self.details_mode,
+            "ui focus changed"
+        );
     }
 
     fn focus_ghr(&mut self) {
+        let previous_focus = self.focus;
         self.save_current_conversation_details_state();
         self.focus = FocusTarget::Ghr;
         self.search_active = false;
@@ -9479,9 +16788,15 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.status = "ghr focused".to_string();
+        debug!(
+            from = ?previous_focus,
+            to = ?self.focus,
+            "ui focus changed"
+        );
     }
 
     fn focus_sections(&mut self) {
+        let previous_focus = self.focus;
         self.save_current_conversation_details_state();
         self.focus = FocusTarget::Sections;
         self.search_active = false;
@@ -9491,6 +16806,11 @@ impl AppState {
         self.pr_action_dialog = None;
         self.status = "Sections focused".to_string();
         self.clamp_positions();
+        debug!(
+            from = ?previous_focus,
+            to = ?self.focus,
+            "ui focus changed"
+        );
     }
 
     fn move_section(&mut self, delta: isize) {
@@ -9512,6 +16832,13 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.comment_search_query.clear();
+        debug!(
+            from_index = current,
+            to_index = next,
+            delta,
+            view = %self.active_view,
+            "ui section moved"
+        );
     }
 
     fn select_section(&mut self, index: usize) {
@@ -9520,7 +16847,9 @@ impl AppState {
             return;
         }
         self.save_current_conversation_details_state();
-        self.set_current_section_position(index.min(len - 1));
+        let previous = self.current_section_position().min(len - 1);
+        let next = index.min(len - 1);
+        self.set_current_section_position(next);
         self.set_current_selected_position(0);
         self.clear_current_list_scroll_offset();
         self.focus = FocusTarget::Sections;
@@ -9533,6 +16862,12 @@ impl AppState {
         self.comment_search_query.clear();
         self.global_search_active = false;
         self.status = "Sections focused".to_string();
+        debug!(
+            from_index = previous,
+            to_index = next,
+            view = %self.active_view,
+            "ui section selected"
+        );
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -9545,7 +16880,8 @@ impl AppState {
         }
         self.save_current_conversation_details_state();
         let current = self.current_selected_position().min(len - 1);
-        self.set_current_selected_position(move_bounded(current, len, delta));
+        let next = move_bounded(current, len, delta);
+        self.set_current_selected_position(next);
         self.clear_current_list_scroll_offset();
         self.details_scroll = 0;
         self.selected_comment_index = 0;
@@ -9554,10 +16890,19 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.comment_search_query.clear();
+        debug!(
+            from_index = current,
+            to_index = next,
+            delta,
+            view = %self.active_view,
+            section = self.current_section().map(|section| section.title.as_str()).unwrap_or(""),
+            "ui list selection moved"
+        );
     }
 
     fn set_selection(&mut self, index: usize) {
         self.save_current_conversation_details_state();
+        let previous = self.current_selected_position();
         self.set_current_selected_position(index);
         self.clear_current_list_scroll_offset();
         self.details_scroll = 0;
@@ -9568,6 +16913,13 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_search_query.clear();
         self.clamp_positions();
+        debug!(
+            from_index = previous,
+            to_index = self.current_selected_position(),
+            view = %self.active_view,
+            section = self.current_section().map(|section| section.title.as_str()).unwrap_or(""),
+            "ui list selection set"
+        );
     }
 
     fn scroll_list_viewport(&mut self, area: Rect, delta: isize) {
@@ -9596,6 +16948,7 @@ impl AppState {
             self.status = "diff still loading".to_string();
             return;
         };
+        self.save_current_diff_file_details_scroll();
         if count == 0 {
             self.selected_diff_file.insert(item_id.clone(), 0);
             self.selected_diff_line.insert(item_id.clone(), 0);
@@ -9606,10 +16959,11 @@ impl AppState {
         }
 
         let next = index.min(count - 1);
+        let previous = self.selected_diff_file.get(&item_id).copied().unwrap_or(0);
         self.selected_diff_file.insert(item_id.clone(), next);
         self.selected_diff_line.insert(item_id.clone(), 0);
         self.diff_mark.remove(&item_id);
-        self.details_scroll = 0;
+        self.restore_selected_diff_file_details_scroll(&item_id, 0);
         let position = self
             .current_diff_file_order()
             .and_then(|order| {
@@ -9620,6 +16974,14 @@ impl AppState {
             })
             .unwrap_or(next + 1);
         self.status = format!("file {position}/{count} focused");
+        debug!(
+            item_id = %item_id,
+            from_index = previous,
+            to_index = next,
+            position,
+            count,
+            "ui diff file selected"
+        );
     }
 
     fn select_diff_line(&mut self, index: usize, area: Option<Rect>) {
@@ -9969,6 +17331,7 @@ impl AppState {
     }
 
     fn focus_details(&mut self) {
+        let previous_focus = self.focus;
         if self.current_item().is_some() {
             if self.details_mode == DetailsMode::Conversation {
                 self.restore_current_conversation_details_state();
@@ -9984,6 +17347,13 @@ impl AppState {
                 self.mark_current_details_viewed();
             }
             self.status = "details focused".to_string();
+            debug!(
+                from = ?previous_focus,
+                to = ?self.focus,
+                mode = ?self.details_mode,
+                item_id = self.current_item().map(|item| item.id.as_str()).unwrap_or(""),
+                "ui focus changed"
+            );
         } else {
             self.status = "nothing to focus".to_string();
         }
@@ -10021,6 +17391,8 @@ impl AppState {
         }
 
         let item_id = item.id.clone();
+        let previous_mode = self.details_mode;
+        let previous_focus = self.focus;
         self.save_current_conversation_details_state();
         let loading = !self.diffs.contains_key(&item_id);
         let saved_diff_state = self.diff_mode_state.get(&item_id).cloned();
@@ -10046,6 +17418,7 @@ impl AppState {
             .as_ref()
             .map(|saved| saved.details_scroll)
             .unwrap_or(0);
+        self.restore_selected_diff_file_details_scroll(&item_id, self.details_scroll);
         self.search_active = false;
         self.comment_search_active = false;
         self.comment_search_query.clear();
@@ -10057,9 +17430,19 @@ impl AppState {
         } else {
             "files focused".to_string()
         };
+        debug!(
+            item_id = %item_id,
+            from_mode = ?previous_mode,
+            to_mode = ?self.details_mode,
+            from_focus = ?previous_focus,
+            to_focus = ?self.focus,
+            loading,
+            "ui diff mode opened"
+        );
     }
 
     fn leave_diff(&mut self) {
+        let previous_focus = self.focus;
         self.save_current_diff_mode_state();
         self.details_mode = DetailsMode::Conversation;
         self.search_active = false;
@@ -10080,6 +17463,11 @@ impl AppState {
             self.details_scroll = 0;
         }
         self.status = "returned from diff".to_string();
+        debug!(
+            from_focus = ?previous_focus,
+            to_focus = ?self.focus,
+            "ui diff mode closed"
+        );
     }
 
     fn save_current_diff_mode_state(&mut self) {
@@ -10089,6 +17477,7 @@ impl AppState {
         let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
             return;
         };
+        self.save_current_diff_file_details_scroll();
         self.diff_mode_state.insert(
             item_id.clone(),
             DiffModeState {
@@ -10130,6 +17519,7 @@ impl AppState {
     }
 
     fn focus_list(&mut self) {
+        let previous_focus = self.focus;
         self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         self.status = if self.details_mode == DetailsMode::Diff {
@@ -10137,6 +17527,12 @@ impl AppState {
         } else {
             "list focused".to_string()
         };
+        debug!(
+            from = ?previous_focus,
+            to = ?self.focus,
+            mode = ?self.details_mode,
+            "ui focus changed"
+        );
     }
 
     fn scroll_details(&mut self, delta: i16) {
@@ -10148,9 +17544,15 @@ impl AppState {
     }
 
     fn select_comment(&mut self, index: usize) {
+        let previous = self.selected_comment_index;
         self.selected_comment_index = index;
         self.clamp_selected_comment();
         self.status = format!("comment {} focused", self.selected_comment_index + 1);
+        debug!(
+            from_index = previous,
+            to_index = self.selected_comment_index,
+            "ui comment selected"
+        );
     }
 
     fn move_comment(&mut self, delta: isize) {
@@ -10166,17 +17568,25 @@ impl AppState {
             self.status = "no comments".to_string();
             return;
         }
-        let current_position = order
+        let next_position = match order
             .iter()
             .position(|index| *index == self.selected_comment_index)
-            .unwrap_or(0);
-        let next_position = move_bounded(current_position, order.len(), delta);
+        {
+            Some(position) => move_bounded(position, order.len(), delta),
+            None if delta < 0 => order.len() - 1,
+            None => 0,
+        };
         self.selected_comment_index = order[next_position];
         self.status = format!("comment {} focused", next_position + 1);
     }
 
     fn move_comment_in_view(&mut self, delta: isize, area: Option<Rect>) {
-        if self.move_comment_search_match(delta, area) {
+        if self.details_mode == DetailsMode::Conversation
+            && self.move_comment_search_match(delta, area)
+        {
+            return;
+        }
+        if self.move_rendered_comment(delta, area) {
             return;
         }
 
@@ -10187,6 +17597,36 @@ impl AppState {
         } else {
             self.scroll_selected_comment_into_view(area);
         }
+    }
+
+    fn move_rendered_comment(&mut self, delta: isize, area: Option<Rect>) -> bool {
+        let Some(area) = area else {
+            return false;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            return false;
+        }
+        let document = build_details_document(self, inner.width);
+        let order = document
+            .comments
+            .iter()
+            .map(|comment| comment.index)
+            .collect::<Vec<_>>();
+        if order.is_empty() {
+            self.status = "no comments".to_string();
+            return true;
+        }
+        let current_position = order
+            .iter()
+            .position(|index| *index == self.selected_comment_index)
+            .unwrap_or(0);
+        let next_position = move_bounded(current_position, order.len(), delta);
+        self.selected_comment_index = order[next_position];
+        self.status = format!("comment {}/{} focused", next_position + 1, order.len());
+        self.scroll_selected_comment_into_view(Some(area));
+        true
     }
 
     fn move_comment_search_match(&mut self, delta: isize, area: Option<Rect>) -> bool {
@@ -10258,9 +17698,6 @@ impl AppState {
     }
 
     fn scroll_selected_comment_into_view(&mut self, area: Option<Rect>) {
-        if self.details_mode != DetailsMode::Conversation {
-            return;
-        }
         let Some(area) = area else {
             return;
         };
@@ -10320,7 +17757,12 @@ impl AppState {
         focus_line >= viewport_start && focus_line < viewport_end
     }
 
-    fn handle_detail_action(&mut self, action: DetailAction, tx: Option<&UnboundedSender<AppMsg>>) {
+    fn handle_detail_action(
+        &mut self,
+        action: DetailAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         match action {
             DetailAction::ReplyComment(index) => {
                 self.select_comment(index);
@@ -10339,8 +17781,14 @@ impl AppState {
                 self.select_comment(index);
                 self.start_comment_reaction_dialog(index);
             }
-            DetailAction::AddLabel => self.start_add_label_dialog(tx),
+            DetailAction::AddLabel => self.start_add_label_dialog_with_store(store, tx),
             DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
+            DetailAction::AssignAssignee => {
+                self.start_assignee_dialog_with_store(AssigneeAction::Assign, store, tx)
+            }
+            DetailAction::UnassignAssignee => {
+                self.start_assignee_dialog_with_store(AssigneeAction::Unassign, store, tx)
+            }
         }
     }
 
@@ -10362,7 +17810,11 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
@@ -10401,7 +17853,11 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
         self.pr_action_dialog = None;
+        self.assignee_dialog = None;
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
@@ -10489,7 +17945,906 @@ impl AppState {
         }
     }
 
+    fn start_close_or_reopen_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        let action = match close_or_reopen_action_for_item(&item) {
+            Ok(action) => action,
+            Err(message) => {
+                self.status = message.to_string();
+                return;
+            }
+        };
+        self.start_item_action_dialog(item, action);
+    }
+
     fn start_pr_action_dialog(&mut self, action: PrAction) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        self.start_item_action_dialog(item, action);
+    }
+
+    fn start_item_action_dialog(&mut self, item: WorkItem, action: PrAction) {
+        if pr_action_requires_open_pull_request(action) && !item_is_open_pull_request(&item) {
+            self.status = "selected pull request is not open".to_string();
+            return;
+        }
+        let summary = match self.pr_action_dialog_summary(&item, action) {
+            Ok(summary) => summary,
+            Err((title, body, status)) => {
+                self.status = status;
+                self.message_dialog = Some(message_dialog(title, body));
+                return;
+            }
+        };
+        let item_kind = item.kind;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.reviewer_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action,
+            checkout: None,
+            summary,
+            merge_method: MergeMethod::default(),
+        });
+        self.pr_action_running = false;
+        self.status = if action == PrAction::Merge {
+            "confirm pull request merge (method: merge)".to_string()
+        } else {
+            pr_action_confirm_status(action, item_kind)
+        };
+    }
+
+    fn start_pr_checkout_dialog(&mut self, config: &Config) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+
+        let directory = match resolve_pr_checkout_directory(config, &item.repo) {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.message_dialog = Some(message_dialog("Checkout Unavailable", error));
+                self.status = "pull request checkout unavailable".to_string();
+                return;
+            }
+        };
+        let branch = self
+            .action_hints
+            .get(&item.id)
+            .and_then(|state| match state {
+                ActionHintState::Loaded(hints) => hints.head.clone(),
+                _ => None,
+            });
+
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.reviewer_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.pr_action_dialog = Some(PrActionDialog {
+            item,
+            action: PrAction::Checkout,
+            checkout: Some(PrCheckoutPlan { directory, branch }),
+            summary: Vec::new(),
+            merge_method: MergeMethod::default(),
+        });
+        self.pr_action_running = false;
+        self.status = "confirm local pull request checkout".to_string();
+    }
+
+    fn start_pr_draft_ready_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        if !item_is_open_pull_request(&item) {
+            self.status = "selected pull request is not open".to_string();
+            return;
+        }
+
+        let action = if item_is_draft_pull_request(&item) {
+            PrAction::MarkReadyForReview
+        } else {
+            PrAction::ConvertToDraft
+        };
+        self.start_pr_action_dialog(action);
+    }
+
+    fn pr_action_dialog_summary(
+        &self,
+        item: &WorkItem,
+        action: PrAction,
+    ) -> Result<PrActionDialogSummary, PrActionDialogSummaryError> {
+        if action != PrAction::RerunFailedChecks {
+            return Ok(Vec::new());
+        }
+
+        match self.action_hints.get(&item.id) {
+            Some(ActionHintState::Loaded(hints)) => match &hints.checks {
+                Some(checks) if checks.failed == 0 => Err((
+                    "No Failed Checks",
+                    "This pull request has no failed checks in the latest loaded action hints. Refresh if checks changed.".to_string(),
+                    "no failed checks to rerun".to_string(),
+                )),
+                Some(checks) => {
+                    let mut summary =
+                        vec![("failed checks", format!("{} of {}", checks.failed, checks.total))];
+                    if hints.failed_check_runs.is_empty() {
+                        summary.push((
+                            "workflow runs",
+                            "not mapped in loaded hints; ghr will query latest PR checks before rerunning".to_string(),
+                        ));
+                    } else {
+                        summary.push((
+                            "workflow runs",
+                            failed_check_runs_summary(&hints.failed_check_runs),
+                        ));
+                    }
+                    Ok(summary)
+                }
+                None => Ok(vec![(
+                    "checks",
+                    "not loaded; ghr will query latest PR checks before rerunning".to_string(),
+                )]),
+            },
+            Some(ActionHintState::Loading) | None => Ok(vec![(
+                "checks",
+                "loading; ghr will query latest PR checks before rerunning".to_string(),
+            )]),
+            Some(ActionHintState::Error(error)) => Ok(vec![(
+                "checks",
+                format!("hints unavailable ({error}); ghr will query latest PR checks"),
+            )]),
+        }
+    }
+
+    fn start_item_edit_dialog(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !item_supports_metadata_edit(&item) {
+            self.status = "selected item is not an issue or pull request".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.pr_action_dialog = None;
+        self.milestone_dialog = None;
+        self.item_edit_dialog = Some(ItemEditDialog { item });
+        self.status = "choose title or body to edit".to_string();
+    }
+
+    fn handle_item_edit_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.item_edit_dialog = None;
+                self.status = "edit cancelled".to_string();
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                self.start_item_metadata_editor(ItemEditField::Title);
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.start_item_metadata_editor(ItemEditField::Body);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_item_metadata_editor(&mut self, field: ItemEditField) {
+        let Some(dialog) = self.item_edit_dialog.take() else {
+            return;
+        };
+        let value = match field {
+            ItemEditField::Title => dialog.item.title,
+            ItemEditField::Body => dialog.item.body.unwrap_or_default(),
+        };
+        self.focus = FocusTarget::Details;
+        self.comment_dialog = Some(CommentDialog {
+            mode: CommentDialogMode::ItemMetadata { field },
+            body: value,
+            scroll: 0,
+        });
+        self.scroll_comment_dialog_to_cursor();
+        self.status = format!("editing {}", field.label());
+    }
+
+    fn handle_pr_action_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        self.handle_pr_action_dialog_key_with_submit(
+            key,
+            |item, action, checkout, merge_method| {
+                start_pr_action(
+                    item,
+                    action,
+                    checkout,
+                    merge_method,
+                    config.clone(),
+                    store.clone(),
+                    tx.clone(),
+                );
+            },
+        );
+    }
+
+    fn handle_pr_action_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, PrAction, Option<PrCheckoutPlan>, Option<MergeMethod>),
+    {
+        if self.pr_action_running {
+            self.status = "item action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pr_action_dialog = None;
+                self.status = "item action cancelled".to_string();
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(action) = self.pr_action_dialog.as_ref().map(|dialog| dialog.action) {
+                    self.submit_pr_action(action, &mut submit);
+                }
+            }
+            KeyCode::Tab => self.cycle_merge_method(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.select_merge_method(MergeMethod::Merge),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.select_merge_method(MergeMethod::Squash)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.select_merge_method(MergeMethod::Rebase)
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_pr_action<F>(&mut self, action: PrAction, submit: &mut F)
+    where
+        F: FnMut(WorkItem, PrAction, Option<PrCheckoutPlan>, Option<MergeMethod>),
+    {
+        let Some(dialog) = &self.pr_action_dialog else {
+            return;
+        };
+        let item = dialog.item.clone();
+        let checkout = dialog.checkout.clone();
+        let merge_method = (action == PrAction::Merge).then_some(dialog.merge_method);
+        self.pr_action_running = true;
+        self.status = if action == PrAction::Merge {
+            format!(
+                "merging pull request with {}",
+                merge_method.unwrap_or_default().label()
+            )
+        } else {
+            pr_action_running_status(action, item.kind)
+        };
+        submit(item, action, checkout, merge_method);
+    }
+
+    fn select_merge_method(&mut self, method: MergeMethod) {
+        let Some(dialog) = &mut self.pr_action_dialog else {
+            return;
+        };
+        if dialog.action != PrAction::Merge {
+            return;
+        }
+        dialog.merge_method = method;
+        self.status = format!("merge method: {}", method.label());
+    }
+
+    fn cycle_merge_method(&mut self) {
+        let Some(method) = self
+            .pr_action_dialog
+            .as_ref()
+            .filter(|dialog| dialog.action == PrAction::Merge)
+            .map(|dialog| dialog.merge_method.next())
+        else {
+            return;
+        };
+        self.select_merge_method(method);
+    }
+
+    fn start_review_submit_dialog(&mut self, event: PullRequestReviewEvent) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+
+        let (mode, body) = self
+            .pending_reviews
+            .get(&item.id)
+            .map(|pending| {
+                (
+                    ReviewSubmitMode::Pending {
+                        review_id: pending.review_id,
+                    },
+                    pending.body.clone(),
+                )
+            })
+            .unwrap_or((ReviewSubmitMode::New, String::new()));
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.pr_action_dialog = None;
+        self.comment_dialog = None;
+        self.review_submit_dialog = Some(ReviewSubmitDialog {
+            item,
+            event,
+            body,
+            scroll: 0,
+            mode,
+        });
+        self.scroll_review_submit_dialog_to_cursor();
+        self.status = match mode {
+            ReviewSubmitMode::New => format!("review summary: {}", event.label()),
+            ReviewSubmitMode::Pending { .. } => {
+                format!("pending review summary: {}", event.label())
+            }
+        };
+    }
+
+    fn handle_review_submit_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        let tx = tx.clone();
+        self.handle_review_submit_dialog_key_with_submit(
+            key,
+            area,
+            {
+                let tx = tx.clone();
+                move |pending| match pending.mode {
+                    ReviewSubmitMode::New => {
+                        start_review_submit(pending.item, pending.event, pending.body, tx.clone());
+                    }
+                    ReviewSubmitMode::Pending { review_id } => {
+                        start_pending_review_submit(
+                            pending.item,
+                            review_id,
+                            pending.event,
+                            pending.body,
+                            tx.clone(),
+                        );
+                    }
+                }
+            },
+            move |item, body| {
+                start_review_draft_create(item, body, tx.clone());
+            },
+        );
+    }
+
+    fn handle_review_submit_dialog_key_with_submit<F, G>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+        mut create_pending: G,
+    ) where
+        F: FnMut(PendingReviewSubmit),
+        G: FnMut(WorkItem, String),
+    {
+        if self.review_submit_running {
+            self.status = "review action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.review_submit_dialog = None;
+                self.status = "review cancelled".to_string();
+            }
+            KeyCode::Tab => self.cycle_review_submit_event(),
+            KeyCode::Char('1') => self.set_review_submit_event(PullRequestReviewEvent::Comment),
+            KeyCode::Char('2') => {
+                self.set_review_submit_event(PullRequestReviewEvent::RequestChanges)
+            }
+            KeyCode::Char('3') => self.set_review_submit_event(PullRequestReviewEvent::Approve),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.create_pending_review_from_dialog(area, &mut create_pending)
+            }
+            KeyCode::PageDown => self.scroll_review_submit_dialog(6, area),
+            KeyCode::PageUp => self.scroll_review_submit_dialog(-6, area),
+            _ if is_comment_submit_key(key) => {
+                if let Some(pending) = self.prepare_review_submit() {
+                    submit(pending);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.push('\n');
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.pop();
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.review_submit_dialog {
+                    dialog.body.push(value);
+                }
+                self.scroll_review_submit_dialog_to_cursor_in_area(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_review_submit_event(&mut self) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        dialog.event = dialog.event.next();
+        self.status = format!("review event: {}", dialog.event.label());
+    }
+
+    fn set_review_submit_event(&mut self, event: PullRequestReviewEvent) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        dialog.event = event;
+        self.status = format!("review event: {}", event.label());
+    }
+
+    fn create_pending_review_from_dialog<G>(&mut self, area: Option<Rect>, create_pending: &mut G)
+    where
+        G: FnMut(WorkItem, String),
+    {
+        let Some(dialog) = self.review_submit_dialog.take() else {
+            return;
+        };
+        let body = dialog.body.trim().to_string();
+        let item = dialog.item.clone();
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.review_submit_dialog = Some(dialog);
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Creating Pending Review",
+            "Waiting for GitHub to create the pending review...",
+        ));
+        self.status = "creating pending review".to_string();
+        create_pending(item, body);
+        self.scroll_review_submit_dialog_to_cursor_in_area(area);
+    }
+
+    fn prepare_review_submit(&mut self) -> Option<PendingReviewSubmit> {
+        let dialog = self.review_submit_dialog.take()?;
+        let body = dialog.body.trim().to_string();
+        if dialog.event.requires_body() && body.is_empty() {
+            let event = dialog.event;
+            self.review_submit_dialog = Some(dialog);
+            self.status = format!("{} review needs a summary", event.label());
+            return None;
+        }
+        if dialog.item.kind != ItemKind::PullRequest || dialog.item.number.is_none() {
+            self.review_submit_dialog = Some(dialog);
+            self.status = "selected item is not a pull request".to_string();
+            return None;
+        }
+        let event = dialog.event;
+        let mode = dialog.mode;
+        let item = dialog.item;
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Submitting Review",
+            format!("Waiting for GitHub to {}...", event.label()),
+        ));
+        self.status = match mode {
+            ReviewSubmitMode::New => format!("submitting review: {}", event.label()),
+            ReviewSubmitMode::Pending { .. } => {
+                format!("submitting pending review: {}", event.label())
+            }
+        };
+        Some(PendingReviewSubmit {
+            item,
+            event,
+            body,
+            mode,
+        })
+    }
+
+    fn discard_pending_review(&mut self, tx: &UnboundedSender<AppMsg>) {
+        self.discard_pending_review_with_submit(|item, review_id| {
+            start_pending_review_discard(item, review_id, tx.clone());
+        });
+    }
+
+    fn discard_pending_review_with_submit<F>(&mut self, mut submit: F)
+    where
+        F: FnMut(WorkItem, u64),
+    {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "selected item is not a pull request".to_string();
+            return;
+        }
+        let Some(pending) = self.pending_reviews.get(&item.id).cloned() else {
+            self.status = "no pending review to discard".to_string();
+            return;
+        };
+        if self.review_submit_running {
+            self.status = "review action already running".to_string();
+            return;
+        }
+        self.review_submit_dialog = None;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_running = true;
+        self.message_dialog = Some(message_dialog(
+            "Discarding Pending Review",
+            "Waiting for GitHub to discard the pending review...",
+        ));
+        self.status = "discarding pending review".to_string();
+        submit(item, pending.review_id);
+    }
+
+    fn scroll_review_submit_dialog(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.review_submit_dialog else {
+            return;
+        };
+        let (width, height) = review_submit_editor_size(dialog, area);
+        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        if delta < 0 {
+            dialog.scroll = dialog.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.scroll = dialog.scroll.saturating_add(delta as u16);
+        }
+        dialog.scroll = dialog.scroll.min(max_scroll);
+    }
+
+    fn scroll_review_submit_dialog_to_cursor(&mut self) {
+        self.scroll_review_submit_dialog_to_cursor_in_area(None);
+    }
+
+    fn scroll_review_submit_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.review_submit_dialog {
+            let (width, height) = review_submit_editor_size(dialog, area);
+            dialog.scroll =
+                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.scroll);
+        }
+    }
+
+    fn start_milestone_dialog(&mut self, tx: &UnboundedSender<AppMsg>) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+            self.status = "selected item is not an issue or pull request".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.pr_action_dialog = None;
+        self.milestone_dialog = Some(MilestoneDialog {
+            item: item.clone(),
+            state: MilestoneDialogState::Loading,
+            input: String::new(),
+            selected: 0,
+        });
+        self.milestone_action_running = false;
+        self.status = "loading milestones".to_string();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            start_milestones_load(item, tx.clone());
+        }
+    }
+
+    fn handle_milestone_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        self.handle_milestone_dialog_key_with_submit(key, |item, choice| {
+            start_milestone_change(item, choice, config.clone(), store.clone(), tx.clone());
+        });
+    }
+
+    fn handle_milestone_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, MilestoneChoice),
+    {
+        if self.milestone_action_running {
+            self.status = "milestone change already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.milestone_dialog = None;
+                self.status = "milestone change cancelled".to_string();
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = self.milestone_dialog.as_mut() {
+                    dialog.input.pop();
+                    reset_milestone_dialog_selection(dialog);
+                }
+            }
+            KeyCode::Down => self.move_milestone_choice(1),
+            KeyCode::Up => self.move_milestone_choice(-1),
+            KeyCode::Enter => self.submit_milestone_choice(&mut submit),
+            KeyCode::Char(value) if !value.is_control() => {
+                if let Some(dialog) = self.milestone_dialog.as_mut() {
+                    dialog.input.push(value);
+                    reset_milestone_dialog_selection(dialog);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_milestone_choice(&mut self, delta: isize) {
+        let Some(dialog) = self.milestone_dialog.as_mut() else {
+            return;
+        };
+        let choices = milestone_choices(dialog);
+        if choices.is_empty() {
+            dialog.selected = 0;
+            return;
+        }
+        dialog.selected = move_bounded(dialog.selected, choices.len(), delta);
+    }
+
+    fn submit_milestone_choice<F>(&mut self, submit: &mut F)
+    where
+        F: FnMut(WorkItem, MilestoneChoice),
+    {
+        let Some(dialog) = self.milestone_dialog.as_ref() else {
+            return;
+        };
+        match &dialog.state {
+            MilestoneDialogState::Loading => {
+                self.status = "milestones still loading".to_string();
+            }
+            MilestoneDialogState::Error(_) => {
+                self.status = "milestones failed to load".to_string();
+            }
+            MilestoneDialogState::Loaded(_) => {
+                let choices = milestone_choices(dialog);
+                let Some(choice) = choices.get(dialog.selected).cloned() else {
+                    self.status = "no milestone matches prefix".to_string();
+                    return;
+                };
+                let item = dialog.item.clone();
+                self.milestone_action_running = true;
+                self.status = match &choice {
+                    MilestoneChoice::Clear => "clearing milestone".to_string(),
+                    MilestoneChoice::Set(_) => "changing milestone".to_string(),
+                    MilestoneChoice::Create(_) => "creating milestone".to_string(),
+                };
+                submit(item, choice);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn start_assignee_dialog(
+        &mut self,
+        action: AssigneeAction,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
+        self.start_assignee_dialog_with_store(action, None, tx);
+    }
+
+    fn start_assignee_dialog_with_store(
+        &mut self,
+        action: AssigneeAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+            self.status = "selected item cannot have assignees".to_string();
+            return;
+        }
+        if action == AssigneeAction::Unassign && item.assignees.is_empty() {
+            self.status = "selected item has no assignees".to_string();
+            return;
+        }
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.pr_action_dialog = None;
+        let repo = item.repo.clone();
+        let cached_suggestions = (action == AssigneeAction::Assign)
+            .then(|| self.assignee_suggestions_cache.get(&repo).cloned())
+            .flatten();
+        let has_cached_suggestions = cached_suggestions.is_some();
+        self.assignee_dialog = Some(AssigneeDialog {
+            item,
+            action,
+            input: String::new(),
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
+            suggestions_error: None,
+            selected_suggestion: 0,
+        });
+        self.assignee_action_running = false;
+        let suggestions_refreshing = action == AssigneeAction::Assign
+            && tx
+                .map(|tx| start_assignee_suggestions_load(repo, store.cloned(), tx.clone()))
+                .unwrap_or(false);
+        if let Some(dialog) = &mut self.assignee_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
+        }
+        self.status = match action {
+            AssigneeAction::Assign if has_cached_suggestions && suggestions_refreshing => {
+                "assignee candidates cached; refreshing".to_string()
+            }
+            AssigneeAction::Assign if suggestions_refreshing => {
+                "loading assignee candidates".to_string()
+            }
+            AssigneeAction::Assign => "enter assignee to add".to_string(),
+            AssigneeAction::Unassign => "enter assignee to remove".to_string(),
+        };
+    }
+
+    fn handle_assignee_dialog_key(&mut self, key: KeyEvent, tx: &UnboundedSender<AppMsg>) {
+        let tx = tx.clone();
+        self.handle_assignee_dialog_key_with_submit(key, move |item, action, assignees| {
+            start_assignee_update(item, action, assignees, tx.clone());
+        });
+    }
+
+    fn handle_assignee_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    where
+        F: FnMut(WorkItem, AssigneeAction, Vec<String>),
+    {
+        if self.assignee_action_running {
+            self.status = "assignee action already running".to_string();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.assignee_dialog = None;
+                self.status = "assignee action cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                self.submit_assignee_action(&mut submit);
+            }
+            KeyCode::Down | KeyCode::Tab => self.move_assignee_suggestion(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_assignee_suggestion(-1),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.assignee_dialog {
+                    dialog.input.pop();
+                    dialog.selected_suggestion = 0;
+                    clamp_assignee_dialog_selection(dialog);
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.assignee_dialog {
+                    dialog.input.push(value);
+                    dialog.selected_suggestion = 0;
+                    clamp_assignee_dialog_selection(dialog);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_assignee_action<F>(&mut self, submit: &mut F)
+    where
+        F: FnMut(WorkItem, AssigneeAction, Vec<String>),
+    {
+        let Some(dialog) = &self.assignee_dialog else {
+            return;
+        };
+        let assignees = assignee_dialog_submit_logins(dialog);
+        if assignees.is_empty() {
+            self.status = "assignee login is empty".to_string();
+            return;
+        }
+        let item = dialog.item.clone();
+        let action = dialog.action;
+        self.assignee_action_running = true;
+        self.status = match action {
+            AssigneeAction::Assign => "assigning assignee".to_string(),
+            AssigneeAction::Unassign => "removing assignee".to_string(),
+        };
+        submit(item, action, assignees);
+    }
+
+    fn move_assignee_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.assignee_dialog else {
+            return;
+        };
+        let count = assignee_dialog_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no assignee candidates match".to_string();
+            return;
+        }
+        dialog.selected_suggestion = move_wrapping(dialog.selected_suggestion, count, delta);
+        let login = assignee_dialog_suggestion_matches(dialog)
+            .get(dialog.selected_suggestion)
+            .cloned()
+            .unwrap_or_else(|| dialog.input.trim().to_string());
+        self.status = format!("selected assignee candidate: {login}");
+    }
+
+    #[cfg(test)]
+    fn start_reviewer_dialog(&mut self, action: ReviewerAction) {
+        self.start_reviewer_dialog_with_store(action, None, None);
+    }
+
+    fn start_reviewer_dialog_with_store(
+        &mut self,
+        action: ReviewerAction,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -10502,68 +18857,137 @@ impl AppState {
         self.global_search_active = false;
         self.comment_search_active = false;
         self.comment_dialog = None;
-        self.label_dialog = None;
-        self.issue_dialog = None;
-        self.reaction_dialog = None;
-        self.pr_action_dialog = Some(PrActionDialog { item, action });
-        self.pr_action_running = false;
-        self.status = match action {
-            PrAction::Merge => "confirm pull request merge".to_string(),
-            PrAction::Close => "confirm pull request close".to_string(),
-            PrAction::Approve => "confirm pull request approval".to_string(),
+        self.pr_action_dialog = None;
+        let repo = item.repo.clone();
+        let cached_suggestions = self
+            .reviewer_suggestions_cache
+            .get(&repo)
+            .cloned()
+            .or_else(|| self.assignee_suggestions_cache.get(&repo).cloned());
+        let has_cached_suggestions = cached_suggestions.is_some();
+        self.reviewer_dialog = Some(ReviewerDialog {
+            item,
+            action,
+            input: String::new(),
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
+            suggestions_error: None,
+            selected_suggestion: 0,
+        });
+        self.reviewer_action_running = false;
+        let suggestions_refreshing = tx
+            .map(|tx| start_reviewer_suggestions_load(repo, store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        if let Some(dialog) = &mut self.reviewer_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
+        }
+        self.status = match (action, has_cached_suggestions, suggestions_refreshing) {
+            (ReviewerAction::Request, true, true) => {
+                "reviewer candidates cached; refreshing".to_string()
+            }
+            (ReviewerAction::Remove, true, true) => {
+                "reviewer candidates cached; refreshing".to_string()
+            }
+            (ReviewerAction::Request, _, true) => "loading reviewer candidates".to_string(),
+            (ReviewerAction::Remove, _, true) => "loading reviewer candidates".to_string(),
+            (ReviewerAction::Request, _, _) => "enter reviewer logins to request".to_string(),
+            (ReviewerAction::Remove, _, _) => "enter reviewer logins to remove".to_string(),
         };
     }
 
-    fn handle_pr_action_dialog_key(
+    fn handle_reviewer_dialog_key(
         &mut self,
         key: KeyEvent,
         config: &Config,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        self.handle_pr_action_dialog_key_with_submit(key, |item, action| {
-            start_pr_action(item, action, config.clone(), store.clone(), tx.clone());
+        self.handle_reviewer_dialog_key_with_submit(key, |item, action, reviewers| {
+            start_reviewer_action(
+                item,
+                action,
+                reviewers,
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+            );
         });
     }
 
-    fn handle_pr_action_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
+    fn handle_reviewer_dialog_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
     where
-        F: FnMut(WorkItem, PrAction),
+        F: FnMut(WorkItem, ReviewerAction, Vec<String>),
     {
-        if self.pr_action_running {
-            self.status = "pull request action already running".to_string();
+        if self.reviewer_action_running {
+            self.status = "reviewer action already running".to_string();
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                self.pr_action_dialog = None;
-                self.status = "pull request action cancelled".to_string();
+                self.reviewer_dialog = None;
+                self.status = "reviewer action cancelled".to_string();
             }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(action) = self.pr_action_dialog.as_ref().map(|dialog| dialog.action) {
-                    self.submit_pr_action(action, &mut submit);
+            KeyCode::Enter => {
+                if let Some((item, action, reviewers)) = self.prepare_reviewer_submit() {
+                    submit(item, action, reviewers);
+                }
+            }
+            KeyCode::Up => self.move_reviewer_suggestion(-1),
+            KeyCode::Down => self.move_reviewer_suggestion(1),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.reviewer_dialog {
+                    dialog.input.pop();
+                    clamp_reviewer_dialog_selection(dialog);
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.reviewer_dialog {
+                    dialog.input.push(value);
+                    dialog.selected_suggestion = 0;
+                    clamp_reviewer_dialog_selection(dialog);
                 }
             }
             _ => {}
         }
     }
 
-    fn submit_pr_action<F>(&mut self, action: PrAction, submit: &mut F)
-    where
-        F: FnMut(WorkItem, PrAction),
-    {
-        let Some(dialog) = &self.pr_action_dialog else {
+    fn move_reviewer_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.reviewer_dialog else {
             return;
         };
-        let item = dialog.item.clone();
-        self.pr_action_running = true;
-        self.status = match action {
-            PrAction::Merge => "merging pull request".to_string(),
-            PrAction::Close => "closing pull request".to_string(),
-            PrAction::Approve => "approving pull request".to_string(),
+        let count = reviewer_dialog_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no reviewer candidates match".to_string();
+            return;
+        }
+        dialog.selected_suggestion = move_wrapping(dialog.selected_suggestion, count, delta);
+        let login = reviewer_dialog_suggestion_matches(dialog)
+            .get(dialog.selected_suggestion)
+            .cloned()
+            .unwrap_or_else(|| dialog.input.trim().to_string());
+        self.status = format!("selected reviewer candidate: {login}");
+    }
+
+    fn prepare_reviewer_submit(&mut self) -> Option<(WorkItem, ReviewerAction, Vec<String>)> {
+        let Some(dialog) = &self.reviewer_dialog else {
+            return None;
         };
-        submit(item, action);
+        let reviewers = reviewer_dialog_submit_logins(dialog);
+        if reviewers.is_empty() {
+            self.status = "enter at least one reviewer login".to_string();
+            return None;
+        }
+        let item = dialog.item.clone();
+        let action = dialog.action;
+        self.reviewer_action_running = true;
+        self.status = match action {
+            ReviewerAction::Request => format!("requesting review from {}", reviewers.join(", ")),
+            ReviewerAction::Remove => {
+                format!("removing review requests for {}", reviewers.join(", "))
+            }
+        };
+        Some((item, action, reviewers))
     }
 
     fn start_new_comment_dialog(&mut self) {
@@ -10575,10 +18999,15 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
             body: String::new(),
@@ -10603,10 +19032,14 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
@@ -10642,10 +19075,14 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
@@ -10688,10 +19125,14 @@ impl AppState {
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.pr_action_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
@@ -10734,10 +19175,22 @@ impl AppState {
             PendingCommentMode::Review { target } => {
                 start_review_comment_submit(submit.item, target, submit.body, tx.clone());
             }
+            PendingCommentMode::ItemMetadata { field } => {
+                start_item_metadata_edit(submit.item, field, submit.body, tx.clone());
+            }
         });
     }
 
+    #[cfg(test)]
     fn start_add_label_dialog(&mut self, tx: Option<&UnboundedSender<AppMsg>>) {
+        self.start_add_label_dialog_with_store(None, tx);
+    }
+
+    fn start_add_label_dialog_with_store(
+        &mut self,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -10747,13 +19200,14 @@ impl AppState {
             return;
         };
         let repo = item.repo.clone();
-        let suggestions_loading = tx.is_some();
+        let cached_suggestions = self.label_suggestions_cache.get(&repo).cloned();
+        let has_cached_suggestions = cached_suggestions.is_some();
         self.label_dialog = Some(LabelDialog {
             mode: LabelDialogMode::Add { repo: repo.clone() },
             input: String::new(),
             existing_labels: item.labels,
-            suggestions: Vec::new(),
-            suggestions_loading,
+            suggestions: cached_suggestions.unwrap_or_default(),
+            suggestions_loading: false,
             suggestions_error: None,
             selected_suggestion: 0,
         });
@@ -10766,10 +19220,15 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.focus = FocusTarget::Details;
-        if let Some(tx) = tx {
-            start_label_suggestions_load(repo, tx.clone());
+        let suggestions_refreshing = tx
+            .map(|tx| start_label_suggestions_load(repo, store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        if let Some(dialog) = &mut self.label_dialog {
+            dialog.suggestions_loading = suggestions_refreshing && !has_cached_suggestions;
         }
-        self.status = if suggestions_loading {
+        self.status = if has_cached_suggestions && suggestions_refreshing {
+            "label suggestions cached; refreshing".to_string()
+        } else if suggestions_refreshing {
             "loading label suggestions".to_string()
         } else {
             "label input mode".to_string()
@@ -10933,6 +19392,7 @@ impl AppState {
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
+        self.pr_create_dialog = None;
         self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.issue_dialog = Some(IssueDialog {
@@ -10945,6 +19405,78 @@ impl AppState {
         });
         self.issue_creating = false;
         self.status = "new issue".to_string();
+    }
+
+    fn start_new_issue_or_pull_request_dialog(&mut self, config: &Config) {
+        if self.new_dialog_target_is_pull_request() {
+            self.start_new_pull_request_dialog(config);
+        } else {
+            self.start_new_issue_dialog();
+        }
+    }
+
+    fn new_dialog_target_is_pull_request(&self) -> bool {
+        if self.focus == FocusTarget::Details {
+            match self.current_item().map(|item| item.kind) {
+                Some(ItemKind::PullRequest) => return true,
+                Some(ItemKind::Issue) => return false,
+                _ => {}
+            }
+        }
+
+        self.current_section()
+            .is_some_and(|section| section.kind == SectionKind::PullRequests)
+    }
+
+    fn start_new_pull_request_dialog(&mut self, config: &Config) {
+        let Some(repo) = self.current_repo_scope() else {
+            self.status = "select a repo before creating a pull request".to_string();
+            return;
+        };
+        let Some(local_dir) = configured_local_dir_for_repo(config, &repo) else {
+            self.status =
+                format!("repo {repo} has no local_dir; set [[repos]].local_dir to create a PR");
+            return;
+        };
+        if let Err(error) = ensure_directory_tracks_repo(&local_dir, &repo) {
+            self.status = format!("local_dir cannot create PR: {error}");
+            return;
+        }
+        let branch = match current_git_branch_for_directory(&local_dir) {
+            Ok(branch) => branch,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        self.focus = FocusTarget::Details;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_create_dialog = None;
+        self.reaction_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
+        self.pr_create_dialog = Some(PrCreateDialog {
+            repo,
+            local_dir,
+            branch,
+            title: String::new(),
+            body: String::new(),
+            field: PrCreateField::Title,
+            body_scroll: 0,
+        });
+        self.pr_creating = false;
+        self.status = "new pull request".to_string();
     }
 
     fn handle_issue_dialog_key(
@@ -11102,12 +19634,168 @@ impl AppState {
         self.issue_creating = true;
         self.status = format!("creating issue in {repo}");
         self.message_dialog = Some(message_dialog("Creating Issue", "Waiting for GitHub..."));
-        Some(PendingIssueCreate {
+        let pending = PendingIssueCreate {
             repo,
             title,
             body,
             labels,
-        })
+            dialog,
+        };
+        self.pending_issue_create = Some(pending.clone());
+        Some(pending)
+    }
+
+    fn handle_pr_create_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        self.handle_pr_create_dialog_key_with_submit(key, area, |pending| {
+            start_pr_create(pending, tx.clone());
+        });
+    }
+
+    fn handle_pr_create_dialog_key_with_submit<F>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+    ) where
+        F: FnMut(PendingPrCreate),
+    {
+        if self.pr_creating {
+            return;
+        }
+
+        if is_comment_submit_key(key) {
+            if let Some(pending) = self.prepare_pr_create() {
+                submit(pending);
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pr_create_dialog = None;
+                self.status = "pull request creation cancelled".to_string();
+            }
+            KeyCode::Tab => self.move_pr_create_dialog_field(1),
+            KeyCode::BackTab => self.move_pr_create_dialog_field(-1),
+            KeyCode::PageDown => self.scroll_pr_create_dialog_body(6, area),
+            KeyCode::PageUp => self.scroll_pr_create_dialog_body(-6, area),
+            KeyCode::Enter => {
+                if self
+                    .pr_create_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.field == PrCreateField::Body)
+                {
+                    if let Some(dialog) = &mut self.pr_create_dialog {
+                        dialog.body.push('\n');
+                    }
+                    self.scroll_pr_create_dialog_to_cursor_in_area(area);
+                } else {
+                    self.move_pr_create_dialog_field(1);
+                }
+            }
+            KeyCode::Backspace => {
+                self.pop_pr_create_dialog_char();
+                self.scroll_pr_create_dialog_to_cursor_in_area(area);
+            }
+            KeyCode::Char(value) => {
+                self.push_pr_create_dialog_char(value);
+                self.scroll_pr_create_dialog_to_cursor_in_area(area);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_pr_create_dialog_field(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.pr_create_dialog {
+            dialog.field = dialog.field.next(delta);
+            self.status = match dialog.field {
+                PrCreateField::Title => "editing pull request title".to_string(),
+                PrCreateField::Body => "editing pull request body".to_string(),
+            };
+        }
+    }
+
+    fn push_pr_create_dialog_char(&mut self, value: char) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        match dialog.field {
+            PrCreateField::Title => dialog.title.push(value),
+            PrCreateField::Body => dialog.body.push(value),
+        }
+    }
+
+    fn pop_pr_create_dialog_char(&mut self) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        match dialog.field {
+            PrCreateField::Title => {
+                dialog.title.pop();
+            }
+            PrCreateField::Body => {
+                dialog.body.pop();
+            }
+        }
+    }
+
+    fn scroll_pr_create_dialog_body(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.pr_create_dialog else {
+            return;
+        };
+        let (width, height) = pr_create_dialog_body_editor_size(area);
+        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        if delta < 0 {
+            dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.body_scroll = dialog.body_scroll.saturating_add(delta as u16);
+        }
+        dialog.body_scroll = dialog.body_scroll.min(max_scroll);
+    }
+
+    fn scroll_pr_create_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.pr_create_dialog {
+            if dialog.field != PrCreateField::Body {
+                return;
+            }
+            let (width, height) = pr_create_dialog_body_editor_size(area);
+            dialog.body_scroll =
+                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.body_scroll);
+        }
+    }
+
+    fn prepare_pr_create(&mut self) -> Option<PendingPrCreate> {
+        let dialog = self.pr_create_dialog.take()?;
+        let title = dialog.title.trim().to_string();
+        let body = dialog.body.trim().to_string();
+
+        if title.is_empty() {
+            self.pr_create_dialog = Some(dialog);
+            self.status = "pull request title is empty".to_string();
+            return None;
+        }
+
+        self.pr_creating = true;
+        self.status = format!("creating pull request from {}", dialog.branch);
+        self.message_dialog = Some(message_dialog(
+            "Creating Pull Request",
+            "Waiting for GitHub...",
+        ));
+        let pending = PendingPrCreate {
+            repo: dialog.repo.clone(),
+            local_dir: dialog.local_dir.clone(),
+            branch: dialog.branch.clone(),
+            title,
+            body,
+            dialog,
+        };
+        self.pending_pr_create = Some(pending.clone());
+        Some(pending)
     }
 
     fn handle_comment_dialog_key_with_submit<F>(
@@ -11185,17 +19873,28 @@ impl AppState {
     fn prepare_comment_submit(&mut self) -> Option<PendingCommentSubmit> {
         let dialog = self.comment_dialog.take()?;
         let body = dialog.body.trim().to_string();
-        if body.is_empty() {
+        let empty_status = match dialog.mode {
+            CommentDialogMode::ItemMetadata {
+                field: ItemEditField::Title,
+            } => Some("title is empty"),
+            CommentDialogMode::ItemMetadata {
+                field: ItemEditField::Body,
+            } => None,
+            _ => Some("comment is empty"),
+        };
+        if body.is_empty()
+            && let Some(status) = empty_status
+        {
             self.comment_dialog = Some(dialog);
-            self.status = "comment is empty".to_string();
+            self.status = status.to_string();
             return None;
         }
         let Some(item) = self.current_item().cloned() else {
             self.comment_dialog = Some(dialog);
-            self.status = "nothing to comment on".to_string();
+            self.status = "nothing selected".to_string();
             return None;
         };
-        let mode = match dialog.mode {
+        let mode = match dialog.mode.clone() {
             CommentDialogMode::New => PendingCommentMode::Post,
             CommentDialogMode::Reply {
                 review_comment_id: Some(comment_id),
@@ -11212,6 +19911,7 @@ impl AppState {
                 is_review,
             },
             CommentDialogMode::Review { target } => PendingCommentMode::Review { target },
+            CommentDialogMode::ItemMetadata { field } => PendingCommentMode::ItemMetadata { field },
         };
         self.posting_comment = true;
         self.message_dialog = Some(comment_pending_dialog(&mode));
@@ -11220,8 +19920,16 @@ impl AppState {
             PendingCommentMode::ReviewReply { .. } => "posting review reply".to_string(),
             PendingCommentMode::Edit { .. } => "updating comment".to_string(),
             PendingCommentMode::Review { .. } => "posting review comment".to_string(),
+            PendingCommentMode::ItemMetadata { field } => format!("updating {}", field.label()),
         };
-        Some(PendingCommentSubmit { item, body, mode })
+        let pending = PendingCommentSubmit {
+            item,
+            body,
+            mode,
+            dialog,
+        };
+        self.pending_comment_submit = Some(pending.clone());
+        Some(pending)
     }
 
     fn start_global_search_input(&mut self) {
@@ -11235,15 +19943,81 @@ impl AppState {
         self.global_search_query.clear();
         self.search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
         self.reaction_dialog = None;
         self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.reviewer_dialog = None;
         self.status = match self.current_repo_scope() {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
         };
+    }
+
+    fn start_filter_input(&mut self) {
+        let Some(section) = self.current_section() else {
+            self.status = "no section selected".to_string();
+            return;
+        };
+        let section_key = section.key.clone();
+        let section_kind = section.kind;
+        if !matches!(
+            section_kind,
+            SectionKind::PullRequests | SectionKind::Issues
+        ) {
+            self.status = "quick filters are available for PR and issue sections".to_string();
+            return;
+        }
+
+        self.save_current_conversation_details_state();
+        self.focus = FocusTarget::List;
+        self.filter_input_active = true;
+        self.filter_input_query = self
+            .quick_filters
+            .get(&section_key)
+            .map(QuickFilter::display)
+            .unwrap_or_default();
+        self.search_active = false;
+        self.global_search_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.pr_action_dialog = None;
+        self.status = "filter mode: state:closed label:bug author:alice".to_string();
+    }
+
+    fn handle_filter_input_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter_input_active = false;
+                self.status = "filter cancelled".to_string();
+            }
+            KeyCode::Enter => match QuickFilter::parse(&self.filter_input_query) {
+                Ok(filter) => {
+                    self.filter_input_active = false;
+                    self.filter_input_query.clear();
+                    start_filtered_section_load(self, config, tx, filter);
+                }
+                Err(message) => {
+                    self.status = message;
+                }
+            },
+            KeyCode::Backspace => {
+                self.filter_input_query.pop();
+            }
+            KeyCode::Char(value) => {
+                self.filter_input_query.push(value);
+            }
+            _ => {}
+        }
     }
 
     fn handle_global_search_key(
@@ -11285,6 +20059,7 @@ impl AppState {
                 self.search_active = false;
                 self.search_query.clear();
                 self.comment_search_active = false;
+                self.filter_input_active = false;
                 self.status = match repo_scope {
                     Some(repo) => format!("searching {repo} for '{query}'"),
                     None => format!("searching GitHub for '{query}'"),
@@ -11307,6 +20082,7 @@ impl AppState {
         self.search_active = true;
         self.global_search_active = false;
         self.comment_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.label_dialog = None;
         self.issue_dialog = None;
@@ -11319,6 +20095,7 @@ impl AppState {
         self.save_current_conversation_details_state();
         self.search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.search_query.clear();
         self.focus = FocusTarget::List;
         self.details_scroll = 0;
@@ -11356,6 +20133,7 @@ impl AppState {
         self.comment_search_active = true;
         self.search_active = false;
         self.global_search_active = false;
+        self.filter_input_active = false;
         self.comment_dialog = None;
         self.label_dialog = None;
         self.pr_action_dialog = None;
@@ -11415,6 +20193,84 @@ impl AppState {
         self.open_url(&url);
     }
 
+    fn copy_github_link(&mut self) {
+        let Some((url, label)) = self.selected_github_link() else {
+            self.status = "no GitHub link selected".to_string();
+            return;
+        };
+
+        match copy_text_to_clipboard(&url) {
+            Ok(()) => {
+                self.status = format!("copied {label} link");
+            }
+            Err(error) => {
+                self.status = format!("copy failed: {error}");
+            }
+        }
+    }
+
+    fn copy_content(&mut self) {
+        let Some((content, label)) = self.selected_copy_content() else {
+            self.status = "no content selected".to_string();
+            return;
+        };
+
+        match copy_text_to_clipboard(&content) {
+            Ok(()) => {
+                self.status = format!("copied {label}");
+            }
+            Err(error) => {
+                self.status = format!("copy failed: {error}");
+            }
+        }
+    }
+
+    fn selected_github_link(&self) -> Option<(String, &'static str)> {
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
+                .current_selected_comment()
+                .and_then(|comment| comment.url.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some((url.to_string(), "comment"));
+        }
+
+        let item = self.current_item()?;
+        let url = item.url.trim();
+        if url.is_empty() {
+            return None;
+        }
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request",
+            ItemKind::Issue => "issue",
+            ItemKind::Notification => "GitHub",
+        };
+        Some((url.to_string(), label))
+    }
+
+    fn selected_copy_content(&self) -> Option<(String, &'static str)> {
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(comment) = self.current_selected_comment()
+            && !comment.body.trim().is_empty()
+        {
+            return Some((comment.body.clone(), "comment content"));
+        }
+
+        let item = self.current_item()?;
+        let body = item
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())?;
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request description",
+            ItemKind::Issue => "issue description",
+            ItemKind::Notification => "GitHub content",
+        };
+        Some((body.to_string(), label))
+    }
+
     fn selected_open_url(&self) -> Option<String> {
         let item = self.current_item()?;
         if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
@@ -11471,10 +20327,7 @@ impl AppState {
 
     fn current_item_supports_comments(&self) -> bool {
         self.current_item()
-            .map(|item| {
-                matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
-                    && item.number.is_some()
-            })
+            .map(item_supports_metadata_edit)
             .unwrap_or(false)
     }
 
@@ -11558,6 +20411,10 @@ impl AppState {
     }
 
     fn save_current_conversation_details_state(&mut self) {
+        if self.details_mode == DetailsMode::Diff {
+            self.save_current_diff_mode_state();
+            return;
+        }
         if self.details_mode != DetailsMode::Conversation {
             return;
         }
@@ -11791,6 +20648,62 @@ impl AppState {
 
     fn filtered_indices(&self, section: &SectionSnapshot) -> Vec<usize> {
         filtered_indices(section, &self.search_query)
+            .into_iter()
+            .filter(|index| {
+                section
+                    .items
+                    .get(*index)
+                    .is_some_and(|item| !self.ignored_items.contains(&item.id))
+            })
+            .collect()
+    }
+
+    fn ignored_count_for_section(&self, section: &SectionSnapshot) -> usize {
+        section
+            .items
+            .iter()
+            .filter(|item| self.ignored_items.contains(&item.id))
+            .count()
+    }
+
+    fn ignore_current_item(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing to ignore".to_string();
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            self.status = "only issues and pull requests can be ignored".to_string();
+            return;
+        }
+
+        let label = item_kind_label(item.kind);
+        let number = item
+            .number
+            .map(|number| format!(" #{number}"))
+            .unwrap_or_default();
+        self.ignored_items.insert(item.id.clone());
+        self.focus = FocusTarget::List;
+        self.details_mode = DetailsMode::Conversation;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_action_dialog = None;
+        self.item_edit_dialog = None;
+        self.clamp_positions();
+        self.status = format!("ignored {label}{number}; use Info to inspect ignored state");
+    }
+
+    fn clear_ignored_items(&mut self) {
+        let count = self.ignored_items.len();
+        self.ignored_items.clear();
+        self.clamp_positions();
+        self.status = if count == 0 {
+            "ignored list already empty".to_string()
+        } else {
+            format!("cleared {count} ignored item(s)")
+        };
     }
 
     fn view_tabs(&self) -> Vec<ViewTab> {
@@ -11838,6 +20751,16 @@ impl AppState {
         }
 
         tabs
+    }
+
+    fn has_unread_notifications(&self) -> bool {
+        self.sections.iter().any(|section| {
+            matches!(section.kind, SectionKind::Notifications)
+                && section
+                    .items
+                    .iter()
+                    .any(|item| item.unread.unwrap_or(false))
+        })
     }
 }
 
@@ -11942,6 +20865,12 @@ fn searchable_comment_text(comment: &CommentPreview) -> String {
         if let Some(diff_hunk) = &review.diff_hunk {
             parts.push(diff_hunk.clone());
         }
+        if review.is_resolved {
+            parts.push("resolved".to_string());
+        }
+        if review.is_outdated {
+            parts.push("outdated".to_string());
+        }
     }
     parts.join(" ").to_lowercase()
 }
@@ -12007,9 +20936,52 @@ fn item_meta(item: &WorkItem) -> String {
     parts.join(" ")
 }
 
+fn item_is_open_pull_request(item: &WorkItem) -> bool {
+    item.state
+        .as_deref()
+        .is_none_or(|state| state.eq_ignore_ascii_case("open"))
+}
+
+fn item_is_draft_pull_request(item: &WorkItem) -> bool {
+    item.extra
+        .as_deref()
+        .is_some_and(|extra| extra.split_whitespace().any(|part| part == "draft"))
+}
+
+fn pr_action_requires_open_pull_request(action: PrAction) -> bool {
+    matches!(
+        action,
+        PrAction::UpdateBranch | PrAction::ConvertToDraft | PrAction::MarkReadyForReview
+    )
+}
+
+fn mark_item_draft(item: &mut WorkItem) {
+    if !item_is_draft_pull_request(item) {
+        item.extra = Some(match item.extra.take() {
+            Some(extra) if !extra.trim().is_empty() => format!("{extra} draft"),
+            _ => "draft".to_string(),
+        });
+    }
+}
+
+fn mark_item_ready_for_review(item: &mut WorkItem) {
+    let Some(extra) = item.extra.take() else {
+        return;
+    };
+    let remaining = extra
+        .split_whitespace()
+        .filter(|part| *part != "draft")
+        .collect::<Vec<_>>()
+        .join(" ");
+    item.extra = (!remaining.is_empty()).then_some(remaining);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CHECKOUT_TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn fuzzy_score_matches_ordered_subsequence() {
@@ -12042,6 +21014,22 @@ mod tests {
 
         assert_eq!(compact_error_label(error), "GitHub search rate limited");
         assert!(!compact_error_label(error).contains("--json"));
+    }
+
+    #[test]
+    fn error_chain_message_keeps_gh_failure_detail() {
+        let error = anyhow::anyhow!(
+            "gh pr create --repo owner/repo --head feature failed: a pull request already exists"
+        )
+        .context("failed to create pull request in owner/repo");
+        let message = error_chain_message(error);
+
+        assert!(message.contains("failed to create pull request in owner/repo"));
+        assert!(message.contains("a pull request already exists"));
+        assert_eq!(
+            operation_error_body(&message),
+            "a pull request already exists"
+        );
     }
 
     #[test]
@@ -12196,6 +21184,8 @@ deleted file mode 100644
             side: Some("RIGHT".to_string()),
             start_side: None,
             diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
         };
         let mut parent = comment(
             "alice",
@@ -12236,6 +21226,22 @@ deleted file mode 100644
         );
         assert_document_link_for_text(&document, "alice", "https://github.com/alice");
         assert_document_link_for_text(&document, "bob", "https://github.com/bob");
+        let right_border_column = comment_right_border_column(120);
+        let selected_right_border_columns = rendered
+            .iter()
+            .filter(|line| line.ends_with('┃'))
+            .map(|line| display_width(line).saturating_sub(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !selected_right_border_columns.is_empty(),
+            "selected inline comment should render a right border: {rendered:?}"
+        );
+        assert!(
+            selected_right_border_columns
+                .iter()
+                .all(|column| *column == right_border_column),
+            "selected inline comment right border should align: {rendered:?}"
+        );
 
         let body_line = rendered
             .iter()
@@ -12299,6 +21305,8 @@ deleted file mode 100644
             side: Some("RIGHT".to_string()),
             start_side: None,
             diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![comment]));
@@ -12332,6 +21340,74 @@ deleted file mode 100644
         );
 
         assert_eq!(app.status, "opened https://github.com/cuviper");
+    }
+
+    #[test]
+    fn diff_details_render_resolved_and_outdated_review_comment_states() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let mut resolved = comment("alice", "Fixed now.", None);
+        resolved.id = Some(1);
+        resolved.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: true,
+            is_outdated: false,
+        });
+        let mut outdated = comment("bob", "This pointed at an old line.", None);
+        outdated.id = Some(2);
+        outdated.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(99),
+            original_line: Some(99),
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: true,
+        });
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![resolved, outdated]),
+        );
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("✓ + new"));
+        assert!(rendered.contains("resolved"));
+        assert!(rendered.contains("outdated"));
+        assert!(rendered.contains("not attached to a current diff line"));
     }
 
     #[test]
@@ -12456,7 +21532,7 @@ deleted file mode 100644
     }
 
     #[test]
-    fn n_and_p_page_diff_details_instead_of_jumping_hunks() {
+    fn h_and_l_page_diff_details_instead_of_jumping_comments() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -12480,7 +21556,7 @@ deleted file mode 100644
 
         assert!(!handle_key_in_area(
             &mut app,
-            key(KeyCode::Char('n')),
+            key(KeyCode::Char('h')),
             &config,
             &store,
             &tx,
@@ -12494,7 +21570,7 @@ deleted file mode 100644
 
         assert!(!handle_key_in_area(
             &mut app,
-            key(KeyCode::Char('p')),
+            key(KeyCode::Char('l')),
             &config,
             &store,
             &tx,
@@ -12504,6 +21580,84 @@ deleted file mode 100644
         let (expected_index, expected_line) = first_visible_diff_line(&app, area);
         assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
         assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+    }
+
+    #[test]
+    fn n_and_p_focus_comments_in_diff_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut first = comment("alice", "first inline", None);
+        first.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        let mut second = comment("bob", "second inline", None);
+        second.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(2),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old1
++new1
+-old2
++new2
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![first, second]));
+        let area = Rect::new(0, 0, 120, 36);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 1);
+        assert_eq!(app.status, "comment 2/2 focused");
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 0);
+        assert_eq!(app.status, "comment 1/2 focused");
     }
 
     #[test]
@@ -12969,12 +22123,19 @@ diff --git a/src/main.rs b/src/main.rs
             ),
         );
 
+        app.details_scroll = 6;
         app.move_diff_file(1);
         assert_eq!(app.selected_diff_file.get("1"), Some(&1));
         assert_eq!(app.details_scroll, 0);
 
+        app.details_scroll = 13;
         app.move_diff_file(1);
         assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+        assert_eq!(app.details_scroll, 6);
+
+        app.move_diff_file(1);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.details_scroll, 13);
     }
 
     #[test]
@@ -13019,6 +22180,66 @@ diff --git a/README.md b/README.md
         assert!(labels.contains(&(1, Some(0), "app.rs", "M +1 -1")));
         assert!(labels.contains(&(1, Some(1), "github.rs", "M +1 -1")));
         assert!(labels.contains(&(0, Some(2), "README.md", "M +1 -1")));
+    }
+
+    #[test]
+    fn diff_tree_file_stats_include_review_comment_counts() {
+        let diff = parse_pull_request_diff(
+            r#"diff --git a/src/app.rs b/src/app.rs
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/github.rs b/src/github.rs
+--- a/src/github.rs
++++ b/src/github.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+        )
+        .expect("parse diff");
+        let mut app_comment = comment("alice", "inline", None);
+        app_comment.id = Some(1);
+        app_comment.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/app.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        let mut app_reply = comment("bob", "reply", None);
+        app_reply.id = Some(2);
+        app_reply.parent_id = Some(1);
+        let mut github_comment = comment("carol", "inline", None);
+        github_comment.id = Some(3);
+        github_comment.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/github.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        let counts = diff_file_comment_counts(&diff, &[app_comment, app_reply, github_comment]);
+        let entries = diff_tree_entries_with_comment_counts(&diff, &counts);
+        let labels = entries
+            .iter()
+            .map(|entry| (entry.label.as_str(), entry.stats.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&("app.rs", "M +1 -1 2c")));
+        assert!(labels.contains(&("github.rs", "M +1 -1 1c")));
     }
 
     #[test]
@@ -13275,7 +22496,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert_eq!(app.startup_dialog, Some(StartupDialog::Ready));
         assert_eq!(app.setup_dialog, None);
-        assert_eq!(app.status, "refresh complete");
+        assert_eq!(app.status, "latest");
 
         let (_title, lines, show_ok) =
             startup_dialog_content(StartupDialog::Ready, &app, &paths, 0);
@@ -13308,11 +22529,11 @@ diff --git a/src/github.rs b/src/github.rs
         });
 
         assert_eq!(app.startup_dialog, None);
-        assert_eq!(app.status, "refresh complete");
+        assert_eq!(app.status, "latest");
     }
 
     #[test]
-    fn refresh_finished_invalidates_pr_action_hints() {
+    fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.action_hints.insert(
             "1".to_string(),
@@ -13320,7 +22541,9 @@ diff --git a/src/github.rs b/src/github.rs
                 labels: Vec::new(),
                 checks: None,
                 commits: None,
+                failed_check_runs: Vec::new(),
                 note: Some("Merge blocked: GitHub is still computing mergeability".to_string()),
+                head: None,
             }),
         );
 
@@ -13329,9 +22552,46 @@ diff --git a/src/github.rs b/src/github.rs
             save_error: None,
         });
 
-        assert!(!app.action_hints.contains_key("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
         let item = app.current_item().expect("current PR item").clone();
         assert!(app.action_hints_load_needed(&item));
+        assert!(app.start_action_hints_load_if_needed(&item));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_refreshing.contains("1"));
+        assert!(!app.action_hints_stale.contains("1"));
+    }
+
+    #[test]
+    fn refresh_finished_does_not_overwrite_active_quick_filter_rows() {
+        let mut filtered = test_section();
+        filtered.items.truncate(1);
+        filtered.filters = "repo:owner/repo archived:false is:closed sort:updated-desc".to_string();
+        let mut refreshed = test_section();
+        refreshed.filters = "repo:owner/repo is:open archived:false sort:updated-desc".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![filtered]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed").unwrap().expect("filter"),
+        );
+
+        app.handle_msg(AppMsg::RefreshFinished {
+            sections: vec![refreshed],
+            save_error: None,
+        });
+
+        assert_eq!(app.sections[0].items.len(), 1);
+        assert_eq!(
+            app.base_section_filters.get("pull_requests:test"),
+            Some(&"repo:owner/repo is:open archived:false sort:updated-desc".to_string())
+        );
+        assert_eq!(app.status, "latest");
     }
 
     #[test]
@@ -13372,7 +22632,7 @@ diff --git a/src/github.rs b/src/github.rs
         });
 
         assert_eq!(app.startup_dialog, Some(StartupDialog::Ready));
-        assert_eq!(app.status, "refresh complete");
+        assert_eq!(app.status, "latest");
     }
 
     #[test]
@@ -13391,7 +22651,7 @@ diff --git a/src/github.rs b/src/github.rs
         });
 
         assert_eq!(app.startup_dialog, None);
-        assert_eq!(app.status, "refresh complete");
+        assert_eq!(app.status, "latest");
     }
 
     #[test]
@@ -13505,6 +22765,7 @@ diff --git a/src/github.rs b/src/github.rs
             active_view: builtin_view_key(SectionKind::Issues),
             section_index: HashMap::from([(builtin_view_key(SectionKind::Issues), 0)]),
             selected_index: HashMap::from([(builtin_view_key(SectionKind::Issues), 1)]),
+            view_snapshots: HashMap::new(),
             focus: "details".to_string(),
             details_mode: "conversation".to_string(),
             details_scroll: 7,
@@ -13516,6 +22777,8 @@ diff --git a/src/github.rs b/src/github.rs
             viewed_comments_snapshot: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
+            diff_file_details_scroll: HashMap::new(),
+            ignored_items: Vec::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -13570,6 +22833,82 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn ui_state_restores_diff_file_details_scroll_after_diff_load() {
+        let state = UiState {
+            active_view: builtin_view_key(SectionKind::PullRequests),
+            selected_index: HashMap::from([(builtin_view_key(SectionKind::PullRequests), 0)]),
+            focus: "details".to_string(),
+            details_mode: "diff".to_string(),
+            details_scroll: 3,
+            selected_diff_file: HashMap::from([("1".to_string(), 1)]),
+            diff_file_details_scroll: HashMap::from([("1::src/main.rs".to_string(), 22)]),
+            ..UiState::default()
+        };
+        let mut app =
+            AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
+
+        app.handle_msg(AppMsg::DiffLoaded {
+            item_id: "1".to_string(),
+            diff: Ok(parse_pull_request_diff(
+                r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8 +8 @@
+-main_old
++main_new
+"#,
+            )
+            .expect("parse diff")),
+        });
+
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.details_scroll, 22);
+    }
+
+    #[test]
+    fn ui_state_saves_current_diff_file_details_scroll() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8 +8 @@
+-main_old
++main_new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.selected_diff_file.insert("1".to_string(), 1);
+        app.details_scroll = 31;
+
+        let saved = app.ui_state();
+
+        assert_eq!(
+            saved.diff_file_details_scroll.get("1::src/main.rs"),
+            Some(&31)
+        );
+    }
+
+    #[test]
     fn conversation_details_position_is_restored_per_item() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.details.insert(
@@ -13611,6 +22950,7 @@ diff --git a/src/github.rs b/src/github.rs
             item_id: "1".to_string(),
             comments: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
             }),
         });
@@ -13669,6 +23009,124 @@ diff --git a/src/github.rs b/src/github.rs
             app.current_item().map(|item| item.id.as_str()),
             Some("fiber-1")
         );
+    }
+
+    #[test]
+    fn project_switch_restores_saved_view_snapshot() {
+        let fiber_key = "repo:Fiber:pull_requests:Pull Requests";
+        let ghr_key = "repo:ghr:pull_requests:Pull Requests";
+        let sections = vec![
+            SectionSnapshot {
+                key: fiber_key.to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Pull Requests".to_string(),
+                filters: String::new(),
+                items: vec![
+                    work_item("fiber-1", "nervosnetwork/fiber", 1, "First", None),
+                    work_item("fiber-2", "nervosnetwork/fiber", 2, "Second", None),
+                ],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: ghr_key.to_string(),
+                kind: SectionKind::PullRequests,
+                title: "Pull Requests".to_string(),
+                filters: String::new(),
+                items: vec![work_item("ghr-1", "chenyukang/ghr", 1, "Ghr", None)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+
+        app.switch_project_view(repo_view_key("Fiber"));
+        app.set_selection(1);
+        app.details.insert(
+            "fiber-2".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+                comment("carol", "third", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 12;
+        app.selected_comment_index = 2;
+        app.set_current_list_scroll_offset(5);
+
+        app.switch_project_view(repo_view_key("ghr"));
+        app.sections[0].items.swap(0, 1);
+        app.switch_project_view(repo_view_key("Fiber"));
+
+        assert_eq!(app.active_view, repo_view_key("Fiber"));
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("fiber-2")
+        );
+        assert_eq!(app.current_selected_position(), 0);
+        assert_eq!(app.details_scroll, 12);
+        assert_eq!(app.selected_comment_index, 2);
+        assert_eq!(app.list_scroll_offset.get(fiber_key), Some(&5));
+    }
+
+    #[test]
+    fn ui_state_saves_and_restores_project_view_snapshot() {
+        let fiber_key = "repo:Fiber:pull_requests:Pull Requests";
+        let sections = vec![SectionSnapshot {
+            key: fiber_key.to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: String::new(),
+            items: vec![
+                work_item("fiber-1", "nervosnetwork/fiber", 1, "First", None),
+                work_item("fiber-2", "nervosnetwork/fiber", 2, "Second", None),
+            ],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::PullRequests, sections.clone());
+
+        app.switch_project_view(repo_view_key("Fiber"));
+        app.set_selection(1);
+        app.focus_details();
+        app.details_scroll = 8;
+        app.selected_comment_index = 1;
+        app.set_current_list_scroll_offset(3);
+
+        let saved = app.ui_state();
+        let snapshot = saved
+            .view_snapshots
+            .get(&repo_view_key("Fiber"))
+            .expect("repo view snapshot");
+        assert_eq!(snapshot.focus, "details");
+        assert_eq!(snapshot.section_key.as_deref(), Some(fiber_key));
+        assert_eq!(snapshot.item_id.as_deref(), Some("fiber-2"));
+        assert_eq!(snapshot.selected_index, 1);
+        assert_eq!(snapshot.list_scroll_offset, 3);
+        assert_eq!(snapshot.details_scroll, 8);
+
+        let restored = AppState::with_ui_state(SectionKind::PullRequests, sections, saved);
+
+        assert_eq!(restored.active_view, repo_view_key("Fiber"));
+        assert_eq!(restored.focus, FocusTarget::Details);
+        assert_eq!(
+            restored.current_item().map(|item| item.id.as_str()),
+            Some("fiber-2")
+        );
+        assert_eq!(restored.details_scroll, 8);
+        assert_eq!(restored.selected_comment_index, 1);
+        assert_eq!(restored.list_scroll_offset.get(fiber_key), Some(&3));
     }
 
     #[test]
@@ -13915,6 +23373,77 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn stale_pr_action_hints_refresh_keeps_loaded_fields_visible() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Mergeable".to_string()],
+                checks: Some(CheckSummary {
+                    passed: 4,
+                    failed: 0,
+                    pending: 0,
+                    skipped: 0,
+                    total: 4,
+                    incomplete: false,
+                }),
+                commits: Some(2),
+                failed_check_runs: Vec::new(),
+                note: Some("Mergeable".to_string()),
+                head: Some(PullRequestBranch {
+                    repository: "rust-lang/rust".to_string(),
+                    branch: "feature/no-flicker".to_string(),
+                }),
+            }),
+        );
+        app.action_hints_stale.insert("1".to_string());
+        let item = app.current_item().cloned().expect("item");
+
+        assert!(app.start_action_hints_load_if_needed(&item));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("commits: 2"));
+        assert!(rendered.contains("branch: rust-lang/rust:feature/no-flicker"));
+        assert!(rendered.contains("action: Mergeable"));
+        assert!(rendered.contains("checks: 4 pass"));
+        assert!(!rendered.contains("action: loading..."));
+        assert!(!rendered.contains("branch: loading..."));
+        assert!(!rendered.contains("checks: loading..."));
+    }
+
+    #[test]
+    fn background_action_hints_error_keeps_last_loaded_fields() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let hints = ActionHints {
+            labels: vec!["Mergeable".to_string()],
+            checks: None,
+            commits: None,
+            failed_check_runs: Vec::new(),
+            note: None,
+            head: None,
+        };
+        app.action_hints
+            .insert("1".to_string(), ActionHintState::Loaded(hints.clone()));
+        app.action_hints_refreshing.insert("1".to_string());
+
+        app.handle_msg(AppMsg::ActionHintsLoaded {
+            item_id: "1".to_string(),
+            actions: Err("temporary gh api failure".to_string()),
+        });
+
+        assert!(!app.action_hints_refreshing.contains("1"));
+        assert_eq!(
+            app.action_hints.get("1"),
+            Some(&ActionHintState::Loaded(hints))
+        );
+    }
+
+    #[test]
     fn list_focused_details_load_is_debounced_but_details_focus_is_immediate() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.focus_list();
@@ -14072,22 +23601,787 @@ diff --git a/src/github.rs b/src/github.rs
 
     #[test]
     fn help_dialog_content_lists_core_shortcuts() {
-        let text = help_dialog_content()
+        let text = help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
         assert!(text.contains("Tab / Shift+Tab"));
-        assert!(text.contains("Ctrl+Enter"));
+        assert!(text.contains(":"));
         assert!(text.contains("R"));
         assert!(text.contains("edit focused comment"));
         assert!(text.contains("drag split border"));
         assert!(text.contains("open PR merge confirmation"));
-        assert!(text.contains("open PR close confirmation"));
-        assert!(text.contains("run the confirmed PR action"));
+        assert!(text.contains("open close or reopen confirmation"));
+        assert!(text.contains("open PR enable auto-merge confirmation"));
+        assert!(text.contains("open PR disable auto-merge confirmation"));
+        assert!(text.contains("open PR update-branch confirmation"));
+        assert!(text.contains("toggle PR draft / ready for review"));
+        assert!(text.contains("change issue or PR milestone"));
         assert!(text.contains("search PRs and issues in the current repo"));
         assert!(text.contains("terminal text selection"));
+        assert!(text.contains("@ / -"));
+        assert!(text.contains("add a reaction"));
+        assert!(!text.contains("Reaction Dialog"));
+        assert!(!text.contains("Ctrl+Enter"));
+    }
+
+    #[test]
+    fn wide_help_dialog_uses_two_columns() {
+        let single_column = help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY);
+        let two_columns = help_dialog_content_for_width(140, DEFAULT_COMMAND_PALETTE_KEY);
+        let text = two_columns
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(two_columns.len() < single_column.len());
+        assert!(text.contains("General"));
+        assert!(text.contains("Mouse"));
+        assert!(
+            two_columns
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= 140)
+        );
+    }
+
+    #[test]
+    fn help_dialog_two_columns_wrap_instead_of_clipping() {
+        let width = 110_u16;
+        let two_columns = help_dialog_content_for_width(width, DEFAULT_COMMAND_PALETTE_KEY);
+        let text = two_columns
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(two_columns.len() > help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY).len() / 2);
+        assert!(collapsed.contains("open PR disable auto-merge confirmation"));
+        assert!(collapsed.contains("filter with state:closed"));
+        assert!(collapsed.contains("label:bug author:alice"));
+        assert!(
+            two_columns
+                .iter()
+                .all(|line| display_width(&line.to_string()) <= usize::from(width))
+        );
+    }
+
+    #[test]
+    fn help_dialog_width_can_use_wide_terminals() {
+        assert_eq!(
+            help_dialog_width(Rect::new(0, 0, 200, 40)),
+            HELP_DIALOG_MAX_WIDTH
+        );
+        assert_eq!(help_dialog_width(Rect::new(0, 0, 80, 40)), 78);
+    }
+
+    #[test]
+    fn colon_opens_command_palette() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.command_palette, Some(CommandPalette::default()));
+        assert_eq!(app.status, "command palette");
+    }
+
+    #[test]
+    fn printable_command_palette_key_is_text_inside_comment_editor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft:")
+        );
+    }
+
+    #[test]
+    fn printable_command_palette_key_is_text_inside_filter_and_repo_search() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.start_filter_input();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.filter_input_query, ":");
+
+        app.filter_input_active = false;
+        app.start_global_search_input();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(':')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.global_search_query, ":");
+    }
+
+    #[test]
+    fn modified_command_palette_key_can_open_over_text_input() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.defaults.command_palette_key = "Ctrl+L".to_string();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+
+        assert!(!handle_key(
+            &mut app,
+            ctrl_key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft")
+        );
+        assert_eq!(app.command_palette_key, "Ctrl+L");
+    }
+
+    #[test]
+    fn command_palette_lists_and_fuzzy_filters_shortcuts() {
+        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+        assert!(commands.iter().any(|command| command.keys == ":"));
+        assert!(commands.iter().any(|command| command.keys == "Ctrl+Enter"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Open PR Merge Confirmation")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Create Issue / PR")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Change Milestone")
+        );
+        assert!(commands.iter().any(|command| command.title == "Info"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Ignore Selected Item" && command.keys == "i")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Load Next Result Page" && command.keys == "Alt+]")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.scope == "Reaction Dialog")
+        );
+
+        let merge_matches = command_palette_filtered_indices(&commands, "merge");
+        assert_eq!(
+            commands[merge_matches[0]].title,
+            "Open PR Merge Confirmation"
+        );
+
+        let issue_matches = command_palette_filtered_indices(&commands, "ctrl enter issue");
+        assert!(
+            issue_matches
+                .iter()
+                .any(|index| commands[*index].title == "Create Issue from Dialog")
+        );
+
+        let milestone_matches = command_palette_filtered_indices(&commands, "milestone");
+        let milestone_titles = milestone_matches
+            .iter()
+            .map(|index| commands[*index].title)
+            .collect::<Vec<_>>();
+        assert!(milestone_titles.contains(&"Change Milestone"));
+        assert!(!milestone_titles.contains(&"Open PR Merge Confirmation"));
+        assert!(!milestone_titles.contains(&"Open PR Close Confirmation"));
+        assert!(!milestone_titles.contains(&"Open PR Approve Confirmation"));
+        assert!(!milestone_titles.contains(&"Toggle Mouse Text Selection"));
+
+        let reaction_matches = command_palette_filtered_indices(&commands, "+");
+        assert!(
+            reaction_matches
+                .iter()
+                .any(|index| commands[*index].title == "Add Reaction")
+        );
+        assert!(command_palette_filtered_indices(&commands, ".").is_empty());
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Project Switch")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Project Add")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Project Remove")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Copy GitHub Link")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Copy Content")
+        );
+    }
+
+    #[test]
+    fn command_palette_info_opens_runtime_info_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.defaults.log_level = "debug".to_string();
+        let paths = unique_test_paths("runtime-info");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        app.command_palette = Some(CommandPalette {
+            query: "info".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        let dialog = app.message_dialog.as_ref().expect("info dialog");
+        assert_eq!(dialog.kind, MessageDialogKind::Info);
+        assert_eq!(dialog.title, "Info");
+        assert!(dialog.body.contains("version:"));
+        assert!(dialog.body.contains("ghr memory:"));
+        assert!(dialog.body.contains("ignored items:"));
+        assert!(
+            dialog
+                .body
+                .contains(&format!("config: {}", paths.config_path.display()))
+        );
+        assert!(
+            dialog
+                .body
+                .contains(&format!("db: {}", paths.db_path.display()))
+        );
+        assert!(dialog.body.contains("log_level: debug"));
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.status, "info");
+    }
+
+    #[test]
+    fn project_switcher_lists_repo_tabs_and_filters_by_prefix() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "CKB".to_string(),
+            repo: "nervosnetwork/ckb".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        app.show_project_switcher();
+
+        assert_eq!(
+            app.project_switcher_candidates_for_query("")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["ghr", "Fiber", "CKB"]
+        );
+        assert_eq!(
+            app.project_switcher_candidates_for_query("fi")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["Fiber"]
+        );
+    }
+
+    #[test]
+    fn command_palette_switch_project_opens_project_switcher() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "project switch".to_string(),
+            selected: 0,
+        });
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &config,
+            &store,
+            &tx,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.project_switcher, Some(ProjectSwitcher::default()));
+        assert_eq!(app.status, "project switch");
+    }
+
+    #[test]
+    fn command_palette_project_add_opens_project_add_dialog() {
+        let mut config = Config::default();
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let paths = unique_test_paths("project-add-open");
+        app.command_palette = Some(CommandPalette {
+            query: "project add".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(
+            app.project_add_dialog.as_ref().map(|dialog| dialog.field),
+            Some(ProjectAddField::RepoUrl)
+        );
+        assert_eq!(app.status, "project add");
+    }
+
+    #[test]
+    fn project_switcher_enter_switches_to_selected_project() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        app.show_project_switcher();
+        app.handle_project_switcher_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_project_switcher_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_view, "repo:Fiber");
+        assert_eq!(app.focus, FocusTarget::Ghr);
+        assert!(app.project_switcher.is_none());
+        assert_eq!(app.status, "project switched: Fiber");
+    }
+
+    #[test]
+    fn project_add_saves_repo_to_config_and_adds_menu_tab() {
+        let paths = unique_test_paths("project-add-confirm");
+        let mut config = Config::default();
+        config.save(&paths.config_path).expect("save config");
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.show_project_add_dialog();
+        {
+            let dialog = app.project_add_dialog.as_mut().expect("project add dialog");
+            dialog.repo_url = "https://github.com/chenyukang/ghr".to_string();
+            dialog.local_dir = String::new();
+        }
+        app.handle_project_add_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+        );
+
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "ghr");
+        assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+        assert_eq!(config.repos[0].local_dir.as_deref(), Some(""));
+        assert!(app.project_add_dialog.is_none());
+        assert_eq!(app.active_view, "repo:ghr");
+        assert!(
+            app.view_tabs()
+                .iter()
+                .any(|view| view.key == "repo:ghr" && view.label == "ghr")
+        );
+        assert_eq!(
+            app.visible_sections()
+                .iter()
+                .map(|section| section.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pull Requests", "Issues"]
+        );
+        assert_eq!(app.status, "project added: ghr");
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.repos.len(), 1);
+        assert_eq!(saved.repos[0].name, "ghr");
+        assert_eq!(saved.repos[0].repo, "chenyukang/ghr");
+        assert_eq!(saved.repos[0].local_dir.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn project_add_uses_custom_title_and_local_dir() {
+        let paths = unique_test_paths("project-add-custom");
+        let mut config = Config::default();
+        config.save(&paths.config_path).expect("save config");
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.show_project_add_dialog();
+        {
+            let dialog = app.project_add_dialog.as_mut().expect("project add dialog");
+            dialog.title = "GHR Local".to_string();
+            dialog.repo_url = "git@github.com:chenyukang/ghr.git".to_string();
+            dialog.local_dir = "/Users/yukang/code/playground/ghr".to_string();
+        }
+        app.handle_project_add_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+        );
+
+        assert_eq!(config.repos[0].name, "GHR Local");
+        assert_eq!(config.repos[0].repo, "chenyukang/ghr");
+        assert_eq!(
+            config.repos[0].local_dir.as_deref(),
+            Some("/Users/yukang/code/playground/ghr")
+        );
+        assert_eq!(app.active_view, "repo:GHR Local");
+    }
+
+    #[test]
+    fn project_add_repo_input_accepts_owner_repo_and_github_urls() {
+        assert_eq!(
+            project_add_repo_from_input("chenyukang/ghr"),
+            Some("chenyukang/ghr".to_string())
+        );
+        assert_eq!(
+            project_add_repo_from_input("https://github.com/chenyukang/ghr"),
+            Some("chenyukang/ghr".to_string())
+        );
+        assert_eq!(
+            project_add_repo_from_input("https://github.com/chenyukang/ghr/pulls"),
+            Some("chenyukang/ghr".to_string())
+        );
+        assert_eq!(
+            project_add_repo_from_input("git@github.com:chenyukang/ghr.git"),
+            Some("chenyukang/ghr".to_string())
+        );
+    }
+
+    #[test]
+    fn command_palette_project_remove_opens_configured_project_picker() {
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: Some("/tmp/fiber".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let paths = unique_test_paths("project-remove-open");
+        app.command_palette = Some(CommandPalette {
+            query: "project remove".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        let dialog = app
+            .project_remove_dialog
+            .as_ref()
+            .expect("remove dialog should open");
+        assert!(app.command_palette.is_none());
+        assert_eq!(dialog.candidates.len(), 1);
+        assert_eq!(dialog.candidates[0].name, "Fiber");
+        assert_eq!(app.status, "project remove");
+    }
+
+    #[test]
+    fn project_remove_confirmation_removes_repo_from_config_and_ui() {
+        let paths = unique_test_paths("project-remove-confirm");
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some("/tmp/ghr".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: Some("/tmp/fiber".to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config.save(&paths.config_path).expect("save config");
+        let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+        app.switch_view("repo:Fiber");
+
+        app.show_project_remove_dialog(&config);
+        app.handle_project_remove_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+
+        assert_eq!(
+            app.project_remove_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.confirm.as_ref())
+                .map(|candidate| candidate.name.as_str()),
+            Some("Fiber")
+        );
+
+        app.handle_project_remove_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "ghr");
+        assert!(app.project_remove_dialog.is_none());
+        assert!(
+            !app.sections
+                .iter()
+                .any(|section| section_view_key(section) == "repo:Fiber")
+        );
+        assert_ne!(app.active_view, "repo:Fiber");
+        assert_eq!(app.status, "project removed: Fiber");
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.repos.len(), 1);
+        assert_eq!(saved.repos[0].name, "ghr");
+    }
+
+    #[test]
+    fn command_palette_area_is_centered_in_viewport() {
+        let area = Rect::new(0, 0, 120, 40);
+        let palette = command_palette_area(area);
+
+        assert_eq!(palette.width, 91);
+        assert_eq!(palette.height, 18);
+        assert_eq!(palette.x, 14);
+        assert_eq!(palette.y, 11);
+    }
+
+    #[test]
+    fn modal_footer_is_below_dialog_and_same_width() {
+        let area = Rect::new(0, 0, 120, 40);
+        let dialog = Rect::new(14, 11, 91, 18);
+
+        assert_eq!(
+            modal_footer_area(area, dialog),
+            Some(Rect::new(14, 29, 91, 1))
+        );
+    }
+
+    #[test]
+    fn command_palette_enter_dispatches_selected_shortcut() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "help".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(app.help_dialog);
+        assert_eq!(app.status, "help");
+    }
+
+    #[test]
+    fn command_palette_global_command_works_over_comment_editor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+        app.command_palette = Some(CommandPalette {
+            query: "help".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(app.help_dialog);
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft")
+        );
+    }
+
+    #[test]
+    fn command_palette_escape_dismisses_without_dispatching() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "merge".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert!(!app.help_dialog);
+        assert_eq!(app.status, "command palette dismissed");
     }
 
     #[test]
@@ -14186,26 +24480,115 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn footer_uses_contextual_list_shortcuts() {
+    fn first_load_repo_section_renders_loading_hint_in_list() {
+        let section = SectionSnapshot::empty_for_view(
+            "repo:ghr",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:chenyukang/ghr is:open archived:false sort:created-desc",
+        );
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.switch_view("repo:ghr");
+        app.refreshing = true;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Git repo is loading ..."));
+    }
+
+    #[test]
+    fn empty_loaded_repo_section_renders_empty_hint_not_loading() {
+        let mut section = SectionSnapshot::empty_for_view(
+            "repo:ghr",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:chenyukang/ghr is:open archived:false sort:created-desc",
+        );
+        section.refreshed_at = Some(Utc::now());
+        section.total_count = Some(0);
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.switch_view("repo:ghr");
+        app.refreshing = true;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("No items found."));
+        assert!(!rendered.contains(
+            "Git repo is loading, it will take for a while at the first time, please wait ..."
+        ));
+    }
+
+    #[test]
+    fn footer_uses_list_shortcuts_and_status() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.focus_list();
         let paths = test_paths();
         let text = footer_line(&app, &paths).to_string();
 
         assert!(
-            text.contains("List items  j/k move  pg page  [ ] results  g/G ends  enter Details")
-        );
-        assert!(text.contains("/ search"));
-        assert!(text.contains("v diff"));
-        assert!(text.contains("M/C/A pr action"));
-        assert!(
             text.contains(
-                "| 1-4 focus  ? help  S repo  r refresh  o open  m text-select  q quit |"
+                "j/k move  [ ] page  enter Details  / search  v diff  i ignore  a comment"
             )
         );
-        assert!(text.contains("| focus List  refresh idle  state list focused"));
+        assert!(!text.contains("List items"));
+        assert!(!text.contains("Details content"));
+        assert!(text.contains("/ search"));
+        assert!(text.contains("v diff"));
+        assert!(text.contains("i ignore"));
+        assert!(text.contains("? help  : cmd  f filter  r refresh  q quit  o open"));
+        assert!(text.contains("m text-select"));
+        assert!(!text.contains("focus List"));
+        assert!(!text.contains("refresh idle"));
+        assert!(!text.contains("status:"));
+        assert!(!text.contains("state list focused"));
         assert!(!text.contains("1 ghr  2 Sections  3 list  4 Details"));
         assert!(!text.contains("n/p comment"));
+        assert!(!text.contains("db "));
+
+        let compact = footer_line_for_width(&app, &paths, 80).to_string();
+        assert!(display_width(&compact) <= 80);
+        assert!(compact.contains("j/k move"));
+        assert!(compact.contains("[ ] page"));
+        assert!(compact.contains("enter Details"));
+        assert!(compact.contains("/ search"));
+        assert!(!compact.contains("M/C/D/U/E/O/F/X actions"));
+        assert!(!compact.contains("1-4 focus"));
+
+        app.refreshing = true;
+        let refreshing = footer_line(&app, &paths).to_string();
+        assert!(refreshing.contains("j/k move"));
+        assert!(!refreshing.contains("status: refreshing"));
+        assert_eq!(top_status_line(&app, 32).to_string(), "status: refreshing");
+    }
+
+    #[test]
+    fn footer_shows_merge_method_shortcuts_in_merge_confirmation() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        let paths = test_paths();
+        let text = footer_line(&app, &paths).to_string();
+
+        assert!(!text.contains("Confirm PR action"));
+        assert!(text.contains("m/s/r method"));
+        assert!(text.contains("y/enter run"));
+        assert!(text.contains("esc cancel"));
+        assert!(
+            top_status_line(&app, 40)
+                .to_string()
+                .contains("confirm pull request merge")
+        );
     }
 
     #[test]
@@ -14215,26 +24598,59 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
-        assert!(ghr.contains("ghr tabs  tab/h/l switch  j/enter Sections  esc List"));
-        assert!(!ghr.contains("M/C/A pr action"));
+        assert!(ghr.contains("tab/h/l switch  j/enter Sections  esc List"));
+        assert!(!ghr.contains("M/C/D/U/E/O/F/X actions"));
+        assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
-        assert!(sections.contains("Sections tabs  tab/h/l switch  k ghr  j/enter List"));
+        assert!(sections.contains("tab/h/l switch  k ghr  j/enter List"));
         assert!(!sections.contains("a comment"));
 
         app.focus_details();
         let details = footer_line(&app, &paths).to_string();
-        assert!(details.contains("Details content  j/k scroll"));
-        assert!(details.contains("n/p comment  enter expand  c/a comment  R reply  e edit"));
+        assert!(details.contains("j/k scroll"));
+        assert!(!details.contains("Details content"));
+        assert!(details.contains("v diff  / search  c/a comment"));
+        assert!(!details.contains("R reply"));
+        assert!(!details.contains("e edit"));
+        assert!(!details.contains("enter expand"));
         assert!(details.contains("esc List"));
         assert!(!details.contains("g/G ends"));
+
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "Needs a reply", None)]),
+        );
+        let details_with_comment = footer_line(&app, &paths).to_string();
+        assert!(details_with_comment.contains("n/p comment  enter expand"));
+        assert!(details_with_comment.contains("R reply"));
+        assert!(!details_with_comment.contains("e edit"));
+
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![own_comment(
+                42,
+                "chenyukang",
+                "My editable comment",
+                None,
+            )]),
+        );
+        let details_with_own_comment = footer_line(&app, &paths).to_string();
+        assert!(details_with_own_comment.contains("R reply  e edit"));
+
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
+        let details_with_assignee = footer_line(&app, &paths).to_string();
+        assert!(!details_with_assignee.contains("@/- assign"));
 
         app.show_diff();
         app.focus_details();
         let diff = footer_line(&app, &paths).to_string();
-        assert!(diff.contains("Details diff  j/k line  n/p page  g/G top/bottom"));
-        assert!(diff.contains("[ ] file  m begin  e end  c inline  a comment  M/C/A pr action"));
+        assert!(diff.contains("j/k line  n/p comment  h/l page"));
+        assert!(!diff.contains("Details diff"));
+        assert!(diff.contains("c inline  a comment"));
+        assert!(!diff.contains("m/e range"));
+        assert!(!diff.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!diff.contains("m text-select"));
         assert!(diff.contains("q back"));
         assert!(!diff.contains("q quit"));
@@ -14363,27 +24779,26 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn footer_context_label_uses_active_color() {
+    fn top_status_label_uses_active_color() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        let paths = test_paths();
 
         app.focus_details();
-        let line = footer_line(&app, &paths);
+        let line = top_status_line(&app, 40);
 
-        let details = line
+        let status = line
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == "Details")
-            .expect("details context label");
-        assert_eq!(details.style.fg, Some(Color::Cyan));
-        assert!(details.style.add_modifier.contains(Modifier::BOLD));
+            .find(|span| span.content.as_ref() == "status:")
+            .expect("status label");
+        assert_eq!(status.style.fg, Some(Color::Cyan));
+        assert!(status.style.add_modifier.contains(Modifier::BOLD));
 
-        let content = line
+        let value = line
             .spans
             .iter()
-            .find(|span| span.content.as_ref() == "content")
-            .expect("details context value");
-        assert_eq!(content.style.fg, Some(Color::Gray));
+            .find(|span| span.content.as_ref() == "details focused")
+            .expect("status value");
+        assert_eq!(value.style.fg, Some(Color::Green));
     }
 
     #[test]
@@ -14550,6 +24965,109 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn quick_filter_query_replaces_state_and_adds_qualifiers_before_sort() {
+        let filter =
+            QuickFilter::parse("state:closed label:bug author:alice assignee:bob").unwrap();
+        let filter = filter.expect("filter");
+
+        assert_eq!(
+            quick_filter_query(
+                "repo:owner/repo is:open author:me label:old archived:false sort:updated-desc",
+                &filter,
+            ),
+            "repo:owner/repo archived:false is:closed assignee:bob author:alice label:bug sort:updated-desc"
+        );
+    }
+
+    #[test]
+    fn quick_filter_state_shortcuts_toggle_query_state() {
+        let base = "repo:owner/repo is:open archived:false sort:updated-desc";
+        let closed = QuickFilter::parse("closed").unwrap().expect("closed");
+        let close = QuickFilter::parse("state:close").unwrap().expect("close");
+        let merged = QuickFilter::parse("state:merged").unwrap().expect("merged");
+        let draft = QuickFilter::parse("draft").unwrap().expect("draft");
+        let all = QuickFilter::parse("all").unwrap().expect("all");
+
+        assert!(quick_filter_query(base, &closed).contains("is:closed"));
+        assert!(quick_filter_query(base, &close).contains("is:closed"));
+        assert_eq!(close.display(), "state:closed");
+        assert!(quick_filter_query(base, &merged).contains("is:merged"));
+        assert!(quick_filter_query(base, &draft).contains("is:draft"));
+        assert_eq!(
+            quick_filter_query(base, &all),
+            "repo:owner/repo archived:false sort:updated-desc"
+        );
+    }
+
+    #[test]
+    fn quick_filter_applies_assignee_author_and_multiple_labels() {
+        let filter = QuickFilter::parse("assignee:bob author:alice labels:bug,regression")
+            .unwrap()
+            .expect("filter");
+
+        assert_eq!(
+            quick_filter_query("is:open sort:updated-desc", &filter),
+            "is:open assignee:bob author:alice label:bug label:regression sort:updated-desc"
+        );
+        assert_eq!(
+            filter.display(),
+            "assignee:bob author:alice label:bug label:regression"
+        );
+    }
+
+    #[test]
+    fn quick_filter_clear_inputs_reset_overlay() {
+        assert_eq!(QuickFilter::parse("").unwrap(), None);
+        assert_eq!(QuickFilter::parse("clear").unwrap(), None);
+        assert_eq!(QuickFilter::parse("reset").unwrap(), None);
+    }
+
+    #[test]
+    fn list_title_and_footer_show_active_quick_filter() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed label:bug")
+                .unwrap()
+                .expect("filter"),
+        );
+        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Test [state:closed label:bug]"));
+        assert!(rendered.contains("filter: state:closed label:bug"));
+    }
+
+    #[test]
+    fn filter_input_prompt_is_discoverable_and_prefilled() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.quick_filters.insert(
+            "pull_requests:test".to_string(),
+            QuickFilter::parse("state:closed author:alice")
+                .unwrap()
+                .expect("filter"),
+        );
+
+        app.start_filter_input();
+
+        assert!(app.filter_input_active);
+        assert_eq!(app.filter_input_query, "state:closed author:alice");
+        assert_eq!(
+            active_list_input_prompt(&app).map(|(prompt, _)| prompt),
+            Some(
+                "Filter: fstate:closed author:alice_  Enter apply  empty/clear resets  Esc cancel"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn details_comment_search_input_focuses_matching_comment() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let item_id = app.current_item().expect("item").id.clone();
@@ -14651,6 +25169,44 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn ghr_title_is_bold_when_unread_notifications_exist() {
+        let notification_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Notifications".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::PullRequests,
+            vec![test_section(), notification_section],
+        );
+        app.focus_list();
+        let base = Style::default().fg(Color::DarkGray);
+
+        assert!(app.has_unread_notifications());
+        assert!(
+            view_tabs_title_style(&app, base)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+
+        app.sections[1].items[0].unread = Some(false);
+
+        assert!(!app.has_unread_notifications());
+        assert!(
+            !view_tabs_title_style(&app, base)
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
     fn list_title_shows_visible_loaded_and_total_count() {
         let mut section = many_items_section(50);
         section.total_count = Some(120);
@@ -14693,7 +25249,7 @@ diff --git a/src/github.rs b/src/github.rs
         section.page = 1;
         section.page_size = 100;
         section.filters =
-            "repo:rust-lang/rust is:open archived:false sort:updated-desc".to_string();
+            "repo:rust-lang/rust is:open archived:false sort:created-desc".to_string();
         let app = AppState::new(SectionKind::PullRequests, vec![section]);
         let request = app
             .section_page_request(1, &Config::default())
@@ -14704,7 +25260,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(request.total_pages, 3);
         assert_eq!(
             request.filters,
-            "repo:rust-lang/rust is:open archived:false sort:updated-desc"
+            "repo:rust-lang/rust is:open archived:false sort:created-desc"
         );
     }
 
@@ -14743,6 +25299,7 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.global_search_active);
         assert!(!app.search_active);
+        assert!(!app.filter_input_active);
         assert_eq!(app.global_search_query, "");
         assert_eq!(app.status, "repo search mode in rust-lang/rust");
     }
@@ -14792,7 +25349,7 @@ diff --git a/src/github.rs b/src/github.rs
             key: "repo:Fiber:pull_requests:Pull Requests".to_string(),
             kind: SectionKind::PullRequests,
             title: "Pull Requests".to_string(),
-            filters: "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc"
+            filters: "repo:nervosnetwork/fiber is:open archived:false sort:created-desc"
                 .to_string(),
             items: Vec::new(),
             total_count: None,
@@ -14963,7 +25520,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(rendered.contains(&format!("created: {}", local_datetime(Some(created_at)))));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
-        assert!(rendered.contains("labels: T-compiler remove  add label"));
+        assert!(rendered.contains("milestone: -"));
+        assert!(rendered.contains("labels: T-compiler ×  +"));
         assert!(!rendered.contains("reason: -"));
 
         let author_line = lines
@@ -14977,9 +25535,64 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert_document_action_for_text(
             &document,
-            "remove",
+            "×",
             DetailAction::RemoveLabel("T-compiler".to_string()),
         );
+    }
+
+    #[test]
+    fn pr_details_meta_shows_milestone_title() {
+        let mut item = work_item("1", "chenyukang/ghr", 1, "More on tui", Some("chenyukang"));
+        item.milestone = Some(Milestone {
+            number: 9,
+            title: "next-release".to_string(),
+        });
+        let section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("milestone: next-release"));
+    }
+
+    #[test]
+    fn comments_loaded_updates_details_milestone_metadata() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_reactions: ReactionSummary::default(),
+                item_milestone: Some(Milestone {
+                    number: 9,
+                    title: "next-release".to_string(),
+                }),
+                comments: Vec::new(),
+            }),
+        });
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("milestone: next-release"));
     }
 
     #[test]
@@ -15003,7 +25616,7 @@ diff --git a/src/github.rs b/src/github.rs
         let document = build_details_document(&app, 120);
 
         assert_document_link_for_text(&document, "alice", "https://github.com/alice");
-        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
+        assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     }
 
     #[test]
@@ -15033,8 +25646,8 @@ diff --git a/src/github.rs b/src/github.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("labels: none  add label"));
-        assert_document_action_for_text(&document, "add label", DetailAction::AddLabel);
+        assert!(rendered.contains("labels: none  +"));
+        assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     }
 
     #[test]
@@ -15071,17 +25684,22 @@ diff --git a/src/github.rs b/src/github.rs
                     incomplete: false,
                 }),
                 commits: Some(4),
+                failed_check_runs: Vec::new(),
                 note: Some("Merge blocked: checks pending".to_string()),
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "feature/checks".to_string(),
+                }),
             }),
         );
 
         let document = build_details_document(&app, 120);
-        let rendered = document
+        let lines = document
             .lines
             .iter()
             .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
 
         assert!(rendered.contains("action: Approvable, Mergeable"));
         assert!(rendered.contains("checks: 10 pass, 2 fail, 1 pending"));
@@ -15091,7 +25709,20 @@ diff --git a/src/github.rs b/src/github.rs
             "4",
             "https://github.com/chenyukang/ghr/pull/1/commits",
         );
+        assert!(rendered.contains("branch: chenyukang/ghr:feature/checks"));
         assert!(rendered.contains("action note: Merge blocked: checks pending"));
+        let branch_line = lines
+            .iter()
+            .position(|line| line.contains("branch: chenyukang/ghr:feature/checks"))
+            .expect("branch line");
+        let action_line = lines
+            .iter()
+            .position(|line| line.contains("action: Approvable, Mergeable"))
+            .expect("action line");
+        assert!(
+            action_line > branch_line,
+            "action/checks should start on a new line"
+        );
     }
 
     #[test]
@@ -15111,6 +25742,45 @@ diff --git a/src/github.rs b/src/github.rs
             .expect("failed check segment");
         assert_eq!(failed.style.fg, Some(Color::LightRed));
         assert!(failed.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn mergeable_action_label_is_rendered_green() {
+        let segments = action_label_segments(&["Approvable".to_string(), "Mergeable".to_string()]);
+
+        let approvable = segments
+            .iter()
+            .find(|segment| segment.text == "Approvable")
+            .expect("approvable segment");
+        assert_eq!(approvable.style, Style::default());
+
+        let mergeable = segments
+            .iter()
+            .find(|segment| segment.text == "Mergeable")
+            .expect("mergeable segment");
+        assert_eq!(mergeable.style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn merge_conflict_action_note_is_rendered_red() {
+        let segments =
+            action_note_segments("Merge blocked: draft; merge conflicts must be resolved");
+
+        let conflict = segments
+            .iter()
+            .find(|segment| segment.text == "merge conflicts must be resolved")
+            .expect("conflict segment");
+        assert_eq!(conflict.style.fg, Some(Color::LightRed));
+        assert!(conflict.style.add_modifier.contains(Modifier::BOLD));
+
+        let rendered = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            "Merge blocked: draft; merge conflicts must be resolved"
+        );
     }
 
     #[test]
@@ -15578,7 +26248,7 @@ diff --git a/src/github.rs b/src/github.rs
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("reactions: ❤️ 1  👀 1  react"));
+        assert!(rendered.contains("reactions: ❤️ 1  👀 1  + react"));
         assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     }
 
@@ -15694,6 +26364,8 @@ diff --git a/src/github.rs b/src/github.rs
             side: Some("RIGHT".to_string()),
             start_side: None,
             diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
         };
         let mut parent = comment("alice", "parent review", None);
         parent.id = Some(1);
@@ -15794,7 +26466,7 @@ diff --git a/src/github.rs b/src/github.rs
             Some(DetailAction::ToggleCommentExpanded(0))
         );
 
-        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0), None);
+        app.handle_detail_action(DetailAction::ToggleCommentExpanded(0), None, None);
         let expanded = build_details_document(&app, 120)
             .lines
             .iter()
@@ -15832,6 +26504,8 @@ diff --git a/src/github.rs b/src/github.rs
             diff_hunk: Some(
                 "@@ -873,6 +873,7 @@ fn run_gh_json(args: &[String]) -> Result<String> {\n \n     let output = Command::new(\"gh\")\n         .env(\"GH_PROMPT_DISABLED\", \"1\")\n+       .env(\"GH_NO_UPDATE_NOTIFIER\", \"1\")\n         .args(args)\n         .output()\n         .await".to_string(),
             ),
+            is_resolved: false,
+            is_outdated: false,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -15875,6 +26549,8 @@ diff --git a/src/github.rs b/src/github.rs
             side: Some("RIGHT".to_string()),
             start_side: Some("RIGHT".to_string()),
             diff_hunk: Some(diff_hunk),
+            is_resolved: false,
+            is_outdated: false,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -16007,7 +26683,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::EditComment(0), None);
+        app.handle_detail_action(DetailAction::EditComment(0), None, None);
 
         let dialog = app.comment_dialog.expect("edit dialog");
         assert_eq!(
@@ -16030,7 +26706,7 @@ diff --git a/src/github.rs b/src/github.rs
             DetailState::Loaded(vec![comment("alice", "Quoted body", None)]),
         );
 
-        app.handle_detail_action(DetailAction::ReplyComment(0), None);
+        app.handle_detail_action(DetailAction::ReplyComment(0), None, None);
 
         let dialog = app.comment_dialog.expect("reply dialog");
         assert_eq!(
@@ -16043,6 +26719,350 @@ diff --git a/src/github.rs b/src/github.rs
         );
         assert!(dialog.body.contains("> @alice wrote:"));
         assert!(dialog.body.contains("> Quoted body"));
+    }
+
+    #[test]
+    fn assignee_actions_are_rendered_in_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        let document = build_details_document(&app, 100);
+        let assignee_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("assignees: -"))
+            .expect("empty assignee row");
+        let empty_line = document.lines[assignee_line].to_string();
+        let assign_column = empty_line.find("@ assign").expect("assign action") as u16;
+        assert!(!empty_line.contains("- unassign"));
+        assert_eq!(
+            document.action_at(assignee_line, assign_column),
+            Some(DetailAction::AssignAssignee)
+        );
+
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
+
+        let document = build_details_document(&app, 100);
+        let assignee_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("assignees: alice"))
+            .expect("assignee row");
+        let assign_column = document.lines[assignee_line]
+            .to_string()
+            .find("@ assign")
+            .expect("assign action") as u16;
+        let unassign_column = document.lines[assignee_line]
+            .to_string()
+            .find("- unassign")
+            .expect("unassign action") as u16;
+
+        assert_eq!(
+            document.action_at(assignee_line, assign_column),
+            Some(DetailAction::AssignAssignee)
+        );
+        assert_eq!(
+            document.action_at(assignee_line, unassign_column),
+            Some(DetailAction::UnassignAssignee)
+        );
+    }
+
+    #[test]
+    fn at_and_minus_open_assignee_dialogs() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('@')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(
+            app.assignee_dialog.as_ref().map(|dialog| dialog.action),
+            Some(AssigneeAction::Assign)
+        );
+        assert_eq!(app.status, "enter assignee to add");
+
+        app.assignee_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('-')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(app.status, "selected item has no assignees");
+
+        app.sections[0].items[0].assignees = vec!["alice".to_string()];
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('-')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(
+            app.assignee_dialog.as_ref().map(|dialog| dialog.action),
+            Some(AssigneeAction::Unassign)
+        );
+        assert_eq!(app.status, "enter assignee to remove");
+    }
+
+    #[test]
+    fn assignee_dialog_enter_submits_parsed_logins() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_dialog.as_mut().unwrap().input = "@alice, bob alice".to_string();
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert!(app.assignee_action_running);
+        assert_eq!(app.status, "assigning assignee");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_dialog_enter_uses_prefix_candidate_for_last_login() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        let dialog = app.assignee_dialog.as_mut().expect("dialog");
+        dialog.input = "alice, bo".to_string();
+        dialog.suggestions = vec!["bob".to_string(), "bobby".to_string(), "carol".to_string()];
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_dialog_can_cycle_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        let dialog = app.assignee_dialog.as_mut().expect("dialog");
+        dialog.input = "bo".to_string();
+        dialog.suggestions = vec!["bob".to_string(), "bobby".to_string()];
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(key(KeyCode::Down), |_, _, _| {});
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Assign,
+                vec!["bobby".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_unassign_dialog_defaults_to_the_only_current_assignee() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].assignees = vec!["chenyukang".to_string()];
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert!(app.assignee_action_running);
+        assert_eq!(app.status, "removing assignee");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Unassign,
+                vec!["chenyukang".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn unassign_dialog_uses_current_assignees_as_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].assignees = vec!["alice".to_string(), "bob".to_string()];
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
+        app.assignee_dialog.as_mut().unwrap().input = "bo".to_string();
+        let mut submitted = None;
+
+        app.handle_assignee_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, assignees| {
+                submitted = Some((item.id, action, assignees));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                AssigneeAction::Unassign,
+                vec!["bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn assignee_suggestions_loaded_updates_active_assign_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["alice".to_string(), "bob".to_string()]),
+        });
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["alice", "bob"]);
+        assert_eq!(
+            app.assignee_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["alice".to_string(), "bob".to_string()])
+        );
+        assert_eq!(app.status, "assignee candidates loaded");
+    }
+
+    #[test]
+    fn assignee_dialog_uses_cached_candidates_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-user".to_string(), "chenyukang".to_string()],
+        );
+
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-user", "chenyukang"]);
+    }
+
+    #[test]
+    fn assignee_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["alice".to_string()]),
+        });
+
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(
+            app.assignee_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["alice".to_string()])
+        );
+    }
+
+    #[test]
+    fn assignee_suggestion_refresh_error_keeps_cached_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-user".to_string()],
+        );
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::AssigneeSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.assignee_dialog.as_ref().expect("dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-user"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(
+            app.status,
+            "assignee candidates refresh failed; using cache"
+        );
+    }
+
+    #[test]
+    fn assignee_update_success_refreshes_item_state() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Assign, None);
+        app.assignee_action_running = true;
+        let mut updated = app.current_item().cloned().expect("item");
+        updated.assignees = vec!["alice".to_string()];
+
+        app.handle_msg(AppMsg::AssigneesUpdated {
+            item_id: "1".to_string(),
+            action: AssigneeAction::Assign,
+            result: Ok(updated),
+        });
+
+        assert!(!app.assignee_action_running);
+        assert!(app.assignee_dialog.is_none());
+        assert_eq!(app.current_item().unwrap().assignees, vec!["alice"]);
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "assignee added");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| dialog.title.as_str()),
+            Some("Assignee Added")
+        );
+    }
+
+    #[test]
+    fn assignee_update_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_assignee_dialog(AssigneeAction::Unassign, None);
+        app.assignee_action_running = true;
+
+        app.handle_msg(AppMsg::AssigneesUpdated {
+            item_id: "1".to_string(),
+            action: AssigneeAction::Unassign,
+            result: Err("gh api repos/owner/repo/issues/1/assignees failed: HTTP 422".to_string()),
+        });
+
+        assert!(!app.assignee_action_running);
+        assert_eq!(app.status, "unassign failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Unassign Failed");
+        assert_eq!(dialog.body, "HTTP 422");
     }
 
     #[test]
@@ -16192,6 +27212,147 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn copy_github_link_prefers_selected_comment_when_details_focused() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment(
+                "alice",
+                "looks good",
+                Some("https://github.com/rust-lang/rust/pull/1#issuecomment-1"),
+            )]),
+        );
+        app.focus_details();
+
+        assert_eq!(
+            app.selected_github_link(),
+            Some((
+                "https://github.com/rust-lang/rust/pull/1#issuecomment-1".to_string(),
+                "comment"
+            ))
+        );
+
+        app.copy_github_link();
+
+        assert_eq!(app.status, "copied comment link");
+    }
+
+    #[test]
+    fn copy_github_link_uses_item_link_without_selected_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        assert_eq!(
+            app.selected_github_link(),
+            Some((
+                "https://github.com/rust-lang/rust/pull/1".to_string(),
+                "pull request"
+            ))
+        );
+
+        app.copy_github_link();
+
+        assert_eq!(app.status, "copied pull request link");
+    }
+
+    #[test]
+    fn copy_content_prefers_selected_comment_when_details_focused() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment(
+                "alice",
+                "comment body\nwith markdown",
+                Some("https://github.com/rust-lang/rust/pull/1#issuecomment-1"),
+            )]),
+        );
+        app.focus_details();
+
+        assert_eq!(
+            app.selected_copy_content(),
+            Some(("comment body\nwith markdown".to_string(), "comment content"))
+        );
+
+        app.copy_content();
+
+        assert_eq!(app.status, "copied comment content");
+    }
+
+    #[test]
+    fn copy_content_uses_item_description_without_selected_comment() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        assert_eq!(
+            app.selected_copy_content(),
+            Some((
+                "A body with useful context".to_string(),
+                "pull request description"
+            ))
+        );
+
+        app.copy_content();
+
+        assert_eq!(app.status, "copied pull request description");
+    }
+
+    #[test]
+    fn copy_content_reports_missing_description() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].body = None;
+
+        assert_eq!(app.selected_copy_content(), None);
+
+        app.copy_content();
+
+        assert_eq!(app.status, "no content selected");
+    }
+
+    #[test]
+    fn command_palette_copy_github_link_copies_current_item_link() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "copy github".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.status, "copied pull request link");
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
+    fn command_palette_copy_content_copies_current_item_description() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "copy content".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert_eq!(app.status, "copied pull request description");
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
     fn label_dialog_submits_add_label() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_add_label_dialog(None);
@@ -16238,6 +27399,59 @@ diff --git a/src/github.rs b/src/github.rs
             pending.action,
             LabelAction::Add("good first issue".to_string())
         );
+    }
+
+    #[test]
+    fn label_dialog_uses_cached_suggestions_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.label_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["T-compiler".to_string(), "A-diagnostics".to_string()],
+        );
+
+        app.start_add_label_dialog(None);
+
+        let dialog = app.label_dialog.as_ref().expect("label dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["T-compiler", "A-diagnostics"]);
+    }
+
+    #[test]
+    fn label_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::LabelSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["bug".to_string()]),
+        });
+
+        assert!(app.label_dialog.is_none());
+        assert_eq!(
+            app.label_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["bug".to_string()])
+        );
+    }
+
+    #[test]
+    fn label_suggestion_refresh_error_keeps_cached_suggestions() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.label_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["cached-label".to_string()],
+        );
+        app.start_add_label_dialog(None);
+        app.label_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::LabelSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.label_dialog.as_ref().expect("label dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["cached-label"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(app.status, "label suggestions refresh failed; using cache");
     }
 
     #[test]
@@ -16306,6 +27520,330 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn capital_n_in_pr_repo_with_local_dir_opens_pr_create_dialog() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/new-pr");
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        app.start_new_issue_or_pull_request_dialog(&config);
+        let dialog = app.pr_create_dialog.as_ref().expect("pr create dialog");
+
+        assert!(app.issue_dialog.is_none());
+        assert_eq!(dialog.repo, "chenyukang/ghr");
+        assert_eq!(dialog.local_dir, local_dir);
+        assert_eq!(dialog.branch, "feature/new-pr");
+        assert_eq!(dialog.field, PrCreateField::Title);
+        assert_eq!(app.status, "new pull request");
+    }
+
+    #[test]
+    fn capital_n_in_pr_repo_without_local_dir_shows_hint() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+
+        app.start_new_issue_or_pull_request_dialog(&Config::default());
+
+        assert!(app.pr_create_dialog.is_none());
+        assert!(app.issue_dialog.is_none());
+        assert!(app.status.contains("has no local_dir"));
+    }
+
+    #[test]
+    fn capital_n_in_issue_section_still_opens_issue_dialog() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+
+        app.start_new_issue_or_pull_request_dialog(&Config::default());
+
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(
+            app.issue_dialog.as_ref().map(|dialog| dialog.repo.as_str()),
+            Some("chenyukang/ghr")
+        );
+    }
+
+    #[test]
+    fn capital_n_in_issue_list_opens_issue_dialog() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('N')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(
+            app.issue_dialog.as_ref().map(|dialog| dialog.repo.as_str()),
+            Some("chenyukang/ghr")
+        );
+        assert_eq!(app.status, "new issue");
+    }
+
+    #[test]
+    fn capital_n_in_pr_details_opens_pr_create_dialog() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/details-pr");
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: vec![work_item("8", "chenyukang/ghr", 8, "Add diff UI", None)],
+            total_count: Some(1),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        app.focus_details();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('N')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.issue_dialog.is_none());
+        let dialog = app.pr_create_dialog.as_ref().expect("pr create dialog");
+        assert_eq!(dialog.repo, "chenyukang/ghr");
+        assert_eq!(dialog.local_dir, local_dir);
+        assert_eq!(dialog.branch, "feature/details-pr");
+        assert_eq!(app.status, "new pull request");
+    }
+
+    #[test]
+    fn capital_n_in_issue_details_opens_issue_dialog() {
+        let mut issue = work_item("issue-8", "chenyukang/ghr", 8, "Bug report", None);
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/chenyukang/ghr/issues/8".to_string();
+        let section = SectionSnapshot {
+            key: "repo:ghr:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: vec![issue],
+            total_count: Some(1),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        app.focus_details();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('N')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_create_dialog.is_none());
+        let dialog = app.issue_dialog.as_ref().expect("issue dialog");
+        assert_eq!(dialog.repo, "chenyukang/ghr");
+        assert_eq!(dialog.field, IssueDialogField::Title);
+        assert_eq!(app.status, "new issue");
+    }
+
+    #[test]
+    fn pr_create_dialog_submits_title_body_and_branch() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.pr_create_dialog = Some(PrCreateDialog {
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: local_dir.clone(),
+            branch: "feature/pr-body".to_string(),
+            title: "Add PR creation".to_string(),
+            body: "Created from the TUI".to_string(),
+            field: PrCreateField::Body,
+            body_scroll: 0,
+        });
+
+        let pending = app.prepare_pr_create().expect("pending pr create");
+
+        assert!(app.pr_creating);
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(pending.repo, "chenyukang/ghr");
+        assert_eq!(pending.local_dir, local_dir);
+        assert_eq!(pending.branch, "feature/pr-body");
+        assert_eq!(pending.title, "Add PR creation");
+        assert_eq!(pending.body, "Created from the TUI");
+    }
+
+    #[test]
+    fn issue_create_failure_restores_dialog_for_retry() {
+        let mut app = AppState::new(SectionKind::Issues, vec![test_section()]);
+        let dialog = IssueDialog {
+            repo: "chenyukang/ghr".to_string(),
+            title: "Crash in parser".to_string(),
+            labels: "bug, T-compiler".to_string(),
+            body: "Steps to reproduce".to_string(),
+            field: IssueDialogField::Body,
+            body_scroll: 1,
+        };
+        app.issue_creating = true;
+        app.pending_issue_create = Some(PendingIssueCreate {
+            repo: "chenyukang/ghr".to_string(),
+            title: "Crash in parser".to_string(),
+            body: "Steps to reproduce".to_string(),
+            labels: vec!["bug".to_string(), "T-compiler".to_string()],
+            dialog,
+        });
+
+        app.handle_msg(AppMsg::IssueCreated {
+            result: Err("failed to create issue in chenyukang/ghr: gh api repos/chenyukang/ghr/issues failed: validation failed".to_string()),
+        });
+
+        assert!(!app.issue_creating);
+        assert_eq!(app.status, "issue create failed");
+        let message = app.message_dialog.as_ref().expect("failure dialog");
+        assert_eq!(message.title, "Issue Create Failed");
+        assert_eq!(message.kind, MessageDialogKind::RetryableError);
+        assert!(message.body.contains("validation failed"));
+        let restored = app.issue_dialog.as_ref().expect("restored issue dialog");
+        assert_eq!(restored.title, "Crash in parser");
+        assert_eq!(restored.labels, "bug, T-compiler");
+        assert_eq!(restored.body, "Steps to reproduce");
+        assert_eq!(restored.field, IssueDialogField::Body);
+        assert_eq!(restored.body_scroll, 1);
+    }
+
+    #[test]
+    fn pull_request_create_failure_shows_gh_detail_and_restores_dialog() {
+        let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let dialog = PrCreateDialog {
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: local_dir.clone(),
+            branch: "feature/pr-body".to_string(),
+            title: "Add PR creation".to_string(),
+            body: "Created from the TUI".to_string(),
+            field: PrCreateField::Body,
+            body_scroll: 2,
+        };
+        app.pr_creating = true;
+        app.pending_pr_create = Some(PendingPrCreate {
+            repo: "chenyukang/ghr".to_string(),
+            local_dir,
+            branch: "feature/pr-body".to_string(),
+            title: "Add PR creation".to_string(),
+            body: "Created from the TUI".to_string(),
+            dialog,
+        });
+
+        app.handle_msg(AppMsg::PullRequestCreated {
+            result: Err("failed to create pull request in chenyukang/ghr: gh pr create --repo chenyukang/ghr --head feature/pr-body failed: a pull request for branch \"feature/pr-body\" already exists: https://github.com/chenyukang/ghr/pull/42".to_string()),
+        });
+
+        assert!(!app.pr_creating);
+        assert_eq!(app.status, "pull request create failed");
+        let message = app.message_dialog.as_ref().expect("failure dialog");
+        assert_eq!(message.title, "Pull Request Create Failed");
+        assert_eq!(message.kind, MessageDialogKind::RetryableError);
+        assert!(message.body.contains("already exists"));
+        assert!(
+            message
+                .body
+                .contains("https://github.com/chenyukang/ghr/pull/42")
+        );
+        let restored = app
+            .pr_create_dialog
+            .as_ref()
+            .expect("restored pr create dialog");
+        assert_eq!(restored.title, "Add PR creation");
+        assert_eq!(restored.body, "Created from the TUI");
+        assert_eq!(restored.field, PrCreateField::Body);
+        assert_eq!(restored.body_scroll, 2);
+    }
+
+    #[test]
     fn created_issue_is_inserted_into_matching_repo_issue_section() {
         let pr_section = SectionSnapshot {
             key: "repo:Fiber:pull_requests:Pull Requests".to_string(),
@@ -16363,7 +27901,11 @@ diff --git a/src/github.rs b/src/github.rs
     fn remove_label_action_opens_confirmation_and_updates_local_item() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
-        app.handle_detail_action(DetailAction::RemoveLabel("T-compiler".to_string()), None);
+        app.handle_detail_action(
+            DetailAction::RemoveLabel("T-compiler".to_string()),
+            None,
+            None,
+        );
         assert_eq!(
             app.label_dialog.as_ref().map(|dialog| &dialog.mode),
             Some(&LabelDialogMode::Remove {
@@ -16429,7 +27971,68 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.pr_action_dialog.as_ref().expect("merge dialog");
         assert_eq!(dialog.action, PrAction::Merge);
         assert_eq!(dialog.item.id, "1");
-        assert_eq!(app.status, "confirm pull request merge");
+        assert_eq!(dialog.merge_method, MergeMethod::Merge);
+        assert_eq!(app.status, "confirm pull request merge (method: merge)");
+    }
+
+    #[test]
+    fn merge_confirmation_switches_methods() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('s')), |_, _, _, _| {
+            panic!("method switch should not submit");
+        });
+
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Squash
+        );
+        assert_eq!(app.status, "merge method: squash");
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Char('r')), |_, _, _, _| {
+            panic!("method switch should not submit");
+        });
+
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Rebase
+        );
+        assert_eq!(app.status, "merge method: rebase");
+    }
+
+    #[test]
+    fn merge_confirmation_cycles_methods_with_tab() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Tab), |_, _, _, _| {
+            panic!("method switch should not submit");
+        });
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Squash
+        );
+
+        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Tab), |_, _, _, _| {
+            panic!("method switch should not submit");
+        });
+        assert_eq!(
+            app.pr_action_dialog
+                .as_ref()
+                .expect("merge dialog")
+                .merge_method,
+            MergeMethod::Rebase
+        );
     }
 
     #[test]
@@ -16454,7 +28057,103 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
-    fn capital_a_key_opens_approve_confirmation_for_pull_request_details() {
+    fn capital_c_key_opens_reopen_confirmation_for_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request reopen");
+    }
+
+    #[test]
+    fn capital_c_key_rejects_merged_pull_request_reopen() {
+        let mut section = test_section();
+        section.items[0].state = Some("merged".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "merged pull requests cannot be reopened");
+    }
+
+    #[test]
+    fn capital_c_key_opens_issue_close_or_reopen_confirmation() {
+        let mut open_issue = work_item("issue-1", "rust-lang/rust", 1, "Open issue", None);
+        open_issue.kind = ItemKind::Issue;
+        open_issue.state = Some("open".to_string());
+        let mut closed_issue = work_item("issue-2", "rust-lang/rust", 2, "Closed issue", None);
+        closed_issue.kind = ItemKind::Issue;
+        closed_issue.state = Some("CLOSED".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![open_issue, closed_issue],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue close dialog");
+        assert_eq!(dialog.action, PrAction::Close);
+        assert_eq!(dialog.item.kind, ItemKind::Issue);
+        assert_eq!(app.status, "confirm issue close");
+
+        app.pr_action_dialog = None;
+        app.move_selection(1);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('C')),
+            &config,
+            &store,
+            &tx
+        ));
+        let dialog = app.pr_action_dialog.as_ref().expect("issue reopen dialog");
+        assert_eq!(dialog.action, PrAction::Reopen);
+        assert_eq!(dialog.item.id, "issue-2");
+        assert_eq!(app.status, "confirm issue reopen");
+    }
+
+    #[test]
+    fn capital_a_key_opens_approve_review_summary_for_pull_request_details() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -16469,10 +28168,664 @@ diff --git a/src/github.rs b/src/github.rs
             &tx
         ));
 
-        let dialog = app.pr_action_dialog.as_ref().expect("approve dialog");
-        assert_eq!(dialog.action, PrAction::Approve);
+        let dialog = app
+            .review_submit_dialog
+            .as_ref()
+            .expect("approve review dialog");
+        assert_eq!(dialog.event, PullRequestReviewEvent::Approve);
         assert_eq!(dialog.item.id, "1");
-        assert_eq!(app.status, "confirm pull request approval");
+        assert_eq!(app.status, "review summary: approve");
+    }
+
+    #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_list() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = checkout_test_config();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "checkout-pr");
+        assert!(dialog.checkout.is_some());
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn capital_x_key_opens_checkout_confirmation_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = checkout_test_config();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.action_hints.insert(
+            "checkout-pr".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                failed_check_runs: Vec::new(),
+                note: None,
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "codex/pr-checkout-local".to_string(),
+                }),
+            }),
+        );
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        assert_eq!(dialog.action, PrAction::Checkout);
+        assert_eq!(dialog.item.id, "checkout-pr");
+        assert_eq!(
+            dialog
+                .checkout
+                .as_ref()
+                .and_then(|checkout| checkout.branch.as_ref())
+                .map(pull_request_branch_label)
+                .as_deref(),
+            Some("chenyukang/ghr:codex/pr-checkout-local")
+        );
+        assert_eq!(app.status, "confirm local pull request checkout");
+    }
+
+    #[test]
+    fn capital_f_key_opens_rerun_failed_checks_confirmation() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 2,
+                    failed: 1,
+                    pending: 0,
+                    skipped: 0,
+                    total: 3,
+                    incomplete: false,
+                }),
+                failed_check_runs: vec![FailedCheckRunSummary {
+                    run_id: 123,
+                    workflow: Some("CI".to_string()),
+                    checks: vec!["test".to_string()],
+                }],
+                ..ActionHints::default()
+            }),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('F')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("rerun dialog");
+        assert_eq!(dialog.action, PrAction::RerunFailedChecks);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm failed check rerun");
+        assert!(
+            dialog
+                .summary
+                .iter()
+                .any(|(_, value)| value.contains("CI #123"))
+        );
+    }
+
+    #[test]
+    fn checkout_confirmation_remote_branch_is_clickable() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let config = checkout_test_config();
+        app.action_hints.insert(
+            "checkout-pr".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: Vec::new(),
+                checks: None,
+                commits: None,
+                failed_check_runs: Vec::new(),
+                note: None,
+                head: Some(PullRequestBranch {
+                    repository: "chenyukang/ghr".to_string(),
+                    branch: "codex/pr-checkout-local".to_string(),
+                }),
+            }),
+        );
+        app.start_pr_checkout_dialog(&config);
+        let dialog = app.pr_action_dialog.as_ref().expect("checkout dialog");
+        let area = Rect::new(0, 0, 120, 40);
+        let inner = block_inner(pr_action_dialog_area(dialog, area));
+        let branch_column = inner
+            .x
+            .saturating_add(display_width("remote branch: ") as u16)
+            .saturating_add(1);
+        let branch_row = inner.y.saturating_add(PR_ACTION_REMOTE_BRANCH_LINE);
+
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column, branch_row).as_deref(),
+            Some("https://github.com/chenyukang/ghr/tree/codex/pr-checkout-local")
+        );
+        assert_eq!(
+            pr_action_dialog_link_at(dialog, area, branch_column.saturating_sub(2), branch_row),
+            None
+        );
+    }
+
+    #[test]
+    fn checkout_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![checkout_test_section()]);
+        let config = checkout_test_config();
+        app.start_pr_checkout_dialog(&config);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, checkout, _merge_method| {
+                submitted = Some((item.id, action, checkout));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "checking out pull request locally");
+        assert!(matches!(
+            submitted,
+            Some((id, PrAction::Checkout, Some(_))) if id == "checkout-pr"
+        ));
+    }
+
+    #[test]
+    fn pr_checkout_command_construction_uses_repo_and_number() {
+        let args = pr_checkout_command_args("rust-lang/rust", 123);
+
+        assert_eq!(
+            args,
+            vec![
+                "pr".to_string(),
+                "checkout".to_string(),
+                "123".to_string(),
+                "--repo".to_string(),
+                "rust-lang/rust".to_string(),
+            ]
+        );
+        assert_eq!(
+            pr_checkout_command_display(&args),
+            "gh pr checkout 123 --repo rust-lang/rust"
+        );
+    }
+
+    #[test]
+    fn capital_e_key_opens_enable_auto_merge_confirmation_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("enable dialog");
+        assert_eq!(dialog.action, PrAction::EnableAutoMerge);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request auto-merge enable");
+    }
+
+    #[test]
+    fn capital_o_key_opens_disable_auto_merge_confirmation_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('O')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("disable dialog");
+        assert_eq!(dialog.action, PrAction::DisableAutoMerge);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request auto-merge disable");
+    }
+
+    #[test]
+    fn auto_merge_action_dialog_prompt_is_clear() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::EnableAutoMerge);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Enable auto-merge for this pull request on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, enable auto-merge for PR"));
+    }
+
+    #[test]
+    fn capital_u_key_opens_update_branch_confirmation_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('U')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("update branch dialog");
+        assert_eq!(dialog.action, PrAction::UpdateBranch);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm pull request branch update");
+    }
+
+    #[test]
+    fn update_branch_dialog_prompt_names_base_branch_update() {
+        let mut section = test_section();
+        let item = section.items.remove(0);
+        let dialog = PrActionDialog {
+            item,
+            action: PrAction::UpdateBranch,
+            checkout: None,
+            summary: Vec::new(),
+            merge_method: MergeMethod::default(),
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw_pr_action_dialog(frame, &dialog, false, frame.area()))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Update Pull Request Branch"));
+        assert!(rendered.contains("Update this pull request branch from its base branch?"));
+        assert!(rendered.contains("y/Enter: yes, update PR"));
+    }
+
+    #[test]
+    fn p_key_opens_request_reviewers_dialog_for_pull_request() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('P')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app
+            .reviewer_dialog
+            .as_ref()
+            .expect("request reviewers dialog");
+        assert_eq!(dialog.action, ReviewerAction::Request);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "enter reviewer logins to request");
+    }
+
+    #[test]
+    fn y_key_opens_remove_reviewers_dialog_for_pull_request_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('Y')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app
+            .reviewer_dialog
+            .as_ref()
+            .expect("remove reviewers dialog");
+        assert_eq!(dialog.action, ReviewerAction::Remove);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "enter reviewer logins to remove");
+    }
+
+    #[test]
+    fn reviewer_dialog_submission_parses_comma_separated_logins() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_dialog.as_mut().unwrap().input = " alice, bob, Alice ,, ".to_string();
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert!(app.reviewer_action_running);
+        assert_eq!(app.status, "requesting review from alice, bob");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["alice".to_string(), "bob".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_dialog_uses_cached_candidates_immediately() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.reviewer_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["chenyukang".to_string(), "reviewer-b".to_string()],
+        );
+
+        app.start_reviewer_dialog(ReviewerAction::Request);
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["chenyukang", "reviewer-b"]);
+    }
+
+    #[test]
+    fn reviewer_dialog_falls_back_to_assignee_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.assignee_suggestions_cache.insert(
+            "rust-lang/rust".to_string(),
+            vec!["assignable-user".to_string()],
+        );
+
+        app.start_reviewer_dialog(ReviewerAction::Request);
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert_eq!(dialog.suggestions, vec!["assignable-user"]);
+    }
+
+    #[test]
+    fn reviewer_dialog_enter_uses_prefix_candidate_for_last_login() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        let dialog = app.reviewer_dialog.as_mut().expect("reviewer dialog");
+        dialog.input = "alice, ch".to_string();
+        dialog.suggestions = vec![
+            "bob".to_string(),
+            "chenyukang".to_string(),
+            "chris".to_string(),
+        ];
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["alice".to_string(), "chenyukang".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_dialog_can_cycle_prefix_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        let dialog = app.reviewer_dialog.as_mut().expect("reviewer dialog");
+        dialog.input = "ch".to_string();
+        dialog.suggestions = vec![
+            "chenyukang".to_string(),
+            "chris".to_string(),
+            "reviewer".to_string(),
+        ];
+        let mut submitted = None;
+
+        app.handle_reviewer_dialog_key_with_submit(key(KeyCode::Down), |_, _, _| {});
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, reviewers| {
+                submitted = Some((item.id, action, reviewers));
+            },
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                ReviewerAction::Request,
+                vec!["chris".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn reviewer_suggestions_loaded_updates_cache_without_active_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.handle_msg(AppMsg::ReviewerSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Ok(vec!["chenyukang".to_string()]),
+        });
+
+        assert!(app.reviewer_dialog.is_none());
+        assert_eq!(
+            app.reviewer_suggestions_cache.get("rust-lang/rust"),
+            Some(&vec!["chenyukang".to_string()])
+        );
+    }
+
+    #[test]
+    fn reviewer_suggestion_refresh_error_keeps_cached_candidates() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.reviewer_suggestions_cache
+            .insert("rust-lang/rust".to_string(), vec!["chenyukang".to_string()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_dialog.as_mut().unwrap().suggestions_loading = true;
+
+        app.handle_msg(AppMsg::ReviewerSuggestionsLoaded {
+            repo: "rust-lang/rust".to_string(),
+            result: Err("network failed".to_string()),
+        });
+
+        let dialog = app.reviewer_dialog.as_ref().expect("reviewer dialog");
+        assert!(!dialog.suggestions_loading);
+        assert_eq!(dialog.suggestions, vec!["chenyukang"]);
+        assert!(dialog.suggestions_error.is_none());
+        assert_eq!(
+            app.status,
+            "reviewer candidates refresh failed; using cache"
+        );
+    }
+
+    #[test]
+    fn reviewer_dialog_empty_input_stays_open() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Remove);
+        let mut submitted = false;
+
+        app.handle_reviewer_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |_item, _action, _reviewers| {
+                submitted = true;
+            },
+        );
+
+        assert!(!submitted);
+        assert!(!app.reviewer_action_running);
+        assert!(app.reviewer_dialog.is_some());
+        assert_eq!(app.status, "enter at least one reviewer login");
+    }
+
+    #[test]
+    fn reviewer_action_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('P')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.reviewer_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn reviewer_action_finished_refreshes_details_and_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_reviewer_dialog(ReviewerAction::Request);
+        app.reviewer_action_running = true;
+        app.action_hints
+            .insert("1".to_string(), ActionHintState::Loading);
+
+        app.handle_msg(AppMsg::ReviewerActionFinished {
+            item_id: "1".to_string(),
+            action: ReviewerAction::Request,
+            reviewers: vec!["alice".to_string()],
+            result: Ok(()),
+        });
+
+        assert!(app.reviewer_dialog.is_none());
+        assert!(!app.reviewer_action_running);
+        assert!(app.details_stale.contains("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loading)
+        ));
+        assert!(app.action_hints_stale.contains("1"));
+        assert_eq!(app.status, "requested review from alice; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Reviewers Requested");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn capital_d_key_opens_convert_to_draft_confirmation_for_ready_pr() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('D')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("draft dialog");
+        assert_eq!(dialog.action, PrAction::ConvertToDraft);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm convert pull request to draft");
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Convert this pull request to draft on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, convert PR"));
+    }
+
+    #[test]
+    fn capital_d_key_opens_ready_confirmation_for_draft_pr_details() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('D')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.pr_action_dialog.as_ref().expect("ready dialog");
+        assert_eq!(dialog.action, PrAction::MarkReadyForReview);
+        assert_eq!(dialog.item.id, "1");
+        assert_eq!(app.status, "confirm mark pull request ready");
+
+        let backend = ratatui::backend::TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+        assert!(rendered.contains("Mark this pull request ready for review on GitHub?"));
+        assert!(rendered.contains("y/Enter: yes, mark ready PR"));
     }
 
     #[test]
@@ -16481,13 +28834,139 @@ diff --git a/src/github.rs b/src/github.rs
         app.start_pr_action_dialog(PrAction::Approve);
         let mut submitted = None;
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Enter), |item, action| {
-            submitted = Some((item.id, action));
-        });
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
 
         assert!(app.pr_action_running);
         assert_eq!(app.status, "approving pull request");
-        assert_eq!(submitted, Some(("1".to_string(), PrAction::Approve)));
+        assert_eq!(submitted, Some(("1".to_string(), PrAction::Approve, None)));
+    }
+
+    #[test]
+    fn merge_confirmation_submits_selected_method() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        app.select_merge_method(MergeMethod::Squash);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "merging pull request with squash");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::Merge, Some(MergeMethod::Squash)))
+        );
+    }
+
+    #[test]
+    fn merge_confirmation_submits_default_merge_method() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Merge);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "merging pull request with merge");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::Merge, Some(MergeMethod::Merge)))
+        );
+    }
+
+    #[test]
+    fn update_branch_confirmation_submits_selected_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Char('y')),
+            |item, action, _checkout, merge_method| {
+                submitted = Some((item.id, action, merge_method));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "updating pull request branch");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::UpdateBranch, None))
+        );
+    }
+
+    #[test]
+    fn draft_ready_confirmation_submits_selected_action() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.start_pr_draft_ready_dialog();
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, _merge_method| {
+                submitted = Some((item.id, action));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "marking pull request ready for review");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::MarkReadyForReview))
+        );
+    }
+
+    #[test]
+    fn issue_state_action_confirmation_submits_selected_action() {
+        let mut item = work_item("issue-1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.state = Some("closed".to_string());
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        app.start_close_or_reopen_dialog();
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Enter),
+            |item, action, _checkout, _merge_method| {
+                submitted = Some((item.id, item.kind, action));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "reopening issue");
+        assert_eq!(
+            submitted,
+            Some(("issue-1".to_string(), ItemKind::Issue, PrAction::Reopen))
+        );
     }
 
     #[test]
@@ -16495,13 +28974,248 @@ diff --git a/src/github.rs b/src/github.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
 
-        app.handle_pr_action_dialog_key_with_submit(key(KeyCode::Esc), |_item, _action| {
-            panic!("escape should not submit the action");
-        });
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Esc),
+            |_item, _action, _checkout, _merge_method| {
+                panic!("escape should not submit the action");
+            },
+        );
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
-        assert_eq!(app.status, "pull request action cancelled");
+        assert_eq!(app.status, "item action cancelled");
+    }
+
+    #[test]
+    fn rerun_failed_checks_rejects_pr_without_failed_checks() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 3,
+                    failed: 0,
+                    pending: 0,
+                    skipped: 0,
+                    total: 3,
+                    incomplete: false,
+                }),
+                ..ActionHints::default()
+            }),
+        );
+
+        app.start_pr_action_dialog(PrAction::RerunFailedChecks);
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "no failed checks to rerun");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "No Failed Checks");
+    }
+
+    #[test]
+    fn rerun_failed_checks_confirmation_submits_action() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                checks: Some(CheckSummary {
+                    passed: 0,
+                    failed: 1,
+                    pending: 0,
+                    skipped: 0,
+                    total: 1,
+                    incomplete: false,
+                }),
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::RerunFailedChecks);
+        let mut submitted = None;
+
+        app.handle_pr_action_dialog_key_with_submit(
+            key(KeyCode::Char('y')),
+            |item, action, _checkout, _merge_method| {
+                submitted = Some((item.id, action));
+            },
+        );
+
+        assert!(app.pr_action_running);
+        assert_eq!(app.status, "rerunning failed checks");
+        assert_eq!(
+            submitted,
+            Some(("1".to_string(), PrAction::RerunFailedChecks))
+        );
+    }
+
+    #[test]
+    fn review_submit_dialog_selects_event_and_edits_summary() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('2')),
+            None,
+            |_pending| panic!("event selection should not submit"),
+            |_item, _body| panic!("event selection should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('o')),
+            None,
+            |_pending| panic!("typing should not submit"),
+            |_item, _body| panic!("typing should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('k')),
+            None,
+            |_pending| panic!("typing should not submit"),
+            |_item, _body| panic!("typing should not create a draft"),
+        );
+
+        let dialog = app.review_submit_dialog.as_ref().expect("review dialog");
+        assert_eq!(dialog.event, PullRequestReviewEvent::RequestChanges);
+        assert_eq!(dialog.body, "ok");
+        assert_eq!(app.status, "review event: request changes");
+    }
+
+    #[test]
+    fn review_submit_dialog_submits_selected_event() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        app.review_submit_dialog.as_mut().unwrap().body = "looks good overall".to_string();
+        let mut submitted = None;
+
+        app.handle_review_submit_dialog_key_with_submit(
+            key(KeyCode::Char('3')),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+
+        assert!(app.review_submit_dialog.is_none());
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "submitting review: approve");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::Approve,
+                "looks good overall".to_string(),
+                ReviewSubmitMode::New
+            ))
+        );
+    }
+
+    #[test]
+    fn approve_shortcut_submits_empty_approve_review() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('A')),
+            &config,
+            &store,
+            &tx
+        ));
+        let mut submitted = None;
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.event, pending.body)),
+            |_item, _body| panic!("approve should submit, not create a draft"),
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::Approve,
+                String::new()
+            ))
+        );
+    }
+
+    #[test]
+    fn pending_review_submit_and_discard_use_local_pending_review() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.pending_reviews.insert(
+            "1".to_string(),
+            PendingReviewState {
+                review_id: 77,
+                body: "draft summary".to_string(),
+            },
+        );
+
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        let dialog = app.review_submit_dialog.as_ref().expect("pending dialog");
+        assert_eq!(dialog.body, "draft summary");
+        assert_eq!(dialog.mode, ReviewSubmitMode::Pending { review_id: 77 });
+        app.review_submit_dialog.as_mut().unwrap().event = PullRequestReviewEvent::RequestChanges;
+        let mut submitted = None;
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            None,
+            |pending| {
+                submitted = Some((pending.item.id, pending.event, pending.body, pending.mode))
+            },
+            |_item, _body| panic!("submit should not create a draft"),
+        );
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                PullRequestReviewEvent::RequestChanges,
+                "draft summary".to_string(),
+                ReviewSubmitMode::Pending { review_id: 77 }
+            ))
+        );
+
+        app.review_submit_running = false;
+        app.review_submit_dialog = None;
+        let mut discarded = None;
+        app.discard_pending_review_with_submit(|item, review_id| {
+            discarded = Some((item.id, review_id));
+        });
+
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "discarding pending review");
+        assert_eq!(discarded, Some(("1".to_string(), 77)));
+    }
+
+    #[test]
+    fn ctrl_p_creates_pending_review_draft_from_summary() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+        app.review_submit_dialog.as_mut().unwrap().body = "hold these notes".to_string();
+        let mut created = None;
+
+        app.handle_review_submit_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            None,
+            |_pending| panic!("draft create should not submit a review"),
+            |item, body| created = Some((item.id, body)),
+        );
+
+        assert!(app.review_submit_dialog.is_none());
+        assert!(app.review_submit_running);
+        assert_eq!(app.status, "creating pending review");
+        assert_eq!(
+            created,
+            Some(("1".to_string(), "hold these notes".to_string()))
+        );
     }
 
     #[test]
@@ -16539,6 +29253,347 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn checkout_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('X')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn auto_merge_action_rejects_non_pull_request() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected item is not a pull request");
+    }
+
+    #[test]
+    fn item_edit_key_opens_choice_from_list_and_details() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('T')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_some());
+        assert_eq!(app.status, "choose title or body to edit");
+
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('T')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_some());
+        assert_eq!(app.status, "choose title or body to edit");
+    }
+
+    #[test]
+    fn item_edit_choice_opens_title_or_body_editor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
+
+        assert!(app.item_edit_dialog.is_none());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (&dialog.mode, dialog.body.as_str())),
+            Some((
+                &CommentDialogMode::ItemMetadata {
+                    field: ItemEditField::Title,
+                },
+                "Compiler diagnostics"
+            ))
+        );
+        assert_eq!(app.status, "editing title");
+
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (&dialog.mode, dialog.body.as_str())),
+            Some((
+                &CommentDialogMode::ItemMetadata {
+                    field: ItemEditField::Body,
+                },
+                "A body with useful context"
+            ))
+        );
+        assert_eq!(app.status, "editing body");
+    }
+
+    #[test]
+    fn item_title_edit_submit_updates_title() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
+        app.comment_dialog.as_mut().unwrap().body = "New title".to_string();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "updating title");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Updating Title",
+                "Waiting for GitHub to accept the title update..."
+            ))
+        );
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                "New title".to_string(),
+                PendingCommentMode::ItemMetadata {
+                    field: ItemEditField::Title,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn item_body_edit_submit_allows_empty_body() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_item_edit_dialog();
+        app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
+        app.comment_dialog.as_mut().unwrap().body.clear();
+        let mut submitted = None;
+
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
+
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "updating body");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                String::new(),
+                PendingCommentMode::ItemMetadata {
+                    field: ItemEditField::Body,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn item_metadata_update_success_refreshes_cached_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.posting_comment = true;
+
+        app.handle_msg(AppMsg::ItemMetadataUpdated {
+            item_id: "1".to_string(),
+            field: ItemEditField::Title,
+            result: Ok(ItemMetadataUpdate {
+                title: "New title".to_string(),
+                body: Some("New body".to_string()),
+                updated_at: None,
+            }),
+        });
+
+        assert!(!app.posting_comment);
+        assert_eq!(app.sections[0].items[0].title, "New title");
+        assert_eq!(app.sections[0].items[0].body.as_deref(), Some("New body"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "title updated");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Title Updated",
+                "GitHub accepted the update and the current item was refreshed."
+            ))
+        );
+    }
+
+    #[test]
+    fn item_metadata_update_failure_reports_status() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.posting_comment = true;
+
+        app.handle_msg(AppMsg::ItemMetadataUpdated {
+            item_id: "1".to_string(),
+            field: ItemEditField::Body,
+            result: Err("gh api repos/owner/repo/issues/1 failed: validation failed".to_string()),
+        });
+
+        assert!(!app.posting_comment);
+        assert_eq!(app.status, "body update failed");
+        let dialog = app.message_dialog.as_ref().expect("failure dialog");
+        assert_eq!(dialog.title, "Body Update Failed");
+        assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+        assert!(dialog.body.contains("validation failed"));
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn item_edit_rejects_non_issue_or_pull_request_items() {
+        let section = SectionSnapshot {
+            key: "notifications:test".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![WorkItem {
+                id: "thread-1".to_string(),
+                kind: ItemKind::Notification,
+                repo: "rust-lang/rust".to_string(),
+                number: None,
+                title: "Notification only".to_string(),
+                body: None,
+                author: None,
+                state: None,
+                url: "https://github.com/rust-lang/rust".to_string(),
+                created_at: None,
+                updated_at: None,
+                labels: Vec::new(),
+                reactions: ReactionSummary::default(),
+                milestone: None,
+                assignees: Vec::new(),
+                comments: None,
+                unread: Some(true),
+                reason: Some("mention".to_string()),
+                extra: Some("Commit".to_string()),
+            }],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('T')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.item_edit_dialog.is_none());
+        assert_eq!(app.status, "selected item is not an issue or pull request");
+    }
+
+    #[test]
+    fn update_branch_rejects_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected pull request is not open");
+    }
+
+    #[test]
+    fn draft_ready_action_rejects_closed_pull_request() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('D')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.pr_action_dialog.is_none());
+        assert_eq!(app.status, "selected pull request is not open");
+    }
+
+    #[test]
     fn pr_action_finished_marks_item_state_and_closes_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_pr_action_dialog(PrAction::Merge);
@@ -16546,7 +29601,9 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
+            merge_method: Some(MergeMethod::Merge),
             result: Ok(()),
         });
 
@@ -16554,9 +29611,37 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!app.pr_action_running);
         assert_eq!(app.sections[0].items[0].state.as_deref(), Some("merged"));
         assert!(app.details_stale.contains("1"));
-        assert_eq!(app.status, "pull request merged; refreshing");
+        assert_eq!(app.status, "pull request merged using merge; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Merged");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn reopen_action_finished_marks_item_open_and_refreshes_details() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.start_close_or_reopen_dialog();
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::Reopen,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "pull request reopened; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Reopened");
         assert!(dialog.auto_close_at.is_some());
     }
 
@@ -16568,7 +29653,9 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Approve,
+            merge_method: None,
             result: Ok(()),
         });
 
@@ -16579,7 +29666,172 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "pull request approved; refreshing");
         let dialog = app.message_dialog.as_ref().expect("success dialog");
         assert_eq!(dialog.title, "Pull Request Approved");
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
         assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn auto_merge_action_finished_refreshes_details_and_action_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Auto-mergeable".to_string()],
+                checks: None,
+                note: None,
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::EnableAutoMerge);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::EnableAutoMerge,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
+        assert_eq!(app.status, "pull request auto-merge enabled; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Auto-Merge Enabled");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn update_branch_finished_keeps_item_open_and_refreshes_details_and_hints() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Update branch".to_string()],
+                checks: None,
+                note: None,
+                ..ActionHints::default()
+            }),
+        );
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(PullRequestDiff {
+                files: Vec::new(),
+                additions: 0,
+                deletions: 0,
+            }),
+        );
+        app.start_pr_action_dialog(PrAction::UpdateBranch);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::UpdateBranch,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert!(app.details_stale.contains("1"));
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
+        assert!(!app.diffs.contains_key("1"));
+        assert_eq!(
+            app.status,
+            "pull request branch update accepted; refreshing"
+        );
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Branch Updated");
+        assert!(dialog.auto_close_at.is_some());
+    }
+
+    #[test]
+    fn auto_merge_action_failure_reports_action_specific_status() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::DisableAutoMerge);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::DisableAutoMerge,
+            merge_method: None,
+            result: Err("auto-merge is already disabled for owner/repo#1".to_string()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request auto-merge disable failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Disable Auto-Merge Failed");
+        assert!(dialog.body.contains("auto-merge is already disabled"));
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn draft_ready_action_finished_updates_item_extra_and_refreshes_action_hints() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["Draft".to_string()],
+                checks: None,
+                note: Some("Merge blocked: draft".to_string()),
+                ..ActionHints::default()
+            }),
+        );
+        app.start_pr_draft_ready_dialog();
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::MarkReadyForReview,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.sections[0].items[0].state.as_deref(), Some("open"));
+        assert_eq!(app.sections[0].items[0].extra, None);
+        assert!(matches!(
+            app.action_hints.get("1"),
+            Some(ActionHintState::Loaded(_))
+        ));
+        assert!(app.action_hints_stale.contains("1"));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "pull request marked ready; refreshing");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Ready for Review");
+        assert!(dialog.auto_close_at.is_some());
+
+        app.handle_msg(AppMsg::PrActionFinished {
+            item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
+            action: PrAction::ConvertToDraft,
+            merge_method: None,
+            result: Ok(()),
+        });
+
+        assert_eq!(app.sections[0].items[0].extra.as_deref(), Some("draft"));
+        assert_eq!(app.status, "pull request converted to draft; refreshing");
     }
 
     #[test]
@@ -16590,7 +29842,9 @@ diff --git a/src/github.rs b/src/github.rs
 
         app.handle_msg(AppMsg::PrActionFinished {
             item_id: "1".to_string(),
+            item_kind: ItemKind::PullRequest,
             action: PrAction::Merge,
+            merge_method: Some(MergeMethod::Squash),
             result: Err(
                 "merge blocked for owner/repo#1: review approval required; 1 check(s) failing"
                     .to_string(),
@@ -16599,11 +29853,298 @@ diff --git a/src/github.rs b/src/github.rs
 
         assert!(app.pr_action_dialog.is_none());
         assert!(!app.pr_action_running);
-        assert_eq!(app.status, "pull request merge failed");
+        assert_eq!(app.status, "pull request squash merge failed");
         let dialog = app.message_dialog.as_ref().expect("message dialog");
         assert_eq!(dialog.title, "Merge Failed");
         assert!(dialog.body.contains("review approval required"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_finished_shows_success_output() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Ok(PrCheckoutResult {
+                command: "gh pr checkout 1 --repo rust-lang/rust".to_string(),
+                directory: PathBuf::from("/tmp/rust"),
+                output: "Switched to branch 'diagnostics'".to_string(),
+            }),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checked out locally");
+        let dialog = app.message_dialog.as_ref().expect("success dialog");
+        assert_eq!(dialog.title, "Pull Request Checked Out");
+        assert!(
+            dialog
+                .body
+                .contains("gh pr checkout 1 --repo rust-lang/rust")
+        );
+        assert!(dialog.body.contains("Checkout runs from /tmp/rust."));
+        assert!(dialog.body.contains("Switched to branch"));
+        assert_eq!(dialog.kind, MessageDialogKind::Success);
+        assert_eq!(message_dialog_accent(dialog), Color::LightGreen);
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pr_checkout_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_pr_action_dialog(PrAction::Checkout);
+        app.pr_action_running = true;
+
+        app.handle_msg(AppMsg::PrCheckoutFinished {
+            result: Err(
+                "gh pr checkout 1 --repo rust-lang/rust failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
+                    .to_string(),
+            ),
+        });
+
+        assert!(app.pr_action_dialog.is_none());
+        assert!(!app.pr_action_running);
+        assert_eq!(app.status, "pull request checkout failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Checkout Failed");
+        assert!(dialog.body.contains("Checkout runs from /tmp."));
+        assert!(dialog.body.contains("fatal: not a git repository"));
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert_eq!(message_dialog_accent(dialog), Color::LightRed);
+        assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn milestone_prefix_matching_is_case_insensitive() {
+        let milestone = Milestone {
+            number: 1,
+            title: "Release Train".to_string(),
+        };
+
+        assert!(milestone_matches_prefix(&milestone, "rel"));
+        assert!(milestone_matches_prefix(&milestone, "RELEASE"));
+        assert!(!milestone_matches_prefix(&milestone, "train"));
+    }
+
+    #[test]
+    fn t_key_opens_milestone_dialog_for_issue() {
+        let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('t')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        let dialog = app.milestone_dialog.as_ref().expect("milestone dialog");
+        assert_eq!(dialog.item.id, "1");
+        assert!(matches!(dialog.state, MilestoneDialogState::Loading));
+        assert_eq!(app.status, "loading milestones");
+    }
+
+    #[test]
+    fn milestone_dialog_filters_by_prefix_and_submits_selection() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_milestone_dialog(&tx);
+        app.handle_msg(AppMsg::MilestonesLoaded {
+            item_id: "1".to_string(),
+            result: Ok(vec![
+                Milestone {
+                    number: 1,
+                    title: "alpha".to_string(),
+                },
+                Milestone {
+                    number: 2,
+                    title: "beta".to_string(),
+                },
+            ]),
+        });
+
+        let mut submitted = None;
+        app.handle_milestone_dialog_key_with_submit(key(KeyCode::Char('b')), |item, milestone| {
+            submitted = Some((item.id, milestone));
+        });
+        app.handle_milestone_dialog_key_with_submit(key(KeyCode::Enter), |item, milestone| {
+            submitted = Some((item.id, milestone));
+        });
+
+        assert!(app.milestone_action_running);
+        assert_eq!(app.status, "changing milestone");
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                MilestoneChoice::Set(Milestone {
+                    number: 2,
+                    title: "beta".to_string(),
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn milestone_dialog_can_submit_clear_choice() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_milestone_dialog(&tx);
+        app.handle_msg(AppMsg::MilestonesLoaded {
+            item_id: "1".to_string(),
+            result: Ok(vec![Milestone {
+                number: 1,
+                title: "alpha".to_string(),
+            }]),
+        });
+        let mut submitted = None;
+
+        app.handle_milestone_dialog_key_with_submit(key(KeyCode::Enter), |item, milestone| {
+            submitted = Some((item.id, milestone));
+        });
+
+        assert_eq!(submitted, Some(("1".to_string(), MilestoneChoice::Clear)));
+        assert_eq!(app.status, "clearing milestone");
+    }
+
+    #[test]
+    fn milestone_dialog_can_create_missing_prefix_milestone() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_milestone_dialog(&tx);
+        app.handle_msg(AppMsg::MilestonesLoaded {
+            item_id: "1".to_string(),
+            result: Ok(vec![Milestone {
+                number: 1,
+                title: "alpha".to_string(),
+            }]),
+        });
+
+        let mut submitted = None;
+        for value in "next-release".chars() {
+            app.handle_milestone_dialog_key_with_submit(
+                key(KeyCode::Char(value)),
+                |item, choice| {
+                    submitted = Some((item.id, choice));
+                },
+            );
+        }
+        let choices = milestone_choices(app.milestone_dialog.as_ref().expect("milestone dialog"));
+        assert_eq!(
+            choices,
+            vec![
+                MilestoneChoice::Clear,
+                MilestoneChoice::Create("next-release".to_string())
+            ]
+        );
+
+        app.handle_milestone_dialog_key_with_submit(key(KeyCode::Enter), |item, choice| {
+            submitted = Some((item.id, choice));
+        });
+
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                MilestoneChoice::Create("next-release".to_string())
+            ))
+        );
+        assert!(app.milestone_action_running);
+        assert_eq!(app.status, "creating milestone");
+    }
+
+    #[test]
+    fn milestone_action_rejects_non_issue_items() {
+        let section = SectionSnapshot {
+            key: "notifications:test".to_string(),
+            kind: SectionKind::Notifications,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![WorkItem {
+                kind: ItemKind::Notification,
+                ..notification_item("thread-1", true)
+            }],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        app.start_milestone_dialog(&tx);
+
+        assert!(app.milestone_dialog.is_none());
+        assert_eq!(app.status, "selected item is not an issue or pull request");
+    }
+
+    #[test]
+    fn milestone_changed_marks_item_and_details_stale() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.milestone_dialog = Some(MilestoneDialog {
+            item: app.sections[0].items[0].clone(),
+            state: MilestoneDialogState::Loaded(Vec::new()),
+            input: String::new(),
+            selected: 0,
+        });
+        app.milestone_action_running = true;
+        let milestone = Milestone {
+            number: 9,
+            title: "v1".to_string(),
+        };
+
+        app.handle_msg(AppMsg::MilestoneChanged {
+            item_id: "1".to_string(),
+            milestone: Some(milestone.clone()),
+            result: Ok(()),
+        });
+
+        assert!(app.milestone_dialog.is_none());
+        assert!(!app.milestone_action_running);
+        assert_eq!(app.sections[0].items[0].milestone, Some(milestone));
+        assert!(app.details_stale.contains("1"));
+        assert_eq!(app.status, "milestone changed; refreshing");
+    }
+
+    #[test]
+    fn milestone_change_failure_opens_message_dialog() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.milestone_action_running = true;
+
+        app.handle_msg(AppMsg::MilestoneChanged {
+            item_id: "1".to_string(),
+            milestone: None,
+            result: Err("gh api failed: HTTP 403".to_string()),
+        });
+
+        assert!(!app.milestone_action_running);
+        assert_eq!(app.status, "milestone change failed");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "Milestone Failed");
+        assert!(dialog.body.contains("HTTP 403"));
     }
 
     #[test]
@@ -16627,12 +30168,82 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn retryable_message_dialog_esc_edits_and_enter_cancels() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let pr_dialog = PrCreateDialog {
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: PathBuf::from("/tmp/ghr"),
+            branch: "dev-next".to_string(),
+            title: "Retry title".to_string(),
+            body: "Retry body".to_string(),
+            field: PrCreateField::Body,
+            body_scroll: 0,
+        };
+        app.pr_create_dialog = Some(pr_dialog.clone());
+        app.message_dialog = Some(retryable_message_dialog(
+            "Pull Request Create Failed",
+            "a pull request already exists",
+        ));
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.message_dialog.is_none());
+        assert_eq!(app.pr_create_dialog, Some(pr_dialog.clone()));
+        assert_eq!(app.status, "edit and retry");
+
+        app.message_dialog = Some(retryable_message_dialog(
+            "Pull Request Create Failed",
+            "a pull request already exists",
+        ));
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Enter),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.message_dialog.is_none());
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(app.status, "retry cancelled");
+    }
+
+    #[test]
+    fn retryable_message_dialog_footer_shows_cancel_and_retry_keys() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.message_dialog = Some(retryable_message_dialog(
+            "Pull Request Create Failed",
+            "a pull request already exists",
+        ));
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Enter: cancel  Esc: edit and retry"));
+    }
+
+    #[test]
     fn success_message_dialog_auto_dismisses_after_deadline() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let deadline = Instant::now() + Duration::from_millis(5);
         app.message_dialog = Some(MessageDialog {
             title: "Comment Posted".to_string(),
             body: "ok".to_string(),
+            kind: MessageDialogKind::Success,
             auto_close_at: Some(deadline),
         });
 
@@ -16654,6 +30265,14 @@ diff --git a/src/github.rs b/src/github.rs
         let dialog = app.message_dialog.as_ref().expect("blocking dialog");
         assert_eq!(dialog.title, "Comment Failed");
         assert!(dialog.auto_close_at.is_none());
+    }
+
+    #[test]
+    fn pending_message_dialog_is_not_error_colored() {
+        let dialog = comment_pending_dialog(&PendingCommentMode::Post);
+
+        assert_eq!(dialog.kind, MessageDialogKind::Info);
+        assert_ne!(message_dialog_accent(&dialog), Color::LightRed);
     }
 
     #[test]
@@ -16765,6 +30384,8 @@ diff --git a/src/github.rs b/src/github.rs
             side: Some("RIGHT".to_string()),
             start_side: None,
             diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -16799,6 +30420,8 @@ diff --git a/src/github.rs b/src/github.rs
             side: Some("RIGHT".to_string()),
             start_side: None,
             diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
         });
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
@@ -16898,11 +30521,11 @@ diff --git a/src/github.rs b/src/github.rs
         ));
         assert!(app.comment_dialog.is_none());
         assert!(matches!(
-            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
-            Some(PrAction::Approve)
+            app.review_submit_dialog.as_ref().map(|dialog| dialog.event),
+            Some(PullRequestReviewEvent::Approve)
         ));
 
-        app.pr_action_dialog = None;
+        app.review_submit_dialog = None;
         assert!(!handle_key(
             &mut app,
             key(KeyCode::Char('M')),
@@ -16913,6 +30536,32 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(matches!(
             app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
             Some(PrAction::Merge)
+        ));
+
+        app.pr_action_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('E')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::EnableAutoMerge)
+        ));
+
+        app.pr_action_dialog = None;
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('O')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert!(matches!(
+            app.pr_action_dialog.as_ref().map(|dialog| dialog.action),
+            Some(PrAction::DisableAutoMerge)
         ));
     }
 
@@ -16987,6 +30636,7 @@ diff --git a/src/github.rs b/src/github.rs
             item_id: "1".to_string(),
             result: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![comment("alice", "posted", None)],
             }),
         });
@@ -17016,6 +30666,16 @@ diff --git a/src/github.rs b/src/github.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.posting_comment = true;
         app.message_dialog = Some(comment_pending_dialog(&PendingCommentMode::Post));
+        app.pending_comment_submit = Some(PendingCommentSubmit {
+            item: app.sections[0].items[0].clone(),
+            body: "draft body".to_string(),
+            mode: PendingCommentMode::Post,
+            dialog: CommentDialog {
+                mode: CommentDialogMode::New,
+                body: "draft body".to_string(),
+                scroll: 0,
+            },
+        });
 
         app.handle_msg(AppMsg::CommentPosted {
             item_id: "1".to_string(),
@@ -17026,8 +30686,15 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "comment post failed");
         let dialog = app.message_dialog.as_ref().expect("failure dialog");
         assert_eq!(dialog.title, "Comment Failed");
-        assert_eq!(dialog.body, "HTTP 403");
+        assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+        assert!(dialog.body.contains("HTTP 403"));
         assert!(dialog.auto_close_at.is_none());
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("draft body")
+        );
     }
 
     #[test]
@@ -17045,6 +30712,7 @@ diff --git a/src/github.rs b/src/github.rs
             comment_index: 0,
             result: Ok(CommentFetchResult {
                 item_reactions: ReactionSummary::default(),
+                item_milestone: None,
                 comments: vec![own_comment(42, "chenyukang", "updated", None)],
             }),
         });
@@ -17090,7 +30758,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "comment update failed");
         let dialog = app.message_dialog.as_ref().expect("failure dialog");
         assert_eq!(dialog.title, "Update Failed");
-        assert_eq!(dialog.body, "validation failed");
+        assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+        assert!(dialog.body.contains("validation failed"));
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -17135,7 +30804,8 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(app.status, "review comment failed");
         let dialog = app.message_dialog.as_ref().expect("failure dialog");
         assert_eq!(dialog.title, "Review Comment Failed");
-        assert_eq!(dialog.body, "validation failed");
+        assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+        assert!(dialog.body.contains("validation failed"));
         assert!(dialog.auto_close_at.is_none());
     }
 
@@ -17164,6 +30834,21 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn comment_dialog_cursor_uses_display_width_for_chinese_input() {
+        let area = Rect::new(10, 5, 30, 10);
+
+        assert_eq!(
+            comment_dialog_cursor_position("你好", 0, area, 28, 6),
+            Some(Position::new(15, 6))
+        );
+        assert_eq!(comment_dialog_body_lines("你好ab", 5), vec!["你好a", "b"]);
+        assert_eq!(
+            comment_dialog_cursor_position("你好ab", 0, area, 5, 6),
+            Some(Position::new(12, 7))
+        );
+    }
+
+    #[test]
     fn comment_dialog_cursor_is_hidden_when_scrolled_away_from_input() {
         let body = (1..=80)
             .map(|line| format!("line {line}"))
@@ -17181,6 +30866,24 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(
             comment_dialog_cursor_position("abcde", 0, area, 5, 6),
             Some(Position::new(11, 7))
+        );
+    }
+
+    #[test]
+    fn issue_dialog_single_line_cursor_uses_display_width_for_chinese_input() {
+        let dialog = IssueDialog {
+            repo: "rust-lang/rust".to_string(),
+            title: "中文".to_string(),
+            labels: "标签".to_string(),
+            body: String::new(),
+            field: IssueDialogField::Title,
+            body_scroll: 0,
+        };
+        let area = Rect::new(10, 5, 80, 22);
+
+        assert_eq!(
+            issue_dialog_cursor_position(&dialog, 0, area, 78, 12),
+            Some(Position::new(22, 8))
         );
     }
 
@@ -17266,10 +30969,7 @@ diff --git a/src/github.rs b/src/github.rs
         assert_eq!(long_area.height, comment_dialog_max_height(area));
 
         let inner = block_inner(long_area);
-        let editor_height = inner
-            .height
-            .saturating_sub(COMMENT_DIALOG_FOOTER_HEIGHT)
-            .max(1);
+        let editor_height = inner.height.max(1);
         assert!(max_comment_dialog_scroll(&long.body, inner.width, editor_height) > 0);
     }
 
@@ -17397,13 +31097,13 @@ diff --git a/src/github.rs b/src/github.rs
                 "repo:fiber",
                 SectionKind::PullRequests,
                 "Pull Requests",
-                "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc",
+                "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
             SectionSnapshot::empty_for_view(
                 "repo:fiber",
                 SectionKind::Issues,
                 "Issues",
-                "repo:nervosnetwork/fiber is:open archived:false sort:updated-desc",
+                "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
             ),
         ];
         let mut app = AppState::new(SectionKind::PullRequests, sections);
@@ -17432,14 +31132,22 @@ diff --git a/src/github.rs b/src/github.rs
         config.repos.push(crate::config::RepoConfig {
             name: "runnel".to_string(),
             repo: "chenyukang/runnel".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         config.repos.push(crate::config::RepoConfig {
             name: "Fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            local_dir: None,
             show_prs: true,
             show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
         });
         let app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
 
@@ -17598,6 +31306,26 @@ diff --git a/src/github.rs b/src/github.rs
         assert!(!handle_key_in_area(
             &mut app,
             key(KeyCode::PageUp),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), 0);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char(']')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.current_selected_position(), visible_rows);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('[')),
             &config,
             &store,
             &tx,
@@ -18651,6 +32379,48 @@ diff --git a/d.rs b/d.rs
         );
     }
 
+    #[test]
+    fn ignore_key_hides_selected_issue_or_pull_request_and_persists() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('i')),
+            &config,
+            &store,
+            &tx
+        ));
+
+        assert!(app.ignored_items.contains("1"));
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(
+            app.filtered_indices(app.current_section().unwrap()),
+            vec![1]
+        );
+        assert_eq!(app.ui_state().ignored_items, vec!["1"]);
+        assert!(app.status.contains("ignored pull request #1"));
+    }
+
+    #[test]
+    fn ignored_items_restore_from_ui_state() {
+        let state = UiState {
+            ignored_items: vec!["1".to_string()],
+            ..UiState::default()
+        };
+
+        let app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("2"));
+        assert_eq!(
+            section_count_label(&app, app.current_section().unwrap()),
+            "1"
+        );
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
@@ -18661,6 +32431,23 @@ diff --git a/d.rs b/d.rs
 
     fn test_paths() -> Paths {
         let root = std::path::PathBuf::from("/tmp/ghr-test");
+        Paths {
+            config_path: root.join("config.toml"),
+            db_path: root.join("ghr.db"),
+            log_path: root.join("ghr.log"),
+            state_path: root.join("state.toml"),
+            root,
+        }
+    }
+
+    fn unique_test_paths(prefix: &str) -> Paths {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ghr-{prefix}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create test root");
         Paths {
             config_path: root.join("config.toml"),
             db_path: root.join("ghr.db"),
@@ -18701,6 +32488,103 @@ diff --git a/d.rs b/d.rs
             refreshed_at: None,
             error: None,
         }
+    }
+
+    fn checkout_test_section() -> SectionSnapshot {
+        SectionSnapshot {
+            key: "pull_requests:checkout".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Checkout".to_string(),
+            filters: String::new(),
+            items: vec![work_item(
+                "checkout-pr",
+                "chenyukang/ghr",
+                19,
+                "Add local PR checkout",
+                None,
+            )],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }
+    }
+
+    fn checkout_test_config() -> Config {
+        let local_dir = checkout_test_repo_dir();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+        config
+    }
+
+    fn checkout_test_repo_dir() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let counter = CHECKOUT_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ghr-checkout-test-{}-{unique}-{counter}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create checkout test dir");
+
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .output()
+            .expect("run git init");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            command_output_text(&init.stdout, &init.stderr)
+        );
+
+        let remote = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/chenyukang/ghr.git",
+            ])
+            .output()
+            .expect("run git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {}",
+            command_output_text(&remote.stdout, &remote.stderr)
+        );
+
+        dir
+    }
+
+    fn checkout_test_repo_dir_on_branch(branch: &str) -> PathBuf {
+        let dir = checkout_test_repo_dir();
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["checkout", "-q", "-b", branch])
+            .output()
+            .expect("run git checkout -b");
+        assert!(
+            checkout.status.success(),
+            "git checkout -b failed: {}",
+            command_output_text(&checkout.stdout, &checkout.stderr)
+        );
+        dir
     }
 
     fn many_items_section(count: u64) -> SectionSnapshot {
@@ -18772,6 +32656,15 @@ diff --git a/d.rs b/d.rs
         text: &str,
         expected_action: DetailAction,
     ) {
+        assert_document_action_for_text_on_line(document, text, text, expected_action);
+    }
+
+    fn assert_document_action_for_text_on_line(
+        document: &DetailsDocument,
+        line_text: &str,
+        text: &str,
+        expected_action: DetailAction,
+    ) {
         let rendered = document
             .lines
             .iter()
@@ -18779,9 +32672,11 @@ diff --git a/d.rs b/d.rs
             .collect::<Vec<_>>();
         let line_index = rendered
             .iter()
-            .position(|line| line.contains(text))
+            .position(|line| line.contains(line_text))
             .expect("action text line");
-        let column = rendered[line_index].find(text).expect("action text column") as u16;
+        let column = display_width(
+            &rendered[line_index][..rendered[line_index].find(text).expect("action text column")],
+        ) as u16;
         assert_eq!(
             document.action_at(line_index, column),
             Some(expected_action)
@@ -18833,6 +32728,8 @@ diff --git a/d.rs b/d.rs
             updated_at: None,
             labels: vec!["T-compiler".to_string()],
             reactions: ReactionSummary::default(),
+            milestone: None,
+            assignees: Vec::new(),
             comments: Some(0),
             unread: None,
             reason: None,
@@ -18855,6 +32752,8 @@ diff --git a/d.rs b/d.rs
             updated_at: None,
             labels: Vec::new(),
             reactions: ReactionSummary::default(),
+            milestone: None,
+            assignees: Vec::new(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

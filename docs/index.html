@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="ghr is a fast terminal workspace for GitHub pull requests, issues, notifications, conversations, checks, and diffs."
+    />
+    <title>ghr - GitHub review, wired for the terminal</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="ghr home">
+        <span class="brand-mark">g</span>
+        <span>ghr</span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#shortcuts">Shortcuts</a>
+        <a href="https://github.com/chenyukang/ghr">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Rust TUI for GitHub triage</p>
+          <h1>ghr</h1>
+          <p class="lede">
+            Pull requests, issues, notifications, conversations, checks, diffs,
+            and review actions in one snapshot-first terminal workspace.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#install">Install</a>
+            <a class="button" href="#shortcuts">Browse shortcuts</a>
+          </div>
+          <div class="install-card" aria-label="Quick install" id="install">
+            <div class="terminal-window" aria-label="Install commands">
+              <code><span>$</span> cargo install ghr-cli</code>
+              <code><span>$</span> ghr</code>
+            </div>
+            <p>Press <kbd>:</kbd> inside ghr to fuzzy-search commands.</p>
+          </div>
+        </div>
+        <figure class="hero-shot">
+          <img
+            src="assets/screenshot.webp"
+            alt="ghr terminal dashboard showing GitHub pull requests and details"
+          />
+        </figure>
+      </section>
+
+      <section class="feature-grid" id="features">
+        <article>
+          <p class="kicker">Cache first</p>
+          <h2>Instant startup, live refresh</h2>
+          <p>
+            ghr shows the local SQLite snapshot immediately, then refreshes in
+            the background through the GitHub CLI.
+          </p>
+        </article>
+        <article>
+          <p class="kicker">Triage</p>
+          <h2>PRs, issues, notifications</h2>
+          <p>
+            Configurable sections, repo tabs, filters, result paging, ignored
+            items, and unread notification handling keep the list signal clean.
+          </p>
+        </article>
+        <article>
+          <p class="kicker">Review</p>
+          <h2>Diffs without leaving the terminal</h2>
+          <p>
+            Open PR diffs, move by changed file, mark ranges, post inline
+            review comments, and submit reviews from the focused pane.
+          </p>
+        </article>
+        <article>
+          <p class="kicker">Workflow</p>
+          <h2>Actions where the context is</h2>
+          <p>
+            Comment, reply, edit, label, assign, merge, close, update branches,
+            rerun checks, request reviewers, and checkout local PR branches.
+          </p>
+        </article>
+      </section>
+
+      <section class="split-section">
+        <div>
+          <p class="eyebrow">Diff review</p>
+          <h2>Read, mark, comment, submit</h2>
+          <p>
+            The diff view keeps changed files and rendered hunks side by side.
+            Inline comments are shown in context, and pending review state stays
+            local until you submit it.
+          </p>
+        </div>
+        <figure class="panel-shot">
+          <img
+            src="assets/screenshot-diff.webp"
+            alt="ghr diff review mode showing changed files and a file diff"
+          />
+        </figure>
+      </section>
+
+      <section class="docs-band" id="shortcuts">
+        <div class="section-heading">
+          <p class="eyebrow">Keyboard surface</p>
+          <h2>Every shortcut, searchable</h2>
+          <p>
+            Press <kbd>?</kbd> inside ghr for the live reference, or use
+            <kbd>:</kbd> to fuzzy-search and run commands from the TUI.
+          </p>
+        </div>
+        <label class="shortcut-search">
+          <span>Filter shortcuts</span>
+          <input
+            id="shortcut-filter"
+            type="search"
+            placeholder="Try review, ignore, diff, project, comment..."
+            autocomplete="off"
+          />
+        </label>
+        <div class="shortcut-table" id="shortcut-table"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>ghr is MIT licensed.</span>
+      <a href="https://crates.io/crates/ghr-cli">crates.io</a>
+      <a href="https://github.com/chenyukang/ghr">GitHub repository</a>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>

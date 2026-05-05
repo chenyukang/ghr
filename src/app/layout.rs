@@ -4,6 +4,9 @@ use crate::state::{DEFAULT_LIST_WIDTH_PERCENT, clamp_list_width_percent};
 
 use super::AppState;
 
+const CENTERED_RECT_MIN_WIDTH: u16 = 48;
+const CENTERED_RECT_MAX_WIDTH: u16 = 112;
+
 #[cfg(test)]
 pub(super) fn body_area(area: Rect) -> Rect {
     page_areas(area)[2]
@@ -89,7 +92,9 @@ pub(super) fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect
 
 pub(super) fn centered_rect_width(width_percent: u16, area: Rect) -> u16 {
     let mut width = area.width.saturating_mul(width_percent).saturating_div(100);
-    width = width.max(48.min(area.width)).min(area.width);
+    width = width
+        .max(CENTERED_RECT_MIN_WIDTH.min(area.width))
+        .min(CENTERED_RECT_MAX_WIDTH.min(area.width));
     width
 }
 
@@ -97,4 +102,24 @@ pub(super) fn centered_rect_with_size(width: u16, height: u16, area: Rect) -> Re
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_rect_width_caps_wide_terminals() {
+        let area = Rect::new(0, 0, 240, 40);
+
+        assert_eq!(centered_rect_width(78, area), CENTERED_RECT_MAX_WIDTH);
+        assert_eq!(centered_rect(78, 14, area), Rect::new(64, 13, 112, 14));
+    }
+
+    #[test]
+    fn centered_rect_width_keeps_percentage_before_cap() {
+        let area = Rect::new(0, 0, 120, 40);
+
+        assert_eq!(centered_rect_width(76, area), 91);
+    }
 }

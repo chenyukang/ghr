@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(not(test))]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 #[cfg(not(test))]
 use std::process::Stdio;
@@ -29,7 +29,6 @@ use ratatui::widgets::{
     Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 
@@ -65,7 +64,9 @@ use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
 
 mod diff;
+mod keymap;
 mod layout;
+mod pr_checkout;
 mod search;
 mod status;
 mod text;
@@ -74,6 +75,7 @@ use diff::{
     DiffFile, DiffLine, DiffLineKind, PullRequestDiff, parse_inline_diff_hunk,
     parse_pull_request_diff,
 };
+use keymap::{command_palette_key_binding, normalized_command_palette_key};
 use layout::{
     block_inner, body_areas_with_ratio, centered_rect, centered_rect_width,
     centered_rect_with_size, details_area_for, page_areas, rect_contains,
@@ -81,7 +83,14 @@ use layout::{
 };
 #[cfg(test)]
 use layout::{body_area, body_areas};
-use search::{filtered_indices, fuzzy_score};
+use pr_checkout::{
+    PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
+    current_git_branch_for_directory, ensure_directory_tracks_repo, resolve_pr_checkout_directory,
+    run_pr_checkout,
+};
+#[cfg(test)]
+use pr_checkout::{command_output_text, pr_checkout_command_args, pr_checkout_command_display};
+use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
 use status::{
     comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
     operation_error_body, persistent_success_message_dialog, pr_action_error_body,
@@ -618,19 +627,6 @@ struct PrActionDialog {
     merge_method: MergeMethod,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrCheckoutResult {
-    command: String,
-    directory: PathBuf,
-    output: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrCheckoutPlan {
-    directory: PathBuf,
-    branch: Option<PullRequestBranch>,
-}
-
 #[derive(Debug, Clone)]
 struct MilestoneDialog {
     item: WorkItem,
@@ -837,45 +833,6 @@ struct ProjectRemoveCandidate {
     name: String,
     repo: String,
     local_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct KeyBinding {
-    label: String,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-}
-
-impl KeyBinding {
-    fn matches(&self, key: KeyEvent) -> bool {
-        let expected_modifiers = command_palette_modifier_bits(self.modifiers);
-        let actual_modifiers = command_palette_modifier_bits(key.modifiers);
-        if expected_modifiers != actual_modifiers {
-            return false;
-        }
-        if self.modifiers.contains(KeyModifiers::SHIFT)
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            return false;
-        }
-
-        match (&self.code, key.code) {
-            (KeyCode::Char(expected), KeyCode::Char(actual))
-                if expected_modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                expected.eq_ignore_ascii_case(&actual)
-            }
-            (KeyCode::Char(expected), KeyCode::Char(actual)) => *expected == actual,
-            (expected, actual) => *expected == actual,
-        }
-    }
-
-    fn is_plain_text_char(&self) -> bool {
-        matches!(self.code, KeyCode::Char(value) if !value.is_control())
-            && !self
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1320,210 +1277,6 @@ struct SectionPageRequest {
     page_size: usize,
     total_pages: usize,
     total_is_capped: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuickFilterState {
-    Open,
-    Closed,
-    Merged,
-    Draft,
-    All,
-}
-
-impl QuickFilterState {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "open" => Some(Self::Open),
-            "closed" | "close" => Some(Self::Closed),
-            "merged" => Some(Self::Merged),
-            "draft" => Some(Self::Draft),
-            "all" => Some(Self::All),
-            _ => None,
-        }
-    }
-
-    fn display(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
-            Self::Merged => "merged",
-            Self::Draft => "draft",
-            Self::All => "all",
-        }
-    }
-
-    fn query_token(self) -> Option<&'static str> {
-        match self {
-            Self::Open => Some("is:open"),
-            Self::Closed => Some("is:closed"),
-            Self::Merged => Some("is:merged"),
-            Self::Draft => Some("is:draft"),
-            Self::All => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct QuickFilter {
-    state: Option<QuickFilterState>,
-    assignee: Option<String>,
-    author: Option<String>,
-    labels: Vec<String>,
-}
-
-impl QuickFilter {
-    fn parse(input: &str) -> std::result::Result<Option<Self>, String> {
-        let input = input.trim();
-        if input.is_empty() || matches!(input, "clear" | "reset") {
-            return Ok(None);
-        }
-
-        let mut filter = Self::default();
-        for token in input.split_whitespace() {
-            if let Some(state) = QuickFilterState::parse(token) {
-                filter.state = Some(state);
-                continue;
-            }
-            if let Some(value) = token
-                .strip_prefix("state:")
-                .or_else(|| token.strip_prefix("is:"))
-            {
-                filter.state = Some(
-                    QuickFilterState::parse(value)
-                        .ok_or_else(|| format!("unknown state filter: {value}"))?,
-                );
-                continue;
-            }
-            if let Some(value) = token.strip_prefix("assignee:") {
-                filter.assignee = Some(non_empty_filter_value("assignee", value)?);
-                continue;
-            }
-            if let Some(value) = token.strip_prefix("author:") {
-                filter.author = Some(non_empty_filter_value("author", value)?);
-                continue;
-            }
-            if let Some(value) = token
-                .strip_prefix("label:")
-                .or_else(|| token.strip_prefix("labels:"))
-            {
-                for label in comma_separated_filter_values("label", value)? {
-                    if !filter.labels.contains(&label) {
-                        filter.labels.push(label);
-                    }
-                }
-                continue;
-            }
-
-            return Err(format!("unknown filter token: {token}"));
-        }
-
-        Ok(Some(filter))
-    }
-
-    fn display(&self) -> String {
-        let mut tokens = Vec::new();
-        if let Some(state) = self.state {
-            tokens.push(format!("state:{}", state.display()));
-        }
-        if let Some(assignee) = &self.assignee {
-            tokens.push(format!("assignee:{assignee}"));
-        }
-        if let Some(author) = &self.author {
-            tokens.push(format!("author:{author}"));
-        }
-        tokens.extend(self.labels.iter().map(|label| format!("label:{label}")));
-        tokens.join(" ")
-    }
-}
-
-fn non_empty_filter_value(name: &str, value: &str) -> std::result::Result<String, String> {
-    let value = value.trim();
-    if value.is_empty() {
-        Err(format!("{name} filter is empty"))
-    } else {
-        Ok(value.to_string())
-    }
-}
-
-fn comma_separated_filter_values(
-    name: &str,
-    value: &str,
-) -> std::result::Result<Vec<String>, String> {
-    let values = value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        Err(format!("{name} filter is empty"))
-    } else {
-        Ok(values)
-    }
-}
-
-fn quick_filter_query(base_filters: &str, filter: &QuickFilter) -> String {
-    if base_filters.contains(" | ") {
-        return base_filters
-            .split(" | ")
-            .map(|filters| quick_filter_query(filters, filter))
-            .collect::<Vec<_>>()
-            .join(" | ");
-    }
-
-    let base_tokens = base_filters
-        .split_whitespace()
-        .filter(|token| !quick_filter_replaces_token(token, filter))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let overlay_tokens = quick_filter_tokens(filter);
-    insert_tokens_before_sort(base_tokens, overlay_tokens).join(" ")
-}
-
-fn quick_filter_replaces_token(token: &str, filter: &QuickFilter) -> bool {
-    (filter.state.is_some() && is_state_filter_token(token))
-        || (filter.assignee.is_some() && token.starts_with("assignee:"))
-        || (filter.author.is_some() && token.starts_with("author:"))
-        || (!filter.labels.is_empty()
-            && (token.starts_with("label:") || token.starts_with("labels:")))
-}
-
-fn quick_filter_tokens(filter: &QuickFilter) -> Vec<String> {
-    let mut tokens = Vec::new();
-    if let Some(token) = filter.state.and_then(QuickFilterState::query_token) {
-        tokens.push(token.to_string());
-    }
-    if let Some(assignee) = &filter.assignee {
-        tokens.push(format!("assignee:{assignee}"));
-    }
-    if let Some(author) = &filter.author {
-        tokens.push(format!("author:{author}"));
-    }
-    tokens.extend(filter.labels.iter().map(|label| format!("label:{label}")));
-    tokens
-}
-
-fn insert_tokens_before_sort(
-    mut base_tokens: Vec<String>,
-    overlay_tokens: Vec<String>,
-) -> Vec<String> {
-    if overlay_tokens.is_empty() {
-        return base_tokens;
-    }
-    let sort_index = base_tokens
-        .iter()
-        .position(|token| token.starts_with("sort:"))
-        .unwrap_or(base_tokens.len());
-    base_tokens.splice(sort_index..sort_index, overlay_tokens);
-    base_tokens
-}
-
-fn is_state_filter_token(token: &str) -> bool {
-    matches!(
-        token,
-        "is:open" | "is:closed" | "is:merged" | "is:draft" | "draft:true" | "draft:false"
-    ) || token.starts_with("state:")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2655,276 +2408,6 @@ fn start_pr_action(
             });
         }
     });
-}
-
-async fn run_pr_checkout(
-    item: WorkItem,
-    directory: PathBuf,
-) -> std::result::Result<PrCheckoutResult, String> {
-    let number = item
-        .number
-        .ok_or_else(|| "selected item has no pull request number".to_string())?;
-    let args = pr_checkout_command_args(&item.repo, number);
-    let command = pr_checkout_command_display(&args);
-    debug!(
-        command = %command,
-        cwd = %directory.display(),
-        "gh request started"
-    );
-    let output = TokioCommand::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .current_dir(&directory)
-        .args(&args)
-        .output()
-        .await
-        .map_err(|error| {
-            debug!(
-                command = %command,
-                cwd = %directory.display(),
-                error = %error,
-                "gh request failed to start"
-            );
-            if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
-                    checkout_directory_notice(&directory),
-                )
-            } else {
-                format!(
-                    "failed to run {command}: {error}\n\n{}",
-                    checkout_directory_notice(&directory),
-                )
-            }
-        })?;
-    debug!(
-        command = %command,
-        cwd = %directory.display(),
-        status = %output.status,
-        success = output.status.success(),
-        stdout_bytes = output.stdout.len(),
-        stderr_bytes = output.stderr.len(),
-        "gh request finished"
-    );
-
-    let output_text = command_output_text(&output.stdout, &output.stderr);
-    if !output.status.success() {
-        let detail = if output_text.is_empty() {
-            "gh did not return any output".to_string()
-        } else {
-            output_text
-        };
-        return Err(format!(
-            "{} failed.\n\n{}\n\n{}",
-            command,
-            checkout_directory_notice(&directory),
-            truncate_text(&detail, 900),
-        ));
-    }
-
-    let output = if output_text.is_empty() {
-        "gh pr checkout completed successfully.".to_string()
-    } else {
-        truncate_text(&output_text, 900)
-    };
-    Ok(PrCheckoutResult {
-        command,
-        directory,
-        output,
-    })
-}
-
-fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "checkout".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ]
-}
-
-fn pr_checkout_command_display(args: &[String]) -> String {
-    format!("gh {}", args.join(" "))
-}
-
-fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => stdout,
-        (true, false) => stderr,
-        (false, false) => format!("{stdout}\n{stderr}"),
-    }
-}
-
-fn checkout_directory_notice(directory: &Path) -> String {
-    format!("Checkout runs from {}.", directory.display())
-}
-
-fn resolve_pr_checkout_directory(
-    config: &Config,
-    repository: &str,
-) -> std::result::Result<PathBuf, String> {
-    if let Some(directory) = configured_local_dir_for_repo(config, repository) {
-        ensure_directory_tracks_repo(&directory, repository).map_err(|error| {
-            format!(
-                "Configured local_dir for {repository} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repository}."
-            )
-        })?;
-        return Ok(directory);
-    }
-
-    let cwd = std::env::current_dir().map_err(|error| {
-        format!(
-            "Could not inspect the current working directory for {repository}: {error}\n\nSet [[repos]].local_dir for this repository."
-        )
-    })?;
-    ensure_directory_tracks_repo(&cwd, repository).map_err(|error| {
-        format!(
-            "No local checkout found for {repository}.\n\n{error}\n\nLaunch ghr inside a checkout whose git remote points at {repository}, or set [[repos]].local_dir for this repository."
-        )
-    })?;
-    Ok(cwd)
-}
-
-fn configured_local_dir_for_repo(config: &Config, repository: &str) -> Option<PathBuf> {
-    config
-        .repos
-        .iter()
-        .find(|repo| repo.repo.eq_ignore_ascii_case(repository))
-        .and_then(|repo| repo.local_dir.as_deref())
-        .map(str::trim)
-        .filter(|local_dir| !local_dir.is_empty())
-        .map(expand_user_path)
-}
-
-fn expand_user_path(value: &str) -> PathBuf {
-    if value == "~" {
-        return home_dir().unwrap_or_else(|| PathBuf::from(value));
-    }
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(value)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(::dirs::home_dir)
-}
-
-fn ensure_directory_tracks_repo(
-    directory: &Path,
-    repository: &str,
-) -> std::result::Result<(), String> {
-    if !directory.is_dir() {
-        return Err(format!("{} is not a directory.", directory.display()));
-    }
-    let remotes = git_remotes_for_directory(directory)?;
-    if remotes
-        .iter()
-        .any(|(_, repo)| repo.eq_ignore_ascii_case(repository))
-    {
-        return Ok(());
-    }
-
-    let remote_list = if remotes.is_empty() {
-        "no GitHub remotes found".to_string()
-    } else {
-        remotes
-            .iter()
-            .map(|(remote, repo)| format!("{remote} -> {repo}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    Err(format!(
-        "{} does not track {repository}; found {remote_list}.",
-        directory.display()
-    ))
-}
-
-fn current_git_branch_for_directory(directory: &Path) -> std::result::Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
-        .map_err(|error| {
-            format!(
-                "failed to inspect current git branch in {}: {error}",
-                directory.display()
-            )
-        })?;
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() && !branch.is_empty() {
-        return Ok(branch);
-    }
-
-    let detail = command_output_text(&output.stdout, &output.stderr);
-    let detail = if detail.is_empty() {
-        "detached HEAD or no branch is checked out".to_string()
-    } else {
-        detail
-    };
-    Err(format!(
-        "cannot create PR from {}: {detail}",
-        directory.display()
-    ))
-}
-
-fn git_remotes_for_directory(
-    directory: &Path,
-) -> std::result::Result<Vec<(String, String)>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .arg("remote")
-        .output()
-        .map_err(|error| {
-            format!(
-                "failed to run git remote in {}: {error}",
-                directory.display()
-            )
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} is not a usable git checkout: {}",
-            directory.display(),
-            command_output_text(&output.stdout, &output.stderr)
-        ));
-    }
-
-    let mut remotes = Vec::new();
-    let names = String::from_utf8_lossy(&output.stdout);
-    for remote in names
-        .lines()
-        .map(str::trim)
-        .filter(|remote| !remote.is_empty())
-    {
-        if let Some(repo) = git_remote_repo(directory, remote) {
-            remotes.push((remote.to_string(), repo));
-        }
-    }
-    Ok(remotes)
-}
-
-fn git_remote_repo(directory: &Path, remote: &str) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(["remote", "get-url", remote])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?;
-    github_repo_from_remote_url(url.trim())
 }
 
 fn start_milestones_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
@@ -13860,113 +13343,6 @@ fn is_ctrl_c_key(key: KeyEvent) -> bool {
 fn is_ctrl_d_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&'d'))
-}
-
-fn normalized_command_palette_key(value: &str) -> String {
-    command_palette_key_binding(value).label
-}
-
-fn command_palette_key_binding(value: &str) -> KeyBinding {
-    parse_key_binding(value).unwrap_or_else(|| {
-        parse_key_binding(DEFAULT_COMMAND_PALETTE_KEY).expect("default command palette key parses")
-    })
-}
-
-fn parse_key_binding(value: &str) -> Option<KeyBinding> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if value.chars().count() == 1 {
-        let ch = value.chars().next()?;
-        return Some(KeyBinding {
-            label: value.to_string(),
-            code: KeyCode::Char(ch),
-            modifiers: KeyModifiers::NONE,
-        });
-    }
-
-    let mut modifiers = KeyModifiers::NONE;
-    let mut key = None;
-    for raw_part in value.split('+') {
-        let part = raw_part.trim();
-        if part.is_empty() {
-            return None;
-        }
-        match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers.insert(KeyModifiers::CONTROL),
-            "alt" | "option" => modifiers.insert(KeyModifiers::ALT),
-            "shift" => modifiers.insert(KeyModifiers::SHIFT),
-            _ if key.is_none() => key = Some(part.to_string()),
-            _ => return None,
-        }
-    }
-
-    let key = key?;
-    let code = parse_key_code(&key)?;
-    Some(KeyBinding {
-        label: key_binding_label(modifiers, &code),
-        code,
-        modifiers,
-    })
-}
-
-fn parse_key_code(value: &str) -> Option<KeyCode> {
-    let lower = value.to_ascii_lowercase();
-    match lower.as_str() {
-        "esc" | "escape" => Some(KeyCode::Esc),
-        "enter" | "return" => Some(KeyCode::Enter),
-        "tab" => Some(KeyCode::Tab),
-        "backtab" => Some(KeyCode::BackTab),
-        "backspace" => Some(KeyCode::Backspace),
-        "space" => Some(KeyCode::Char(' ')),
-        _ if value.chars().count() == 1 => Some(KeyCode::Char(value.chars().next()?)),
-        _ => None,
-    }
-}
-
-fn key_binding_label(modifiers: KeyModifiers, code: &KeyCode) -> String {
-    let mut parts = Vec::new();
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        parts.push("Ctrl".to_string());
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        parts.push("Alt".to_string());
-    }
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        parts.push("Shift".to_string());
-    }
-    parts.push(key_code_label_with_modifiers(code, modifiers));
-    parts.join("+")
-}
-
-fn key_code_label_with_modifiers(code: &KeyCode, modifiers: KeyModifiers) -> String {
-    match code {
-        KeyCode::Char(value)
-            if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && value.is_ascii_alphabetic() =>
-        {
-            value.to_ascii_uppercase().to_string()
-        }
-        _ => key_code_label(code),
-    }
-}
-
-fn key_code_label(code: &KeyCode) -> String {
-    match code {
-        KeyCode::Esc => "Esc".to_string(),
-        KeyCode::Enter => "Enter".to_string(),
-        KeyCode::Tab => "Tab".to_string(),
-        KeyCode::BackTab => "Shift+Tab".to_string(),
-        KeyCode::Backspace => "Backspace".to_string(),
-        KeyCode::Char(' ') => "Space".to_string(),
-        KeyCode::Char(value) => value.to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn command_palette_modifier_bits(modifiers: KeyModifiers) -> KeyModifiers {
-    modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn should_open_command_palette(app: &AppState, key: KeyEvent) -> bool {

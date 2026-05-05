@@ -2995,6 +2995,19 @@ pub async fn mark_notification_thread_read(thread_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn mark_notification_thread_done(thread_id: &str) -> Result<()> {
+    let path = format!("notifications/threads/{thread_id}");
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "DELETE".to_string(),
+        path,
+    ])
+    .await
+    .with_context(|| format!("failed to mark notification {thread_id} as done"))?;
+    Ok(())
+}
+
 pub async fn mark_all_notifications_read() -> Result<()> {
     run_gh_json(&[
         "api".to_string(),

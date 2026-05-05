@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 
 use crate::model::{
     SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
-    mark_notification_read_in_section,
+    mark_notification_done_in_section, mark_notification_read_in_section,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,6 +211,17 @@ impl SnapshotStore {
         let mut changed = false;
         for mut section in self.load_all()?.into_values() {
             if mark_notification_read_in_section(&mut section, thread_id) {
+                self.save_section(&section)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn mark_notification_done(&self, thread_id: &str) -> Result<bool> {
+        let mut changed = false;
+        for mut section in self.load_all()?.into_values() {
+            if mark_notification_done_in_section(&mut section, thread_id) {
                 self.save_section(&section)?;
                 changed = true;
             }
@@ -423,6 +434,58 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("db-wal"));
         let _ = fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mark_notification_done_removes_cached_notification_from_all_sections() {
+        let path = temp_db_path("snapshot-notification-done");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        let done_item = notification_item("thread-1", true);
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![done_item.clone(), notification_item("thread-2", true)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save unread snapshot");
+        store
+            .save_section(&SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![done_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: Some(Utc::now()),
+                error: None,
+            })
+            .expect("save all snapshot");
+
+        assert!(
+            store
+                .mark_notification_done("thread-1")
+                .expect("mark notification done")
+        );
+
+        let cached = store.load_all().expect("load cached snapshots");
+        let unread = cached.get("notifications:unread").expect("unread section");
+        assert_eq!(unread.items.len(), 1);
+        assert_eq!(unread.items[0].id, "thread-2");
+        let all = cached.get("notifications:all").expect("all section");
+        assert!(all.items.is_empty());
+
+        remove_db_files(&path);
     }
 
     #[test]

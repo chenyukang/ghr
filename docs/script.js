@@ -69,6 +69,7 @@ const shortcuts = [
   ["Project", "Palette", "Project Add: add a repo project to config.toml"],
   ["Project", "Palette", "Project Remove: remove a repo project from config.toml"],
   ["Cache", "Palette", "Clear Cache: choose which local cache layer to clear"],
+  ["Inbox", "Palette", "Mark Done: move the selected GitHub inbox notification out of inbox lists"],
   ["Inbox", "Palette", "Mark All Read: mark every GitHub inbox notification as read"],
   ["Inbox", "Palette", "Mute Thread: ignore future notifications for the selected inbox thread"],
   ["Inbox", "Palette", "Subscribe Thread: subscribe to the selected inbox thread"],

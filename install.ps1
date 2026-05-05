@@ -37,6 +37,26 @@ if ($env:GITHUB_TOKEN) {
     $Headers["Authorization"] = "Bearer $env:GITHUB_TOKEN"
 }
 
+function Save-Download {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $true)]
+        [string]$OutFile,
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    Write-Host "ghr install: downloading $Label"
+    $PreviousProgressPreference = $ProgressPreference
+    $ProgressPreference = "Continue"
+    try {
+        Invoke-WebRequest -Headers $Headers -Uri $Uri -OutFile $OutFile
+    } finally {
+        $ProgressPreference = $PreviousProgressPreference
+    }
+}
+
 if ($Version -eq "latest") {
     $Release = Invoke-RestMethod -Headers $Headers -Uri "https://api.github.com/repos/$Repo/releases/latest"
     $Tag = $Release.tag_name
@@ -60,8 +80,7 @@ $ExtractDir = Join-Path $TempDir "extract"
 New-Item -ItemType Directory -Force -Path $TempDir, $ExtractDir | Out-Null
 
 try {
-    Write-Host "ghr install: downloading $Archive"
-    Invoke-WebRequest -Headers $Headers -Uri "$BaseUrl/$Archive" -OutFile $ArchivePath
+    Save-Download -Uri "$BaseUrl/$Archive" -OutFile $ArchivePath -Label $Archive
     Invoke-WebRequest -Headers $Headers -Uri "$BaseUrl/$Archive.sha256" -OutFile $ChecksumPath
 
     $Expected = ([regex]::Match((Get-Content $ChecksumPath -Raw), "^[A-Fa-f0-9]+")).Value.ToLowerInvariant()

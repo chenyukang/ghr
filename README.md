@@ -26,8 +26,8 @@
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
-- Inbox read-state handling when opening notifications or using explicit inbox commands, with local cache updates, GitHub read-state sync, and dimmed read items.
-- Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
+- Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
+- Mouse support for tabs, lists, links, descriptions, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
 - Uses the GitHub CLI for authentication, API access, and browser opening behavior.
@@ -91,6 +91,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
+| `Mark Done` | Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless the thread is muted |
 | `Mark All Read` | Mark every GitHub inbox notification as read |
 | `Mute Thread` | Ignore future notifications for the selected inbox thread |
 | `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |

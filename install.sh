@@ -57,6 +57,27 @@ fetch_to_file() {
   fi
 }
 
+download_to_file() {
+  url="$1"
+  output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      curl -fL --progress-bar -H "Authorization: Bearer $GITHUB_TOKEN" "$url" -o "$output" || return 1
+    else
+      curl -fL --progress-bar "$url" -o "$output" || return 1
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      wget --header="Authorization: Bearer $GITHUB_TOKEN" -O "$output" "$url" || return 1
+    else
+      wget -O "$output" "$url" || return 1
+    fi
+  else
+    echo "ghr install: curl or wget is required" >&2
+    exit 1
+  fi
+}
+
 fetch_stdout() {
   url="$1"
   tmp_file="$tmp_dir/response.json"
@@ -149,7 +170,7 @@ archive_path="$tmp_dir/$archive"
 checksum_path="$tmp_dir/$archive.sha256"
 
 echo "ghr install: downloading $archive"
-if ! fetch_to_file "$base_url/$archive" "$archive_path"; then
+if ! download_to_file "$base_url/$archive" "$archive_path"; then
   echo "ghr install: release asset not found: $base_url/$archive" >&2
   echo "This release may have been created before prebuilt binaries were added." >&2
   exit 1

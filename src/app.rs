@@ -45,14 +45,15 @@ use crate::github::{
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
     fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
     fetch_repository_assignees, fetch_repository_labels, mark_all_notifications_read,
-    mark_notification_thread_read, mark_pull_request_ready_for_review, merge_pull_request,
-    mute_notification_thread, post_issue_comment, post_pull_request_review_comment,
-    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
-    refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
-    reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
-    search_global, submit_pending_pull_request_review, submit_pull_request_review,
-    subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
-    update_pull_request_branch, with_background_github_priority,
+    mark_notification_thread_done, mark_notification_thread_read,
+    mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
+    post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
+    refresh_dashboard, refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
+    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
+    submit_pending_pull_request_review, submit_pull_request_review, subscribe_notification_thread,
+    unsubscribe_notification_thread, update_issue_assignees, update_pull_request_branch,
+    with_background_github_priority,
 };
 #[cfg(test)]
 use crate::model::CommentPreviewKind;
@@ -60,8 +61,8 @@ use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
     PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
     configured_sections, global_search_view_key, mark_all_notifications_read_in_section,
-    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    repo_view_key, section_view_key,
+    mark_notification_done_in_section, mark_notification_read_in_section, merge_cached_sections,
+    merge_refreshed_sections, repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
@@ -224,6 +225,10 @@ enum AppMsg {
         result: std::result::Result<(), String>,
     },
     NotificationReadFinished {
+        thread_id: String,
+        result: std::result::Result<Option<String>, String>,
+    },
+    NotificationDoneFinished {
         thread_id: String,
         result: std::result::Result<Option<String>, String>,
     },
@@ -909,6 +914,7 @@ enum PaletteAction {
     ShowDiff,
     ClearIgnoredItems,
     ClearCache,
+    InboxMarkDone,
     InboxMarkAllRead,
     InboxThreadAction(InboxThreadAction),
 }
@@ -1177,6 +1183,7 @@ struct AppState {
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
     notification_read_pending: HashSet<String>,
+    notification_done_pending: HashSet<String>,
     selected_comment_index: usize,
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
@@ -1923,6 +1930,23 @@ fn start_notification_read_sync(
             Err(error) => Err(error.to_string()),
         };
         let _ = tx.send(AppMsg::NotificationReadFinished { thread_id, result });
+    });
+}
+
+fn start_notification_done_sync(
+    thread_id: String,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let result = match mark_notification_thread_done(&thread_id).await {
+            Ok(()) => match store.mark_notification_done(&thread_id) {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(error.to_string())),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(AppMsg::NotificationDoneFinished { thread_id, result });
     });
 }
 
@@ -3556,10 +3580,18 @@ fn handle_left_click(
         return;
     }
     let clicked_comment = document.comment_at(line_index);
+    let clicked_description = document.description_at(line_index);
     if let Some(url) = document.link_at(line_index, column) {
-        debug!(url = %url, comment = ?clicked_comment, "details link clicked");
+        debug!(
+            url = %url,
+            comment = ?clicked_comment,
+            description = clicked_description,
+            "details link clicked"
+        );
         if let Some(comment_index) = clicked_comment {
             app.select_comment(comment_index);
+        } else if clicked_description {
+            app.select_details_body_without_scroll();
         }
         app.open_url(&url);
         return;
@@ -3574,6 +3606,9 @@ fn handle_left_click(
     if let Some(comment_index) = clicked_comment {
         debug!(comment_index, "comment clicked");
         app.select_comment(comment_index);
+    } else if clicked_description {
+        debug!("description clicked");
+        app.select_details_body_without_scroll();
     }
 }
 
@@ -7715,6 +7750,13 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             PaletteAction::Refresh,
         ),
         palette_command(
+            "Mark Done",
+            "",
+            "Inbox",
+            "Move the selected GitHub notification out of inbox lists",
+            PaletteAction::InboxMarkDone,
+        ),
+        palette_command(
             "Mark All Read",
             "",
             "Inbox",
@@ -9634,6 +9676,7 @@ struct DetailsDocument {
     lines: Vec<Line<'static>>,
     links: Vec<LinkRegion>,
     actions: Vec<ActionRegion>,
+    description: Option<DescriptionRegion>,
     comments: Vec<CommentRegion>,
     diff_files: Vec<usize>,
     diff_lines: Vec<DiffLineRegion>,
@@ -9666,6 +9709,12 @@ impl DetailsDocument {
         self.comments.iter().find(|comment| comment.index == index)
     }
 
+    fn description_at(&self, line: usize) -> bool {
+        self.description
+            .as_ref()
+            .is_some_and(|description| description.contains(line))
+    }
+
     fn diff_line_at(&self, line: usize) -> Option<usize> {
         self.diff_lines
             .iter()
@@ -9688,6 +9737,18 @@ struct ActionRegion {
     start: u16,
     end: u16,
     action: DetailAction,
+}
+
+#[derive(Debug, Clone)]
+struct DescriptionRegion {
+    start_line: usize,
+    end_line: usize,
+}
+
+impl DescriptionRegion {
+    fn contains(&self, line: usize) -> bool {
+        line >= self.start_line && line < self.end_line
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9996,6 +10057,7 @@ impl DetailsBuilder {
                 lines: Vec::new(),
                 links: Vec::new(),
                 actions: Vec::new(),
+                description: None,
                 comments: Vec::new(),
                 diff_files: Vec::new(),
                 diff_lines: Vec::new(),
@@ -10841,6 +10903,7 @@ fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String]) {
 
 fn push_description_block(builder: &mut DetailsBuilder, app: &AppState, item: &WorkItem) {
     let selected = app.focus == FocusTarget::Details && app.comment_selection_cleared();
+    let start_line = builder.document.lines.len();
     if !selected {
         builder.push_heading("Description");
         builder.push_blank();
@@ -10850,6 +10913,10 @@ fn push_description_block(builder: &mut DetailsBuilder, app: &AppState, item: &W
             22,
             2_400,
         );
+        builder.document.description = Some(DescriptionRegion {
+            start_line,
+            end_line: builder.document.lines.len(),
+        });
         return;
     }
 
@@ -10882,6 +10949,10 @@ fn push_description_block(builder: &mut DetailsBuilder, app: &AppState, item: &W
         content_start_line,
         builder.document.lines.len() - 1,
     );
+    builder.document.description = Some(DescriptionRegion {
+        start_line,
+        end_line: builder.document.lines.len(),
+    });
 }
 
 fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
@@ -14093,6 +14164,7 @@ impl AppState {
             details_refreshing: HashSet::new(),
             pending_details_load: None,
             notification_read_pending: HashSet::new(),
+            notification_done_pending: HashSet::new(),
             selected_comment_index: 0,
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
@@ -15421,6 +15493,31 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::NotificationDoneFinished { thread_id, result } => {
+                self.notification_done_pending.remove(&thread_id);
+                match result {
+                    Ok(save_error) => {
+                        let changed = self.apply_notification_done_local(&thread_id);
+                        self.status = match (changed, save_error) {
+                            (_, Some(error)) => {
+                                format!("notification marked done; snapshot save failed: {error}")
+                            }
+                            (true, None) => "notification marked done".to_string(),
+                            (false, None) => "notification done synced".to_string(),
+                        };
+                    }
+                    Err(error) => {
+                        let setup_dialog = setup_dialog_from_error(&error);
+                        if self.setup_dialog.is_none() {
+                            self.setup_dialog = setup_dialog;
+                        }
+                        self.status = format!(
+                            "notification done sync failed: {}",
+                            operation_error_body(&error)
+                        );
+                    }
+                }
+            }
             AppMsg::InboxMarkAllReadFinished { result } => match result {
                 Ok(save_error) => {
                     let changed = self.apply_all_notifications_read_local();
@@ -15797,6 +15894,10 @@ impl AppState {
             }
             PaletteAction::ClearCache => {
                 self.show_cache_clear_dialog();
+                false
+            }
+            PaletteAction::InboxMarkDone => {
+                self.mark_current_notification_done(store, tx);
                 false
             }
             PaletteAction::InboxMarkAllRead => {
@@ -16757,6 +16858,33 @@ impl AppState {
         start_notification_read_sync(thread_id, store.clone(), tx.clone());
     }
 
+    fn mark_current_notification_done(
+        &mut self,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(thread_id) = self.current_inbox_thread_id() else {
+            self.status = "select an inbox item to mark done".to_string();
+            return;
+        };
+
+        self.mark_notification_done(thread_id, store, tx);
+    }
+
+    fn mark_notification_done(
+        &mut self,
+        thread_id: String,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        if !self.notification_done_pending.insert(thread_id.clone()) {
+            return;
+        }
+
+        self.status = "marking notification done".to_string();
+        start_notification_done_sync(thread_id, store.clone(), tx.clone());
+    }
+
     fn mark_all_inbox_read(&mut self, store: &SnapshotStore, tx: &UnboundedSender<AppMsg>) {
         self.status = "marking all inbox notifications read".to_string();
         start_inbox_mark_all_read_sync(store.clone(), tx.clone());
@@ -16791,6 +16919,17 @@ impl AppState {
         let mut changed = false;
         for section in &mut self.sections {
             changed |= mark_notification_read_in_section(section, thread_id);
+        }
+        if changed {
+            self.clamp_positions();
+        }
+        changed
+    }
+
+    fn apply_notification_done_local(&mut self, thread_id: &str) -> bool {
+        let mut changed = false;
+        for section in &mut self.sections {
+            changed |= mark_notification_done_in_section(section, thread_id);
         }
         if changed {
             self.clamp_positions();
@@ -18243,6 +18382,10 @@ impl AppState {
 
     fn select_details_body(&mut self) {
         self.details_scroll = 0;
+        self.select_details_body_without_scroll();
+    }
+
+    fn select_details_body_without_scroll(&mut self) {
         self.clear_selected_comment();
         self.status = self.details_body_focus_status();
     }
@@ -24973,6 +25116,7 @@ diff --git a/src/main.rs b/src/main.rs
                 .iter()
                 .any(|command| command.title == "Mark All Read")
         );
+        assert!(commands.iter().any(|command| command.title == "Mark Done"));
         assert!(
             commands
                 .iter()
@@ -27661,6 +27805,99 @@ diff --git a/src/main.rs b/src/main.rs
                 .any(|line| line.starts_with("┃ Description")),
             "issue description should use the same selected details-body treatment: {issue_rendered:?}"
         );
+    }
+
+    #[test]
+    fn mouse_clicking_description_selects_details_body_without_jumping_scroll() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "First comment", None)]),
+        );
+        app.selected_comment_index = 0;
+        app.details_scroll = 1;
+        let area = Rect::new(0, 0, 120, 40);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let description_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("A body with useful context"))
+            .expect("description body line");
+        assert!(document.description_at(description_line));
+        let description_row = inner.y + description_line as u16 - app.details_scroll;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 2,
+                row: description_row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert_eq!(app.details_scroll, 1);
+        assert_eq!(app.status, "pull request details focused");
+    }
+
+    #[test]
+    fn mouse_clicking_inbox_linked_description_selects_details_body() {
+        let mut item = notification_item("thread-1", true);
+        item.body = Some("Loaded notification description.".to_string());
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        app.focus_details();
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "First comment", None)]),
+        );
+        app.selected_comment_index = 0;
+        let area = Rect::new(0, 0, 120, 40);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let description_line = document
+            .lines
+            .iter()
+            .position(|line| {
+                line.to_string()
+                    .contains("Loaded notification description.")
+            })
+            .expect("notification description line");
+        assert!(document.description_at(description_line));
+        let description_row = inner.y + description_line as u16 - app.details_scroll;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 2,
+                row: description_row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+        assert_eq!(app.status, "pull request details focused");
     }
 
     #[test]
@@ -34168,6 +34405,49 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
+    fn notification_done_local_removes_item_from_all_notification_sections() {
+        let done_item = notification_item("thread-1", false);
+        let other_item = notification_item("thread-2", true);
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![done_item.clone(), other_item.clone()],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![done_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+
+        assert!(app.apply_notification_done_local("thread-1"));
+
+        assert_eq!(app.sections[0].items.len(), 1);
+        assert_eq!(app.sections[0].items[0].id, "thread-2");
+        assert!(app.sections[1].items.is_empty());
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-2")
+        );
+    }
+
+    #[test]
     fn all_notifications_read_local_clears_unread_sections_and_updates_all_items() {
         let before = Utc::now();
         let unread_item = notification_item("thread-1", true);
@@ -34241,6 +34521,33 @@ diff --git a/d.rs b/d.rs
         assert!(!app.notification_read_pending.contains("thread-1"));
         assert!(app.sections[0].items.is_empty());
         assert_eq!(app.status, "notification marked read");
+    }
+
+    #[test]
+    fn notification_done_finished_updates_local_state_and_clears_pending() {
+        let sections = vec![SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        }];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        app.notification_done_pending.insert("thread-1".to_string());
+
+        app.handle_msg(AppMsg::NotificationDoneFinished {
+            thread_id: "thread-1".to_string(),
+            result: Ok(None),
+        });
+
+        assert!(!app.notification_done_pending.contains("thread-1"));
+        assert!(app.sections[0].items.is_empty());
+        assert_eq!(app.status, "notification marked done");
     }
 
     #[test]

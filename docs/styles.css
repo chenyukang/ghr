@@ -192,7 +192,49 @@ p {
   margin-top: 22px;
 }
 
-.install-card p {
+.install-terminal {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid rgba(156, 255, 74, 0.28);
+  border-radius: 8px;
+  background: var(--black);
+}
+
+.install-row {
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(50, 56, 44, 0.78);
+}
+
+.install-row:last-child {
+  border-bottom: 0;
+}
+
+.install-label {
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.install-row code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--green);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.install-row code span {
+  color: var(--cyan);
+}
+
+.install-card > p {
   margin: 10px 0 0;
   font-size: 14px;
 }
@@ -210,28 +252,6 @@ p {
 .panel-shot img {
   width: 100%;
   border-radius: 7px;
-}
-
-.terminal-window {
-  display: grid;
-  gap: 8px;
-  padding: 14px 16px;
-  border: 1px solid rgba(156, 255, 74, 0.28);
-  border-radius: 8px;
-  background: var(--black);
-}
-
-.terminal-window code {
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--green);
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
-.terminal-window span {
-  color: var(--cyan);
 }
 
 .feature-grid {
@@ -438,6 +458,11 @@ pre code {
 
   .feature-grid {
     grid-template-columns: 1fr;
+  }
+
+  .install-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 
   .shortcut-row {

@@ -531,6 +531,16 @@ pub fn mark_notification_read_in_section(section: &mut SectionSnapshot, thread_i
     changed
 }
 
+pub fn mark_notification_done_in_section(section: &mut SectionSnapshot, thread_id: &str) -> bool {
+    if !matches!(section.kind, SectionKind::Notifications) {
+        return false;
+    }
+
+    let previous_len = section.items.len();
+    section.items.retain(|item| item.id != thread_id);
+    section.items.len() != previous_len
+}
+
 pub fn mark_all_notifications_read_in_section(
     section: &mut SectionSnapshot,
     last_read_at: DateTime<Utc>,
@@ -755,6 +765,35 @@ mod tests {
         );
 
         assert_eq!(section_view_key(&section), "search");
+    }
+
+    #[test]
+    fn mark_notification_done_removes_matching_notification_item() {
+        let mut section = test_section(
+            SectionKind::Notifications,
+            vec![
+                test_work_item("thread-1", ItemKind::Notification),
+                test_work_item("thread-2", ItemKind::Notification),
+            ],
+        );
+
+        assert!(mark_notification_done_in_section(&mut section, "thread-1"));
+
+        assert_eq!(section.items.len(), 1);
+        assert_eq!(section.items[0].id, "thread-2");
+    }
+
+    #[test]
+    fn mark_notification_done_ignores_non_notification_sections() {
+        let mut section = test_section(
+            SectionKind::PullRequests,
+            vec![test_work_item("thread-1", ItemKind::PullRequest)],
+        );
+
+        assert!(!mark_notification_done_in_section(&mut section, "thread-1"));
+
+        assert_eq!(section.items.len(), 1);
+        assert_eq!(section.items[0].id, "thread-1");
     }
 
     fn test_section(kind: SectionKind, items: Vec<WorkItem>) -> SectionSnapshot {

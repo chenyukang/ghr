@@ -37,20 +37,32 @@
             <a class="button" href="#shortcuts">Browse shortcuts</a>
           </div>
           <div class="install-card" aria-label="Quick install" id="install">
-            <div class="terminal-window" aria-label="Install commands">
-              <code
-                ><span>$</span> curl -fsSL
-                https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh
-                | sh</code
-              >
-              <code
-                ><span>PS&gt;</span> irm
-                https://raw.githubusercontent.com/chenyukang/ghr/main/install.ps1
-                | iex</code
-              >
-              <code><span>$</span> ghr</code>
+            <div class="install-terminal" aria-label="Install commands">
+              <div class="install-row">
+                <span class="install-label">macOS/Linux</span>
+                <code
+                  ><span>$</span> curl -fsSL
+                  https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh
+                  | sh</code
+                >
+              </div>
+              <div class="install-row">
+                <span class="install-label">Windows</span>
+                <code
+                  ><span>PS&gt;</span> irm
+                  https://raw.githubusercontent.com/chenyukang/ghr/main/install.ps1
+                  | iex</code
+                >
+              </div>
+              <div class="install-row">
+                <span class="install-label">Cargo</span>
+                <code><span>$</span> cargo install ghr-cli</code>
+              </div>
             </div>
-            <p>Press <kbd>:</kbd> inside ghr to fuzzy-search commands.</p>
+            <p>
+              Then run <code>ghr</code>. Press <kbd>:</kbd> inside ghr to
+              fuzzy-search commands.
+            </p>
           </div>
         </div>
         <figure class="hero-shot">

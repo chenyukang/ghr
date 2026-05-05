@@ -68,12 +68,11 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff details back to diff files |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
-| `[` / `]` in List | Page the current list selection up/down |
-| `PgDown` / `PgUp` or `d` / `u` | Page list/details movement |
+| `[` / `]` in List | Load previous/next GitHub result page |
+| `PgDown` / `PgUp` or `d` / `u` | Page current list/details movement |
 | `n` / `p` in Details | Focus next/previous comment in conversation or diff details |
 | `h` / `l` in diff Details | Page down/up through the file diff |
 | `g` / `G` | Jump to top/bottom in list, details, or diff |
-| `Alt+[` / `Alt+]` | Load previous/next GitHub result page |
 | `[` / `]` in diff mode | Switch diff files |
 | `/` | Fuzzy filter the current list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
@@ -225,7 +224,7 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 
 Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
 
-`pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `Alt+[` and `Alt+]` in the list to load adjacent GitHub result pages.
+`pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 
 ## Local Data
 
@@ -240,4 +239,3 @@ The snapshot cache is intentionally local and disposable. Delete `~/.ghr/ghr.db`
 
 ## Contributing
 Contributions are very welcome! Please open an issue or a pull request with any bug fixes, improvements, or new features.
-

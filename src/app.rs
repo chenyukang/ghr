@@ -3348,14 +3348,16 @@ fn handle_key_in_area_mut(
                 app.move_selection(-1);
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(']') => {
+            KeyCode::PageDown | KeyCode::Char('d') => {
                 app.move_selection(list_page_delta(app, area, 1));
                 app.mark_current_notification_read(store, tx);
             }
-            KeyCode::PageUp | KeyCode::Char('u') | KeyCode::Char('[') => {
+            KeyCode::PageUp | KeyCode::Char('u') => {
                 app.move_selection(list_page_delta(app, area, -1));
                 app.mark_current_notification_read(store, tx);
             }
+            KeyCode::Char('[') => start_section_page_load(app, config, store, tx, -1),
+            KeyCode::Char(']') => start_section_page_load(app, config, store, tx, 1),
             KeyCode::Char('g') => {
                 app.set_selection(0);
                 app.mark_current_notification_read(store, tx);
@@ -7927,14 +7929,14 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
         ),
         palette_command(
             "Page List Down",
-            "] / PgDown / d",
+            "PgDown / d",
             "List",
             "Move the list selection down by a visible page",
             palette_key(KeyCode::PageDown),
         ),
         palette_command(
             "Page List Up",
-            "[ / PgUp / u",
+            "PgUp / u",
             "List",
             "Move the list selection up by a visible page",
             palette_key(KeyCode::PageUp),
@@ -7969,14 +7971,14 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
         ),
         palette_command(
             "Load Previous Result Page",
-            "Alt+[",
+            "[",
             "List",
             "Load previous GitHub search result page",
             palette_alt_key(KeyCode::Char('[')),
         ),
         palette_command(
             "Load Next Result Page",
-            "Alt+]",
+            "]",
             "List",
             "Load next GitHub search result page",
             palette_alt_key(KeyCode::Char(']')),
@@ -9250,9 +9252,8 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("List"),
         help_key_line("j/k or Up/Down", "move selection"),
-        help_key_line("[ / ]", "move by visible page"),
-        help_key_line("PgDown/PgUp or d/u", "also move by visible page"),
-        help_key_line("Alt+[ / Alt+]", "load previous / next GitHub result page"),
+        help_key_line("[ / ]", "load previous / next GitHub result page"),
+        help_key_line("PgDown/PgUp or d/u", "move by visible page"),
         help_key_line("g / G", "first / last item"),
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
@@ -23811,7 +23812,7 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             commands
                 .iter()
-                .any(|command| command.title == "Load Next Result Page" && command.keys == "Alt+]")
+                .any(|command| command.title == "Load Next Result Page" && command.keys == "]")
         );
         assert!(
             commands
@@ -31312,6 +31313,19 @@ diff --git a/src/main.rs b/src/main.rs
             Some(area)
         ));
         assert_eq!(app.current_selected_position(), 0);
+    }
+
+    #[test]
+    fn list_brackets_load_github_result_pages_instead_of_moving_selection() {
+        let mut section = many_items_section(30);
+        section.total_count = Some(30);
+        section.page_size = 50;
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.set_selection(10);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let area = Rect::new(0, 0, 120, 20);
 
         assert!(!handle_key_in_area(
             &mut app,
@@ -31321,8 +31335,10 @@ diff --git a/src/main.rs b/src/main.rs
             &tx,
             Some(area)
         ));
-        assert_eq!(app.current_selected_position(), visible_rows);
+        assert_eq!(app.current_selected_position(), 10);
+        assert_eq!(app.status, "only one result page");
 
+        app.status.clear();
         assert!(!handle_key_in_area(
             &mut app,
             key(KeyCode::Char('[')),
@@ -31331,7 +31347,8 @@ diff --git a/src/main.rs b/src/main.rs
             &tx,
             Some(area)
         ));
-        assert_eq!(app.current_selected_position(), 0);
+        assert_eq!(app.current_selected_position(), 10);
+        assert_eq!(app.status, "only one result page");
     }
 
     #[test]

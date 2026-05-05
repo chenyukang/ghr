@@ -238,27 +238,6 @@ Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode
 
 The snapshot cache is intentionally local and disposable. Delete `~/.ghr/ghr.db` if you want to rebuild it from GitHub.
 
-## Website
+## Contributing
+Contributions are very welcome! Please open an issue or a pull request with any bug fixes, improvements, or new features.
 
-The landing and documentation site lives in `docs/` and is deployed by the `Pages` GitHub Actions workflow. After GitHub Pages is enabled for Actions, the project URL is:
-
-```text
-https://chenyukang.github.io/ghr/
-```
-
-## Release
-
-CI runs formatting, `cargo check`, strict `clippy`, tests on Linux and macOS, and `cargo package`.
-
-Publishing is automatic on version tags:
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-The release workflow verifies that the tag matches `Cargo.toml`, publishes `ghr-cli` to crates.io, and creates a GitHub release. Configure the repository environment `crates-io` with a `CARGO_REGISTRY_TOKEN` secret before pushing a release tag.
-
-## Design Notes
-
-`ghr` is inspired by tools like `gh-dash`, but it is not a strict rewrite. The main goal is a responsive Rust TUI that opens instantly from cached state, then refreshes GitHub data in the background.

@@ -102,6 +102,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff mode |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
+| `n` / `p` in ghr, Sections, or List | Mirror next/previous movement for focus or list selection; `p` at the first list item returns to Sections |
 | `[` / `]` in List | Load previous/next GitHub result page |
 | `PgDown` / `PgUp` or `d` / `u` | Page current list/details movement |
 | `n` / `p` in Details | Focus next/previous comment in conversation or diff details; `p` from the first conversation comment returns to PR/issue details |

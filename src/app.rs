@@ -2967,15 +2967,19 @@ fn handle_key_in_area_mut(
         FocusTarget::Ghr => match key.code {
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => app.move_view(1),
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => app.move_view(-1),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => app.focus_sections(),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') | KeyCode::Enter => {
+                app.focus_sections()
+            }
             KeyCode::Esc => app.focus_list(),
             _ => {}
         },
         FocusTarget::Sections => match key.code {
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => app.move_section(1),
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => app.move_section(-1),
-            KeyCode::Up | KeyCode::Char('k') => app.focus_ghr(),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => app.focus_list(),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => app.focus_ghr(),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') | KeyCode::Enter => {
+                app.focus_list()
+            }
             KeyCode::Esc => app.focus_list(),
             _ => {}
         },
@@ -2989,11 +2993,15 @@ fn handle_key_in_area_mut(
             }
             KeyCode::Esc => {}
             KeyCode::Char('/') => app.start_search(),
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
                 app.move_selection(1);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.move_selection(-1);
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+                if app.current_selected_position() == 0 {
+                    app.focus_sections();
+                } else {
+                    app.move_selection(-1);
+                }
             }
             KeyCode::PageDown | KeyCode::Char('d') => {
                 app.move_selection(list_page_delta(app, area, 1));
@@ -5023,13 +5031,13 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
     match app.focus {
         FocusTarget::Ghr => {
             push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
-            push_footer_pair(&mut spans, "j/enter", "Sections", Color::Cyan);
+            push_footer_pair(&mut spans, "j/n/enter", "Sections", Color::Cyan);
             push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::Sections => {
             push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
-            push_footer_pair(&mut spans, "k", "ghr", Color::Cyan);
-            push_footer_pair(&mut spans, "j/enter", "List", Color::Cyan);
+            push_footer_pair(&mut spans, "k/p", "ghr", Color::Cyan);
+            push_footer_pair(&mut spans, "j/n/enter", "List", Color::Cyan);
             push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::List => {
@@ -5042,7 +5050,7 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
-                push_footer_pair(&mut spans, "j/k", "move", Color::Cyan);
+                push_footer_pair(&mut spans, "j/k/n/p", "move", Color::Cyan);
                 push_footer_pair(&mut spans, "[ ]", "page", Color::Cyan);
                 push_footer_pair(&mut spans, "tab", "Details", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "Details", Color::Cyan);
@@ -7946,6 +7954,20 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             palette_key(KeyCode::Char('h')),
         ),
         palette_command(
+            "Move Focus Down",
+            "j / n / Down",
+            "Focus",
+            "Move focus from ghr to Sections, or from Sections to List",
+            palette_key(KeyCode::Char('j')),
+        ),
+        palette_command(
+            "Move Focus Up",
+            "k / p / Up",
+            "Focus",
+            "Move focus from Sections to ghr",
+            palette_key(KeyCode::Char('k')),
+        ),
+        palette_command(
             "Search Current List",
             "/",
             "List",
@@ -7954,16 +7976,16 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
         ),
         palette_command(
             "Move Selection Down",
-            "j / Down",
+            "j / n / Down",
             "List",
-            "Move list selection or diff cursor down",
+            "Move list selection down",
             palette_key(KeyCode::Char('j')),
         ),
         palette_command(
             "Move Selection Up",
-            "k / Up",
+            "k / p / Up",
             "List",
-            "Move list selection or diff cursor up",
+            "Move list selection up, or focus Sections from the first item",
             palette_key(KeyCode::Char('k')),
         ),
         palette_command(
@@ -9285,12 +9307,15 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
             "switch the focused tab group",
         ),
         help_key_line(
-            "j/k or Up/Down",
+            "j/k/n/p or Up/Down",
             "move focus between ghr, Sections, and List",
         ),
         Line::from(""),
         help_heading("List"),
-        help_key_line("j/k or Up/Down", "move selection"),
+        help_key_line(
+            "j/k/n/p or Up/Down",
+            "move selection; k/p at first item focuses Sections",
+        ),
         help_key_line("Tab / Shift+Tab", "focus Details"),
         help_key_line("[ / ]", "load previous / next GitHub result page"),
         help_key_line("PgDown/PgUp or d/u", "move by visible page"),
@@ -25140,6 +25165,25 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             commands
                 .iter()
+                .any(|command| command.title == "Move Focus Down"
+                    && command.keys == "j / n / Down")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Move Focus Up" && command.keys == "k / p / Up")
+        );
+        assert!(commands.iter().any(
+            |command| command.title == "Move Selection Down" && command.keys == "j / n / Down"
+        ));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Move Selection Up" && command.keys == "k / p / Up")
+        );
+        assert!(
+            commands
+                .iter()
                 .any(|command| command.title == "Load Next Result Page" && command.keys == "]")
         );
         assert!(
@@ -26064,7 +26108,7 @@ diff --git a/src/main.rs b/src/main.rs
         let text = footer_line(&app, &paths).to_string();
 
         assert!(text.contains(
-            "j/k move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  a comment"
+            "j/k/n/p move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  a comment"
         ));
         assert!(!text.contains("List items"));
         assert!(!text.contains("Details content"));
@@ -26083,7 +26127,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         let compact = footer_line_for_width(&app, &paths, 80).to_string();
         assert!(display_width(&compact) <= 80);
-        assert!(compact.contains("j/k move"));
+        assert!(compact.contains("j/k/n/p move"));
         assert!(compact.contains("[ ] page"));
         assert!(compact.contains("tab Details"));
         assert!(compact.contains("enter Details"));
@@ -26093,7 +26137,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.refreshing = true;
         let refreshing = footer_line(&app, &paths).to_string();
-        assert!(refreshing.contains("j/k move"));
+        assert!(refreshing.contains("j/k/n/p move"));
         assert!(!refreshing.contains("status: refreshing"));
         assert_eq!(top_status_line(&app, 32).to_string(), "status: refreshing");
     }
@@ -26167,13 +26211,13 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
-        assert!(ghr.contains("tab/h/l switch  j/enter Sections  esc List"));
+        assert!(ghr.contains("tab/h/l switch  j/n/enter Sections  esc List"));
         assert!(!ghr.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
-        assert!(sections.contains("tab/h/l switch  k ghr  j/enter List"));
+        assert!(sections.contains("tab/h/l switch  k/p ghr  j/n/enter List"));
         assert!(!sections.contains("a comment"));
 
         app.focus_details();
@@ -33954,6 +33998,51 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
+    fn n_and_p_mirror_j_and_k_between_ghr_sections_and_list_focus() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        app.focus_ghr();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::Sections);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+
+        app.focus_sections();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+    }
+
+    #[test]
     fn h_and_l_switch_only_the_focused_tab_group() {
         let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
         issue.kind = ItemKind::Issue;
@@ -34591,6 +34680,108 @@ diff --git a/d.rs b/d.rs
                 .iter()
                 .all(|item| item.unread == Some(true))
         );
+    }
+
+    #[test]
+    fn n_and_p_mirror_j_and_k_in_primary_lists() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        for kind in [
+            SectionKind::PullRequests,
+            SectionKind::Issues,
+            SectionKind::Notifications,
+        ] {
+            let (key_prefix, title, items) = match kind {
+                SectionKind::PullRequests => (
+                    "pull_requests",
+                    "Pull Requests",
+                    vec![
+                        work_item("pr-1", "rust-lang/rust", 1, "First PR", None),
+                        work_item("pr-2", "rust-lang/rust", 2, "Second PR", None),
+                    ],
+                ),
+                SectionKind::Issues => {
+                    let mut first = work_item("issue-1", "rust-lang/rust", 1, "First issue", None);
+                    first.kind = ItemKind::Issue;
+                    let mut second =
+                        work_item("issue-2", "rust-lang/rust", 2, "Second issue", None);
+                    second.kind = ItemKind::Issue;
+                    ("issues", "Issues", vec![first, second])
+                }
+                SectionKind::Notifications => (
+                    "notifications",
+                    "All",
+                    vec![
+                        notification_item("thread-1", true),
+                        notification_item("thread-2", true),
+                    ],
+                ),
+            };
+            let sections = vec![SectionSnapshot {
+                key: format!("{key_prefix}:test"),
+                kind,
+                title: title.to_string(),
+                filters: String::new(),
+                items,
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            }];
+            let mut app = AppState::new(kind, sections);
+
+            assert_eq!(app.current_selected_position(), 0);
+            assert!(!handle_key(
+                &mut app,
+                key(KeyCode::Char('n')),
+                &config,
+                &store,
+                &tx
+            ));
+            assert_eq!(app.current_selected_position(), 1, "{kind:?} n moves down");
+            assert!(!handle_key(
+                &mut app,
+                key(KeyCode::Char('p')),
+                &config,
+                &store,
+                &tx
+            ));
+            assert_eq!(app.current_selected_position(), 0, "{kind:?} p moves up");
+            assert_eq!(app.focus, FocusTarget::List, "{kind:?} p stays in list");
+
+            if matches!(kind, SectionKind::Notifications) {
+                assert!(app.notification_read_pending.is_empty());
+                assert!(
+                    app.sections[0]
+                        .items
+                        .iter()
+                        .all(|item| item.unread == Some(true))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn k_and_p_leave_primary_list_at_first_item_then_continue_to_ghr() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+        for code in [KeyCode::Char('k'), KeyCode::Char('p')] {
+            let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+            app.focus_list();
+            assert_eq!(app.current_selected_position(), 0);
+
+            assert!(!handle_key(&mut app, key(code), &config, &store, &tx));
+            assert_eq!(app.focus, FocusTarget::Sections);
+            assert_eq!(app.current_selected_position(), 0);
+
+            assert!(!handle_key(&mut app, key(code), &config, &store, &tx));
+            assert_eq!(app.focus, FocusTarget::Ghr);
+        }
     }
 
     #[test]

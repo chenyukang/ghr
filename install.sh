@@ -12,7 +12,7 @@ Install ghr from GitHub release binaries.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.3.0 sh
+  curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.4.0 sh
   curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_INSTALL_DIR=/usr/local/bin sh
 
 Environment:

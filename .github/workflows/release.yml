@@ -206,17 +206,23 @@ jobs:
 
       - name: Publish GitHub release
         run: |
-          notes="Published to crates.io: https://crates.io/crates/${CRATE_NAME}/${GITHUB_REF_NAME#v}"
+          notes_file="$(mktemp)"
+          release_notes=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$release_notes" ]; then
+            cat "$release_notes" > "$notes_file"
+            printf '\n\n' >> "$notes_file"
+          fi
+          printf 'Published to crates.io: https://crates.io/crates/%s/%s\n' "$CRATE_NAME" "${GITHUB_REF_NAME#v}" >> "$notes_file"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" \
               --title "ghr $GITHUB_REF_NAME" \
-              --notes "$notes"
+              --notes-file "$notes_file"
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
               --verify-tag \
               --title "ghr $GITHUB_REF_NAME" \
-              --notes "$notes"
+              --notes-file "$notes_file"
           fi
         env:
           GH_TOKEN: ${{ github.token }}

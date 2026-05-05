@@ -12071,14 +12071,6 @@ fn push_comment(
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::link("open", url.clone()));
     }
-    if let Some(review) = &comment.review {
-        header.push(DetailSegment::raw("  "));
-        header.push(DetailSegment::styled(
-            review_comment_label(review),
-            diff_metadata_style(),
-        ));
-        append_review_state_segments(&mut header, review);
-    }
     append_reaction_segments(&mut header, &comment.reactions);
     if !comment.kind.is_activity() {
         header.push(DetailSegment::raw("  "));
@@ -12131,6 +12123,14 @@ fn push_comment(
         comment_right_padding(options.selected),
         2,
     );
+    if let Some(review) = &comment.review {
+        builder.push_prefixed_wrapped_limited(
+            review_comment_metadata_segments(review),
+            prefix.clone(),
+            comment_right_padding(options.selected),
+            2,
+        );
+    }
     if options.selected
         && let Some(review) = &comment.review
     {
@@ -12646,6 +12646,17 @@ fn review_comment_label(review: &crate::model::ReviewCommentPreview) -> String {
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "line".to_string());
     format!("inline {}:{line} {side}", review.path)
+}
+
+fn review_comment_metadata_segments(
+    review: &crate::model::ReviewCommentPreview,
+) -> Vec<DetailSegment> {
+    let mut segments = vec![DetailSegment::styled(
+        review_comment_label(review),
+        diff_metadata_style(),
+    )];
+    append_review_state_segments(&mut segments, review);
+    segments
 }
 
 fn push_comment_separator(
@@ -28634,12 +28645,88 @@ diff --git a/src/main.rs b/src/main.rs
             .join("\n");
 
         assert!(rendered.contains("inline src/github.rs:876 right"));
+        let header_line = rendered
+            .lines()
+            .find(|line| line.contains("chenyukang") && line.contains("open"))
+            .expect("inline comment header");
+        assert!(
+            !header_line.contains("inline src/github.rs:876 right"),
+            "review metadata should stay off the author/action header: {rendered}"
+        );
+        let metadata_line = rendered
+            .lines()
+            .find(|line| line.contains("inline src/github.rs:876 right"))
+            .expect("inline review metadata line");
+        assert!(
+            !metadata_line.contains("+ react") && !metadata_line.contains("reply"),
+            "review metadata line should not carry comment actions: {rendered}"
+        );
         assert!(rendered.contains("GH_NO_UPDATE_NOTIFIER"));
         assert!(rendered.lines().any(|line| {
             line.contains('>') && line.contains('+') && line.contains("GH_NO_UPDATE_NOTIFIER")
         }));
         assert!(rendered.contains("This is a review comment?"));
         assert!(rendered.contains("comments: 1"));
+    }
+
+    #[test]
+    fn details_comments_keep_long_inline_review_metadata_on_own_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut inline = comment(
+            "mejrs",
+            "It seems wrong to suggest this.",
+            Some("https://github.com/rust-lang/rust/pull/156000#discussion_r99"),
+        );
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "tests/ui/drop/explicit-drop-call-error.stderr".to_string(),
+            line: Some(10),
+            original_line: None,
+            start_line: Some(9),
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: Some("RIGHT".to_string()),
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: true,
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+        app.focus_details();
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let header_index = rendered
+            .iter()
+            .position(|line| line.contains("mejrs") && line.contains("+ react"))
+            .expect("comment action header");
+        let metadata_index = rendered
+            .iter()
+            .position(|line| {
+                line.contains("inline tests/ui/drop/explicit-drop-call-error.stderr:9-10 right")
+            })
+            .expect("inline review metadata line");
+
+        assert_eq!(
+            metadata_index,
+            header_index + 1,
+            "review metadata should be directly below the author/action header: {rendered:?}"
+        );
+        assert!(
+            rendered[metadata_index].contains("outdated"),
+            "outdated state should stay with review metadata: {rendered:?}"
+        );
+        assert!(
+            !rendered[header_index].contains("tests/ui/drop"),
+            "long review metadata should not share the author/action header: {rendered:?}"
+        );
+        assert!(
+            !rendered[metadata_index].contains("+ react")
+                && !rendered[metadata_index].contains("reply"),
+            "comment actions should stay on the header: {rendered:?}"
+        );
     }
 
     #[test]

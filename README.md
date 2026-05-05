@@ -1,6 +1,6 @@
 # ghr
 
-`ghr` is a fast terminal workspace for staying on top of GitHub. It brings pull requests, issues, notifications, repo tabs, conversations, checks, and diffs into one stateful TUI, so you can triage, review, comment, approve, merge, and jump back in without waiting on a fresh GitHub fetch.
+`ghr` is a fast terminal workspace for staying on top of GitHub. It brings your GitHub inbox, pull requests, issues, repo tabs, conversations, checks, and diffs into one stateful TUI, so you can triage, review, comment, approve, merge, and jump back in without waiting on a fresh GitHub fetch.
 
 [![CI](https://github.com/chenyukang/ghr/actions/workflows/ci.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/ci.yml)
 [![Release](https://github.com/chenyukang/ghr/actions/workflows/release.yml/badge.svg)](https://github.com/chenyukang/ghr/actions/workflows/release.yml)
@@ -15,7 +15,7 @@
 
 ## Features
 
-- Pull request, issue, and notification views.
+- Inbox, pull request, and issue views.
 - Snapshot-first startup: cached data is shown immediately, then refreshed in the background.
 - Configurable sections and repo tabs, including multi-query sections such as `All Requests`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
@@ -25,7 +25,7 @@
 - Details pane with rendered Markdown, clickable links, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, labels, milestones, action hints, and check summaries.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
-- Unread notification handling with local cache updates and GitHub read-state sync.
+- Inbox read-state handling with local cache updates, GitHub read-state sync, and dimmed read items.
 - Mouse support for tabs, lists, links, comments, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
@@ -89,6 +89,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
+| `Mark All Read` | Mark every GitHub inbox notification as read |
+| `Mute Thread` | Ignore future notifications for the selected inbox thread |
+| `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
 | `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
@@ -177,6 +181,13 @@ Mouse behavior:
 
 ## Default Sections
 
+Inbox:
+
+- `All`
+- `Review Requested`
+- `Assigned`
+- `Mentioned`
+
 Pull Requests:
 
 - `My Pull Requests`: open PRs authored by you.
@@ -188,14 +199,6 @@ Issues:
 - `Assigned to Me`
 - `Mentioned`
 - `Involved`
-
-Notifications:
-
-- `Unread`
-- `Review Requested`
-- `Assigned`
-- `Mentioned`
-- `All`
 
 ## Configuration
 
@@ -263,7 +266,7 @@ Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode
 - `ghr.log`: log file
 - `state.toml`: persisted UI state, including ignored PRs/issues
 
-The snapshot cache is intentionally local and disposable. Delete `~/.ghr/ghr.db` if you want to rebuild it from GitHub.
+The snapshot cache is intentionally local and disposable. Use the `Clear Cache` command to clear one cache layer, or delete `~/.ghr/ghr.db` if you want to rebuild every persisted cache row from GitHub.
 
 ## Contributing
 Contributions are very welcome! Please open an issue or a pull request with any bug fixes, improvements, or new features.

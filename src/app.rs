@@ -44,21 +44,22 @@ use crate::github::{
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
     fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
-    fetch_repository_assignees, fetch_repository_labels, mark_notification_thread_read,
-    mark_pull_request_ready_for_review, merge_pull_request, post_issue_comment,
-    post_pull_request_review_comment, post_pull_request_review_reply, refresh_dashboard,
-    refresh_dashboard_with_progress, refresh_section_page, remove_issue_label,
-    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
-    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_global,
-    submit_pending_pull_request_review, submit_pull_request_review, update_issue_assignees,
+    fetch_repository_assignees, fetch_repository_labels, mark_all_notifications_read,
+    mark_notification_thread_read, mark_pull_request_ready_for_review, merge_pull_request,
+    mute_notification_thread, post_issue_comment, post_pull_request_review_comment,
+    post_pull_request_review_reply, refresh_dashboard, refresh_dashboard_with_progress,
+    refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
+    reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
+    search_global, submit_pending_pull_request_review, submit_pull_request_review,
+    subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
     update_pull_request_branch, with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
     PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
-    configured_sections, global_search_view_key, mark_notification_read_in_section,
-    merge_cached_sections, merge_refreshed_sections, repo_view_key, section_counts,
-    section_view_key,
+    configured_sections, global_search_view_key, mark_all_notifications_read_in_section,
+    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
+    repo_view_key, section_counts, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
@@ -221,6 +222,13 @@ enum AppMsg {
     NotificationReadFinished {
         thread_id: String,
         result: std::result::Result<Option<String>, String>,
+    },
+    InboxMarkAllReadFinished {
+        result: std::result::Result<Option<String>, String>,
+    },
+    InboxThreadActionFinished {
+        action: InboxThreadAction,
+        result: std::result::Result<(), String>,
     },
     SectionPageLoaded {
         section_key: String,
@@ -799,6 +807,40 @@ struct ProjectRemoveDialog {
     confirm: Option<ProjectRemoveCandidate>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CacheClearDialog {
+    selected: usize,
+    confirm: Option<CacheClearTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheClearTarget {
+    CurrentSection,
+    CurrentView,
+    ListSnapshots,
+    CandidateSuggestions,
+    LoadedDetails,
+    All,
+}
+
+const CACHE_CLEAR_TARGETS: [CacheClearTarget; 6] = [
+    CacheClearTarget::CurrentSection,
+    CacheClearTarget::CurrentView,
+    CacheClearTarget::ListSnapshots,
+    CacheClearTarget::CandidateSuggestions,
+    CacheClearTarget::LoadedDetails,
+    CacheClearTarget::All,
+];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CacheClearSummary {
+    snapshot_rows: usize,
+    list_items: usize,
+    candidate_rows: usize,
+    candidate_entries: usize,
+    loaded_entries: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectAddField {
     Title,
@@ -862,6 +904,16 @@ enum PaletteAction {
     OpenSelected,
     ShowDiff,
     ClearIgnoredItems,
+    ClearCache,
+    InboxMarkAllRead,
+    InboxThreadAction(InboxThreadAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxThreadAction {
+    Mute,
+    Subscribe,
+    Unsubscribe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,6 +931,30 @@ struct ReviewerDialog {
     suggestions_loading: bool,
     suggestions_error: Option<String>,
     selected_suggestion: usize,
+}
+
+fn inbox_thread_action_label(action: InboxThreadAction) -> &'static str {
+    match action {
+        InboxThreadAction::Mute => "mute thread",
+        InboxThreadAction::Subscribe => "subscribe thread",
+        InboxThreadAction::Unsubscribe => "unsubscribe thread",
+    }
+}
+
+fn inbox_thread_action_running_status(action: InboxThreadAction) -> &'static str {
+    match action {
+        InboxThreadAction::Mute => "muting inbox thread",
+        InboxThreadAction::Subscribe => "subscribing to inbox thread",
+        InboxThreadAction::Unsubscribe => "unsubscribing from inbox thread",
+    }
+}
+
+fn inbox_thread_action_success_status(action: InboxThreadAction) -> &'static str {
+    match action {
+        InboxThreadAction::Mute => "inbox thread muted",
+        InboxThreadAction::Subscribe => "subscribed to inbox thread",
+        InboxThreadAction::Unsubscribe => "unsubscribed from inbox thread",
+    }
 }
 
 fn item_kind_label(kind: ItemKind) -> &'static str {
@@ -1069,6 +1145,7 @@ struct AppState {
     project_switcher: Option<ProjectSwitcher>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
+    cache_clear_dialog: Option<CacheClearDialog>,
     command_palette_key: String,
     status: String,
     refreshing: bool,
@@ -1592,6 +1669,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.project_switcher.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
+        || app.cache_clear_dialog.is_some()
         || app.help_dialog
         || app.message_dialog.is_some()
         || app.item_edit_dialog.is_some()
@@ -1841,6 +1919,35 @@ fn start_notification_read_sync(
             Err(error) => Err(error.to_string()),
         };
         let _ = tx.send(AppMsg::NotificationReadFinished { thread_id, result });
+    });
+}
+
+fn start_inbox_mark_all_read_sync(store: SnapshotStore, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = match mark_all_notifications_read().await {
+            Ok(()) => match store.mark_all_notifications_read() {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(error.to_string())),
+            },
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = tx.send(AppMsg::InboxMarkAllReadFinished { result });
+    });
+}
+
+fn start_inbox_thread_action_sync(
+    thread_id: String,
+    action: InboxThreadAction,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let result = match action {
+            InboxThreadAction::Mute => mute_notification_thread(&thread_id).await,
+            InboxThreadAction::Subscribe => subscribe_notification_thread(&thread_id).await,
+            InboxThreadAction::Unsubscribe => unsubscribe_notification_thread(&thread_id).await,
+        }
+        .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::InboxThreadActionFinished { action, result });
     });
 }
 
@@ -2677,6 +2784,11 @@ fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.cache_clear_dialog.is_some() {
+        app.handle_cache_clear_key(key, store);
+        return false;
+    }
+
     if should_open_command_palette(app, key) {
         app.show_command_palette();
         return false;
@@ -3213,6 +3325,7 @@ fn handle_mouse_with_sync(
         || app.project_switcher.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
+        || app.cache_clear_dialog.is_some()
     {
         return false;
     }
@@ -3843,6 +3956,9 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     if let Some(dialog) = &app.project_remove_dialog {
         draw_project_remove_dialog(frame, dialog, area);
     }
+    if let Some(dialog) = &app.cache_clear_dialog {
+        draw_cache_clear_dialog(frame, dialog, area);
+    }
 }
 
 fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4055,11 +4171,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .iter()
         .filter_map(|index| section.items.get(*index))
         .map(|item| {
-            let row_style = if app.item_has_unseen_details(item) {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+            let row_style = list_item_row_style(app, item);
             Row::new(vec![
                 item.repo.clone(),
                 item.number
@@ -4216,6 +4328,17 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     frame.render_stateful_widget(table, area, &mut table_state);
     if let Some((message, style)) = empty_state {
         draw_list_empty_state_message(frame, area, &message, style);
+    }
+}
+
+fn list_item_row_style(app: &AppState, item: &WorkItem) -> Style {
+    match item.unread {
+        Some(true) => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        Some(false) => Style::default().fg(Color::DarkGray),
+        None if app.item_has_unseen_details(item) => Style::default().add_modifier(Modifier::BOLD),
+        None => Style::default(),
     }
 }
 
@@ -5830,6 +5953,93 @@ fn draw_project_remove_confirmation(
     );
 }
 
+fn draw_cache_clear_dialog(frame: &mut Frame<'_>, dialog: &CacheClearDialog, area: Rect) {
+    if let Some(target) = dialog.confirm {
+        return draw_cache_clear_confirmation(frame, target, area);
+    }
+
+    let dialog_area = cache_clear_area(area);
+    let inner = block_inner(dialog_area);
+    let selected = dialog
+        .selected
+        .min(CACHE_CLEAR_TARGETS.len().saturating_sub(1));
+    let width = usize::from(inner.width.max(1));
+    let mut lines = Vec::new();
+    lines.push(Line::from("Choose which local cache layer to clear."));
+    lines.push(Line::from(""));
+    for (index, target) in CACHE_CLEAR_TARGETS.iter().copied().enumerate() {
+        lines.push(cache_clear_target_line(target, index == selected, width));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Config, logs, and saved UI preferences are not touched.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Clear Cache",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: choose    Esc: close    Up/Down: select"),
+    );
+}
+
+fn draw_cache_clear_confirmation(frame: &mut Frame<'_>, target: CacheClearTarget, area: Rect) {
+    let dialog_area = cache_clear_confirm_area(area);
+    let lines = vec![
+        Line::from("Clear this cache layer?"),
+        Line::from(""),
+        key_value_line("target", cache_clear_target_label(target).to_string()),
+        key_value_line("scope", cache_clear_target_detail(target).to_string()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This only affects local cache. GitHub data can be fetched again.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightRed))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Confirm Clear Cache",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("y/Enter: clear cache    Esc: cancel"),
+    );
+}
+
 fn project_remove_area(area: Rect) -> Rect {
     let width = centered_rect_width(58, area).max(36).min(area.width);
     let max_height = area.height.saturating_sub(2).max(3);
@@ -5844,6 +6054,20 @@ fn project_remove_confirm_area(area: Rect) -> Rect {
     centered_rect_with_size(width, height, area)
 }
 
+fn cache_clear_area(area: Rect) -> Rect {
+    let width = centered_rect_width(86, area).max(52).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn cache_clear_confirm_area(area: Rect) -> Rect {
+    let width = centered_rect_width(72, area).max(48).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 11.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
 fn project_remove_candidate_line(
     candidate: &ProjectRemoveCandidate,
     selected: bool,
@@ -5851,6 +6075,82 @@ fn project_remove_candidate_line(
 ) -> Line<'static> {
     let marker = if selected { "> " } else { "  " };
     let text = format!("{marker}{:<20} {}", candidate.name, candidate.repo);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(truncate_inline(&text, width), style))
+}
+
+fn cache_clear_target_label(target: CacheClearTarget) -> &'static str {
+    match target {
+        CacheClearTarget::CurrentSection => "current section snapshot",
+        CacheClearTarget::CurrentView => "current view snapshots",
+        CacheClearTarget::ListSnapshots => "all list snapshots",
+        CacheClearTarget::CandidateSuggestions => "candidate suggestions",
+        CacheClearTarget::LoadedDetails => "loaded details and diffs",
+        CacheClearTarget::All => "all cache",
+    }
+}
+
+fn cache_clear_target_detail(target: CacheClearTarget) -> &'static str {
+    match target {
+        CacheClearTarget::CurrentSection => "Clear only the selected section's cached list rows",
+        CacheClearTarget::CurrentView => "Clear cached list rows for the active top-level view",
+        CacheClearTarget::ListSnapshots => "Clear all cached PR, issue, and inbox list rows",
+        CacheClearTarget::CandidateSuggestions => {
+            "Clear cached label, assignee, and reviewer suggestions"
+        }
+        CacheClearTarget::LoadedDetails => "Clear loaded comments, diffs, checks, and branch hints",
+        CacheClearTarget::All => "Clear list snapshots, suggestions, and loaded detail caches",
+    }
+}
+
+fn cache_clear_summary_status(target: CacheClearTarget, summary: CacheClearSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.snapshot_rows > 0 {
+        parts.push(format!("{} db snapshot row(s)", summary.snapshot_rows));
+    }
+    if summary.list_items > 0 {
+        parts.push(format!("{} loaded list item(s)", summary.list_items));
+    }
+    if summary.candidate_rows > 0 {
+        parts.push(format!("{} db suggestion row(s)", summary.candidate_rows));
+    }
+    if summary.candidate_entries > 0 {
+        parts.push(format!(
+            "{} loaded suggestion repo cache(s)",
+            summary.candidate_entries
+        ));
+    }
+    if summary.loaded_entries > 0 {
+        parts.push(format!(
+            "{} loaded detail/diff cache(s)",
+            summary.loaded_entries
+        ));
+    }
+    if parts.is_empty() {
+        parts.push("nothing cached".to_string());
+    }
+    format!(
+        "cleared cache: {} ({})",
+        cache_clear_target_label(target),
+        parts.join(", ")
+    )
+}
+
+fn cache_clear_target_line(
+    target: CacheClearTarget,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let label = cache_clear_target_label(target);
+    let text = format!("{marker}{label:<28} {}", cache_clear_target_detail(target));
     let style = if selected {
         Style::default()
             .fg(Color::Black)
@@ -7410,6 +7710,34 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             PaletteAction::Refresh,
         ),
         palette_command(
+            "Mark All Read",
+            "",
+            "Inbox",
+            "Mark every GitHub notification as read",
+            PaletteAction::InboxMarkAllRead,
+        ),
+        palette_command(
+            "Mute Thread",
+            "",
+            "Inbox",
+            "Ignore future notifications for the selected inbox thread",
+            PaletteAction::InboxThreadAction(InboxThreadAction::Mute),
+        ),
+        palette_command(
+            "Subscribe Thread",
+            "",
+            "Inbox",
+            "Subscribe to the selected inbox thread",
+            PaletteAction::InboxThreadAction(InboxThreadAction::Subscribe),
+        ),
+        palette_command(
+            "Unsubscribe Thread",
+            "",
+            "Inbox",
+            "Unsubscribe from the selected inbox thread",
+            PaletteAction::InboxThreadAction(InboxThreadAction::Unsubscribe),
+        ),
+        palette_command(
             "Search Current Repo",
             "S",
             "General",
@@ -7485,6 +7813,13 @@ fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
             "General",
             "Show all previously ignored pull requests and issues again",
             PaletteAction::ClearIgnoredItems,
+        ),
+        palette_command(
+            "Clear Cache",
+            "",
+            "General",
+            "Choose which local cache layer to clear",
+            PaletteAction::ClearCache,
         ),
         palette_command(
             "Leave Diff Mode",
@@ -9373,6 +9708,15 @@ struct CommentCollapseState {
     char_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommentRenderOptions {
+    selected: bool,
+    search_match: bool,
+    depth: usize,
+    collapse: CommentCollapseState,
+    new_since_last_read: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DiffLineRegion {
     line: usize,
@@ -10285,6 +10629,9 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
         )],
         3,
     );
+    if notification_has_new_since_last_read(item) {
+        builder.push_wrapped_limited(notification_new_since_last_read_segments(item), 2);
+    }
 
     let mut primary_meta = vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
@@ -10434,10 +10781,17 @@ fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
                         &mut builder,
                         index,
                         comment,
-                        app.focus == FocusTarget::Details && index == app.selected_comment_index,
-                        search_match,
-                        entry.depth,
-                        collapse,
+                        CommentRenderOptions {
+                            selected: app.focus == FocusTarget::Details
+                                && index == app.selected_comment_index,
+                            search_match,
+                            depth: entry.depth,
+                            collapse,
+                            new_since_last_read: comment_new_since_last_read(
+                                comment,
+                                item.last_read_at.as_ref(),
+                            ),
+                        },
                     );
                 }
             }
@@ -11466,6 +11820,52 @@ fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary
     builder.push_wrapped_limited(segments, 2);
 }
 
+fn notification_has_new_since_last_read(item: &WorkItem) -> bool {
+    if item.unread.unwrap_or(false) {
+        return true;
+    }
+    match (item.updated_at.as_ref(), item.last_read_at.as_ref()) {
+        (Some(updated_at), Some(last_read_at)) => updated_at > last_read_at,
+        _ => false,
+    }
+}
+
+fn notification_new_since_last_read_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    let mut details = Vec::new();
+    if item.unread.unwrap_or(false) {
+        details.push("unread".to_string());
+    }
+    if let Some(updated_at) = item.updated_at.as_ref().cloned() {
+        details.push(format!("updated {}", relative_time(Some(updated_at))));
+    }
+    if let Some(last_read_at) = item.last_read_at.as_ref().cloned() {
+        details.push(format!("last read {}", local_datetime(Some(last_read_at))));
+    }
+
+    let mut segments = vec![DetailSegment::styled(
+        "New since last read".to_string(),
+        new_since_last_read_style(),
+    )];
+    if !details.is_empty() {
+        segments.push(DetailSegment::raw(format!(" - {}", details.join("; "))));
+    }
+    segments
+}
+
+fn comment_new_since_last_read(
+    comment: &CommentPreview,
+    last_read_at: Option<&DateTime<Utc>>,
+) -> bool {
+    let Some(last_read_at) = last_read_at else {
+        return false;
+    };
+    comment
+        .updated_at
+        .as_ref()
+        .or(comment.created_at.as_ref())
+        .is_some_and(|timestamp| timestamp > last_read_at)
+}
+
 fn append_reaction_segments(segments: &mut Vec<DetailSegment>, reactions: &ReactionSummary) {
     if reactions.is_empty() {
         return;
@@ -11497,10 +11897,7 @@ fn push_comment(
     builder: &mut DetailsBuilder,
     index: usize,
     comment: &CommentPreview,
-    selected: bool,
-    search_match: bool,
-    depth: usize,
-    collapse: CommentCollapseState,
+    options: CommentRenderOptions,
 ) {
     let timestamp = comment
         .updated_at
@@ -11508,15 +11905,20 @@ fn push_comment(
         .or(comment.created_at.as_ref())
         .cloned();
     let start_line = builder.document.lines.len();
-    push_comment_separator(builder, selected, depth, CommentBoxEdge::Top);
+    push_comment_separator(
+        builder,
+        options.selected,
+        options.depth,
+        CommentBoxEdge::Top,
+    );
     let content_start_line = builder.document.lines.len();
 
     let mut header = vec![
         DetailSegment::styled(
-            comment_header_marker(comment, selected, false),
-            comment_status_marker_style(comment, selected),
+            comment_header_marker(comment, options.selected, false),
+            comment_status_marker_style(comment, options.selected),
         ),
-        comment_author_link_segment(&comment.author, selected),
+        comment_author_link_segment(&comment.author, options.selected),
         DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
     ];
     if let Some(url) = &comment.url {
@@ -11537,16 +11939,22 @@ fn push_comment(
         "+ react",
         DetailAction::ReactComment(index),
     ));
-    if search_match {
+    if options.search_match {
         header.push(DetailSegment::styled(
             "  match",
             comment_search_match_style(),
         ));
     }
-    if collapse.long {
+    if options.new_since_last_read {
+        header.push(DetailSegment::styled(
+            "  New since last read",
+            new_since_last_read_style(),
+        ));
+    }
+    if options.collapse.long {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            if collapse.collapsed {
+            if options.collapse.collapsed {
                 "▸ collapsed"
             } else {
                 "▾ expanded"
@@ -11566,18 +11974,20 @@ fn push_comment(
             DetailAction::EditComment(index),
         ));
     }
-    let prefix = comment_line_prefix(selected, depth);
+    let prefix = comment_line_prefix(options.selected, options.depth);
     builder.push_prefixed_wrapped_limited(
         header,
         prefix.clone(),
-        comment_right_padding(selected),
+        comment_right_padding(options.selected),
         2,
     );
-    if selected && let Some(review) = &comment.review {
-        push_inline_review_context(builder, review, selected, depth);
+    if options.selected
+        && let Some(review) = &comment.review
+    {
+        push_inline_review_context(builder, review, options.selected, options.depth);
     }
     let collapsed_body;
-    let body = if collapse.collapsed {
+    let body = if options.collapse.collapsed {
         collapsed_body = collapsed_comment_body(&comment.body);
         collapsed_body.as_str()
     } else {
@@ -11590,15 +12000,21 @@ fn push_comment(
         usize::MAX,
         MarkdownRenderOptions {
             prefix,
-            right_padding: comment_right_padding(selected),
+            right_padding: comment_right_padding(options.selected),
         },
     );
-    if collapse.collapsed {
-        push_comment_expand_line(builder, index, selected, depth, collapse);
+    if options.collapse.collapsed {
+        push_comment_expand_line(
+            builder,
+            index,
+            options.selected,
+            options.depth,
+            options.collapse,
+        );
     }
-    if selected {
+    if options.selected {
         add_selected_comment_text_weight(builder, content_start_line, builder.document.lines.len());
-        push_comment_separator(builder, true, depth, CommentBoxEdge::Bottom);
+        push_comment_separator(builder, true, options.depth, CommentBoxEdge::Bottom);
         add_comment_right_border(builder, start_line + 1, builder.document.lines.len() - 1);
     }
     builder.document.comments.push(CommentRegion {
@@ -13184,6 +13600,12 @@ fn reaction_style() -> Style {
     Style::default().fg(Color::LightYellow)
 }
 
+fn new_since_last_read_style() -> Style {
+    Style::default()
+        .fg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn quote_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
@@ -13369,6 +13791,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.reviewer_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
+        || app.cache_clear_dialog.is_some()
 }
 
 fn is_assignee_assign_key(key: KeyEvent) -> bool {
@@ -13504,6 +13927,7 @@ impl AppState {
             project_switcher: None,
             project_add_dialog: None,
             project_remove_dialog: None,
+            cache_clear_dialog: None,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
@@ -14859,6 +15283,46 @@ impl AppState {
                     }
                 }
             }
+            AppMsg::InboxMarkAllReadFinished { result } => match result {
+                Ok(save_error) => {
+                    let changed = self.apply_all_notifications_read_local();
+                    self.status = match (changed, save_error) {
+                        (_, Some(error)) => {
+                            format!(
+                                "all inbox notifications marked read; snapshot save failed: {error}"
+                            )
+                        }
+                        (true, None) => "all inbox notifications marked read".to_string(),
+                        (false, None) => "all inbox notifications already read".to_string(),
+                    };
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    self.status = format!(
+                        "mark all inbox read failed: {}",
+                        operation_error_body(&error)
+                    );
+                }
+            },
+            AppMsg::InboxThreadActionFinished { action, result } => match result {
+                Ok(()) => {
+                    self.status = inbox_thread_action_success_status(action).to_string();
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    self.status = format!(
+                        "{} failed: {}",
+                        inbox_thread_action_label(action),
+                        operation_error_body(&error)
+                    );
+                }
+            },
             AppMsg::SectionPageLoaded {
                 section_key,
                 section,
@@ -15024,6 +15488,7 @@ impl AppState {
         self.comment_search_active = false;
         self.global_search_active = false;
         self.command_palette = None;
+        self.cache_clear_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
         self.item_edit_dialog = None;
@@ -15040,6 +15505,7 @@ impl AppState {
         self.project_switcher = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
         self.status = "command palette".to_string();
     }
 
@@ -15191,6 +15657,18 @@ impl AppState {
                 self.clear_ignored_items();
                 false
             }
+            PaletteAction::ClearCache => {
+                self.show_cache_clear_dialog();
+                false
+            }
+            PaletteAction::InboxMarkAllRead => {
+                self.mark_all_inbox_read(store, tx);
+                false
+            }
+            PaletteAction::InboxThreadAction(action) => {
+                self.start_inbox_thread_action(action, tx);
+                false
+            }
         }
     }
 
@@ -15220,6 +15698,7 @@ impl AppState {
         self.command_palette = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
         self.project_switcher = Some(ProjectSwitcher {
             query: String::new(),
             selected,
@@ -15309,6 +15788,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
@@ -15510,6 +15990,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.project_add_dialog = None;
+        self.cache_clear_dialog = None;
         self.project_remove_dialog = Some(ProjectRemoveDialog {
             query: String::new(),
             selected,
@@ -15639,6 +16120,225 @@ impl AppState {
             self.list_scroll_offset.remove(&key);
         }
         self.clamp_positions();
+    }
+
+    fn show_cache_clear_dialog(&mut self) {
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.pr_create_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
+        self.cache_clear_dialog = Some(CacheClearDialog::default());
+        self.status = "clear cache".to_string();
+    }
+
+    fn dismiss_cache_clear_dialog(&mut self) {
+        self.cache_clear_dialog = None;
+        self.status = "clear cache cancelled".to_string();
+    }
+
+    fn handle_cache_clear_key(&mut self, key: KeyEvent, store: &SnapshotStore) {
+        if self
+            .cache_clear_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.confirm.is_some())
+        {
+            match key.code {
+                KeyCode::Esc => self.dismiss_cache_clear_dialog(),
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_cache_clear(store)
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.dismiss_cache_clear_dialog(),
+            KeyCode::Enter => self.start_cache_clear_confirmation(),
+            KeyCode::Down | KeyCode::Tab => self.move_cache_clear_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_cache_clear_selection(-1),
+            KeyCode::PageDown => self.move_cache_clear_selection(4),
+            KeyCode::PageUp => self.move_cache_clear_selection(-4),
+            _ => {}
+        }
+    }
+
+    fn move_cache_clear_selection(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.cache_clear_dialog else {
+            return;
+        };
+        dialog.selected = move_wrapping(dialog.selected, CACHE_CLEAR_TARGETS.len(), delta);
+    }
+
+    fn start_cache_clear_confirmation(&mut self) {
+        let Some(target) = self.selected_cache_clear_target() else {
+            self.status = "no cache target selected".to_string();
+            return;
+        };
+        if let Some(dialog) = &mut self.cache_clear_dialog {
+            dialog.confirm = Some(target);
+        }
+        self.status = format!("confirm clear {}", cache_clear_target_label(target));
+    }
+
+    fn selected_cache_clear_target(&self) -> Option<CacheClearTarget> {
+        let dialog = self.cache_clear_dialog.as_ref()?;
+        CACHE_CLEAR_TARGETS
+            .get(
+                dialog
+                    .selected
+                    .min(CACHE_CLEAR_TARGETS.len().saturating_sub(1)),
+            )
+            .copied()
+    }
+
+    fn confirm_cache_clear(&mut self, store: &SnapshotStore) {
+        let Some(target) = self
+            .cache_clear_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.confirm)
+        else {
+            return;
+        };
+
+        self.cache_clear_dialog = None;
+        match self.clear_cache(target, store) {
+            Ok(summary) => {
+                self.status = cache_clear_summary_status(target, summary);
+            }
+            Err(error) => {
+                self.message_dialog = Some(message_dialog(
+                    "Clear Cache Failed",
+                    operation_error_body(&error.to_string()),
+                ));
+                self.status = format!("clear cache failed: {error}");
+            }
+        }
+    }
+
+    fn clear_cache(
+        &mut self,
+        target: CacheClearTarget,
+        store: &SnapshotStore,
+    ) -> Result<CacheClearSummary> {
+        let mut summary = CacheClearSummary::default();
+        match target {
+            CacheClearTarget::CurrentSection => {
+                let keys = self.current_section_keys();
+                summary.snapshot_rows = store.clear_snapshots_by_keys(&keys)?;
+                summary.list_items = self.clear_list_sections_by_keys(&keys);
+            }
+            CacheClearTarget::CurrentView => {
+                let keys = self.current_view_section_keys();
+                summary.snapshot_rows = store.clear_snapshots_by_keys(&keys)?;
+                summary.list_items = self.clear_list_sections_by_keys(&keys);
+            }
+            CacheClearTarget::ListSnapshots => {
+                summary.snapshot_rows = store.clear_snapshots()?;
+                summary.list_items = self.clear_all_list_sections_local();
+            }
+            CacheClearTarget::CandidateSuggestions => {
+                summary.candidate_rows = store.clear_repo_candidate_cache()?;
+                summary.candidate_entries = self.clear_candidate_suggestions_local();
+            }
+            CacheClearTarget::LoadedDetails => {
+                summary.loaded_entries = self.clear_loaded_details_local();
+            }
+            CacheClearTarget::All => {
+                summary.snapshot_rows = store.clear_snapshots()?;
+                summary.candidate_rows = store.clear_repo_candidate_cache()?;
+                summary.list_items = self.clear_all_list_sections_local();
+                summary.candidate_entries = self.clear_candidate_suggestions_local();
+                summary.loaded_entries = self.clear_loaded_details_local();
+            }
+        }
+        Ok(summary)
+    }
+
+    fn current_section_keys(&self) -> Vec<String> {
+        self.current_section()
+            .map(|section| vec![section.key.clone()])
+            .unwrap_or_default()
+    }
+
+    fn current_view_section_keys(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .filter(|section| same_view_key(&section_view_key(section), &self.active_view))
+            .map(|section| section.key.clone())
+            .collect()
+    }
+
+    fn clear_all_list_sections_local(&mut self) -> usize {
+        let keys = self
+            .sections
+            .iter()
+            .map(|section| section.key.clone())
+            .collect::<Vec<_>>();
+        self.clear_list_sections_by_keys(&keys)
+    }
+
+    fn clear_list_sections_by_keys(&mut self, keys: &[String]) -> usize {
+        let keys = keys.iter().cloned().collect::<HashSet<_>>();
+        let mut item_count = 0;
+        for section in &mut self.sections {
+            if !keys.contains(&section.key) {
+                continue;
+            }
+            item_count += section.items.len();
+            section.items.clear();
+            section.total_count = None;
+            section.page = 1;
+            section.page_size = 0;
+            section.refreshed_at = None;
+            section.error = None;
+            self.list_scroll_offset.remove(&section.key);
+        }
+        if item_count > 0 {
+            self.details_scroll = 0;
+            self.selected_comment_index = 0;
+        }
+        self.clamp_positions();
+        item_count
+    }
+
+    fn clear_candidate_suggestions_local(&mut self) -> usize {
+        let count = self.label_suggestions_cache.len()
+            + self.assignee_suggestions_cache.len()
+            + self.reviewer_suggestions_cache.len();
+        self.label_suggestions_cache.clear();
+        self.assignee_suggestions_cache.clear();
+        self.reviewer_suggestions_cache.clear();
+        count
+    }
+
+    fn clear_loaded_details_local(&mut self) -> usize {
+        let count = self.details.len() + self.diffs.len() + self.action_hints.len();
+        self.details.clear();
+        self.diffs.clear();
+        self.action_hints.clear();
+        self.action_hints_stale.clear();
+        self.action_hints_refreshing.clear();
+        self.details_stale.clear();
+        self.details_refreshing.clear();
+        self.pending_details_load = None;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        count
     }
 
     fn mark_item_after_pr_action(&mut self, item_id: &str, action: PrAction) {
@@ -15881,6 +16581,36 @@ impl AppState {
         start_notification_read_sync(thread_id, store.clone(), tx.clone());
     }
 
+    fn mark_all_inbox_read(&mut self, store: &SnapshotStore, tx: &UnboundedSender<AppMsg>) {
+        self.status = "marking all inbox notifications read".to_string();
+        start_inbox_mark_all_read_sync(store.clone(), tx.clone());
+    }
+
+    fn start_inbox_thread_action(
+        &mut self,
+        action: InboxThreadAction,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(thread_id) = self.current_inbox_thread_id() else {
+            self.status = format!(
+                "select an inbox item to {}",
+                inbox_thread_action_label(action)
+            );
+            return;
+        };
+
+        self.status = inbox_thread_action_running_status(action).to_string();
+        start_inbox_thread_action_sync(thread_id, action, tx.clone());
+    }
+
+    fn current_inbox_thread_id(&self) -> Option<String> {
+        let section = self.current_section()?;
+        if !matches!(section.kind, SectionKind::Notifications) {
+            return None;
+        }
+        self.current_item().map(|item| item.id.clone())
+    }
+
     fn notification_thread_id_at_position(&self, position: usize) -> Option<String> {
         let section = self.current_section()?;
         let filtered_indices = self.filtered_indices(section);
@@ -15893,6 +16623,18 @@ impl AppState {
         let mut changed = false;
         for section in &mut self.sections {
             changed |= mark_notification_read_in_section(section, thread_id);
+        }
+        if changed {
+            self.clamp_positions();
+        }
+        changed
+    }
+
+    fn apply_all_notifications_read_local(&mut self) -> bool {
+        let mut changed = false;
+        let last_read_at = Utc::now();
+        for section in &mut self.sections {
+            changed |= mark_all_notifications_read_in_section(section, last_read_at);
         }
         if changed {
             self.clamp_positions();
@@ -20412,9 +21154,9 @@ impl AppState {
     fn view_tabs(&self) -> Vec<ViewTab> {
         let mut tabs = Vec::new();
         for kind in [
+            SectionKind::Notifications,
             SectionKind::PullRequests,
             SectionKind::Issues,
-            SectionKind::Notifications,
         ] {
             let key = builtin_view_key(kind);
             if self
@@ -23702,6 +24444,31 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             commands
                 .iter()
+                .any(|command| command.title == "Clear Cache")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Mark All Read")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Mute Thread")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Subscribe Thread")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Unsubscribe Thread")
+        );
+        assert!(
+            commands
+                .iter()
                 .any(|command| command.title == "Ignore Selected Item" && command.keys == "i")
         );
         assert!(
@@ -23815,6 +24582,116 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(dialog.body.contains("log_level: debug"));
         assert!(app.command_palette.is_none());
         assert_eq!(app.status, "info");
+    }
+
+    #[test]
+    fn command_palette_clear_cache_opens_cache_picker() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        let paths = unique_test_paths("clear-cache-open");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        app.command_palette = Some(CommandPalette {
+            query: "clear cache".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.cache_clear_dialog, Some(CacheClearDialog::default()));
+        assert_eq!(app.status, "clear cache");
+    }
+
+    #[test]
+    fn clear_cache_current_section_removes_persisted_and_loaded_list_items() {
+        let paths = unique_test_paths("clear-cache-current-section");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init snapshot store");
+        let mut section = test_section();
+        section.refreshed_at = Some(Utc::now());
+        let mut other_item = work_item("issue-1", "chenyukang/ghr", 1, "Bug", Some("alice"));
+        other_item.kind = ItemKind::Issue;
+        other_item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        let other = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "is:open".to_string(),
+            items: vec![other_item],
+            total_count: Some(1),
+            page: 1,
+            page_size: 20,
+            refreshed_at: Some(Utc::now()),
+            error: None,
+        };
+        store.save_section(&section).expect("save current section");
+        store.save_section(&other).expect("save other section");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section.clone(), other]);
+
+        app.show_cache_clear_dialog();
+        app.handle_cache_clear_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+        assert_eq!(
+            app.cache_clear_dialog
+                .as_ref()
+                .and_then(|dialog| dialog.confirm),
+            Some(CacheClearTarget::CurrentSection)
+        );
+        app.handle_cache_clear_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store);
+
+        assert!(app.cache_clear_dialog.is_none());
+        assert!(app.sections[0].items.is_empty());
+        assert_eq!(app.sections[0].refreshed_at, None);
+        assert_eq!(app.sections[1].items.len(), 1);
+        let snapshots = store.load_all().expect("load snapshots");
+        assert!(!snapshots.contains_key(&section.key));
+        assert!(snapshots.contains_key("issues:test"));
+        assert!(app.status.contains("current section snapshot"));
+    }
+
+    #[test]
+    fn clear_cache_all_clears_snapshots_candidates_and_loaded_details() {
+        let paths = unique_test_paths("clear-cache-all");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init snapshot store");
+        let mut section = test_section();
+        section.refreshed_at = Some(Utc::now());
+        store.save_section(&section).expect("save section");
+        store
+            .save_label_candidates("chenyukang/ghr", &["ui".to_string()])
+            .expect("save labels");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.label_suggestions_cache
+            .insert("chenyukang/ghr".to_string(), vec!["ui".to_string()]);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(Vec::new()));
+
+        let summary = app
+            .clear_cache(CacheClearTarget::All, &store)
+            .expect("clear all cache");
+
+        assert_eq!(summary.snapshot_rows, 1);
+        assert_eq!(summary.candidate_rows, 1);
+        assert_eq!(summary.loaded_entries, 1);
+        assert!(app.sections[0].items.is_empty());
+        assert!(app.label_suggestions_cache.is_empty());
+        assert!(app.details.is_empty());
+        assert!(store.load_all().expect("load snapshots").is_empty());
+        assert!(
+            store
+                .load_repo_candidate_cache()
+                .expect("load candidates")
+                .labels
+                .is_empty()
+        );
     }
 
     #[test]
@@ -24386,6 +25263,21 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(title_pos < updated_pos);
         assert!(updated_pos.saturating_sub(title_pos) >= 74);
         assert!(updated_pos < meta_pos);
+    }
+
+    #[test]
+    fn inbox_rows_dim_read_items_and_bold_unread_items() {
+        let app = AppState::new(SectionKind::Notifications, vec![]);
+        let unread = notification_item("thread-1", true);
+        let read = notification_item("thread-2", false);
+
+        let unread_style = list_item_row_style(&app, &unread);
+        assert_eq!(unread_style.fg, Some(Color::White));
+        assert!(unread_style.add_modifier.contains(Modifier::BOLD));
+
+        let read_style = list_item_row_style(&app, &read);
+        assert_eq!(read_style.fg, Some(Color::DarkGray));
+        assert!(!read_style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -25522,6 +26414,58 @@ diff --git a/src/main.rs b/src/main.rs
             .join("\n");
 
         assert!(rendered.contains("milestone: next-release"));
+    }
+
+    #[test]
+    fn inbox_details_mark_new_since_last_read_updates() {
+        let last_read = DateTime::parse_from_rfc3339("2026-05-05T01:00:00Z")
+            .expect("last read timestamp")
+            .with_timezone(&Utc);
+        let updated = DateTime::parse_from_rfc3339("2026-05-05T02:00:00Z")
+            .expect("updated timestamp")
+            .with_timezone(&Utc);
+        let mut item = notification_item("thread-1", true);
+        item.body = Some("Notification body".to_string());
+        item.updated_at = Some(updated);
+        item.last_read_at = Some(last_read);
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![CommentPreview {
+                id: None,
+                author: "alice".to_string(),
+                body: "new comment".to_string(),
+                created_at: Some(updated),
+                updated_at: None,
+                url: None,
+                parent_id: None,
+                is_mine: false,
+                reactions: ReactionSummary::default(),
+                review: None,
+            }]),
+        );
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("New since last read"));
+        assert!(rendered.contains("last read"));
     }
 
     #[test]
@@ -29533,6 +30477,7 @@ diff --git a/src/main.rs b/src/main.rs
                 url: "https://github.com/rust-lang/rust".to_string(),
                 created_at: None,
                 updated_at: None,
+                last_read_at: None,
                 labels: Vec::new(),
                 reactions: ReactionSummary::default(),
                 milestone: None,
@@ -31132,6 +32077,20 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn builtin_top_level_tabs_put_inbox_before_pull_requests() {
+        let config = Config::default();
+        let app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+
+        assert_eq!(
+            app.view_tabs()
+                .iter()
+                .map(|view| view.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Inbox", "Pull Requests", "Issues"]
+        );
+    }
+
+    #[test]
     fn current_repo_tab_can_lead_configured_repo_tabs() {
         let mut config = Config::default();
         config.repos.push(crate::config::RepoConfig {
@@ -32303,6 +33262,55 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
+    fn all_notifications_read_local_clears_unread_sections_and_updates_all_items() {
+        let before = Utc::now();
+        let unread_item = notification_item("thread-1", true);
+        let read_item = notification_item("thread-2", false);
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:unread".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Unread".to_string(),
+                filters: "is:unread".to_string(),
+                items: vec![unread_item.clone()],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![unread_item, read_item],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+
+        assert!(app.apply_all_notifications_read_local());
+
+        assert!(app.sections[0].items.is_empty());
+        assert!(
+            app.sections[1]
+                .items
+                .iter()
+                .all(|item| item.unread == Some(false))
+        );
+        assert!(app.sections[1].items.iter().all(|item| {
+            item.last_read_at
+                .as_ref()
+                .is_some_and(|last_read_at| last_read_at >= &before)
+        }));
+    }
+
+    #[test]
     fn notification_read_finished_updates_local_state_and_clears_pending() {
         let sections = vec![SectionSnapshot {
             key: "notifications:unread".to_string(),
@@ -32870,6 +33878,7 @@ diff --git a/d.rs b/d.rs
             url: format!("https://github.com/{repo}/pull/{number}"),
             created_at: None,
             updated_at: None,
+            last_read_at: None,
             labels: vec!["T-compiler".to_string()],
             reactions: ReactionSummary::default(),
             milestone: None,
@@ -32894,6 +33903,7 @@ diff --git a/d.rs b/d.rs
             url: "https://github.com/rust-lang/rust/pull/1".to_string(),
             created_at: None,
             updated_at: None,
+            last_read_at: None,
             labels: Vec::new(),
             reactions: ReactionSummary::default(),
             milestone: None,

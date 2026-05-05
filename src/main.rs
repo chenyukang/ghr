@@ -13,7 +13,7 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, normalized_log_level};
 use crate::dirs::Paths;
 use crate::github::refresh_dashboard;
 use crate::model::{merge_refreshed_sections, section_counts};
@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
     let paths = Paths::resolve(cli.config)?;
     paths.ensure()?;
 
-    let _log_guard = init_logging(&paths)?;
     let mut config = Config::load_or_create(&paths.config_path)?;
+    let _log_guard = init_logging(&paths, &config.defaults.log_level)?;
     let store = SnapshotStore::new(paths.db_path.clone());
     store.init()?;
 
@@ -103,10 +103,15 @@ async fn main() -> Result<()> {
     app::run(config, paths, store).await
 }
 
-fn init_logging(paths: &Paths) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn init_logging(
+    paths: &Paths,
+    log_level: &str,
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let file_appender = tracing_appender::rolling::never(&paths.root, "ghr.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("ghr=info"));
+    let configured_log_level = normalized_log_level(log_level);
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("ghr={configured_log_level}")));
 
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -115,6 +120,18 @@ fn init_logging(paths: &Paths) -> Result<tracing_appender::non_blocking::WorkerG
         .finish();
 
     let _ = tracing::subscriber::set_global_default(subscriber);
+    if !log_level.trim().eq_ignore_ascii_case(configured_log_level) {
+        warn!(
+            configured = log_level.trim(),
+            effective = configured_log_level,
+            "invalid config log_level; using default"
+        );
+    }
+    info!(
+        log_level = configured_log_level,
+        log = %paths.log_path.display(),
+        "logging initialized"
+    );
     Ok(guard)
 }
 

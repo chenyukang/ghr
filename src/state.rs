@@ -17,6 +17,7 @@ pub struct UiState {
     pub active_view: String,
     pub section_index: HashMap<String, usize>,
     pub selected_index: HashMap<String, usize>,
+    pub view_snapshots: HashMap<String, ViewSnapshot>,
     pub focus: String,
     pub details_mode: String,
     pub details_scroll: u16,
@@ -28,6 +29,34 @@ pub struct UiState {
     pub viewed_comments_snapshot: HashMap<String, String>,
     pub selected_diff_file: HashMap<String, usize>,
     pub selected_diff_line: HashMap<String, usize>,
+    pub diff_file_details_scroll: HashMap<String, u16>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ViewSnapshot {
+    pub focus: String,
+    pub section_key: Option<String>,
+    pub item_id: Option<String>,
+    pub selected_index: usize,
+    pub list_scroll_offset: usize,
+    pub details_mode: String,
+    pub details_scroll: u16,
+    pub selected_comment_index: usize,
+}
+
+impl ViewSnapshot {
+    fn normalized(mut self) -> Self {
+        if !matches!(self.focus.as_str(), "ghr" | "sections" | "list" | "details") {
+            self.focus = "list".to_string();
+        }
+        if !matches!(self.details_mode.as_str(), "conversation" | "diff") {
+            self.details_mode = "conversation".to_string();
+        }
+        self.section_key = self.section_key.filter(|value| !value.trim().is_empty());
+        self.item_id = self.item_id.filter(|value| !value.trim().is_empty());
+        self
+    }
 }
 
 impl UiState {
@@ -67,6 +96,13 @@ impl UiState {
         self.expanded_comments
             .retain(|key| !key.trim().is_empty() && seen.insert(key.clone()));
         self.expanded_comments.sort();
+        self.view_snapshots.retain(|key, snapshot| {
+            if key.trim().is_empty() {
+                return false;
+            }
+            *snapshot = snapshot.clone().normalized();
+            true
+        });
         self.details_scroll_by_item
             .retain(|key, _| !key.trim().is_empty());
         self.selected_comment_index_by_item
@@ -75,6 +111,8 @@ impl UiState {
             .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
         self.viewed_comments_snapshot
             .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
+        self.diff_file_details_scroll
+            .retain(|key, _| !key.trim().is_empty());
         self
     }
 }
@@ -86,6 +124,7 @@ impl Default for UiState {
             active_view: String::new(),
             section_index: HashMap::new(),
             selected_index: HashMap::new(),
+            view_snapshots: HashMap::new(),
             focus: "list".to_string(),
             details_mode: "conversation".to_string(),
             details_scroll: 0,
@@ -97,6 +136,7 @@ impl Default for UiState {
             viewed_comments_snapshot: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
+            diff_file_details_scroll: HashMap::new(),
         }
     }
 }
@@ -123,6 +163,19 @@ mod tests {
             active_view: "issues".to_string(),
             section_index: HashMap::from([("issues".to_string(), 1)]),
             selected_index: HashMap::from([("issues".to_string(), 3)]),
+            view_snapshots: HashMap::from([(
+                "repo:Fiber".to_string(),
+                ViewSnapshot {
+                    focus: "details".to_string(),
+                    section_key: Some("repo:Fiber:pull_requests:Pull Requests".to_string()),
+                    item_id: Some("fiber-1".to_string()),
+                    selected_index: 2,
+                    list_scroll_offset: 7,
+                    details_mode: "diff".to_string(),
+                    details_scroll: 11,
+                    selected_comment_index: 1,
+                },
+            )]),
             focus: "details".to_string(),
             details_mode: "diff".to_string(),
             details_scroll: 8,
@@ -140,6 +193,7 @@ mod tests {
             )]),
             selected_diff_file: HashMap::from([("issue-3".to_string(), 4)]),
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
+            diff_file_details_scroll: HashMap::from([("issue-3::src/lib.rs".to_string(), 17)]),
         }
         .save(&path)
         .expect("save state");
@@ -150,6 +204,19 @@ mod tests {
         assert_eq!(state.active_view, "issues");
         assert_eq!(state.section_index.get("issues"), Some(&1));
         assert_eq!(state.selected_index.get("issues"), Some(&3));
+        assert_eq!(
+            state.view_snapshots.get("repo:Fiber"),
+            Some(&ViewSnapshot {
+                focus: "details".to_string(),
+                section_key: Some("repo:Fiber:pull_requests:Pull Requests".to_string()),
+                item_id: Some("fiber-1".to_string()),
+                selected_index: 2,
+                list_scroll_offset: 7,
+                details_mode: "diff".to_string(),
+                details_scroll: 11,
+                selected_comment_index: 1,
+            })
+        );
         assert_eq!(state.focus, "details");
         assert_eq!(state.details_mode, "diff");
         assert_eq!(state.details_scroll, 8);
@@ -170,6 +237,10 @@ mod tests {
         );
         assert_eq!(state.selected_diff_file.get("issue-3"), Some(&4));
         assert_eq!(state.selected_diff_line.get("issue-3"), Some(&9));
+        assert_eq!(
+            state.diff_file_details_scroll.get("issue-3::src/lib.rs"),
+            Some(&17)
+        );
 
         let _ = fs::remove_file(path);
     }

@@ -129,6 +129,10 @@ pub struct ReviewCommentPreview {
     pub start_side: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_hunk: Option<String>,
+    #[serde(default)]
+    pub is_resolved: bool,
+    #[serde(default)]
+    pub is_outdated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

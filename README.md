@@ -55,9 +55,12 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | Key | Action |
 | --- | --- |
 | `:` | Open the command palette and fuzzy search every shortcut |
-| `:` then `Switch Project` | Filter configured repos by prefix and switch project tabs |
+| `:` then `Project Switch` | Filter configured repos by prefix and activate a project tab |
+| `:` then `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `:` then `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `:` then `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
+| `:` then `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `:` then `Info` | Show version, config/db/log paths, memory usage, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Move within the focused tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
@@ -65,7 +68,8 @@ Press `?` in the TUI for the live shortcut reference. The status bar also change
 | `Esc` | Return from details to list, clear search, or leave diff details back to diff files |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |
 | `PgDown` / `PgUp` or `d` / `u` | Page list/details movement |
-| `n` / `p` in Details | Focus next/previous comment; in diff mode, page through the file diff |
+| `n` / `p` in Details | Focus next/previous comment in conversation or diff details |
+| `h` / `l` in diff Details | Page down/up through the file diff |
 | `g` / `G` | Jump to top/bottom in list, details, or diff |
 | `[` / `]` | Load previous/next GitHub result page, or switch diff files in diff mode |
 | `/` | Fuzzy filter the current list |
@@ -185,6 +189,7 @@ issue_labels = ["E-easy"]
 [defaults]
 view = "pull_requests"
 command_palette_key = ":"
+log_level = "info"
 pr_per_page = 50
 issue_per_page = 50
 notification_limit = 50
@@ -213,6 +218,8 @@ Use `[[repos]]` to add repository tabs to the top bar. Each configured repo show
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 
 Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
+
+Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

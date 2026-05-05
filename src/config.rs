@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::SectionKind;
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
+pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +26,7 @@ pub struct Config {
 pub struct Defaults {
     pub view: SectionKind,
     pub command_palette_key: String,
+    pub log_level: String,
     pub pr_per_page: usize,
     pub issue_per_page: usize,
     pub notification_limit: usize,
@@ -374,11 +376,23 @@ impl RepoConfig {
     }
 }
 
+pub fn normalized_log_level(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" => "warn",
+        "error" => "error",
+        _ => DEFAULT_LOG_LEVEL,
+    }
+}
+
 impl Default for Defaults {
     fn default() -> Self {
         Self {
             view: SectionKind::PullRequests,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             pr_per_page: 50,
             issue_per_page: 50,
             notification_limit: 50,
@@ -413,9 +427,14 @@ mod tests {
             encoded.contains(r#"view = "pull_requests""#),
             "default config should use the public snake_case view name"
         );
+        assert!(
+            encoded.contains(r#"log_level = "info""#),
+            "default config should include a configurable log level"
+        );
 
         let decoded = toml::from_str::<Config>(&encoded).expect("decode generated default config");
         assert_eq!(decoded.defaults.view, SectionKind::PullRequests);
+        assert_eq!(decoded.defaults.log_level, "info");
         assert!(decoded.repos.is_empty());
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
@@ -648,6 +667,7 @@ mod tests {
             [defaults]
             view = "pull_requests"
             command_palette_key = ":"
+            log_level = "debug"
             pr_per_page = 50
             issue_per_page = 50
             notification_limit = 50
@@ -671,6 +691,7 @@ mod tests {
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
         assert_eq!(config.defaults.command_palette_key, ":");
+        assert_eq!(config.defaults.log_level, "debug");
         assert_eq!(config.defaults.pr_per_page, 50);
         assert_eq!(config.defaults.issue_per_page, 50);
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
@@ -719,6 +740,13 @@ mod tests {
         .expect("custom command palette key should parse");
 
         assert_eq!(config.defaults.command_palette_key, "Ctrl+L");
+    }
+
+    #[test]
+    fn normalizes_supported_log_levels() {
+        assert_eq!(normalized_log_level("debug"), "debug");
+        assert_eq!(normalized_log_level(" WARN "), "warn");
+        assert_eq!(normalized_log_level("invalid"), "info");
     }
 
     #[test]

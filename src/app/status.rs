@@ -70,6 +70,18 @@ pub(super) fn message_dialog(title: impl Into<String>, body: impl Into<String>) 
     }
 }
 
+pub(super) fn retryable_message_dialog(
+    title: impl Into<String>,
+    body: impl Into<String>,
+) -> MessageDialog {
+    MessageDialog {
+        title: title.into(),
+        body: body.into(),
+        kind: MessageDialogKind::RetryableError,
+        auto_close_at: None,
+    }
+}
+
 pub(super) fn success_message_dialog(
     title: impl Into<String>,
     body: impl Into<String>,
@@ -94,7 +106,10 @@ pub(super) fn persistent_success_message_dialog(
     }
 }
 
-fn info_message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
+pub(super) fn info_message_dialog(
+    title: impl Into<String>,
+    body: impl Into<String>,
+) -> MessageDialog {
     MessageDialog {
         title: title.into(),
         body: body.into(),

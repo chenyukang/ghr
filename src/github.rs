@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
@@ -112,6 +112,89 @@ impl Drop for UserGhRequestGuard {
 async fn wait_for_user_gh_requests() {
     while USER_GH_REQUESTS_IN_FLIGHT.load(Ordering::Acquire) > 0 {
         sleep(BACKGROUND_GH_YIELD_INTERVAL).await;
+    }
+}
+
+fn gh_request_kind(args: &[String]) -> &'static str {
+    if args.first().is_some_and(|arg| arg == "api") {
+        "gh api"
+    } else {
+        "gh"
+    }
+}
+
+fn gh_command_display(args: &[String]) -> String {
+    format!("gh {}", args.join(" "))
+}
+
+fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) {
+    let kind = gh_request_kind(args);
+    let command = gh_command_display(args);
+    if let Some(directory) = directory {
+        debug!(
+            kind,
+            command = %command,
+            cwd = %directory.display(),
+            "gh request started"
+        );
+    } else {
+        debug!(kind, command = %command, "gh request started");
+    }
+}
+
+fn debug_log_gh_request_finished(
+    args: &[String],
+    directory: Option<&Path>,
+    output: &std::process::Output,
+) {
+    let kind = gh_request_kind(args);
+    let command = gh_command_display(args);
+    if let Some(directory) = directory {
+        debug!(
+            kind,
+            command = %command,
+            cwd = %directory.display(),
+            status = %output.status,
+            success = output.status.success(),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request finished"
+        );
+    } else {
+        debug!(
+            kind,
+            command = %command,
+            status = %output.status,
+            success = output.status.success(),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request finished"
+        );
+    }
+}
+
+fn debug_log_gh_request_failed_to_start(
+    args: &[String],
+    directory: Option<&Path>,
+    error: &std::io::Error,
+) {
+    let kind = gh_request_kind(args);
+    let command = gh_command_display(args);
+    if let Some(directory) = directory {
+        debug!(
+            kind,
+            command = %command,
+            cwd = %directory.display(),
+            error = %error,
+            "gh request failed to start"
+        );
+    } else {
+        debug!(
+            kind,
+            command = %command,
+            error = %error,
+            "gh request failed to start"
+        );
     }
 }
 
@@ -316,6 +399,68 @@ struct PullRequestReviewCommentRaw {
     original_start_line: Option<u64>,
     side: Option<String>,
     start_side: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReviewThreadState {
+    is_resolved: bool,
+    is_outdated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadsGraphQlRaw {
+    data: PullRequestReviewThreadsDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewThreadsDataRaw {
+    repository: Option<PullRequestReviewThreadsRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadsRepositoryRaw {
+    pull_request: Option<PullRequestReviewThreadsPullRequestRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadsPullRequestRaw {
+    review_threads: PullRequestReviewThreadConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadConnectionRaw {
+    nodes: Option<Vec<PullRequestReviewThreadRaw>>,
+    page_info: GraphQlPageInfoRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadRaw {
+    is_resolved: bool,
+    is_outdated: bool,
+    comments: PullRequestReviewThreadCommentConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewThreadCommentConnectionRaw {
+    nodes: Option<Vec<PullRequestReviewThreadCommentRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewThreadCommentRaw {
+    database_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlPageInfoRaw {
+    has_next_page: bool,
+    end_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1054,17 +1199,36 @@ pub async fn fetch_pull_request_comments(
     let issue_details = fetch_issue_details_output(repository, number);
     let issue_comments = fetch_issue_comments_output(repository, number);
     let review_comments = fetch_pull_request_review_comments_output(repository, number);
+    let review_thread_states = fetch_pull_request_review_thread_states(repository, number);
     let viewer_login = comment_viewer_login("pull request comment ownership");
-    let (issue_details, issue_output, review_output, viewer_login) =
-        tokio::join!(issue_details, issue_comments, review_comments, viewer_login);
+    let (issue_details, issue_output, review_output, review_thread_states, viewer_login) = tokio::join!(
+        issue_details,
+        issue_comments,
+        review_comments,
+        review_thread_states,
+        viewer_login
+    );
     let viewer_login = viewer_login.as_deref();
     let mut comments =
         parse_issue_comments_output(&issue_output?, repository, number, viewer_login)?;
+    let review_thread_states = match review_thread_states {
+        Ok(states) => states,
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load pull request review thread states"
+            );
+            HashMap::new()
+        }
+    };
     comments.append(&mut parse_pull_request_review_comments_output(
         &review_output?,
         repository,
         number,
         viewer_login,
+        &review_thread_states,
     )?);
     comments.sort_by_key(|comment| comment.created_at);
     let issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
@@ -1089,6 +1253,71 @@ async fn fetch_pull_request_review_comments_output(
         path,
     ])
     .await
+}
+
+async fn fetch_pull_request_review_thread_states(
+    repository: &str,
+    number: u64,
+) -> Result<HashMap<u64, ReviewThreadState>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          isResolved
+          isOutdated
+          comments(first: 100) {
+            nodes {
+              databaseId
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut cursor = None;
+    let mut states = HashMap::new();
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+
+        let output = run_gh_json(&args).await?;
+        let (page_states, has_next_page, end_cursor) =
+            parse_pull_request_review_thread_states_page(&output, repository, number)?;
+        states.extend(page_states);
+        if !has_next_page {
+            break;
+        }
+        let Some(next_cursor) = end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(states)
 }
 
 async fn comment_viewer_login(context: &'static str) -> Option<String> {
@@ -1227,18 +1456,21 @@ fn rerun_failed_check_run_args(repository: &str, run_id: u64) -> Vec<String> {
 }
 
 async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
+    debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .args(args)
         .output()
         .await
         .map_err(|error| {
+            debug_log_gh_request_failed_to_start(args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
                 anyhow!("failed to run gh {}: {error}", args.join(" "))
             }
         })?;
+    debug_log_gh_request_finished(args, None, &output);
 
     if !output.status.success() && output.stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2265,6 +2497,7 @@ fn parse_pull_request_review_comments_output(
     repository: &str,
     number: u64,
     viewer_login: Option<&str>,
+    thread_states: &HashMap<u64, ReviewThreadState>,
 ) -> Result<Vec<CommentPreview>> {
     let pages = serde_json::from_str::<Vec<Vec<PullRequestReviewCommentRaw>>>(output)
         .with_context(|| format!("failed to parse review comments for {repository}#{number}"))?;
@@ -2279,6 +2512,10 @@ fn parse_pull_request_review_comments_output(
                 .unwrap_or("unknown")
                 .to_string();
             let is_mine = viewer_login.is_some_and(|viewer| author.eq_ignore_ascii_case(viewer));
+            let thread_state = comment
+                .id
+                .and_then(|id| thread_states.get(&id).copied())
+                .unwrap_or_default();
             CommentPreview {
                 id: comment.id,
                 author,
@@ -2301,6 +2538,8 @@ fn parse_pull_request_review_comments_output(
                     side: comment.side,
                     start_side: comment.start_side,
                     diff_hunk: comment.diff_hunk,
+                    is_resolved: thread_state.is_resolved,
+                    is_outdated: thread_state.is_outdated,
                 }),
             }
         })
@@ -2308,6 +2547,39 @@ fn parse_pull_request_review_comments_output(
 
     comments.sort_by_key(|comment| comment.created_at);
     Ok(comments)
+}
+
+fn parse_pull_request_review_thread_states_page(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<(HashMap<u64, ReviewThreadState>, bool, Option<String>)> {
+    let raw = serde_json::from_str::<PullRequestReviewThreadsGraphQlRaw>(output)
+        .with_context(|| format!("failed to parse review threads for {repository}#{number}"))?;
+    let threads = raw
+        .data
+        .repository
+        .and_then(|repository| repository.pull_request)
+        .ok_or_else(|| anyhow!("pull request {repository}#{number} was not found"))?
+        .review_threads;
+    let mut states = HashMap::new();
+    for thread in threads.nodes.unwrap_or_default() {
+        let state = ReviewThreadState {
+            is_resolved: thread.is_resolved,
+            is_outdated: thread.is_outdated,
+        };
+        for comment in thread.comments.nodes.unwrap_or_default() {
+            if let Some(id) = comment.database_id {
+                states.insert(id, state);
+            }
+        }
+    }
+
+    Ok((
+        states,
+        threads.page_info.has_next_page,
+        threads.page_info.end_cursor,
+    ))
 }
 
 async fn refresh_notification_sections(config: &Config) -> Vec<SectionSnapshot> {
@@ -2445,18 +2717,21 @@ async fn run_gh_json(args: &[String]) -> Result<String> {
 }
 
 async fn run_gh_json_raw(args: &[String]) -> Result<String> {
+    debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .args(args)
         .output()
         .await
         .map_err(|error| {
+            debug_log_gh_request_failed_to_start(args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
                 anyhow!("failed to run gh {}: {error}", args.join(" "))
             }
         })?;
+    debug_log_gh_request_finished(args, None, &output);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2470,6 +2745,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
 
 async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
     let _guard = UserGhRequestGuard::new();
+    debug_log_gh_request_started(args, Some(directory));
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(directory)
@@ -2477,6 +2753,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
         .output()
         .await
         .map_err(|error| {
+            debug_log_gh_request_failed_to_start(args, Some(directory), &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
@@ -2487,6 +2764,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
                 )
             }
         })?;
+    debug_log_gh_request_finished(args, Some(directory), &output);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -3917,9 +4195,20 @@ mod tests {
         ]
         "##;
 
-        let comments =
-            parse_pull_request_review_comments_output(output, "owner/repo", 1, Some("alice"))
-                .unwrap();
+        let comments = parse_pull_request_review_comments_output(
+            output,
+            "owner/repo",
+            1,
+            Some("alice"),
+            &HashMap::from([(
+                10,
+                ReviewThreadState {
+                    is_resolved: true,
+                    is_outdated: false,
+                },
+            )]),
+        )
+        .unwrap();
 
         assert_eq!(comments.len(), 1);
         let comment = &comments[0];
@@ -3938,6 +4227,69 @@ mod tests {
         assert_eq!(
             review.diff_hunk.as_deref(),
             Some("@@ -55,6 +55,7 @@ fn main() {\n line 55\n+line 57\n line 58")
+        );
+        assert!(review.is_resolved);
+        assert!(!review.is_outdated);
+    }
+
+    #[test]
+    fn review_thread_states_parse_resolved_and_outdated_by_comment_id() {
+        let output = r#"
+        {
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "reviewThreads": {
+                  "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "cursor-2"
+                  },
+                  "nodes": [
+                    {
+                      "isResolved": true,
+                      "isOutdated": false,
+                      "comments": {
+                        "nodes": [
+                          { "databaseId": 10 },
+                          { "databaseId": 11 }
+                        ]
+                      }
+                    },
+                    {
+                      "isResolved": false,
+                      "isOutdated": true,
+                      "comments": {
+                        "nodes": [
+                          { "databaseId": 20 }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        "#;
+
+        let (states, has_next, cursor) =
+            parse_pull_request_review_thread_states_page(output, "owner/repo", 1).unwrap();
+
+        assert!(has_next);
+        assert_eq!(cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(
+            states.get(&10),
+            Some(&ReviewThreadState {
+                is_resolved: true,
+                is_outdated: false,
+            })
+        );
+        assert_eq!(
+            states.get(&20),
+            Some(&ReviewThreadState {
+                is_resolved: false,
+                is_outdated: true,
+            })
         );
     }
 

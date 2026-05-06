@@ -58,11 +58,12 @@ use crate::github::{
 #[cfg(test)]
 use crate::model::CommentPreviewKind;
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, FailedCheckRunSummary, ItemKind, Milestone,
-    PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
-    configured_sections, global_search_view_key, mark_all_notifications_read_in_section,
-    mark_notification_done_in_section, mark_notification_read_in_section, merge_cached_sections,
-    merge_refreshed_sections, repo_view_key, section_view_key,
+    ActionHints, CheckSummary, CommentPreview, EditorDraft, FailedCheckRunSummary, ItemKind,
+    Milestone, PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem,
+    builtin_view_key, configured_sections, global_search_view_key,
+    mark_all_notifications_read_in_section, mark_notification_done_in_section,
+    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
+    repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
@@ -575,6 +576,14 @@ fn editor_redo_key(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+fn editor_save_draft_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s' | 'S'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 fn byte_for_char_column(text: &str, column: usize) -> usize {
     text.char_indices()
         .nth(column)
@@ -595,6 +604,13 @@ struct PendingCommentSubmit {
     body: String,
     mode: PendingCommentMode,
     dialog: CommentDialog,
+    draft_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DraftClearTask {
+    key: String,
+    store: SnapshotStore,
 }
 
 #[derive(Debug, Clone)]
@@ -1328,6 +1344,20 @@ enum PendingCommentMode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftSaveTrigger {
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftSaveOutcome {
+    Saved,
+    Cleared,
+    Unchanged,
+    MissingTarget,
+}
+
 const TABLE_HEADER_HEIGHT: u16 = 2;
 const SUCCESS_DIALOG_AUTO_CLOSE: Duration = Duration::from_secs(1);
 const TAB_DIVIDER_WIDTH: u16 = 3;
@@ -1363,6 +1393,7 @@ const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
+const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
@@ -1445,6 +1476,11 @@ struct AppState {
     selected_comment_index: usize,
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
+    editor_drafts: HashMap<String, EditorDraft>,
+    comment_draft_key: Option<String>,
+    comment_draft_original_body: String,
+    comment_draft_last_saved_body: String,
+    comment_draft_last_auto_save_at: Instant,
     posting_comment: bool,
     reaction_dialog: Option<ReactionDialog>,
     posting_reaction: bool,
@@ -1638,9 +1674,11 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
     let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
     let repo_candidate_cache = store.load_repo_candidate_cache()?;
+    let editor_drafts = store.load_editor_drafts()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
     app.load_repo_candidate_cache(repo_candidate_cache);
+    app.load_editor_drafts(editor_drafts);
     app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
     let startup_setup_dialog = startup_setup_dialog();
     if let Some(dialog) = startup_setup_dialog {
@@ -1751,6 +1789,7 @@ async fn run_loop(
         app.ensure_current_comments_auto_refresh(tx);
         app.ensure_current_diff_loading(tx);
         app.sync_recent_details_visit(Instant::now());
+        app.auto_save_active_comment_draft(store, Instant::now());
         app.dismiss_expired_message_dialog(Instant::now());
 
         if !app.refreshing
@@ -2357,7 +2396,12 @@ fn item_supports_comments_refresh(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
 
-fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
+fn start_comment_submit(
+    item: WorkItem,
+    body: String,
+    draft_clear: Option<DraftClearTask>,
+    tx: UnboundedSender<AppMsg>,
+) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
         let result = match item.number {
@@ -2367,6 +2411,9 @@ fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg
             None => Err("selected item has no issue or pull request number".to_string()),
         };
         let posted = result.is_ok();
+        if posted {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::CommentPosted {
             item_id: item_id.clone(),
             result,
@@ -2384,6 +2431,7 @@ fn start_review_reply_submit(
     item: WorkItem,
     comment_id: u64,
     body: String,
+    draft_clear: Option<DraftClearTask>,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
@@ -2395,6 +2443,9 @@ fn start_review_reply_submit(
             None => Err("selected item has no pull request number".to_string()),
         };
         let posted = result.is_ok();
+        if posted {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::CommentPosted {
             item_id: item_id.clone(),
             result,
@@ -2414,6 +2465,7 @@ fn start_comment_edit(
     comment_id: u64,
     is_review: bool,
     body: String,
+    draft_clear: Option<DraftClearTask>,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
@@ -2430,6 +2482,9 @@ fn start_comment_edit(
             },
             None => Err("selected item has no issue or pull request number".to_string()),
         };
+        if result.is_ok() {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::CommentUpdated {
             item_id: item.id,
             comment_index,
@@ -2442,6 +2497,7 @@ fn start_item_metadata_edit(
     item: WorkItem,
     field: ItemEditField,
     value: String,
+    draft_clear: Option<DraftClearTask>,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
@@ -2456,6 +2512,9 @@ fn start_item_metadata_edit(
             }
             None => Err("selected item has no issue or pull request number".to_string()),
         };
+        if result.is_ok() {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::ItemMetadataUpdated {
             item_id,
             field,
@@ -2468,6 +2527,7 @@ fn start_review_comment_submit(
     item: WorkItem,
     target: DiffReviewTarget,
     body: String,
+    draft_clear: Option<DraftClearTask>,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
@@ -2490,6 +2550,9 @@ fn start_review_comment_submit(
             None => Err("selected item has no pull request number".to_string()),
         };
         let posted = result.is_ok();
+        if posted {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::ReviewCommentPosted {
             item_id: item_id.clone(),
             result,
@@ -2501,6 +2564,25 @@ fn start_review_comment_submit(
             let _ = tx.send(AppMsg::CommentsLoaded { item_id, comments });
         }
     });
+}
+
+fn draft_clear_task(
+    draft_key: Option<String>,
+    store: Option<SnapshotStore>,
+) -> Option<DraftClearTask> {
+    Some(DraftClearTask {
+        key: draft_key?,
+        store: store?,
+    })
+}
+
+fn clear_editor_draft_after_success(draft_clear: Option<DraftClearTask>) {
+    let Some(draft_clear) = draft_clear else {
+        return;
+    };
+    if let Err(error) = draft_clear.store.delete_editor_draft(&draft_clear.key) {
+        warn!(draft_key = %draft_clear.key, error = %error, "failed to clear submitted editor draft");
+    }
 }
 
 fn start_review_draft_create(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
@@ -3171,7 +3253,11 @@ fn handle_key_in_area_mut(
     }
 
     if app.comment_dialog.is_some() {
-        app.handle_comment_dialog_key(key, tx, area);
+        if editor_save_draft_key(key) {
+            app.save_active_comment_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.handle_comment_dialog_key_with_store(key, Some(store), tx, area);
+        }
         return false;
     }
 
@@ -3776,7 +3862,7 @@ fn handle_mouse_with_sync(
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
-        handle_comment_dialog_mouse(app, dialog.clone(), mouse, area);
+        handle_comment_dialog_mouse(app, dialog.clone(), mouse, area, store);
         return false;
     }
 
@@ -3879,8 +3965,20 @@ fn handle_comment_dialog_mouse(
     dialog: CommentDialog,
     mouse: MouseEvent,
     area: Rect,
+    store: Option<&SnapshotStore>,
 ) {
     let dialog_area = comment_dialog_area(&dialog, area);
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && modal_footer_area(area, dialog_area)
+            .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
+    {
+        if let Some(store) = store {
+            app.save_active_comment_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.status = "draft store unavailable".to_string();
+        }
+        return;
+    }
     if !rect_contains(dialog_area, mouse.column, mouse.row) {
         return;
     }
@@ -9259,9 +9357,9 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
         lines.push(Line::from(""));
     }
     let footer = if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
-        "Ctrl+Enter: update    arrows/Home/End edit    Ctrl+W/U/K/X word/line    click cursor"
+        "Ctrl+Enter: update    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
     } else {
-        "Ctrl+Enter: send    arrows/Home/End edit    Ctrl+W/U/K/X word/line    click cursor"
+        "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9757,6 +9855,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("Alt+D", "delete next word"),
         help_key_line("Ctrl+U / Ctrl+K", "delete to line start / end"),
         help_key_line("Ctrl+X", "delete current line"),
+        help_key_line("Ctrl+S / Cmd+S", "save the active editor draft"),
         help_key_line("Ctrl+Z / Cmd+Z", "undo text edits"),
         help_key_line("Ctrl+R / Cmd+Shift+Z", "redo text edits"),
         help_key_line("click editor text", "move cursor to that position"),
@@ -10266,6 +10365,61 @@ fn comments_snapshot_hash(comments: &[CommentPreview]) -> String {
     format!("{:x}", md5::compute(bytes))
 }
 
+fn editor_draft_item_key(item: &WorkItem) -> String {
+    let kind = match item.kind {
+        ItemKind::Notification => "notification",
+        ItemKind::PullRequest => "pull",
+        ItemKind::Issue => "issue",
+    };
+    match item.number {
+        Some(number) => format!("{kind}:{}#{number}", item.repo),
+        None => format!("{kind}:{}", item.id),
+    }
+}
+
+fn new_comment_draft_key(item: &WorkItem) -> String {
+    format!("comment:{}:new", editor_draft_item_key(item))
+}
+
+fn reply_comment_draft_key(item: &WorkItem, comment: &CommentPreview, index: usize) -> String {
+    let target = comment
+        .id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| format!("index-{index}"));
+    format!("comment:{}:reply:{target}", editor_draft_item_key(item))
+}
+
+fn edit_comment_draft_key(item: &WorkItem, comment_id: u64, is_review: bool) -> String {
+    let kind = if is_review { "review" } else { "issue" };
+    format!(
+        "comment:{}:edit:{kind}:{comment_id}",
+        editor_draft_item_key(item)
+    )
+}
+
+fn review_comment_draft_key(item: &WorkItem, target: &DiffReviewTarget) -> String {
+    let start = target
+        .start_line
+        .map(|line| {
+            format!(
+                ":{}:{line}",
+                target.start_side.map_or("-", DiffReviewSide::as_api_value)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "comment:{}:review:{}:{}:{}{start}",
+        editor_draft_item_key(item),
+        target.path,
+        target.side.as_api_value(),
+        target.line
+    )
+}
+
+fn item_metadata_draft_key(item: &WorkItem, field: ItemEditField) -> String {
+    format!("metadata:{}:{}", editor_draft_item_key(item), field.label())
+}
+
 impl AppState {
     #[cfg(test)]
     fn new(active_view: SectionKind, sections: Vec<SectionSnapshot>) -> Self {
@@ -10388,6 +10542,11 @@ impl AppState {
             selected_comment_index: 0,
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
+            editor_drafts: HashMap::new(),
+            comment_draft_key: None,
+            comment_draft_original_body: String::new(),
+            comment_draft_last_saved_body: String::new(),
+            comment_draft_last_auto_save_at: Instant::now(),
             posting_comment: false,
             reaction_dialog: None,
             posting_reaction: false,
@@ -10446,6 +10605,117 @@ impl AppState {
         self.label_suggestions_cache = cache.labels;
         self.assignee_suggestions_cache = cache.assignees;
         self.reviewer_suggestions_cache = cache.reviewers;
+    }
+
+    fn load_editor_drafts(&mut self, drafts: HashMap<String, EditorDraft>) {
+        self.editor_drafts = drafts;
+    }
+
+    fn open_comment_dialog_with_draft(
+        &mut self,
+        mode: CommentDialogMode,
+        default_body: String,
+        draft_key: String,
+    ) -> bool {
+        let (body, loaded) = self
+            .editor_drafts
+            .get(&draft_key)
+            .map(|draft| (draft.body.clone(), true))
+            .unwrap_or_else(|| (default_body.clone(), false));
+        self.comment_draft_key = Some(draft_key);
+        self.comment_draft_original_body = default_body;
+        self.comment_draft_last_saved_body = body.clone();
+        self.comment_draft_last_auto_save_at = Instant::now();
+        self.comment_dialog = Some(CommentDialog {
+            mode,
+            body: EditorText::from_text(body),
+            scroll: 0,
+        });
+        loaded
+    }
+
+    fn save_active_comment_draft(
+        &mut self,
+        store: &SnapshotStore,
+        trigger: DraftSaveTrigger,
+        now: Instant,
+    ) {
+        match self.save_active_comment_draft_result(store, now) {
+            Ok(DraftSaveOutcome::Saved) if trigger == DraftSaveTrigger::Manual => {
+                self.status = "draft saved".to_string();
+            }
+            Ok(DraftSaveOutcome::Cleared) if trigger == DraftSaveTrigger::Manual => {
+                self.status = "draft cleared".to_string();
+            }
+            Ok(DraftSaveOutcome::Unchanged) if trigger == DraftSaveTrigger::Manual => {
+                self.status = "draft already saved".to_string();
+            }
+            Ok(DraftSaveOutcome::MissingTarget) if trigger == DraftSaveTrigger::Manual => {
+                self.status = "drafts unavailable here".to_string();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.status = format!("draft save failed: {error}");
+            }
+        }
+    }
+
+    fn auto_save_active_comment_draft(&mut self, store: &SnapshotStore, now: Instant) {
+        if self.comment_dialog.is_none() {
+            return;
+        }
+        if now.saturating_duration_since(self.comment_draft_last_auto_save_at)
+            < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
+        {
+            return;
+        }
+        self.comment_draft_last_auto_save_at = now;
+        self.save_active_comment_draft(store, DraftSaveTrigger::Auto, now);
+    }
+
+    fn save_active_comment_draft_result(
+        &mut self,
+        store: &SnapshotStore,
+        _now: Instant,
+    ) -> Result<DraftSaveOutcome> {
+        let Some(key) = self.comment_draft_key.clone() else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        let Some(current) = self
+            .comment_dialog
+            .as_ref()
+            .map(|dialog| dialog.body.text().to_string())
+        else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        if current == self.comment_draft_last_saved_body {
+            return Ok(DraftSaveOutcome::Unchanged);
+        }
+
+        if current.trim().is_empty() || current == self.comment_draft_original_body {
+            store.delete_editor_draft(&key)?;
+            self.editor_drafts.remove(&key);
+            self.comment_draft_last_saved_body = current;
+            return Ok(DraftSaveOutcome::Cleared);
+        }
+
+        let draft = store.save_editor_draft(&key, &current)?;
+        self.comment_draft_last_saved_body = draft.body.clone();
+        self.editor_drafts.insert(key, draft);
+        Ok(DraftSaveOutcome::Saved)
+    }
+
+    fn clear_pending_comment_draft_local(&mut self) {
+        if let Some(key) = self
+            .pending_comment_submit
+            .as_ref()
+            .and_then(|pending| pending.draft_key.as_deref())
+        {
+            self.editor_drafts.remove(key);
+            if self.comment_draft_key.as_deref() == Some(key) {
+                self.comment_draft_last_saved_body = self.comment_draft_original_body.clone();
+            }
+        }
     }
 
     fn ui_state(&self) -> UiState {
@@ -10970,6 +11240,7 @@ impl AppState {
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
+                    self.clear_pending_comment_draft_local();
                     self.pending_comment_submit = None;
                     self.status = "comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
@@ -11012,6 +11283,7 @@ impl AppState {
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
+                    self.clear_pending_comment_draft_local();
                     self.pending_comment_submit = None;
                     self.status = "comment updated".to_string();
                     self.message_dialog = Some(success_message_dialog(
@@ -11048,6 +11320,7 @@ impl AppState {
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
+                    self.clear_pending_comment_draft_local();
                     self.pending_comment_submit = None;
                     self.status = "review comment posted".to_string();
                     self.message_dialog = Some(success_message_dialog(
@@ -11635,6 +11908,7 @@ impl AppState {
                     Ok(update) => {
                         self.apply_item_metadata_update(&item_id, update);
                         self.details_stale.insert(item_id);
+                        self.clear_pending_comment_draft_local();
                         self.pending_comment_submit = None;
                         self.status = format!("{} updated", field.label());
                         self.message_dialog = Some(success_message_dialog(
@@ -15762,18 +16036,23 @@ impl AppState {
         let Some(dialog) = self.item_edit_dialog.take() else {
             return;
         };
+        let item = dialog.item;
         let value = match field {
-            ItemEditField::Title => dialog.item.title,
-            ItemEditField::Body => dialog.item.body.unwrap_or_default(),
+            ItemEditField::Title => item.title.clone(),
+            ItemEditField::Body => item.body.clone().unwrap_or_default(),
         };
         self.focus = FocusTarget::Details;
-        self.comment_dialog = Some(CommentDialog {
-            mode: CommentDialogMode::ItemMetadata { field },
-            body: EditorText::from_text(value),
-            scroll: 0,
-        });
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::ItemMetadata { field },
+            value,
+            item_metadata_draft_key(&item, field),
+        );
         self.scroll_comment_dialog_to_cursor();
-        self.status = format!("editing {}", field.label());
+        self.status = if loaded {
+            format!("loaded {} draft", field.label())
+        } else {
+            format!("editing {}", field.label())
+        };
     }
 
     fn handle_pr_action_dialog_key(
@@ -16576,7 +16855,11 @@ impl AppState {
     }
 
     fn start_new_comment_dialog(&mut self) {
-        if !self.current_item_supports_comments() {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "selected item cannot be commented on".to_string();
+            return;
+        };
+        if !item_supports_metadata_edit(&item) {
             self.status = "selected item cannot be commented on".to_string();
             return;
         }
@@ -16594,13 +16877,17 @@ impl AppState {
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
         self.reviewer_dialog = None;
-        self.comment_dialog = Some(CommentDialog {
-            mode: CommentDialogMode::New,
-            body: EditorText::empty(),
-            scroll: 0,
-        });
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::New,
+            String::new(),
+            new_comment_draft_key(&item),
+        );
         self.scroll_comment_dialog_to_cursor();
-        self.status = "new comment".to_string();
+        self.status = if loaded {
+            "loaded comment draft".to_string()
+        } else {
+            "new comment".to_string()
+        };
     }
 
     fn start_reply_to_selected_comment(&mut self) {
@@ -16608,6 +16895,10 @@ impl AppState {
             self.status = "selected item cannot be commented on".to_string();
             return;
         }
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
         let Some(comment) = self.current_selected_comment().cloned() else {
             self.status = "no comment selected".to_string();
             return;
@@ -16632,17 +16923,21 @@ impl AppState {
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
         let body = quote_comment_for_reply(&comment);
-        self.comment_dialog = Some(CommentDialog {
-            mode: CommentDialogMode::Reply {
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
                 author: author.clone(),
                 review_comment_id,
             },
-            body: EditorText::from_text(body),
-            scroll: 0,
-        });
+            body,
+            reply_comment_draft_key(&item, &comment, self.selected_comment_index),
+        );
         self.scroll_comment_dialog_to_cursor();
-        self.status = format!("replying to @{author}");
+        self.status = if loaded {
+            format!("loaded reply draft for @{author}")
+        } else {
+            format!("replying to @{author}")
+        };
     }
 
     fn start_edit_selected_comment_dialog(&mut self) {
@@ -16650,6 +16945,10 @@ impl AppState {
             self.status = "selected item cannot be commented on".to_string();
             return;
         }
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
         let Some(comment) = self.current_selected_comment().cloned() else {
             self.status = "no comment selected".to_string();
             return;
@@ -16676,18 +16975,22 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
-        let body = comment.body;
-        self.comment_dialog = Some(CommentDialog {
-            mode: CommentDialogMode::Edit {
+        let body = comment.body.clone();
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
                 comment_id,
                 is_review: comment.review.is_some(),
             },
-            body: EditorText::from_text(body),
-            scroll: 0,
-        });
+            body,
+            edit_comment_draft_key(&item, comment_id, comment.review.is_some()),
+        );
         self.scroll_comment_dialog_to_cursor();
-        self.status = "editing comment".to_string();
+        self.status = if loaded {
+            "loaded comment edit draft".to_string()
+        } else {
+            "editing comment".to_string()
+        };
     }
 
     fn start_review_comment_dialog(&mut self) {
@@ -16695,7 +16998,7 @@ impl AppState {
             self.status = "review comments are available in diff mode".to_string();
             return;
         }
-        let Some(item) = self.current_item() else {
+        let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
         };
@@ -16728,30 +17031,57 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
-        self.comment_dialog = Some(CommentDialog {
-            mode: CommentDialogMode::Review {
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::Review {
                 target: target.clone(),
             },
-            body: EditorText::empty(),
-            scroll: 0,
-        });
+            String::new(),
+            review_comment_draft_key(&item, &target),
+        );
         self.scroll_comment_dialog_to_cursor();
-        self.status = format!("reviewing {}", target.location_label());
+        self.status = if loaded {
+            format!("loaded review draft for {}", target.location_label())
+        } else {
+            format!("reviewing {}", target.location_label())
+        };
     }
 
+    #[cfg(test)]
     fn handle_comment_dialog_key(
         &mut self,
         key: KeyEvent,
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
+        self.handle_comment_dialog_key_with_store(key, None, tx, area);
+    }
+
+    fn handle_comment_dialog_key_with_store(
+        &mut self,
+        key: KeyEvent,
+        store: Option<&SnapshotStore>,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
         let tx = tx.clone();
+        let store = store.cloned();
         self.handle_comment_dialog_key_with_submit(key, area, move |submit| match submit.mode {
             PendingCommentMode::Post => {
-                start_comment_submit(submit.item, submit.body, tx.clone());
+                start_comment_submit(
+                    submit.item,
+                    submit.body,
+                    draft_clear_task(submit.draft_key, store.clone()),
+                    tx.clone(),
+                );
             }
             PendingCommentMode::ReviewReply { comment_id } => {
-                start_review_reply_submit(submit.item, comment_id, submit.body, tx.clone());
+                start_review_reply_submit(
+                    submit.item,
+                    comment_id,
+                    submit.body,
+                    draft_clear_task(submit.draft_key, store.clone()),
+                    tx.clone(),
+                );
             }
             PendingCommentMode::Edit {
                 comment_index,
@@ -16764,14 +17094,27 @@ impl AppState {
                     comment_id,
                     is_review,
                     submit.body,
+                    draft_clear_task(submit.draft_key, store.clone()),
                     tx.clone(),
                 );
             }
             PendingCommentMode::Review { target } => {
-                start_review_comment_submit(submit.item, target, submit.body, tx.clone());
+                start_review_comment_submit(
+                    submit.item,
+                    target,
+                    submit.body,
+                    draft_clear_task(submit.draft_key, store.clone()),
+                    tx.clone(),
+                );
             }
             PendingCommentMode::ItemMetadata { field } => {
-                start_item_metadata_edit(submit.item, field, submit.body, tx.clone());
+                start_item_metadata_edit(
+                    submit.item,
+                    field,
+                    submit.body,
+                    draft_clear_task(submit.draft_key, store.clone()),
+                    tx.clone(),
+                );
             }
         });
     }
@@ -17489,6 +17832,7 @@ impl AppState {
             body,
             mode,
             dialog,
+            draft_key: self.comment_draft_key.clone(),
         };
         self.pending_comment_submit = Some(pending.clone());
         Some(pending)
@@ -24355,6 +24699,84 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn notification_section_tabs_show_each_section_unread_count() {
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![
+                    notification_item("thread-1", true),
+                    notification_item("thread-2", false),
+                    notification_item("thread-3", true),
+                ],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:review-requested".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Review Requested".to_string(),
+                filters: "reason:review-requested".to_string(),
+                items: vec![notification_item("thread-1", true)],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:assigned".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Assigned".to_string(),
+                filters: "reason:assign".to_string(),
+                items: vec![notification_item("thread-2", false)],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:mentioned".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Mentioned".to_string(),
+                filters: "reason:mention".to_string(),
+                items: vec![
+                    notification_item("thread-4", true),
+                    notification_item("thread-5", true),
+                    notification_item("thread-6", false),
+                ],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let app = AppState::new(SectionKind::Notifications, sections);
+        let labels = app
+            .visible_sections()
+            .into_iter()
+            .map(|section| section_tab_label(&app, section))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "All (2)",
+                "Review Requested (1)",
+                "Assigned",
+                "Mentioned (2)"
+            ]
+        );
+    }
+
+    #[test]
     fn top_tab_highlights_use_high_contrast_blocks() {
         let view = active_view_tab_style();
         assert_eq!(view.fg, Some(Color::Black));
@@ -30758,6 +31180,172 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn comment_dialog_loads_existing_draft_on_open() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let key = new_comment_draft_key(app.current_item().expect("current item"));
+        app.load_editor_drafts(HashMap::from([(
+            key.clone(),
+            EditorDraft {
+                key,
+                body: "saved draft".to_string(),
+                updated_at: Utc::now(),
+            },
+        )]));
+
+        app.start_new_comment_dialog();
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("saved draft")
+        );
+        assert_eq!(app.status, "loaded comment draft");
+    }
+
+    #[test]
+    fn saving_comment_draft_persists_and_reopens_it() {
+        let paths = unique_test_paths("comment-draft-save");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_new_comment_dialog();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("remember me");
+        app.save_active_comment_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+
+        assert_eq!(app.status, "draft saved");
+        assert_eq!(
+            store
+                .load_editor_drafts()
+                .expect("load drafts")
+                .values()
+                .next()
+                .map(|draft| draft.body.as_str()),
+            Some("remember me")
+        );
+
+        app.comment_dialog = None;
+        app.start_new_comment_dialog();
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("remember me")
+        );
+    }
+
+    #[test]
+    fn comment_draft_auto_save_waits_for_interval() {
+        let paths = unique_test_paths("comment-draft-auto-save");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_new_comment_dialog();
+        let opened_at = app.comment_draft_last_auto_save_at;
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("autosaved body");
+
+        app.auto_save_active_comment_draft(
+            &store,
+            opened_at + EDITOR_DRAFT_AUTO_SAVE_INTERVAL - Duration::from_millis(1),
+        );
+        assert!(
+            store
+                .load_editor_drafts()
+                .expect("load drafts before interval")
+                .is_empty()
+        );
+
+        app.auto_save_active_comment_draft(&store, opened_at + EDITOR_DRAFT_AUTO_SAVE_INTERVAL);
+        assert_eq!(
+            store
+                .load_editor_drafts()
+                .expect("load drafts after interval")
+                .values()
+                .next()
+                .map(|draft| draft.body.as_str()),
+            Some("autosaved body")
+        );
+    }
+
+    #[test]
+    fn clicking_comment_dialog_footer_saves_draft() {
+        let paths = unique_test_paths("comment-draft-click");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 100, 30);
+        app.start_new_comment_dialog();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("clicked draft");
+        let dialog_area = comment_dialog_area(app.comment_dialog.as_ref().unwrap(), area);
+        let footer = modal_footer_area(area, dialog_area).expect("footer area");
+
+        handle_mouse_with_sync(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: footer.x,
+                row: footer.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+            Some(&store),
+            None,
+        );
+
+        assert_eq!(app.status, "draft saved");
+        assert_eq!(
+            store
+                .load_editor_drafts()
+                .expect("load drafts")
+                .values()
+                .next()
+                .map(|draft| draft.body.as_str()),
+            Some("clicked draft")
+        );
+    }
+
+    #[test]
+    fn successful_comment_post_clears_saved_draft_state() {
+        let paths = unique_test_paths("comment-draft-clear");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_new_comment_dialog();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("draft body");
+        app.save_active_comment_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+        let key = app.comment_draft_key.clone().expect("draft key");
+
+        app.handle_comment_dialog_key_with_submit(ctrl_key(KeyCode::Enter), None, |_| {});
+        app.handle_msg(AppMsg::CommentPosted {
+            item_id: "1".to_string(),
+            result: Ok(comment("chenyukang", "posted", None)),
+        });
+        clear_editor_draft_after_success(draft_clear_task(Some(key.clone()), Some(store.clone())));
+
+        assert!(!app.editor_drafts.contains_key(&key));
+        assert!(store.load_editor_drafts().expect("load drafts").is_empty());
+    }
+
+    #[test]
     fn mouse_clicking_issue_title_moves_field_cursor() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let area = Rect::new(0, 0, 100, 30);
@@ -31181,6 +31769,7 @@ diff --git a/src/main.rs b/src/main.rs
                 body: EditorText::from_text("draft body"),
                 scroll: 0,
             },
+            draft_key: None,
         });
 
         app.handle_msg(AppMsg::CommentPosted {

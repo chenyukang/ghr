@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
 use crate::model::{
-    SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
+    EditorDraft, SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
     mark_notification_done_in_section, mark_notification_read_in_section,
 };
 
@@ -50,6 +50,11 @@ impl SnapshotStore {
                 values_json TEXT NOT NULL,
                 refreshed_at TEXT NOT NULL,
                 PRIMARY KEY (repo, kind)
+            );
+            CREATE TABLE IF NOT EXISTS editor_drafts (
+                key TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
             "#,
         )
@@ -117,6 +122,39 @@ impl SnapshotStore {
         Ok(sections)
     }
 
+    pub fn load_editor_drafts(&self) -> Result<HashMap<String, EditorDraft>> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT key, body, updated_at
+                FROM editor_drafts
+                "#,
+            )
+            .context("failed to prepare editor draft load")?;
+
+        let mut rows = stmt.query([]).context("failed to load editor drafts")?;
+        let mut drafts = HashMap::new();
+        while let Some(row) = rows.next().context("failed to read editor draft row")? {
+            let key: String = row.get(0)?;
+            let body: String = row.get(1)?;
+            let updated_at_raw: String = row.get(2)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+                .map(|value| value.with_timezone(&Utc))
+                .with_context(|| format!("failed to parse editor draft updated_at for {key}"))?;
+            drafts.insert(
+                key.clone(),
+                EditorDraft {
+                    key,
+                    body,
+                    updated_at,
+                },
+            );
+        }
+
+        Ok(drafts)
+    }
+
     pub fn load_repo_candidate_cache(&self) -> Result<RepoCandidateCache> {
         let conn = self.connect()?;
         let mut stmt = conn
@@ -153,6 +191,36 @@ impl SnapshotStore {
         }
 
         Ok(cache)
+    }
+
+    pub fn save_editor_draft(&self, key: &str, body: &str) -> Result<EditorDraft> {
+        let conn = self.connect()?;
+        let draft = EditorDraft {
+            key: key.to_string(),
+            body: body.to_string(),
+            updated_at: Utc::now(),
+        };
+        conn.execute(
+            r#"
+            INSERT INTO editor_drafts (key, body, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                body = excluded.body,
+                updated_at = excluded.updated_at
+            "#,
+            params![&draft.key, &draft.body, draft.updated_at.to_rfc3339()],
+        )
+        .with_context(|| format!("failed to save editor draft {}", draft.key))?;
+
+        Ok(draft)
+    }
+
+    pub fn delete_editor_draft(&self, key: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let changed = conn
+            .execute("DELETE FROM editor_drafts WHERE key = ?1", params![key])
+            .with_context(|| format!("failed to delete editor draft {key}"))?;
+        Ok(changed > 0)
     }
 
     pub fn save_label_candidates(&self, repo: &str, labels: &[String]) -> Result<()> {
@@ -538,6 +606,51 @@ mod tests {
         assert_eq!(
             cache.labels.get("rust-lang/rust"),
             Some(&vec!["T-rustdoc".to_string()])
+        );
+
+        remove_db_files(&path);
+    }
+
+    #[test]
+    fn editor_drafts_round_trip_and_delete() {
+        let path = temp_db_path("editor-drafts");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        let saved = store
+            .save_editor_draft("comment:rust-lang/rust#1:new", "draft body")
+            .expect("save editor draft");
+        assert_eq!(saved.body, "draft body");
+
+        let loaded = store.load_editor_drafts().expect("load editor drafts");
+        assert_eq!(
+            loaded
+                .get("comment:rust-lang/rust#1:new")
+                .map(|draft| draft.body.as_str()),
+            Some("draft body")
+        );
+
+        store
+            .save_editor_draft("comment:rust-lang/rust#1:new", "updated draft")
+            .expect("update editor draft");
+        let loaded = store.load_editor_drafts().expect("reload editor drafts");
+        assert_eq!(
+            loaded
+                .get("comment:rust-lang/rust#1:new")
+                .map(|draft| draft.body.as_str()),
+            Some("updated draft")
+        );
+
+        assert!(
+            store
+                .delete_editor_draft("comment:rust-lang/rust#1:new")
+                .expect("delete editor draft")
+        );
+        assert!(
+            store
+                .load_editor_drafts()
+                .expect("load editor drafts after delete")
+                .is_empty()
         );
 
         remove_db_files(&path);

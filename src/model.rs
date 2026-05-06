@@ -62,6 +62,13 @@ impl WorkItem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorDraft {
+    pub key: String,
+    pub body: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionSummary {
     #[serde(default)]

@@ -573,15 +573,15 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
         palette_command(
             "Page Diff Details Down",
             "h",
-            "Diff Details",
-            "Page down through the current file diff, then jump to the next file",
+            "Diff",
+            "Page down across diff files from files or details focus",
             palette_key(KeyCode::Char('h')),
         ),
         palette_command(
             "Page Diff Details Up",
             "l",
-            "Diff Details",
-            "Page up through the current file diff, then jump to the previous file",
+            "Diff",
+            "Page up across diff files from files or details focus",
             palette_key(KeyCode::Char('l')),
         ),
         palette_command(

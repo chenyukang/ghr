@@ -3323,6 +3323,8 @@ fn handle_diff_file_list_key(
         KeyCode::PageUp | KeyCode::Char('u') => {
             app.move_diff_file(diff_file_page_delta(app, area, -1));
         }
+        KeyCode::Char('h') => app.page_diff_lines(1, area),
+        KeyCode::Char('l') => app.page_diff_lines(-1, area),
         KeyCode::Char('g') => {
             if let Some(order) = app.current_diff_file_order() {
                 if let Some(file_index) = order.first() {
@@ -8640,6 +8642,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("Tab / Shift+Tab", "focus the file diff"),
         help_key_line("j/k or Up/Down", "choose a changed file"),
         help_key_line("PgDown/PgUp", "move by visible file page"),
+        help_key_line("h / l", "page diff down/up across files"),
         help_key_line("[ / ]", "previous / next changed file"),
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
@@ -8662,7 +8665,10 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
             "n / p",
             "focus comments; p from first returns to PR/issue details",
         ),
-        help_key_line("h / l in diff", "page down/up; cross files at edges"),
+        help_key_line(
+            "h / l in diff",
+            "page down/up across files, stop at diff ends",
+        ),
         help_key_line(
             "Enter in conversation",
             "expand or collapse a long focused comment",
@@ -13167,7 +13173,44 @@ impl AppState {
     }
 
     fn move_diff_file_from_page_boundary(&mut self, direction: isize, area: Option<Rect>) {
-        self.move_diff_file(direction.signum());
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "nothing to diff".to_string();
+            return;
+        };
+        let Some(order) = self.current_diff_file_order() else {
+            self.status = "diff still loading".to_string();
+            return;
+        };
+        if order.is_empty() {
+            self.selected_diff_file.insert(item_id.clone(), 0);
+            self.selected_diff_line.insert(item_id, 0);
+            self.details_scroll = 0;
+            self.status = "no diff files".to_string();
+            return;
+        }
+
+        let current = self
+            .selected_diff_file
+            .get(&item_id)
+            .copied()
+            .unwrap_or_else(|| order[0]);
+        let current_position = order
+            .iter()
+            .position(|file_index| *file_index == current)
+            .unwrap_or(0);
+        let next_position = if direction > 0 {
+            current_position
+                .checked_add(1)
+                .filter(|position| *position < order.len())
+        } else {
+            current_position.checked_sub(1)
+        };
+        let Some(next_position) = next_position else {
+            self.set_diff_page_boundary_status(direction);
+            return;
+        };
+
+        self.select_diff_file(order[next_position]);
         if direction > 0 {
             self.details_scroll = 0;
             if let Some(area) = area {
@@ -13177,6 +13220,14 @@ impl AppState {
             }
         } else {
             self.scroll_diff_details_to_bottom(area);
+        }
+    }
+
+    fn set_diff_page_boundary_status(&mut self, direction: isize) {
+        if direction > 0 {
+            self.status = "already at bottom of diff".to_string();
+        } else {
+            self.status = "already at top of diff".to_string();
         }
     }
 
@@ -17868,7 +17919,62 @@ deleted file mode 100644
     }
 
     #[test]
-    fn h_and_l_cross_diff_files_at_file_edges() {
+    fn h_and_l_page_diff_details_while_diff_files_are_focused() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut diff_lines = String::new();
+        for line in 1..=40 {
+            diff_lines.push_str(&format!(" line {line}\n"));
+        }
+        app.show_diff();
+        app.focus_list();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(&format!(
+                    "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,40 +1,40 @@\n{diff_lines}"
+                ))
+                .expect("parse diff"),
+            ),
+        );
+        let area = Rect::new(0, 0, 120, 28);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('h')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.selected_diff_file.get("1").copied().unwrap_or(0), 0);
+        assert!(app.details_scroll > 0);
+        let after_next = app.details_scroll;
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.focus, FocusTarget::List);
+        assert_eq!(app.selected_diff_file.get("1").copied().unwrap_or(0), 0);
+        assert!(app.details_scroll < after_next);
+        let (expected_index, expected_line) = first_visible_diff_line(&app, area);
+        assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
+        assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+    }
+
+    #[test]
+    fn h_and_l_cross_diff_files_without_wrapping_at_global_edges() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::default();
@@ -17891,8 +17997,8 @@ deleted file mode 100644
             ),
         );
         let area = Rect::new(0, 0, 120, 24);
-        let details_area = details_area_for(&app, area);
-        app.details_scroll = max_details_scroll(&app, details_area);
+        app.scroll_diff_details_to_bottom(Some(area));
+        let first_bottom_scroll = app.details_scroll;
         assert_eq!(app.selected_diff_file.get("1").copied().unwrap_or(0), 0);
 
         assert!(!handle_key_in_area(
@@ -17910,6 +18016,21 @@ deleted file mode 100644
             Some("b.rs".to_string())
         );
 
+        app.scroll_diff_details_to_bottom(Some(area));
+        let second_bottom_scroll = app.details_scroll;
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('h')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+        assert_eq!(app.details_scroll, second_bottom_scroll);
+        assert_eq!(app.status, "already at bottom of diff");
+
+        app.scroll_diff_details_to_top(Some(area));
         assert!(!handle_key_in_area(
             &mut app,
             key(KeyCode::Char('l')),
@@ -17919,7 +18040,7 @@ deleted file mode 100644
             Some(area)
         ));
         assert_eq!(app.selected_diff_file.get("1"), Some(&0));
-        assert!(app.details_scroll > 0);
+        assert_eq!(app.details_scroll, first_bottom_scroll);
         assert_eq!(
             app.current_diff_review_target().map(|target| target.path),
             Some("a.rs".to_string())
@@ -17927,6 +18048,19 @@ deleted file mode 100644
         let (expected_index, expected_line) = first_visible_diff_line(&app, area);
         assert_eq!(app.selected_diff_line.get("1"), Some(&expected_index));
         assert_eq!(selected_diff_document_line(&app, area), Some(expected_line));
+
+        app.scroll_diff_details_to_top(Some(area));
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.status, "already at top of diff");
     }
 
     #[test]

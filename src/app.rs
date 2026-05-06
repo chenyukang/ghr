@@ -12535,7 +12535,10 @@ impl AppState {
     }
 
     fn comments_auto_refresh_due(&self, item: &WorkItem, now: Instant) -> bool {
-        if self.details_mode != DetailsMode::Conversation || !item_supports_comments_refresh(item) {
+        if self.focus != FocusTarget::Details
+            || self.details_mode != DetailsMode::Conversation
+            || !item_supports_comments_refresh(item)
+        {
             return false;
         }
         if self.details_refreshing.contains(&item.id)
@@ -22635,6 +22638,64 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn inbox_linked_issue_or_pr_description_renders_without_preview_truncation() {
+        let body = (1..=31)
+            .map(|index| format!("description line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut item = notification_item("thread-1", true);
+        item.body = Some(body.clone());
+        let inbox_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let inbox_app = AppState::new(SectionKind::Notifications, vec![inbox_section]);
+
+        let inbox_rendered = build_details_document(&inbox_app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            inbox_rendered
+                .iter()
+                .any(|line| line.contains("description line 31")),
+            "inbox linked issue/PR descriptions should render fully: {inbox_rendered:?}"
+        );
+        assert!(
+            !inbox_rendered.iter().any(|line| line.trim() == "..."),
+            "inbox linked issue/PR descriptions should not show preview ellipsis: {inbox_rendered:?}"
+        );
+
+        let mut normal_section = test_section();
+        normal_section.items[0].body = Some(body);
+        let normal_app = AppState::new(SectionKind::PullRequests, vec![normal_section]);
+        let normal_rendered = build_details_document(&normal_app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            normal_rendered.iter().any(|line| line.trim() == "..."),
+            "non-inbox descriptions should keep preview truncation: {normal_rendered:?}"
+        );
+        assert!(
+            !normal_rendered
+                .iter()
+                .any(|line| line.contains("description line 31")),
+            "non-inbox descriptions should still be preview-limited: {normal_rendered:?}"
+        );
+    }
+
+    #[test]
     fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
         let mut item = notification_item("thread-1", true);
         item.body = Some("Loaded from the linked pull request.".to_string());
@@ -23684,15 +23745,31 @@ diff --git a/src/main.rs b/src/main.rs
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
-        let rendered = build_details_document(&app, 100)
+        let rendered_lines = build_details_document(&app, 100)
             .lines
             .iter()
             .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let rendered = rendered_lines.join("\n");
 
         assert!(rendered.contains("  reactions: ❤️ 1  👀 1  + react"));
         assert!(rendered.contains("alice - -  🚀 2  👀 1"));
+        let header_index = rendered_lines
+            .iter()
+            .position(|line| line.contains("alice - -  🚀 2  👀 1"))
+            .expect("comment header");
+        assert!(
+            rendered_lines
+                .get(header_index + 1)
+                .is_some_and(|line| line.trim().is_empty()),
+            "comment header and body should be separated by a blank line: {rendered_lines:?}"
+        );
+        assert!(
+            rendered_lines
+                .get(header_index + 2)
+                .is_some_and(|line| line.contains("A reacted comment")),
+            "comment body should follow the blank spacer: {rendered_lines:?}"
+        );
     }
 
     #[test]
@@ -30532,6 +30609,7 @@ diff --git a/d.rs b/d.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let item = app.current_item().expect("current item").clone();
         let now = Instant::now();
+        app.focus = FocusTarget::Details;
         app.details
             .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
         app.comments_refresh_requested_at
@@ -30548,6 +30626,7 @@ diff --git a/d.rs b/d.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let item = app.current_item().expect("current item").clone();
         let now = Instant::now();
+        app.focus = FocusTarget::Details;
         app.details
             .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
         app.comments_refresh_requested_at.insert(
@@ -30568,6 +30647,7 @@ diff --git a/d.rs b/d.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let item = app.current_item().expect("current item").clone();
         let now = Instant::now();
+        app.focus = FocusTarget::Details;
         app.details
             .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
         app.comments_refresh_requested_at
@@ -30581,6 +30661,21 @@ diff --git a/d.rs b/d.rs
         ));
         assert!(app.start_comments_auto_refresh_if_due(&item, now + COMMENTS_POST_REFRESH_DELAY));
         assert!(!app.comments_refresh_after.contains_key(&item.id));
+    }
+
+    #[test]
+    fn comments_auto_refresh_skips_when_details_not_focused() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item = app.current_item().expect("current item").clone();
+        let now = Instant::now();
+        app.focus = FocusTarget::List;
+        app.details
+            .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
+        app.comments_refresh_requested_at
+            .insert(item.id.clone(), now - COMMENTS_AUTO_REFRESH_INTERVAL);
+
+        assert!(!app.start_comments_auto_refresh_if_due(&item, now));
+        assert!(!app.details_refreshing.contains(&item.id));
     }
 
     fn test_section() -> SectionSnapshot {

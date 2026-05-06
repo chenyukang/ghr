@@ -5,6 +5,8 @@ use super::*;
 const DETAILS_METADATA_PADDING: usize = 2;
 const DETAILS_METADATA_KEY_WIDTH: usize = 11;
 const DESCRIPTION_BODY_PADDING: usize = 2;
+const DESCRIPTION_PREVIEW_MAX_LINES: usize = 22;
+const DESCRIPTION_PREVIEW_MAX_CHARS: usize = 2_400;
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
@@ -1238,6 +1240,7 @@ pub(super) fn push_description_block(
     item: &WorkItem,
 ) {
     let selected = app.focus == FocusTarget::Details && app.comment_selection_cleared();
+    let (max_lines, max_chars) = description_render_limits(app, item);
     let start_line = builder.document.lines.len();
     if !selected {
         builder.push_heading("Description");
@@ -1245,8 +1248,8 @@ pub(super) fn push_description_block(
         builder.push_markdown_block_prefixed(
             item.body.as_deref().unwrap_or(""),
             "No description.",
-            22,
-            2_400,
+            max_lines,
+            max_chars,
             MarkdownRenderOptions {
                 prefix: padding_prefix(DESCRIPTION_BODY_PADDING),
                 right_padding: DESCRIPTION_BODY_PADDING,
@@ -1274,8 +1277,8 @@ pub(super) fn push_description_block(
     builder.push_markdown_block_prefixed(
         item.body.as_deref().unwrap_or(""),
         "No description.",
-        22,
-        2_400,
+        max_lines,
+        max_chars,
         MarkdownRenderOptions {
             prefix: selected_description_prefix(),
             right_padding: comment_right_padding(true),
@@ -1292,6 +1295,18 @@ pub(super) fn push_description_block(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+pub(super) fn description_render_limits(app: &AppState, item: &WorkItem) -> (usize, usize) {
+    let is_inbox_linked_issue_or_pr = matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
+        && app
+            .current_section()
+            .is_some_and(|section| section.kind == SectionKind::Notifications);
+    if is_inbox_linked_issue_or_pr {
+        (usize::MAX, usize::MAX)
+    } else {
+        (DESCRIPTION_PREVIEW_MAX_LINES, DESCRIPTION_PREVIEW_MAX_CHARS)
+    }
 }
 
 pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
@@ -1694,6 +1709,7 @@ pub(super) fn push_diff_inline_comment(
         comment_right_padding(selected),
         2,
     );
+    push_comment_body_gap(builder, &prefix);
     let collapsed_body;
     let body = if collapse.collapsed {
         collapsed_body = collapsed_comment_body(&comment.body);
@@ -2472,6 +2488,7 @@ pub(super) fn push_comment(
             2,
         );
     }
+    push_comment_body_gap(builder, &prefix);
     if options.selected
         && let Some(review) = &comment.review
     {
@@ -2513,6 +2530,10 @@ pub(super) fn push_comment(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+pub(super) fn push_comment_body_gap(builder: &mut DetailsBuilder, prefix: &[DetailSegment]) {
+    builder.push_line(prefix.to_vec());
 }
 
 pub(super) fn add_selected_comment_text_weight(

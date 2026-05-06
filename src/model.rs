@@ -56,6 +56,12 @@ pub struct WorkItem {
     pub extra: Option<String>,
 }
 
+impl WorkItem {
+    pub fn supports_reactions(&self) -> bool {
+        matches!(self.kind, ItemKind::Issue | ItemKind::PullRequest) && self.number.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionSummary {
     #[serde(default)]

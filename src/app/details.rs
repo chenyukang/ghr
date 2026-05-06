@@ -5,8 +5,6 @@ use super::*;
 const DETAILS_METADATA_PADDING: usize = 2;
 const DETAILS_METADATA_KEY_WIDTH: usize = 11;
 const DESCRIPTION_BODY_PADDING: usize = 2;
-const DESCRIPTION_PREVIEW_MAX_LINES: usize = 22;
-const DESCRIPTION_PREVIEW_MAX_CHARS: usize = 2_400;
 const INLINE_COMMENT_MARKER: &str = "💬 ";
 const INLINE_COMMENT_MULTIPLE_MARKER: &str = "💬* ";
 
@@ -1176,7 +1174,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     builder.push_blank();
     push_description_block(&mut builder, app, item);
-    push_reactions_line(&mut builder, &item.reactions);
+    push_reactions_line(&mut builder, &item.reactions, item.supports_reactions());
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -1272,7 +1270,6 @@ pub(super) fn push_description_block(
     item: &WorkItem,
 ) {
     let selected = app.focus == FocusTarget::Details && app.comment_selection_cleared();
-    let (max_lines, max_chars) = description_render_limits(app, item);
     let start_line = builder.document.lines.len();
     if !selected {
         builder.push_heading("Description");
@@ -1280,8 +1277,8 @@ pub(super) fn push_description_block(
         builder.push_markdown_block_prefixed(
             item.body.as_deref().unwrap_or(""),
             "No description.",
-            max_lines,
-            max_chars,
+            usize::MAX,
+            usize::MAX,
             MarkdownRenderOptions {
                 prefix: padding_prefix(DESCRIPTION_BODY_PADDING),
                 right_padding: DESCRIPTION_BODY_PADDING,
@@ -1309,8 +1306,8 @@ pub(super) fn push_description_block(
     builder.push_markdown_block_prefixed(
         item.body.as_deref().unwrap_or(""),
         "No description.",
-        max_lines,
-        max_chars,
+        usize::MAX,
+        usize::MAX,
         MarkdownRenderOptions {
             prefix: selected_description_prefix(),
             right_padding: comment_right_padding(true),
@@ -1327,18 +1324,6 @@ pub(super) fn push_description_block(
         start_line,
         end_line: builder.document.lines.len(),
     });
-}
-
-pub(super) fn description_render_limits(app: &AppState, item: &WorkItem) -> (usize, usize) {
-    let is_inbox_linked_issue_or_pr = matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
-        && app
-            .current_section()
-            .is_some_and(|section| section.kind == SectionKind::Notifications);
-    if is_inbox_linked_issue_or_pr {
-        (usize::MAX, usize::MAX)
-    } else {
-        (DESCRIPTION_PREVIEW_MAX_LINES, DESCRIPTION_PREVIEW_MAX_CHARS)
-    }
 }
 
 pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
@@ -2353,7 +2338,14 @@ pub(super) fn append_review_state_segments(
     }
 }
 
-pub(super) fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &ReactionSummary) {
+pub(super) fn push_reactions_line(
+    builder: &mut DetailsBuilder,
+    reactions: &ReactionSummary,
+    can_react: bool,
+) {
+    if reactions.is_empty() && !can_react {
+        return;
+    }
     builder.push_blank();
     let mut segments = vec![DetailSegment::styled(
         "reactions: ",
@@ -2367,12 +2359,14 @@ pub(super) fn push_reactions_line(builder: &mut DetailsBuilder, reactions: &Reac
             segments.push(segment);
         }
     }
-    segments.push(DetailSegment::raw(if reactions.is_empty() {
-        " "
-    } else {
-        "  "
-    }));
-    segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+    if can_react {
+        segments.push(DetailSegment::raw(if reactions.is_empty() {
+            " "
+        } else {
+            "  "
+        }));
+        segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+    }
     builder.push_prefixed_wrapped_limited(
         segments,
         padding_prefix(DESCRIPTION_BODY_PADDING),

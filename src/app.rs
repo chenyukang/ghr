@@ -498,6 +498,25 @@ struct ReactionDialog {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailsTextPosition {
+    line: usize,
+    column: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailsTextDrag {
+    item_id: String,
+    start: DetailsTextPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailsTextSelection {
+    item_id: String,
+    start: DetailsTextPosition,
+    end: DetailsTextPosition,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LabelDialogMode {
     Add { repo: String },
@@ -1202,6 +1221,8 @@ struct AppState {
     startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
     mouse_capture_enabled: bool,
+    details_text_drag: Option<DetailsTextDrag>,
+    details_text_selection: Option<DetailsTextSelection>,
     help_dialog: bool,
     diff_return_state: Option<DiffReturnState>,
 }
@@ -3552,6 +3573,12 @@ fn handle_mouse_with_sync(
             app.update_split_drag(body_area, mouse.column);
             return app.finish_split_drag();
         }
+        MouseEventKind::Drag(MouseButton::Left) if app.details_text_drag.is_some() => {
+            handle_details_text_drag(app, mouse, layout.details);
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.details_text_drag.is_some() => {
+            finish_details_text_drag(app, mouse, layout.details);
+        }
         MouseEventKind::ScrollDown if rect_contains(layout.table, mouse.column, mouse.row) => {
             handle_list_scroll(app, layout.table, mouse_list_scroll_delta(app, 1));
         }
@@ -3609,6 +3636,9 @@ fn handle_left_click(
     store: Option<&SnapshotStore>,
     tx: Option<&UnboundedSender<AppMsg>>,
 ) {
+    app.details_text_drag = None;
+    app.details_text_selection = None;
+
     if let Some(view) = view_tab_at(app, layout.view_tabs, mouse.column, mouse.row) {
         let previous_view = app.active_view.clone();
         debug!(
@@ -3716,6 +3746,17 @@ fn handle_left_click(
         app.handle_diff_line_click(diff_line, None);
         return;
     }
+    if document.lines.get(line_index).is_some()
+        && let Some(item_id) = app.current_item().map(|item| item.id.clone())
+    {
+        app.details_text_drag = Some(DetailsTextDrag {
+            item_id,
+            start: DetailsTextPosition {
+                line: line_index,
+                column,
+            },
+        });
+    }
     if let Some(comment_index) = clicked_comment {
         debug!(comment_index, "comment clicked");
         app.select_comment(comment_index);
@@ -3723,6 +3764,158 @@ fn handle_left_click(
         debug!("description clicked");
         app.select_details_body_without_scroll();
     }
+}
+
+fn handle_details_text_drag(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(drag) = app.details_text_drag.clone() else {
+        return;
+    };
+    let Some(position) = details_text_position_from_mouse(app, mouse, area, true) else {
+        return;
+    };
+
+    app.focus = FocusTarget::Details;
+    app.search_active = false;
+    app.comment_search_active = false;
+    app.global_search_active = false;
+    app.filter_input_active = false;
+    app.details_text_selection = Some(DetailsTextSelection {
+        item_id: drag.item_id,
+        start: drag.start,
+        end: position,
+    });
+    app.status = "selecting details text; release to copy".to_string();
+}
+
+fn finish_details_text_drag(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    if let Some(position) = details_text_position_from_mouse(app, mouse, area, true)
+        && let Some(selection) = &mut app.details_text_selection
+    {
+        selection.end = position;
+    }
+    app.details_text_drag = None;
+
+    let Some(selection) = app.details_text_selection.clone() else {
+        return;
+    };
+    let Some(item_id) = app.current_item().map(|item| item.id.as_str()) else {
+        app.details_text_selection = None;
+        return;
+    };
+    if selection.item_id != item_id {
+        app.details_text_selection = None;
+        return;
+    }
+
+    let inner = block_inner(area);
+    let document = build_details_document(app, inner.width);
+    let selected = selected_details_text(&document, &selection);
+    if selected.trim().is_empty() {
+        app.details_text_selection = None;
+        app.status = "no details text selected".to_string();
+        return;
+    }
+
+    match copy_text_to_clipboard(&selected) {
+        Ok(()) => {
+            app.status = "copied selected details text".to_string();
+        }
+        Err(error) => {
+            app.status = format!("copy failed: {error}");
+        }
+    }
+}
+
+fn details_text_position_from_mouse(
+    app: &AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    clamp: bool,
+) -> Option<DetailsTextPosition> {
+    let inner = block_inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let (row, column) = if clamp {
+        let row = mouse.row.clamp(
+            inner.y,
+            inner.y.saturating_add(inner.height.saturating_sub(1)),
+        );
+        let column = mouse.column.clamp(
+            inner.x,
+            inner.x.saturating_add(inner.width.saturating_sub(1)),
+        );
+        (row, column)
+    } else {
+        if !rect_contains(inner, mouse.column, mouse.row) {
+            return None;
+        }
+        (mouse.row, mouse.column)
+    };
+
+    let document = build_details_document(app, inner.width);
+    if document.lines.is_empty() {
+        return None;
+    }
+    let visible_line = row.saturating_sub(inner.y);
+    let line = usize::from(app.details_scroll)
+        .saturating_add(usize::from(visible_line))
+        .min(document.lines.len().saturating_sub(1));
+    let line_width = display_width(&document.lines[line].to_string()).min(usize::from(u16::MAX));
+    let column = usize::from(column.saturating_sub(inner.x))
+        .min(line_width)
+        .min(usize::from(u16::MAX)) as u16;
+
+    Some(DetailsTextPosition { line, column })
+}
+
+fn selected_details_text(document: &DetailsDocument, selection: &DetailsTextSelection) -> String {
+    if document.lines.is_empty() {
+        return String::new();
+    }
+    let ((start_line, start_col), (end_line, end_col)) = ordered_details_text_range(selection);
+    let last_line = end_line.min(document.lines.len().saturating_sub(1));
+    if start_line > last_line {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    for line_index in start_line..=last_line {
+        let line = document.lines[line_index].to_string();
+        let line_width = display_width(&line);
+        let start = if line_index == start_line {
+            usize::from(start_col).min(line_width)
+        } else {
+            0
+        };
+        let end = if line_index == end_line {
+            usize::from(end_col).min(line_width)
+        } else {
+            line_width
+        };
+        lines.push(slice_display_columns(&line, start, end));
+    }
+
+    lines.join("\n").trim_end_matches('\n').to_string()
+}
+
+fn slice_display_columns(text: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let width = display_width_char(ch);
+        let next_column = column.saturating_add(width);
+        if next_column > start && column < end {
+            output.push(ch);
+        }
+        column = next_column;
+    }
+    output
 }
 
 fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
@@ -4811,7 +5004,8 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let document = build_details_document(app, area.width.saturating_sub(2));
+    let mut document = build_details_document(app, area.width.saturating_sub(2));
+    apply_details_text_selection(app, &mut document.lines);
 
     let details = Paragraph::new(Text::from(document.lines))
         .block(
@@ -4823,6 +5017,93 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
         .scroll((app.details_scroll, 0));
     frame.render_widget(details, area);
+}
+
+fn apply_details_text_selection(app: &AppState, lines: &mut [Line<'static>]) {
+    let Some(item_id) = app.current_item().map(|item| item.id.as_str()) else {
+        return;
+    };
+    let Some(selection) = app
+        .details_text_selection
+        .as_ref()
+        .filter(|selection| selection.item_id == item_id)
+    else {
+        return;
+    };
+    let ((start_line, start_col), (end_line, end_col)) = ordered_details_text_range(selection);
+    if start_line == end_line && start_col == end_col {
+        return;
+    }
+    if lines.is_empty() {
+        return;
+    }
+
+    let last_line = end_line.min(lines.len().saturating_sub(1));
+    for (line_index, line) in lines
+        .iter_mut()
+        .enumerate()
+        .take(last_line.saturating_add(1))
+        .skip(start_line)
+    {
+        let line_width = display_width(&line.to_string());
+        let selection_start = if line_index == start_line {
+            usize::from(start_col).min(line_width)
+        } else {
+            0
+        };
+        let selection_end = if line_index == end_line {
+            usize::from(end_col).min(line_width)
+        } else {
+            line_width
+        };
+        if selection_start >= selection_end {
+            continue;
+        }
+
+        let spans = std::mem::take(&mut line.spans);
+        line.spans = highlight_details_text_spans(spans, selection_start, selection_end);
+    }
+}
+
+fn ordered_details_text_range(selection: &DetailsTextSelection) -> ((usize, u16), (usize, u16)) {
+    let start = (selection.start.line, selection.start.column);
+    let end = (selection.end.line, selection.end.column);
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn highlight_details_text_spans(
+    spans: Vec<Span<'static>>,
+    selection_start: usize,
+    selection_end: usize,
+) -> Vec<Span<'static>> {
+    let mut highlighted = Vec::new();
+    let mut column = 0_usize;
+    for span in spans {
+        let base_style = span.style;
+        let selected_style = details_text_selection_style(base_style);
+        for ch in span.content.as_ref().chars() {
+            let width = display_width_char(ch);
+            let next_column = column.saturating_add(width);
+            let selected = next_column > selection_start && column < selection_end;
+            push_span_text(
+                &mut highlighted,
+                ch.to_string(),
+                if selected { selected_style } else { base_style },
+            );
+            column = next_column;
+        }
+    }
+    highlighted
+}
+
+fn details_text_selection_style(base: Style) -> Style {
+    base.fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn details_title() -> &'static str {
@@ -8725,6 +9006,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
             "click links / open / reply / edit / react",
             "run that action",
         ),
+        help_key_line("drag Details text", "copy rendered selection"),
         help_key_line("wheel over list/details/dialog", "scroll that area"),
         help_key_line("drag split border", "resize list/details ratio"),
     ]
@@ -9239,6 +9521,8 @@ impl AppState {
             startup_dialog: None,
             message_dialog: None,
             mouse_capture_enabled: true,
+            details_text_drag: None,
+            details_text_selection: None,
             help_dialog: false,
             diff_return_state: None,
             item_edit_dialog: None,
@@ -14041,7 +14325,7 @@ impl AppState {
             self.status = "nothing selected".to_string();
             return;
         };
-        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+        if !item.supports_reactions() {
             self.status = "reactions are available for issues and pull requests".to_string();
             return;
         }
@@ -23313,11 +23597,15 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn inbox_linked_issue_or_pr_description_renders_without_preview_truncation() {
-        let body = (1..=31)
-            .map(|index| format!("description line {index:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+    fn issue_or_pr_description_renders_without_preview_truncation() {
+        let body = format!(
+            "{}\n\n{}final tail marker",
+            (1..=31)
+                .map(|index| format!("description line {index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "word ".repeat(520)
+        );
         let mut item = notification_item("thread-1", true);
         item.body = Some(body.clone());
         let inbox_section = SectionSnapshot {
@@ -23346,6 +23634,12 @@ diff --git a/src/main.rs b/src/main.rs
             "inbox linked issue/PR descriptions should render fully: {inbox_rendered:?}"
         );
         assert!(
+            inbox_rendered
+                .iter()
+                .any(|line| line.contains("final tail marker")),
+            "inbox linked issue/PR descriptions should render past the old character preview limit: {inbox_rendered:?}"
+        );
+        assert!(
             !inbox_rendered.iter().any(|line| line.trim() == "..."),
             "inbox linked issue/PR descriptions should not show preview ellipsis: {inbox_rendered:?}"
         );
@@ -23359,14 +23653,20 @@ diff --git a/src/main.rs b/src/main.rs
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            normal_rendered.iter().any(|line| line.trim() == "..."),
-            "non-inbox descriptions should keep preview truncation: {normal_rendered:?}"
-        );
-        assert!(
-            !normal_rendered
+            normal_rendered
                 .iter()
                 .any(|line| line.contains("description line 31")),
-            "non-inbox descriptions should still be preview-limited: {normal_rendered:?}"
+            "issue/PR descriptions should render fully outside inbox too: {normal_rendered:?}"
+        );
+        assert!(
+            normal_rendered
+                .iter()
+                .any(|line| line.contains("final tail marker")),
+            "issue/PR descriptions should render past the old character preview limit outside inbox too: {normal_rendered:?}"
+        );
+        assert!(
+            !normal_rendered.iter().any(|line| line.trim() == "..."),
+            "issue/PR descriptions should not show preview ellipsis: {normal_rendered:?}"
         );
     }
 
@@ -23499,6 +23799,101 @@ diff --git a/src/main.rs b/src/main.rs
             "reactions:",
             "+ react",
             DetailAction::ReactItem,
+        );
+    }
+
+    #[test]
+    fn notification_details_hide_unavailable_item_reaction_action() {
+        let mut item = work_item(
+            "release-1",
+            "chenyukang/ghr",
+            0,
+            "ghr v0.6.0",
+            Some("chenyukang"),
+        );
+        item.kind = ItemKind::Notification;
+        item.number = None;
+        item.url = "https://github.com/chenyukang/ghr".to_string();
+        item.labels.clear();
+        item.state = None;
+        item.body = None;
+        item.extra = Some("Release".to_string());
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!rendered.contains("+ react"));
+        assert!(!rendered.contains("reactions:"));
+        assert!(
+            !document
+                .actions
+                .iter()
+                .any(|action| matches!(&action.action, DetailAction::ReactItem))
+        );
+    }
+
+    #[test]
+    fn notification_details_show_reaction_counts_without_unavailable_action() {
+        let mut item = work_item(
+            "release-1",
+            "chenyukang/ghr",
+            0,
+            "ghr v0.6.0",
+            Some("chenyukang"),
+        );
+        item.kind = ItemKind::Notification;
+        item.number = None;
+        item.url = "https://github.com/chenyukang/ghr".to_string();
+        item.labels.clear();
+        item.state = None;
+        item.body = None;
+        item.extra = Some("Release".to_string());
+        item.reactions.eyes = 1;
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("reactions: 👀 1"));
+        assert!(!rendered.contains("+ react"));
+        assert!(
+            !document
+                .actions
+                .iter()
+                .any(|action| matches!(&action.action, DetailAction::ReactItem))
         );
     }
 
@@ -23996,6 +24391,96 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(app.focus, FocusTarget::Details);
         assert_eq!(app.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
         assert_eq!(app.status, "pull request details focused");
+    }
+
+    #[test]
+    fn mouse_dragging_details_text_copies_selection_without_text_selection_mode() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].body = Some("alpha beta gamma\nsecond line".to_string());
+        app.focus_details();
+        app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+        let area = Rect::new(0, 0, 120, 40);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("alpha beta gamma"))
+            .expect("description line");
+        let rendered = document.lines[line_index].to_string();
+        let start_column = display_width(&rendered[..rendered.find("alpha").expect("alpha")]);
+        let end_column =
+            display_width(&rendered[..rendered.find("gamma").expect("gamma") + "gamma".len()]);
+        let row = inner.y + line_index as u16 - app.details_scroll;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + start_column as u16,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: inner.x + end_column as u16,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert!(app.mouse_capture_enabled);
+        assert_eq!(app.status, "selecting details text; release to copy");
+        let selection = app
+            .details_text_selection
+            .clone()
+            .expect("active details text selection");
+        assert_eq!(
+            selected_details_text(&document, &selection),
+            "alpha beta gamma"
+        );
+
+        let mut highlighted = build_details_document(&app, inner.width).lines;
+        apply_details_text_selection(&app, &mut highlighted);
+        let selected_line = &highlighted[line_index];
+        assert!(
+            selected_line
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::LightCyan)
+                    && span.content.contains("alpha beta gamma")),
+            "dragged text should be highlighted: {selected_line:?}"
+        );
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: inner.x + end_column as u16,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert!(app.mouse_capture_enabled);
+        assert!(app.details_text_drag.is_none());
+        assert_eq!(app.status, "copied selected details text");
+        assert_eq!(
+            selected_details_text(
+                &build_details_document(&app, inner.width),
+                app.details_text_selection
+                    .as_ref()
+                    .expect("selection remains visible after copy")
+            ),
+            "alpha beta gamma"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
-- Mouse support for tabs, lists, links, descriptions, comments, scrolling, text selection mode, and split resizing.
+- Mouse support for tabs, lists, links, descriptions, comments, details drag-copy, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
 - Uses the GitHub CLI for authentication, API access, and browser opening behavior.
@@ -179,6 +179,7 @@ Mouse behavior:
 - Click ghr or Sections tabs to switch views or sections.
 - Click list rows to select them and focus Details. Mouse hover and mouse wheel do not change PR/issue selection.
 - Click descriptions, comments, links, and visible actions in Details to focus or open them.
+- Drag text inside Details to copy that rendered selection to the clipboard without leaving mouse mode.
 - Scroll Details with the mouse wheel.
 - Drag the split between list and Details to resize panes; the ratio is saved.
 - Press `m` outside diff mode to temporarily disable TUI mouse capture for terminal text selection; press `m` again to restore mouse controls.

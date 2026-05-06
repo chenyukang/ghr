@@ -82,6 +82,7 @@ const shortcuts = [
   ["Mouse", "click list row", "Select item or diff file"],
   ["Mouse", "click descriptions/comments", "Focus the description or selected comment"],
   ["Mouse", "click links/actions", "Open links or run visible actions"],
+  ["Mouse", "drag Details text", "Copy the rendered selection to the clipboard"],
   ["Mouse", "wheel", "Scroll list, details, or dialog under the pointer"],
   ["Mouse", "drag split border", "Resize list/details ratio"],
 ];

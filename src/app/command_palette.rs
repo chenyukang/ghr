@@ -30,6 +30,7 @@ pub(super) enum PaletteAction {
     ShowHelp,
     ShowCommandPalette,
     Refresh,
+    RecentItems,
     SearchCurrentRepo,
     SwitchProject,
     ProjectAdd,
@@ -163,6 +164,13 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "General",
             "Refresh dashboard data from GitHub",
             PaletteAction::Refresh,
+        ),
+        palette_command(
+            "Recent Items",
+            "",
+            "General",
+            "Find recently viewed pull requests and issues",
+            PaletteAction::RecentItems,
         ),
         palette_command(
             "Mark Done",

@@ -65,7 +65,7 @@ use crate::model::{
     merge_refreshed_sections, repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
-use crate::state::{UiState, ViewSnapshot as SavedViewSnapshot};
+use crate::state::{MAX_RECENT_ITEMS, RecentItemState, UiState, ViewSnapshot as SavedViewSnapshot};
 
 mod command_palette;
 mod details;
@@ -1043,6 +1043,37 @@ struct ProjectSwitcher {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RecentItemsDialog {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentItem {
+    id: String,
+    kind: ItemKind,
+    repo: String,
+    number: u64,
+    title: String,
+    url: String,
+    visited_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailsVisitState {
+    item: RecentItem,
+    started_at: Instant,
+    recorded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentItemTarget {
+    view: String,
+    section_position: usize,
+    selected_position: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProjectRemoveDialog {
     query: String,
     selected: usize,
@@ -1323,6 +1354,7 @@ const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
+const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
@@ -1358,6 +1390,9 @@ struct AppState {
     filter_input_query: String,
     command_palette: Option<CommandPalette>,
     project_switcher: Option<ProjectSwitcher>,
+    recent_items_dialog: Option<RecentItemsDialog>,
+    recent_items: Vec<RecentItem>,
+    details_visit: Option<DetailsVisitState>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
     cache_clear_dialog: Option<CacheClearDialog>,
@@ -1706,6 +1741,7 @@ async fn run_loop(
         app.ensure_current_details_loading(tx);
         app.ensure_current_comments_auto_refresh(tx);
         app.ensure_current_diff_loading(tx);
+        app.sync_recent_details_visit(Instant::now());
         app.dismiss_expired_message_dialog(Instant::now());
 
         if !app.refreshing
@@ -1905,6 +1941,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.startup_dialog.is_some()
         || app.command_palette.is_some()
         || app.project_switcher.is_some()
+        || app.recent_items_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.cache_clear_dialog.is_some()
@@ -3099,6 +3136,11 @@ fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.recent_items_dialog.is_some() {
+        app.handle_recent_items_key(key);
+        return false;
+    }
+
     if app.project_add_dialog.is_some() {
         app.handle_project_add_key(key, config, paths, store, tx);
         return false;
@@ -3645,6 +3687,7 @@ fn refresh_scope_view_label(view: &str) -> String {
 }
 
 fn save_ui_state(app: &mut AppState, paths: &Paths) {
+    app.sync_recent_details_visit(Instant::now());
     if let Err(error) = app.ui_state().save(&paths.state_path) {
         let message = error.to_string();
         warn!(error = %message, "failed to save ui state");
@@ -3681,6 +3724,7 @@ fn handle_mouse_with_sync(
     }
     if app.command_palette.is_some()
         || app.project_switcher.is_some()
+        || app.recent_items_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.cache_clear_dialog.is_some()
@@ -4701,6 +4745,9 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
     if let Some(switcher) = &app.project_switcher {
         draw_project_switcher(frame, app, switcher, area);
+    }
+    if let Some(dialog) = &app.recent_items_dialog {
+        draw_recent_items_dialog(frame, app, dialog, area);
     }
     if let Some(dialog) = &app.project_add_dialog {
         draw_project_add_dialog(frame, dialog, area);
@@ -6583,6 +6630,122 @@ fn project_switcher_candidate_line(
     } else if current {
         Style::default()
             .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn draw_recent_items_dialog(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    dialog: &RecentItemsDialog,
+    area: Rect,
+) {
+    let candidates = app.recent_item_candidates_for_query(&dialog.query);
+    let dialog_area = recent_items_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = dialog.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(recent_items_input_line(&dialog.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        let message = if app.recent_items.is_empty() {
+            "No recent PRs or issues yet"
+        } else {
+            "No recent items found"
+        };
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(recent_item_candidate_line(
+                candidate,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Recent Items",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: jump    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&dialog.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn recent_items_area(area: Rect) -> Rect {
+    let width = centered_rect_width(90, area).max(40).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 18.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn recent_items_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "Type to search recent PRs and issues",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Cyan)),
+        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+    ])
+}
+
+fn recent_item_candidate_line(item: &RecentItem, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = truncate_inline(&format!("{marker}{}", recent_item_label(item)), width);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
@@ -8613,6 +8776,7 @@ fn runtime_info_body(app: &AppState, config: &Config, paths: &Paths) -> String {
             app.sections.len()
         ),
         format!("ignored items: {}", app.ignored_items.len()),
+        format!("recent items: {}", app.recent_items.len()),
     ]
     .join("\n")
 }
@@ -8763,6 +8927,26 @@ fn project_switcher_candidate_matches(candidate: &ViewTab, query: &str) -> bool 
             .unwrap_or(candidate.key.as_str()),
     );
     label.starts_with(&query) || key.starts_with(&query)
+}
+
+fn recent_item_matches_query(item: &RecentItem, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+
+    let haystack = format!(
+        "{} {} #{} {} {}",
+        recent_item_label(item),
+        item.repo,
+        item.number,
+        item.title,
+        item.url
+    )
+    .to_lowercase();
+    query
+        .split_whitespace()
+        .all(|token| fuzzy_score(token, &haystack).is_some())
 }
 
 fn project_add_repo_from_input(input: &str) -> Option<String> {
@@ -9890,6 +10074,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.reviewer_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
+        || app.recent_items_dialog.is_some()
         || app.cache_clear_dialog.is_some()
 }
 
@@ -9922,6 +10107,103 @@ fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
 
 fn item_supports_details_memory(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
+}
+
+fn recent_item_from_work_item(item: &WorkItem, visited_at: DateTime<Utc>) -> Option<RecentItem> {
+    if !item_supports_details_memory(item) {
+        return None;
+    }
+    Some(RecentItem {
+        id: item.id.clone(),
+        kind: item.kind,
+        repo: item.repo.clone(),
+        number: item.number?,
+        title: item.title.clone(),
+        url: item.url.clone(),
+        visited_at,
+    })
+}
+
+fn recent_items_from_saved(items: &[RecentItemState]) -> Vec<RecentItem> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let kind = match item.kind.as_str() {
+                "pull_request" => ItemKind::PullRequest,
+                "issue" => ItemKind::Issue,
+                _ => return None,
+            };
+            Some(RecentItem {
+                id: item.id.clone(),
+                kind,
+                repo: item.repo.clone(),
+                number: item.number?,
+                title: item.title.clone(),
+                url: item.url.clone(),
+                visited_at: item.visited_at?,
+            })
+        })
+        .collect()
+}
+
+fn recent_items_to_saved(items: &[RecentItem]) -> Vec<RecentItemState> {
+    items
+        .iter()
+        .map(|item| RecentItemState {
+            id: item.id.clone(),
+            kind: recent_item_state_kind(item.kind).to_string(),
+            repo: item.repo.clone(),
+            number: Some(item.number),
+            title: item.title.clone(),
+            url: item.url.clone(),
+            visited_at: Some(item.visited_at),
+        })
+        .collect()
+}
+
+fn recent_item_state_kind(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::PullRequest => "pull_request",
+        ItemKind::Issue => "issue",
+        ItemKind::Notification => "notification",
+    }
+}
+
+fn recent_item_display_kind(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::PullRequest => "pr",
+        ItemKind::Issue => "issue",
+        ItemKind::Notification => "item",
+    }
+}
+
+fn recent_item_key(item: &RecentItem) -> String {
+    format!(
+        "{}:{}:{}",
+        recent_item_state_kind(item.kind),
+        item.repo.to_ascii_lowercase(),
+        item.number
+    )
+}
+
+fn recent_item_label(item: &RecentItem) -> String {
+    format!(
+        "[{}] #{} {}.  {}",
+        recent_item_display_kind(item.kind),
+        item.number,
+        item.title,
+        item.repo
+    )
+}
+
+fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
+    if item.kind != recent.kind {
+        return false;
+    }
+    if item.repo.eq_ignore_ascii_case(&recent.repo) && item.number == Some(recent.number) {
+        return true;
+    }
+    !recent.id.is_empty() && item.id == recent.id
 }
 
 fn details_snapshot_hash(item: &WorkItem) -> String {
@@ -10024,6 +10306,9 @@ impl AppState {
             filter_input_query: String::new(),
             command_palette: None,
             project_switcher: None,
+            recent_items_dialog: None,
+            recent_items: recent_items_from_saved(&ui_state.recent_items),
+            details_visit: None,
             project_add_dialog: None,
             project_remove_dialog: None,
             cache_clear_dialog: None,
@@ -10178,6 +10463,7 @@ impl AppState {
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
             ignored_items: sorted_strings(&self.ignored_items),
+            recent_items: recent_items_to_saved(&self.recent_items),
         }
     }
 
@@ -11681,11 +11967,13 @@ impl AppState {
     }
 
     fn show_help_dialog(&mut self) {
+        self.finish_details_visit(Instant::now());
         self.help_dialog = true;
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
         self.command_palette = None;
+        self.recent_items_dialog = None;
         self.cache_clear_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
@@ -11699,8 +11987,10 @@ impl AppState {
     }
 
     fn show_command_palette(&mut self) {
+        self.finish_details_visit(Instant::now());
         self.command_palette = Some(CommandPalette::default());
         self.project_switcher = None;
+        self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
@@ -11815,6 +12105,10 @@ impl AppState {
                 trigger_refresh(self, config, store, tx);
                 false
             }
+            PaletteAction::RecentItems => {
+                self.show_recent_items_dialog();
+                false
+            }
             PaletteAction::SearchCurrentRepo => {
                 self.start_global_search_input();
                 false
@@ -11897,7 +12191,9 @@ impl AppState {
             .iter()
             .position(|candidate| candidate.key == self.active_view)
             .unwrap_or(0);
+        self.finish_details_visit(Instant::now());
         self.command_palette = None;
+        self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
@@ -11986,9 +12282,98 @@ impl AppState {
             .collect()
     }
 
-    fn show_project_add_dialog(&mut self) {
+    fn show_recent_items_dialog(&mut self) {
+        let now = Instant::now();
+        self.sync_recent_details_visit(now);
+        self.finish_details_visit(now);
         self.command_palette = None;
         self.project_switcher = None;
+        self.recent_items_dialog = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.recent_items_dialog = Some(RecentItemsDialog::default());
+        self.status = "recent items".to_string();
+    }
+
+    fn dismiss_recent_items_dialog(&mut self) {
+        self.recent_items_dialog = None;
+        self.status = "recent items closed".to_string();
+    }
+
+    fn handle_recent_items_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_recent_items_dialog(),
+            KeyCode::Enter => self.submit_recent_item_selection(),
+            KeyCode::Down | KeyCode::Tab => self.move_recent_item_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_recent_item_selection(-1),
+            KeyCode::PageDown => self.move_recent_item_selection(8),
+            KeyCode::PageUp => self.move_recent_item_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.recent_items_dialog {
+                    dialog.query.pop();
+                    dialog.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(dialog) = &mut self.recent_items_dialog {
+                    dialog.query.push(value);
+                    dialog.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_recent_item_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .recent_items_dialog
+            .as_ref()
+            .map(|dialog| dialog.query.clone())
+        else {
+            return;
+        };
+        let len = self.recent_item_candidates_for_query(&query).len();
+        if let Some(dialog) = &mut self.recent_items_dialog {
+            dialog.selected = move_wrapping(dialog.selected, len, delta);
+        }
+    }
+
+    fn submit_recent_item_selection(&mut self) {
+        self.sync_recent_details_visit(Instant::now());
+        let Some(dialog) = &self.recent_items_dialog else {
+            return;
+        };
+        let candidates = self.recent_item_candidates_for_query(&dialog.query);
+        let selected = dialog.selected.min(candidates.len().saturating_sub(1));
+        let Some(candidate) = candidates.get(selected).cloned() else {
+            self.status = "no matching recent item".to_string();
+            return;
+        };
+
+        self.jump_to_recent_item(&candidate);
+    }
+
+    fn recent_item_candidates_for_query(&self, query: &str) -> Vec<RecentItem> {
+        self.recent_items
+            .iter()
+            .filter(|item| recent_item_matches_query(item, query))
+            .cloned()
+            .collect()
+    }
+
+    fn show_project_add_dialog(&mut self) {
+        self.finish_details_visit(Instant::now());
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.recent_items_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
         self.search_active = false;
@@ -12189,8 +12574,10 @@ impl AppState {
                     .position(|candidate| candidate.name.eq_ignore_ascii_case(active))
             })
             .unwrap_or(0);
+        self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.cache_clear_dialog = None;
         self.project_remove_dialog = Some(ProjectRemoveDialog {
@@ -12325,8 +12712,10 @@ impl AppState {
     }
 
     fn show_cache_clear_dialog(&mut self) {
+        self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
         self.search_active = false;
@@ -14255,6 +14644,7 @@ impl AppState {
             if self.details_mode == DetailsMode::Conversation {
                 self.mark_current_details_viewed();
             }
+            self.sync_recent_details_visit(Instant::now());
             self.status = "details focused".to_string();
             debug!(
                 from = ?previous_focus,
@@ -14901,6 +15291,7 @@ impl AppState {
             self.status = "reactions are available for issues and pull requests".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.reaction_dialog = Some(ReactionDialog {
             target: ReactionTarget::Item,
             target_label: format!("{} #{} {}", item.repo, item.number.unwrap_or(0), item.title),
@@ -14948,6 +15339,7 @@ impl AppState {
         } else {
             ReactionTarget::IssueComment { index, comment_id }
         };
+        self.finish_details_visit(Instant::now());
         self.reaction_dialog = Some(ReactionDialog {
             target,
             target_label: format!("comment by {}", comment.author),
@@ -15089,6 +15481,7 @@ impl AppState {
                 return;
             }
         };
+        self.finish_details_visit(Instant::now());
         let item_kind = item.kind;
         self.search_active = false;
         self.global_search_active = false;
@@ -15143,6 +15536,7 @@ impl AppState {
                 _ => None,
             });
 
+        self.finish_details_visit(Instant::now());
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -15245,6 +15639,7 @@ impl AppState {
             self.status = "selected item is not an issue or pull request".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
@@ -15415,6 +15810,7 @@ impl AppState {
                 )
             })
             .unwrap_or((ReviewSubmitMode::New, String::new()));
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.global_search_active = false;
@@ -15672,6 +16068,7 @@ impl AppState {
             self.status = "selected item is not an issue or pull request".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -15805,6 +16202,7 @@ impl AppState {
             self.status = "selected item has no assignees".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -15952,6 +16350,7 @@ impl AppState {
             self.status = "selected item is not a pull request".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.search_active = false;
         self.global_search_active = false;
         self.comment_search_active = false;
@@ -16094,6 +16493,7 @@ impl AppState {
             self.status = "selected item cannot be commented on".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -16131,6 +16531,7 @@ impl AppState {
         }
         let author = comment.author.clone();
         let review_comment_id = comment.review.as_ref().and(comment.id);
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -16175,6 +16576,7 @@ impl AppState {
             return;
         };
 
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -16226,6 +16628,7 @@ impl AppState {
             }
         };
 
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -16307,6 +16710,7 @@ impl AppState {
         let repo = item.repo.clone();
         let cached_suggestions = self.label_suggestions_cache.get(&repo).cloned();
         let has_cached_suggestions = cached_suggestions.is_some();
+        self.finish_details_visit(Instant::now());
         self.label_dialog = Some(LabelDialog {
             mode: LabelDialogMode::Add { repo: repo.clone() },
             input: String::new(),
@@ -16345,6 +16749,7 @@ impl AppState {
             self.status = "labels are available for issues and pull requests".to_string();
             return;
         }
+        self.finish_details_visit(Instant::now());
         self.label_dialog = Some(LabelDialog {
             mode: LabelDialogMode::Remove { label },
             input: String::new(),
@@ -16490,6 +16895,7 @@ impl AppState {
             self.status = "select an item or repo before creating an issue".to_string();
             return;
         };
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -16555,6 +16961,7 @@ impl AppState {
             }
         };
 
+        self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
         self.search_active = false;
         self.comment_search_active = false;
@@ -17478,7 +17885,187 @@ impl AppState {
         }
     }
 
+    fn sync_recent_details_visit(&mut self, now: Instant) {
+        let active_item =
+            if self.focus == FocusTarget::Details && !self.recent_details_visit_suspended() {
+                self.current_item()
+                    .and_then(|item| recent_item_from_work_item(item, Utc::now()))
+            } else {
+                None
+            };
+
+        match active_item {
+            Some(item) => {
+                let same_item = self
+                    .details_visit
+                    .as_ref()
+                    .is_some_and(|visit| recent_item_key(&visit.item) == recent_item_key(&item));
+                if same_item {
+                    if let Some(visit) = &mut self.details_visit {
+                        visit.item = item;
+                    }
+                    self.promote_elapsed_details_visit(now);
+                } else {
+                    self.finish_details_visit(now);
+                    self.details_visit = Some(DetailsVisitState {
+                        item,
+                        started_at: now,
+                        recorded: false,
+                    });
+                }
+            }
+            None => self.finish_details_visit(now),
+        }
+    }
+
+    fn recent_details_visit_suspended(&self) -> bool {
+        self.setup_dialog.is_some()
+            || self.startup_dialog.is_some()
+            || self.message_dialog.is_some()
+            || self.help_dialog
+            || self.command_palette.is_some()
+            || self.project_switcher.is_some()
+            || self.recent_items_dialog.is_some()
+            || self.project_add_dialog.is_some()
+            || self.project_remove_dialog.is_some()
+            || self.cache_clear_dialog.is_some()
+            || self.search_active
+            || self.comment_search_active
+            || self.global_search_active
+            || self.filter_input_active
+            || self.comment_dialog.is_some()
+            || self.reaction_dialog.is_some()
+            || self.label_dialog.is_some()
+            || self.issue_dialog.is_some()
+            || self.pr_create_dialog.is_some()
+            || self.review_submit_dialog.is_some()
+            || self.item_edit_dialog.is_some()
+            || self.pr_action_dialog.is_some()
+            || self.milestone_dialog.is_some()
+            || self.assignee_dialog.is_some()
+            || self.reviewer_dialog.is_some()
+    }
+
+    fn promote_elapsed_details_visit(&mut self, now: Instant) {
+        let item = match &mut self.details_visit {
+            Some(visit)
+                if !visit.recorded && now.duration_since(visit.started_at) >= RECENT_ITEM_DWELL =>
+            {
+                visit.recorded = true;
+                let mut item = visit.item.clone();
+                item.visited_at = Utc::now();
+                Some(item)
+            }
+            _ => None,
+        };
+        if let Some(item) = item {
+            self.upsert_recent_item(item);
+        }
+    }
+
+    fn finish_details_visit(&mut self, now: Instant) {
+        let Some(visit) = self.details_visit.take() else {
+            return;
+        };
+        if now.duration_since(visit.started_at) < RECENT_ITEM_DWELL {
+            return;
+        }
+        let mut item = visit.item;
+        item.visited_at = Utc::now();
+        self.upsert_recent_item(item);
+    }
+
+    fn upsert_recent_item(&mut self, item: RecentItem) {
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            return;
+        }
+        let key = recent_item_key(&item);
+        self.recent_items
+            .retain(|existing| recent_item_key(existing) != key);
+        self.recent_items.push(item);
+        self.recent_items
+            .sort_by_key(|item| std::cmp::Reverse(item.visited_at));
+        self.recent_items.truncate(MAX_RECENT_ITEMS);
+    }
+
+    fn jump_to_recent_item(&mut self, item: &RecentItem) -> bool {
+        let Some(target) = self.find_recent_item_target(item) else {
+            self.status = format!("recent item not loaded: {}", recent_item_label(item));
+            return false;
+        };
+
+        self.sync_recent_details_visit(Instant::now());
+        self.remember_current_view_snapshot();
+        self.active_view = target.view;
+        self.set_current_section_position(target.section_position);
+        self.set_current_selected_position(target.selected_position);
+        self.clear_current_list_scroll_offset();
+        self.search_active = false;
+        self.search_query.clear();
+        self.comment_search_active = false;
+        self.comment_search_query.clear();
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.project_switcher = None;
+        self.recent_items_dialog = None;
+        self.details_mode = DetailsMode::Conversation;
+        self.diff_return_state = None;
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.focus_details();
+        self.status = format!("recent item opened: {}", recent_item_label(item));
+        true
+    }
+
+    fn find_recent_item_target(&self, recent: &RecentItem) -> Option<RecentItemTarget> {
+        let mut views = vec![self.active_view.clone()];
+        for view in self.view_tabs() {
+            if !views
+                .iter()
+                .any(|candidate| same_view_key(candidate, &view.key))
+            {
+                views.push(view.key);
+            }
+        }
+
+        views
+            .iter()
+            .find_map(|view| self.find_recent_item_target_in_view(view, recent))
+    }
+
+    fn find_recent_item_target_in_view(
+        &self,
+        view: &str,
+        recent: &RecentItem,
+    ) -> Option<RecentItemTarget> {
+        self.sections
+            .iter()
+            .filter(|section| same_view_key(&section_view_key(section), view))
+            .enumerate()
+            .find_map(|(section_position, section)| {
+                let mut selected_position = 0;
+                for item in &section.items {
+                    if self.ignored_items.contains(&item.id) {
+                        continue;
+                    }
+                    if recent_item_matches_work_item(recent, item) {
+                        return Some(RecentItemTarget {
+                            view: section_view_key(section),
+                            section_position,
+                            selected_position,
+                        });
+                    }
+                    selected_position += 1;
+                }
+                None
+            })
+    }
+
     fn save_current_conversation_details_state(&mut self) {
+        if self.focus == FocusTarget::Details {
+            self.finish_details_visit(Instant::now());
+        }
         if self.details_mode == DetailsMode::Diff {
             self.save_current_diff_mode_state();
             return;
@@ -20824,6 +21411,7 @@ diff --git a/src/github.rs b/src/github.rs
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
             ignored_items: Vec::new(),
+            recent_items: Vec::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -21941,6 +22529,151 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(app.command_palette.is_none());
         assert_eq!(app.cache_clear_dialog, Some(CacheClearDialog::default()));
         assert_eq!(app.status, "clear cache");
+    }
+
+    #[test]
+    fn command_palette_recent_items_opens_recent_picker() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        let paths = unique_test_paths("recent-items-open");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        app.command_palette = Some(CommandPalette {
+            query: "recent items".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.recent_items_dialog, Some(RecentItemsDialog::default()));
+        assert_eq!(app.status, "recent items");
+    }
+
+    #[test]
+    fn recent_items_only_records_details_visits_after_ten_seconds() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.focus_details();
+        app.details_visit
+            .as_mut()
+            .expect("details visit")
+            .started_at = Instant::now() - RECENT_ITEM_DWELL + Duration::from_millis(100);
+        app.focus_list();
+
+        assert!(app.recent_items.is_empty());
+        assert!(app.details_visit.is_none());
+
+        app.focus_details();
+        app.details_visit
+            .as_mut()
+            .expect("details visit")
+            .started_at = Instant::now() - RECENT_ITEM_DWELL - Duration::from_millis(100);
+        app.sync_recent_details_visit(Instant::now());
+
+        assert_eq!(app.recent_items.len(), 1);
+        assert_eq!(
+            recent_item_label(&app.recent_items[0]),
+            "[pr] #1 Compiler diagnostics.  rust-lang/rust"
+        );
+    }
+
+    #[test]
+    fn recent_items_filter_keeps_recent_order() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.recent_items = vec![
+            recent_item(
+                "pr-2",
+                ItemKind::PullRequest,
+                "nervosnetwork/fiber",
+                2,
+                "Fix funding state",
+                300,
+            ),
+            recent_item(
+                "issue-1",
+                ItemKind::Issue,
+                "chenyukang/ghr",
+                1,
+                "Fix fuzzy search",
+                200,
+            ),
+            recent_item(
+                "pr-1",
+                ItemKind::PullRequest,
+                "rust-lang/rust",
+                1,
+                "Compiler diagnostics",
+                100,
+            ),
+        ];
+
+        let matches = app
+            .recent_item_candidates_for_query("fix")
+            .into_iter()
+            .map(|item| recent_item_label(&item))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            matches,
+            vec![
+                "[pr] #2 Fix funding state.  nervosnetwork/fiber",
+                "[issue] #1 Fix fuzzy search.  chenyukang/ghr",
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_items_enter_jumps_to_loaded_issue() {
+        let mut issue = work_item(
+            "issue-10",
+            "chenyukang/ghr",
+            10,
+            "Recent bug",
+            Some("alice"),
+        );
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/chenyukang/ghr/issues/10".to_string();
+        let issue_section = SectionSnapshot {
+            key: "issues:triage".to_string(),
+            kind: SectionKind::Issues,
+            title: "Triage".to_string(),
+            filters: String::new(),
+            items: vec![issue.clone()],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::PullRequests,
+            vec![test_section(), issue_section],
+        );
+        app.recent_items = vec![recent_item_from_work_item(&issue, Utc::now()).unwrap()];
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active_view, "issues");
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("issue-10")
+        );
+        assert!(app.recent_items_dialog.is_none());
+        assert!(
+            app.status
+                .contains("[issue] #10 Recent bug.  chenyukang/ghr")
+        );
     }
 
     #[test]
@@ -32999,6 +33732,29 @@ diff --git a/d.rs b/d.rs
             unread: None,
             reason: None,
             extra: None,
+        }
+    }
+
+    fn recent_item(
+        id: &str,
+        kind: ItemKind,
+        repo: &str,
+        number: u64,
+        title: &str,
+        visited_at: i64,
+    ) -> RecentItem {
+        let path_kind = match kind {
+            ItemKind::Issue => "issues",
+            _ => "pull",
+        };
+        RecentItem {
+            id: id.to_string(),
+            kind,
+            repo: repo.to_string(),
+            number,
+            title: title.to_string(),
+            url: format!("https://github.com/{repo}/{path_kind}/{number}"),
+            visited_at: DateTime::from_timestamp(visited_at, 0).unwrap(),
         }
     }
 

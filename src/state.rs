@@ -3,12 +3,14 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 pub const DEFAULT_LIST_WIDTH_PERCENT: u16 = 50;
 pub const MIN_LIST_WIDTH_PERCENT: u16 = 30;
 pub const MAX_LIST_WIDTH_PERCENT: u16 = 85;
+pub const MAX_RECENT_ITEMS: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +33,7 @@ pub struct UiState {
     pub selected_diff_line: HashMap<String, usize>,
     pub diff_file_details_scroll: HashMap<String, u16>,
     pub ignored_items: Vec<String>,
+    pub recent_items: Vec<RecentItemState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +60,36 @@ impl ViewSnapshot {
         self.section_key = self.section_key.filter(|value| !value.trim().is_empty());
         self.item_id = self.item_id.filter(|value| !value.trim().is_empty());
         self
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecentItemState {
+    pub id: String,
+    pub kind: String,
+    pub repo: String,
+    pub number: Option<u64>,
+    pub title: String,
+    pub url: String,
+    pub visited_at: Option<DateTime<Utc>>,
+}
+
+impl RecentItemState {
+    fn normalized(mut self) -> Option<Self> {
+        self.id = self.id.trim().to_string();
+        self.repo = self.repo.trim().to_string();
+        self.title = self.title.trim().to_string();
+        self.url = self.url.trim().to_string();
+        self.kind = match self.kind.trim() {
+            "pr" | "pull_request" | "pull_requests" => "pull_request".to_string(),
+            "issue" | "issues" => "issue".to_string(),
+            _ => return None,
+        };
+        if self.repo.is_empty() || self.number.is_none() || self.visited_at.is_none() {
+            return None;
+        }
+        Some(self)
     }
 }
 
@@ -118,6 +151,7 @@ impl UiState {
         self.ignored_items
             .retain(|key| !key.trim().is_empty() && seen_ignored.insert(key.clone()));
         self.ignored_items.sort();
+        self.recent_items = normalized_recent_items(self.recent_items);
         self
     }
 }
@@ -143,12 +177,35 @@ impl Default for UiState {
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
             ignored_items: Vec::new(),
+            recent_items: Vec::new(),
         }
     }
 }
 
 pub fn clamp_list_width_percent(value: u16) -> u16 {
     value.clamp(MIN_LIST_WIDTH_PERCENT, MAX_LIST_WIDTH_PERCENT)
+}
+
+fn normalized_recent_items(items: Vec<RecentItemState>) -> Vec<RecentItemState> {
+    let mut normalized = items
+        .into_iter()
+        .filter_map(RecentItemState::normalized)
+        .collect::<Vec<_>>();
+    normalized.sort_by_key(|item| std::cmp::Reverse(item.visited_at));
+
+    let mut seen = HashSet::new();
+    normalized.retain(|item| seen.insert(recent_item_key(item)));
+    normalized.truncate(MAX_RECENT_ITEMS);
+    normalized
+}
+
+fn recent_item_key(item: &RecentItemState) -> String {
+    format!(
+        "{}:{}:{}",
+        item.kind,
+        item.repo.to_ascii_lowercase(),
+        item.number.unwrap_or_default()
+    )
 }
 
 #[cfg(test)]
@@ -201,6 +258,26 @@ mod tests {
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
             diff_file_details_scroll: HashMap::from([("issue-3::src/lib.rs".to_string(), 17)]),
             ignored_items: vec!["issue-2".to_string(), "issue-2".to_string(), String::new()],
+            recent_items: vec![
+                RecentItemState {
+                    id: "pr-1".to_string(),
+                    kind: "pull_request".to_string(),
+                    repo: "rust-lang/rust".to_string(),
+                    number: Some(1),
+                    title: "Compiler diagnostics".to_string(),
+                    url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+                    visited_at: Some(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+                },
+                RecentItemState {
+                    id: "pr-1-duplicate".to_string(),
+                    kind: "pr".to_string(),
+                    repo: "RUST-LANG/RUST".to_string(),
+                    number: Some(1),
+                    title: "Older duplicate".to_string(),
+                    url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+                    visited_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
+                },
+            ],
         }
         .save(&path)
         .expect("save state");
@@ -249,6 +326,18 @@ mod tests {
             Some(&17)
         );
         assert_eq!(state.ignored_items, vec!["issue-2"]);
+        assert_eq!(
+            state.recent_items,
+            vec![RecentItemState {
+                id: "pr-1".to_string(),
+                kind: "pull_request".to_string(),
+                repo: "rust-lang/rust".to_string(),
+                number: Some(1),
+                title: "Compiler diagnostics".to_string(),
+                url: "https://github.com/rust-lang/rust/pull/1".to_string(),
+                visited_at: Some(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            }]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -256,6 +345,47 @@ mod tests {
     #[test]
     fn default_split_ratio_is_even() {
         assert_eq!(UiState::default().list_width_percent, 50);
+    }
+
+    #[test]
+    fn recent_items_are_newest_first_deduped_and_limited() {
+        let state = UiState {
+            recent_items: (0..25)
+                .map(|number| RecentItemState {
+                    id: format!("pr-{number}"),
+                    kind: "pr".to_string(),
+                    repo: "chenyukang/ghr".to_string(),
+                    number: Some(number),
+                    title: format!("PR {number}"),
+                    url: format!("https://github.com/chenyukang/ghr/pull/{number}"),
+                    visited_at: Some(
+                        DateTime::from_timestamp(1_700_000_000 + number as i64, 0).unwrap(),
+                    ),
+                })
+                .chain([RecentItemState {
+                    id: "duplicate".to_string(),
+                    kind: "pull_request".to_string(),
+                    repo: "CHENYUKANG/GHR".to_string(),
+                    number: Some(24),
+                    title: "older duplicate".to_string(),
+                    url: "https://github.com/chenyukang/ghr/pull/24".to_string(),
+                    visited_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
+                }])
+                .collect(),
+            ..UiState::default()
+        }
+        .normalized();
+
+        assert_eq!(state.recent_items.len(), MAX_RECENT_ITEMS);
+        assert_eq!(
+            state.recent_items.first().and_then(|item| item.number),
+            Some(24)
+        );
+        assert_eq!(
+            state.recent_items.last().and_then(|item| item.number),
+            Some(5)
+        );
+        assert_eq!(state.recent_items[0].kind, "pull_request");
     }
 
     #[test]

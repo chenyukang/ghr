@@ -21,6 +21,7 @@
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
+- Recent Items command for jumping back to the last 20 PRs and issues where you spent at least 10 seconds in Details.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
@@ -88,6 +89,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Project Switch` | Filter configured repos by prefix and activate a project tab |
 | `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
+| `Recent Items` | Fuzzy search recently viewed PRs/issues and jump back to the selected item |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
@@ -95,7 +97,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Mark All Read` | Mark every GitHub inbox notification as read |
 | `Mute Thread` | Ignore future notifications for the selected inbox thread |
 | `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
-| `Info` | Show version, config/db/log paths, ghr process memory usage, ignored item count, and current UI state |
+| `Info` | Show version, config/db/log paths, ghr process memory usage, ignored/recent item counts, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |

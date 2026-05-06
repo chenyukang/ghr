@@ -27,7 +27,7 @@
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
-- Mouse support for tabs, lists, links, descriptions, comments, details drag-copy, scrolling, text selection mode, and split resizing.
+- Mouse support for tabs, lists, links, descriptions, comments, editor cursor placement, details drag-copy, scrolling, text selection mode, and split resizing.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
 - Uses the GitHub CLI for authentication, API access, and browser opening behavior.
@@ -146,6 +146,14 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Enter` in Reviewer Action | Submit the reviewer login list |
 | `Ctrl+Enter` | Send or update a comment/title/body from the editor dialog |
 | `Ctrl+Enter` in issue dialog | Create the issue |
+| `←` / `→` / `↑` / `↓` in editor dialogs | Move the cursor by character or rendered line |
+| `Home` / `End` in editor dialogs | Jump to the start or end of the current line |
+| `Ctrl+W` / `Alt+Backspace` in editor dialogs | Delete the previous word |
+| `Alt+B` / `Alt+F` / `Alt+D` in editor dialogs | Jump previous/next word, or delete the next word |
+| `Ctrl+U` / `Ctrl+K` in editor dialogs | Delete to the start or end of the current line |
+| `Ctrl+X` in editor dialogs | Delete the current line |
+| `Ctrl+Z` / `Cmd+Z` in editor dialogs | Undo text edits |
+| `Ctrl+R` / `Cmd+Shift+Z` in editor dialogs | Redo text edits |
 | `r` | Refresh from GitHub |
 | `q` / `Ctrl+C` | Save UI state and quit |
 
@@ -179,6 +187,7 @@ Mouse behavior:
 - Click ghr or Sections tabs to switch views or sections.
 - Click list rows to select them and focus Details. Mouse hover and mouse wheel do not change PR/issue selection.
 - Click descriptions, comments, links, and visible actions in Details to focus or open them.
+- Click inside comment, review, issue, or PR editor dialogs to place the edit cursor.
 - Drag text inside Details to copy that rendered selection to the clipboard without leaving mouse mode.
 - Scroll Details with the mouse wheel.
 - Drag the split between list and Details to resize panes; the ratio is saved.

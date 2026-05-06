@@ -30,6 +30,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
+use tui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, github_repo_from_remote_url};
 use crate::dirs::Paths;
@@ -372,10 +373,216 @@ enum CommentDialogMode {
     },
 }
 
+#[derive(Debug, Clone)]
+struct EditorText {
+    textarea: TextArea<'static>,
+    text: String,
+}
+
+impl PartialEq for EditorText {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.textarea.cursor() == other.textarea.cursor()
+    }
+}
+
+impl Eq for EditorText {}
+
+impl PartialEq<&str> for EditorText {
+    fn eq(&self, other: &&str) -> bool {
+        self.text() == *other
+    }
+}
+
+impl EditorText {
+    fn empty() -> Self {
+        Self::from_text("")
+    }
+
+    fn from_text(text: impl AsRef<str>) -> Self {
+        let lines = text.as_ref().split('\n').map(str::to_string).collect();
+        let mut editor = Self::from_lines(lines);
+        editor.move_to_end();
+        editor
+    }
+
+    fn from_lines(mut lines: Vec<String>) -> Self {
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let mut textarea = TextArea::new(lines);
+        textarea.set_wrap_mode(WrapMode::Glyph);
+        textarea.set_style(modal_text_style());
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default().bg(Color::LightMagenta).fg(Color::Black));
+        let text = textarea.lines().join("\n");
+        Self { textarea, text }
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        self.text()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.text.contains(needle)
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    #[cfg(test)]
+    fn set_text(&mut self, text: impl AsRef<str>) {
+        *self = Self::from_text(text);
+    }
+
+    fn sync_text(&mut self) {
+        self.text = self.textarea.lines().join("\n");
+    }
+
+    fn cursor_byte(&self) -> usize {
+        let (row, col) = self.textarea.cursor();
+        let mut offset = 0_usize;
+        for line in self.textarea.lines().iter().take(row) {
+            offset = offset.saturating_add(line.len()).saturating_add(1);
+        }
+        let Some(line) = self.textarea.lines().get(row) else {
+            return offset;
+        };
+        offset.saturating_add(byte_for_char_column(line, col))
+    }
+
+    fn set_cursor_byte(&mut self, cursor: usize) {
+        let cursor = clamp_text_cursor(self.text(), cursor);
+        let mut remaining = cursor;
+        for (row, line) in self.textarea.lines().iter().enumerate() {
+            if remaining <= line.len() {
+                let col = line[..remaining].chars().count();
+                self.move_to(row, col);
+                return;
+            }
+            remaining = remaining.saturating_sub(line.len().saturating_add(1));
+        }
+        self.move_to_end();
+    }
+
+    fn move_to(&mut self, row: usize, col: usize) {
+        self.textarea.move_cursor(CursorMove::Jump(
+            row.min(usize::from(u16::MAX)) as u16,
+            col.min(usize::from(u16::MAX)) as u16,
+        ));
+    }
+
+    fn move_to_end(&mut self) {
+        self.textarea.move_cursor(CursorMove::Bottom);
+        self.textarea.move_cursor(CursorMove::End);
+    }
+
+    fn input_key(&mut self, key: KeyEvent, multiline: bool) -> bool {
+        match key.code {
+            KeyCode::Enter if !multiline => false,
+            KeyCode::Enter => {
+                self.textarea.input(key);
+                self.sync_text();
+                true
+            }
+            KeyCode::Char('m') if !multiline && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                false
+            }
+            KeyCode::Char('z' | 'Z') if editor_redo_key(key) => {
+                self.textarea.redo();
+                self.sync_text();
+                true
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.textarea.delete_line_by_head();
+                self.sync_text();
+                true
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_current_line();
+                true
+            }
+            KeyCode::Char('z' | 'Z') if editor_undo_key(key) => {
+                self.textarea.undo();
+                self.sync_text();
+                true
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.textarea.redo();
+                self.sync_text();
+                true
+            }
+            KeyCode::PageDown | KeyCode::PageUp => false,
+            KeyCode::Char(_)
+            | KeyCode::Tab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End => {
+                self.textarea.input(key);
+                self.sync_text();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn delete_current_line(&mut self) -> bool {
+        let (row, _) = self.textarea.cursor();
+        let old_lines = self.textarea.lines();
+        if old_lines.len() == 1 {
+            if old_lines.first().is_none_or(String::is_empty) {
+                return false;
+            }
+            *self = Self::from_lines(vec![String::new()]);
+            return true;
+        }
+
+        let mut lines = old_lines.to_vec();
+        if row < lines.len() {
+            lines.remove(row);
+        }
+        let next_row = row.min(lines.len().saturating_sub(1));
+        *self = Self::from_lines(lines);
+        self.move_to(next_row, 0);
+        true
+    }
+}
+
+fn editor_undo_key(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn editor_redo_key(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn byte_for_char_column(text: &str, column: usize) -> usize {
+    text.char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommentDialog {
     mode: CommentDialogMode,
-    body: String,
+    body: EditorText,
     scroll: u16,
 }
 
@@ -391,7 +598,7 @@ struct PendingCommentSubmit {
 struct ReviewSubmitDialog {
     item: WorkItem,
     event: PullRequestReviewEvent,
-    body: String,
+    body: EditorText,
     scroll: u16,
     mode: ReviewSubmitMode,
 }
@@ -569,10 +776,10 @@ impl IssueDialogField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IssueDialog {
-    repo: String,
-    title: String,
-    labels: String,
-    body: String,
+    repo: EditorText,
+    title: EditorText,
+    labels: EditorText,
+    body: EditorText,
     field: IssueDialogField,
     body_scroll: u16,
 }
@@ -606,8 +813,8 @@ struct PrCreateDialog {
     repo: String,
     local_dir: PathBuf,
     branch: String,
-    title: String,
-    body: String,
+    title: EditorText,
+    body: EditorText,
     field: PrCreateField,
     body_scroll: u16,
 }
@@ -1417,6 +1624,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -3491,9 +3699,11 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.issue_dialog.is_some() {
+        handle_issue_dialog_mouse(app, mouse, area);
         return false;
     }
     if app.pr_create_dialog.is_some() {
+        handle_pr_create_dialog_mouse(app, mouse, area);
         return false;
     }
     if app.reaction_dialog.is_some() {
@@ -3503,6 +3713,7 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.review_submit_dialog.is_some() {
+        handle_review_submit_dialog_mouse(app, mouse, area);
         return false;
     }
     if app.milestone_dialog.is_some() {
@@ -3512,18 +3723,7 @@ fn handle_mouse_with_sync(
         return false;
     }
     if let Some(dialog) = &app.comment_dialog {
-        let dialog_area = comment_dialog_area(dialog, area);
-        if rect_contains(dialog_area, mouse.column, mouse.row) {
-            match mouse.kind {
-                MouseEventKind::ScrollDown => {
-                    app.scroll_comment_dialog(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area))
-                }
-                MouseEventKind::ScrollUp => {
-                    app.scroll_comment_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area))
-                }
-                _ => {}
-            }
-        }
+        handle_comment_dialog_mouse(app, dialog.clone(), mouse, area);
         return false;
     }
 
@@ -3619,6 +3819,252 @@ fn handle_startup_dialog_mouse(
     }
 
     false
+}
+
+fn handle_comment_dialog_mouse(
+    app: &mut AppState,
+    dialog: CommentDialog,
+    mouse: MouseEvent,
+    area: Rect,
+) {
+    let dialog_area = comment_dialog_area(&dialog, area);
+    if !rect_contains(dialog_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.scroll_comment_dialog(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area));
+        }
+        MouseEventKind::ScrollUp => {
+            app.scroll_comment_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let inner = block_inner(dialog_area);
+            if !rect_contains(inner, mouse.column, mouse.row) {
+                return;
+            }
+            let line = usize::from(dialog.scroll).saturating_add(usize::from(mouse.row - inner.y));
+            let column = mouse.column.saturating_sub(inner.x);
+            if let Some(active) = &mut app.comment_dialog {
+                let cursor = comment_dialog_cursor_for_position(
+                    active.body.text(),
+                    inner.width.max(1),
+                    line,
+                    column,
+                );
+                active.body.set_cursor_byte(cursor);
+            }
+            app.scroll_comment_dialog_to_cursor_in_area(Some(area));
+            app.status = "comment cursor moved".to_string();
+        }
+        _ => {}
+    }
+}
+
+fn handle_review_submit_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(dialog) = app.review_submit_dialog.clone() else {
+        return;
+    };
+    let dialog_area = review_submit_dialog_area(&dialog, area);
+    if !rect_contains(dialog_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.scroll_review_submit_dialog(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area));
+        }
+        MouseEventKind::ScrollUp => {
+            app.scroll_review_submit_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let inner = block_inner(dialog_area);
+            let header_height = 3_u16.min(inner.height);
+            let editor_area = Rect::new(
+                inner.x,
+                inner.y.saturating_add(header_height),
+                inner.width,
+                inner.height.saturating_sub(header_height),
+            );
+            if !rect_contains(editor_area, mouse.column, mouse.row) {
+                return;
+            }
+            let line =
+                usize::from(dialog.scroll).saturating_add(usize::from(mouse.row - editor_area.y));
+            let column = mouse.column.saturating_sub(editor_area.x);
+            if let Some(active) = &mut app.review_submit_dialog {
+                let cursor = comment_dialog_cursor_for_position(
+                    active.body.text(),
+                    editor_area.width.max(1),
+                    line,
+                    column,
+                );
+                active.body.set_cursor_byte(cursor);
+            }
+            app.scroll_review_submit_dialog_to_cursor_in_area(Some(area));
+            app.status = "review summary cursor moved".to_string();
+        }
+        _ => {}
+    }
+}
+
+fn handle_issue_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(dialog) = app.issue_dialog.clone() else {
+        return;
+    };
+    let dialog_area = issue_dialog_area(area);
+    if !rect_contains(dialog_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.scroll_issue_dialog_body(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area));
+        }
+        MouseEventKind::ScrollUp => {
+            app.scroll_issue_dialog_body(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let inner = block_inner(dialog_area);
+            if !rect_contains(inner, mouse.column, mouse.row) {
+                return;
+            }
+            let row = mouse.row.saturating_sub(inner.y);
+            if let Some(active) = &mut app.issue_dialog {
+                match row {
+                    0 => {
+                        active.field = IssueDialogField::Repo;
+                        let cursor = issue_dialog_mouse_input_cursor(
+                            "Repo",
+                            active.repo.text(),
+                            inner,
+                            mouse,
+                        );
+                        active.repo.set_cursor_byte(cursor);
+                        app.status = "editing issue repo".to_string();
+                    }
+                    2 => {
+                        active.field = IssueDialogField::Title;
+                        let cursor = issue_dialog_mouse_input_cursor(
+                            "Title",
+                            active.title.text(),
+                            inner,
+                            mouse,
+                        );
+                        active.title.set_cursor_byte(cursor);
+                        app.status = "editing issue title".to_string();
+                    }
+                    4 => {
+                        active.field = IssueDialogField::Labels;
+                        let cursor = issue_dialog_mouse_input_cursor(
+                            "Labels",
+                            active.labels.text(),
+                            inner,
+                            mouse,
+                        );
+                        active.labels.set_cursor_byte(cursor);
+                        app.status = "editing issue labels".to_string();
+                    }
+                    6 => {
+                        active.field = IssueDialogField::Body;
+                        app.status = "editing issue body".to_string();
+                    }
+                    row if row >= 7 => {
+                        active.field = IssueDialogField::Body;
+                        let line = usize::from(dialog.body_scroll)
+                            .saturating_add(usize::from(row.saturating_sub(7)));
+                        let column = mouse.column.saturating_sub(inner.x);
+                        let cursor = comment_dialog_cursor_for_position(
+                            active.body.text(),
+                            inner.width.max(1),
+                            line,
+                            column,
+                        );
+                        active.body.set_cursor_byte(cursor);
+                        app.status = "editing issue body".to_string();
+                    }
+                    _ => {}
+                }
+            }
+            app.scroll_issue_dialog_to_cursor_in_area(Some(area));
+        }
+        _ => {}
+    }
+}
+
+fn handle_pr_create_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(dialog) = app.pr_create_dialog.clone() else {
+        return;
+    };
+    let dialog_area = pr_create_dialog_area(area);
+    if !rect_contains(dialog_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.scroll_pr_create_dialog_body(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area));
+        }
+        MouseEventKind::ScrollUp => {
+            app.scroll_pr_create_dialog_body(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let inner = block_inner(dialog_area);
+            if !rect_contains(inner, mouse.column, mouse.row) {
+                return;
+            }
+            let row = mouse.row.saturating_sub(inner.y);
+            if let Some(active) = &mut app.pr_create_dialog {
+                match row {
+                    4 => {
+                        active.field = PrCreateField::Title;
+                        let cursor = issue_dialog_mouse_input_cursor(
+                            "Title",
+                            active.title.text(),
+                            inner,
+                            mouse,
+                        );
+                        active.title.set_cursor_byte(cursor);
+                        app.status = "editing pull request title".to_string();
+                    }
+                    6 => {
+                        active.field = PrCreateField::Body;
+                        app.status = "editing pull request body".to_string();
+                    }
+                    row if row >= 7 => {
+                        active.field = PrCreateField::Body;
+                        let line = usize::from(dialog.body_scroll)
+                            .saturating_add(usize::from(row.saturating_sub(7)));
+                        let column = mouse.column.saturating_sub(inner.x);
+                        let cursor = comment_dialog_cursor_for_position(
+                            active.body.text(),
+                            inner.width.max(1),
+                            line,
+                            column,
+                        );
+                        active.body.set_cursor_byte(cursor);
+                        app.status = "editing pull request body".to_string();
+                    }
+                    _ => {}
+                }
+            }
+            app.scroll_pr_create_dialog_to_cursor_in_area(Some(area));
+        }
+        _ => {}
+    }
+}
+
+fn issue_dialog_mouse_input_cursor(
+    label: &'static str,
+    value: &str,
+    inner: Rect,
+    mouse: MouseEvent,
+) -> usize {
+    let prefix_width =
+        display_width(&issue_dialog_field_prefix(label)).min(usize::from(u16::MAX)) as u16;
+    let input_start = inner.x.saturating_add(prefix_width);
+    cursor_for_inline_column(value, mouse.column.saturating_sub(input_start))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6923,13 +7369,14 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     let inner = block_inner(dialog_area);
     let editor_width = inner.width.max(1);
     let editor_height = issue_dialog_body_editor_height(dialog_area);
-    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
-    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
     let scroll = dialog.body_scroll.min(max_scroll);
     let mut lines = vec![
         issue_dialog_field_input_line(
             "Repo",
-            &dialog.repo,
+            dialog.repo.text(),
             IssueDialogField::Repo,
             dialog.field,
             editor_width,
@@ -6937,7 +7384,7 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
         issue_dialog_separator_line(editor_width),
         issue_dialog_field_input_line(
             "Title",
-            &dialog.title,
+            dialog.title.text(),
             IssueDialogField::Title,
             dialog.field,
             editor_width,
@@ -6945,7 +7392,7 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
         issue_dialog_separator_line(editor_width),
         issue_dialog_field_input_line(
             "Labels",
-            &dialog.labels,
+            dialog.labels.text(),
             IssueDialogField::Labels,
             dialog.field,
             editor_width,
@@ -6966,7 +7413,7 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create  Enter: newline/next  Esc: cancel"
+        "Tab: field  Ctrl+Enter: create  arrows/Home/End edit  Ctrl+W/U/K/X word/line  click cursor"
     };
 
     let block = Block::default()
@@ -7004,8 +7451,9 @@ fn draw_pr_create_dialog(
     let inner = block_inner(dialog_area);
     let editor_width = inner.width.max(1);
     let editor_height = pr_create_dialog_body_editor_height(dialog_area);
-    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
-    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
     let scroll = dialog.body_scroll.min(max_scroll);
     let mut lines = vec![
         key_value_line("repo", dialog.repo.clone()),
@@ -7014,7 +7462,7 @@ fn draw_pr_create_dialog(
         issue_dialog_separator_line(editor_width),
         pr_create_dialog_field_input_line(
             "Title",
-            &dialog.title,
+            dialog.title.text(),
             PrCreateField::Title,
             dialog.field,
             editor_width,
@@ -7035,7 +7483,7 @@ fn draw_pr_create_dialog(
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create PR  Enter: newline/next  Esc: cancel"
+        "Tab: field  Ctrl+Enter: create PR  arrows/Home/End edit  Ctrl+W/U/K/X word/line  click cursor"
     };
 
     let block = Block::default()
@@ -7216,6 +7664,101 @@ fn issue_dialog_input_text(value: &str, width: u16) -> String {
     }
 }
 
+fn clamp_text_cursor(text: &str, cursor: usize) -> usize {
+    if cursor >= text.len() {
+        return text.len();
+    }
+    let mut cursor = cursor;
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    cursor
+}
+
+fn text_before_cursor_width(text: &str, cursor: usize) -> u16 {
+    display_width(&text[..clamp_text_cursor(text, cursor)]).min(usize::from(u16::MAX)) as u16
+}
+
+fn cursor_for_inline_column(text: &str, column: u16) -> usize {
+    let target = usize::from(column);
+    let mut current = 0_usize;
+    for (index, ch) in text.char_indices() {
+        if target <= current {
+            return index;
+        }
+        let char_width = display_width_char(ch);
+        let next = current.saturating_add(char_width);
+        if target < next {
+            let midpoint = current.saturating_add(char_width / 2);
+            return if target <= midpoint {
+                index
+            } else {
+                index.saturating_add(ch.len_utf8())
+            };
+        }
+        current = next;
+    }
+    text.len()
+}
+
+fn comment_dialog_cursor_for_position(
+    text: &str,
+    width: u16,
+    target_line: usize,
+    target_column: u16,
+) -> usize {
+    let width = usize::from(width.max(1));
+    let target_column = usize::from(target_column);
+    let mut line = 0_usize;
+    let mut column = 0_usize;
+
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            if line == target_line {
+                return index;
+            }
+            line = line.saturating_add(1);
+            column = 0;
+            continue;
+        }
+
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            if line == target_line {
+                return index;
+            }
+            line = line.saturating_add(1);
+            column = 0;
+        }
+
+        if line == target_line {
+            if target_column <= column {
+                return index;
+            }
+            let next = column.saturating_add(char_width);
+            if target_column < next {
+                let midpoint = column.saturating_add(char_width / 2);
+                return if target_column <= midpoint {
+                    index
+                } else {
+                    index.saturating_add(ch.len_utf8())
+                };
+            }
+        }
+
+        column = column.saturating_add(char_width);
+        if column == width {
+            if line == target_line && target_column >= width {
+                return index.saturating_add(ch.len_utf8());
+            }
+            line = line.saturating_add(1);
+            column = 0;
+        }
+    }
+
+    text.len()
+}
+
 fn issue_dialog_cursor_position(
     dialog: &IssueDialog,
     scroll: u16,
@@ -7233,33 +7776,27 @@ fn issue_dialog_cursor_position(
         display_width(&issue_dialog_field_prefix("Labels")).min(usize::from(u16::MAX)) as u16;
     match dialog.field {
         IssueDialogField::Repo => Some(Position::new(
-            clamp_x(
-                inner
-                    .x
-                    .saturating_add(repo_prefix_width)
-                    .saturating_add(display_width(&dialog.repo).min(usize::from(u16::MAX)) as u16),
-            ),
+            clamp_x(inner.x.saturating_add(repo_prefix_width).saturating_add(
+                text_before_cursor_width(dialog.repo.text(), dialog.repo.cursor_byte()),
+            )),
             inner.y,
         )),
         IssueDialogField::Title => Some(Position::new(
-            clamp_x(
-                inner
-                    .x
-                    .saturating_add(title_prefix_width)
-                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
-            ),
+            clamp_x(inner.x.saturating_add(title_prefix_width).saturating_add(
+                text_before_cursor_width(dialog.title.text(), dialog.title.cursor_byte()),
+            )),
             inner.y.saturating_add(2),
         )),
-        IssueDialogField::Labels => {
-            Some(Position::new(
-                clamp_x(inner.x.saturating_add(labels_prefix_width).saturating_add(
-                    display_width(&dialog.labels).min(usize::from(u16::MAX)) as u16,
-                )),
-                inner.y.saturating_add(4),
-            ))
-        }
+        IssueDialogField::Labels => Some(Position::new(
+            clamp_x(inner.x.saturating_add(labels_prefix_width).saturating_add(
+                text_before_cursor_width(dialog.labels.text(), dialog.labels.cursor_byte()),
+            )),
+            inner.y.saturating_add(4),
+        )),
         IssueDialogField::Body => {
-            let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
+            let body = dialog.body.text();
+            let (line, column) =
+                comment_dialog_cursor_offset_at(body, dialog.body.cursor_byte(), editor_width);
             let visible_end = scroll.saturating_add(editor_height.max(1));
             if line < scroll || line >= visible_end {
                 return None;
@@ -7285,16 +7822,15 @@ fn pr_create_dialog_cursor_position(
         display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
     match dialog.field {
         PrCreateField::Title => Some(Position::new(
-            clamp_x(
-                inner
-                    .x
-                    .saturating_add(title_prefix_width)
-                    .saturating_add(display_width(&dialog.title).min(usize::from(u16::MAX)) as u16),
-            ),
+            clamp_x(inner.x.saturating_add(title_prefix_width).saturating_add(
+                text_before_cursor_width(dialog.title.text(), dialog.title.cursor_byte()),
+            )),
             inner.y.saturating_add(4),
         )),
         PrCreateField::Body => {
-            let (line, column) = comment_dialog_cursor_offset(&dialog.body, editor_width);
+            let body = dialog.body.text();
+            let (line, column) =
+                comment_dialog_cursor_offset_at(body, dialog.body.cursor_byte(), editor_width);
             let visible_end = scroll.saturating_add(editor_height.max(1));
             if line < scroll || line >= visible_end {
                 return None;
@@ -8425,8 +8961,9 @@ fn draw_review_submit_dialog(frame: &mut Frame<'_>, dialog: &ReviewSubmitDialog,
     let header_height = 3.min(inner.height);
     let editor_height = inner.height.saturating_sub(header_height).max(1);
     let editor_width = inner.width.max(1);
-    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
-    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
     let scroll = dialog.scroll.min(max_scroll);
     let mut lines = vec![
         key_value_line("event", review_event_selector_label(dialog.event)),
@@ -8464,11 +9001,12 @@ fn draw_review_submit_dialog(frame: &mut Frame<'_>, dialog: &ReviewSubmitDialog,
         area,
         dialog_area,
         modal_footer_line(
-            "Tab/1/2/3: event    Ctrl+Enter: submit    Ctrl+P: pending    Esc: cancel",
+            "Tab/1/2/3: event    Ctrl+Enter: submit    arrows/Home/End/Ctrl+W/U/K/X edit    click cursor",
         ),
     );
     if let Some(position) = review_submit_cursor_position(
-        &dialog.body,
+        body,
+        dialog.body.cursor_byte(),
         scroll,
         dialog_area,
         editor_width,
@@ -8513,8 +9051,9 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     let inner = block_inner(dialog_area);
     let editor_height = inner.height.max(1);
     let editor_width = inner.width.max(1);
-    let body_lines = comment_dialog_body_lines(&dialog.body, editor_width);
-    let max_scroll = max_comment_dialog_scroll(&dialog.body, editor_width, editor_height);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
     let scroll = dialog.scroll.min(max_scroll);
     let mut lines = body_lines
         .into_iter()
@@ -8526,9 +9065,9 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
         lines.push(Line::from(""));
     }
     let footer = if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
-        "Ctrl+Enter: update    Enter: newline    Pg/Wheel: scroll    Esc: cancel"
+        "Ctrl+Enter: update    arrows/Home/End edit    Ctrl+W/U/K/X word/line    click cursor"
     } else {
-        "Ctrl+Enter: send    Enter: newline    Pg/Wheel: scroll    Esc: cancel"
+        "Ctrl+Enter: send    arrows/Home/End edit    Ctrl+W/U/K/X word/line    click cursor"
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -8548,7 +9087,8 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     frame.render_widget(paragraph, dialog_area);
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) = comment_dialog_cursor_position(
-        &dialog.body,
+        body,
+        dialog.body.cursor_byte(),
         scroll,
         dialog_area,
         editor_width,
@@ -8560,6 +9100,7 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
 
 fn comment_dialog_cursor_position(
     body: &str,
+    cursor: usize,
     scroll: u16,
     area: Rect,
     editor_width: u16,
@@ -8568,7 +9109,7 @@ fn comment_dialog_cursor_position(
     let inner = block_inner(area);
     let width = editor_width.max(1);
     let height = editor_height.max(1);
-    let (line, column) = comment_dialog_cursor_offset(body, width);
+    let (line, column) = comment_dialog_cursor_offset_at(body, cursor, width);
     let visible_end = scroll.saturating_add(height);
     if line < scroll || line >= visible_end {
         return None;
@@ -8584,7 +9125,7 @@ fn comment_dialog_cursor_position(
 fn comment_dialog_area(dialog: &CommentDialog, area: Rect) -> Rect {
     let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
     let editor_width = width.saturating_sub(2).max(1);
-    let editor_height = comment_dialog_desired_editor_height(&dialog.body, editor_width);
+    let editor_height = comment_dialog_desired_editor_height(dialog.body.text(), editor_width);
     let desired_height = editor_height.saturating_add(2);
     let min_height = comment_dialog_min_height(area);
     let max_height = comment_dialog_max_height(area);
@@ -8595,7 +9136,7 @@ fn comment_dialog_area(dialog: &CommentDialog, area: Rect) -> Rect {
 fn review_submit_dialog_area(dialog: &ReviewSubmitDialog, area: Rect) -> Rect {
     let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
     let editor_width = width.saturating_sub(2).max(1);
-    let editor_height = comment_dialog_desired_editor_height(&dialog.body, editor_width);
+    let editor_height = comment_dialog_desired_editor_height(dialog.body.text(), editor_width);
     let desired_height = editor_height.saturating_add(5);
     let min_height = comment_dialog_min_height(area).saturating_add(1);
     let max_height = comment_dialog_max_height(area);
@@ -8605,6 +9146,7 @@ fn review_submit_dialog_area(dialog: &ReviewSubmitDialog, area: Rect) -> Rect {
 
 fn review_submit_cursor_position(
     body: &str,
+    cursor: usize,
     scroll: u16,
     area: Rect,
     editor_width: u16,
@@ -8612,7 +9154,7 @@ fn review_submit_cursor_position(
 ) -> Option<Position> {
     let inner = block_inner(area);
     let header_height = 3_u16.min(inner.height);
-    let (line, column) = comment_dialog_cursor_offset(body, editor_width.max(1));
+    let (line, column) = comment_dialog_cursor_offset_at(body, cursor, editor_width.max(1));
     let visible_end = scroll.saturating_add(editor_height.max(1));
     if line < scroll || line >= visible_end {
         return None;
@@ -8734,13 +9276,14 @@ fn comment_dialog_scrollable_line_count(text: &str, width: u16) -> usize {
 
 fn scroll_for_comment_dialog_cursor(
     text: &str,
+    cursor: usize,
     width: u16,
     height: u16,
     current_scroll: u16,
 ) -> u16 {
     let width = width.max(1);
     let height = height.max(1);
-    let (line, _) = comment_dialog_cursor_offset(text, width);
+    let (line, _) = comment_dialog_cursor_offset_at(text, cursor, width);
     let max_scroll = max_comment_dialog_scroll(text, width, height);
     if line < current_scroll {
         line
@@ -8753,23 +9296,35 @@ fn scroll_for_comment_dialog_cursor(
 }
 
 fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
-    let width = usize::from(width.max(1));
-    let mut line = 0_usize;
-    let mut parts = text.split('\n').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            let (cursor_line, column) = comment_dialog_raw_line_cursor_offset(part, width);
-            line = line.saturating_add(cursor_line);
-            return (
-                line.min(usize::from(u16::MAX)) as u16,
-                column.min(usize::from(u16::MAX)) as u16,
-            );
-        }
+    comment_dialog_cursor_offset_at(text, text.len(), width)
+}
 
-        line = line.saturating_add(comment_dialog_raw_line_height(part, width));
+fn comment_dialog_cursor_offset_at(text: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let width = usize::from(width.max(1));
+    let cursor = clamp_text_cursor(text, cursor);
+    let mut line = 0_usize;
+    let mut raw_line_start = 0_usize;
+
+    for (index, ch) in text.char_indices() {
+        if index >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            line = line.saturating_add(comment_dialog_raw_line_height(
+                &text[raw_line_start..index],
+                width,
+            ));
+            raw_line_start = index.saturating_add(ch.len_utf8());
+        }
     }
 
-    (0, 0)
+    let (cursor_line, column) =
+        comment_dialog_raw_line_cursor_offset(&text[raw_line_start..cursor], width);
+    line = line.saturating_add(cursor_line);
+    (
+        line.min(usize::from(u16::MAX)) as u16,
+        column.min(usize::from(u16::MAX)) as u16,
+    )
 }
 
 fn comment_dialog_raw_line_height(text: &str, width: usize) -> usize {
@@ -8994,6 +9549,23 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("P", "request or re-request PR reviewers"),
         help_key_line("Y", "remove pending PR review requests"),
         help_key_line("o", "open selected item in browser"),
+        Line::from(""),
+        help_heading("Editor"),
+        help_key_line("Left / Right", "move cursor by character"),
+        help_key_line(
+            "Up / Down",
+            "move cursor by rendered line in multiline editors",
+        ),
+        help_key_line("Home / End", "jump to line start / end"),
+        help_key_line("Alt+B / Alt+F", "jump previous / next word"),
+        help_key_line("Backspace / Delete", "delete previous / next character"),
+        help_key_line("Ctrl+W / Alt+Backspace", "delete previous word"),
+        help_key_line("Alt+D", "delete next word"),
+        help_key_line("Ctrl+U / Ctrl+K", "delete to line start / end"),
+        help_key_line("Ctrl+X", "delete current line"),
+        help_key_line("Ctrl+Z / Cmd+Z", "undo text edits"),
+        help_key_line("Ctrl+R / Cmd+Shift+Z", "redo text edits"),
+        help_key_line("click editor text", "move cursor to that position"),
         Line::from(""),
         help_heading("Mouse"),
         help_key_line(
@@ -14715,7 +15287,7 @@ impl AppState {
         self.focus = FocusTarget::Details;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::ItemMetadata { field },
-            body: value,
+            body: EditorText::from_text(value),
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
@@ -14852,7 +15424,7 @@ impl AppState {
         self.review_submit_dialog = Some(ReviewSubmitDialog {
             item,
             event,
-            body,
+            body: EditorText::from_text(body),
             scroll: 0,
             mode,
         });
@@ -14934,25 +15506,13 @@ impl AppState {
                     submit(pending);
                 }
             }
-            KeyCode::Enter => {
-                if let Some(dialog) = &mut self.review_submit_dialog {
-                    dialog.body.push('\n');
+            _ => {
+                if let Some(dialog) = &mut self.review_submit_dialog
+                    && dialog.body.input_key(key, true)
+                {
+                    self.scroll_review_submit_dialog_to_cursor_in_area(area);
                 }
-                self.scroll_review_submit_dialog_to_cursor_in_area(area);
             }
-            KeyCode::Backspace => {
-                if let Some(dialog) = &mut self.review_submit_dialog {
-                    dialog.body.pop();
-                }
-                self.scroll_review_submit_dialog_to_cursor_in_area(area);
-            }
-            KeyCode::Char(value) => {
-                if let Some(dialog) = &mut self.review_submit_dialog {
-                    dialog.body.push(value);
-                }
-                self.scroll_review_submit_dialog_to_cursor_in_area(area);
-            }
-            _ => {}
         }
     }
 
@@ -14979,7 +15539,7 @@ impl AppState {
         let Some(dialog) = self.review_submit_dialog.take() else {
             return;
         };
-        let body = dialog.body.trim().to_string();
+        let body = dialog.body.text().trim().to_string();
         let item = dialog.item.clone();
         if item.kind != ItemKind::PullRequest || item.number.is_none() {
             self.review_submit_dialog = Some(dialog);
@@ -14998,7 +15558,7 @@ impl AppState {
 
     fn prepare_review_submit(&mut self) -> Option<PendingReviewSubmit> {
         let dialog = self.review_submit_dialog.take()?;
-        let body = dialog.body.trim().to_string();
+        let body = dialog.body.text().trim().to_string();
         if dialog.event.requires_body() && body.is_empty() {
             let event = dialog.event;
             self.review_submit_dialog = Some(dialog);
@@ -15075,7 +15635,8 @@ impl AppState {
             return;
         };
         let (width, height) = review_submit_editor_size(dialog, area);
-        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        let body = dialog.body.text();
+        let max_scroll = max_comment_dialog_scroll(body, width, height);
         if delta < 0 {
             dialog.scroll = dialog.scroll.saturating_sub(delta.unsigned_abs());
         } else {
@@ -15091,8 +15652,14 @@ impl AppState {
     fn scroll_review_submit_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
         if let Some(dialog) = &mut self.review_submit_dialog {
             let (width, height) = review_submit_editor_size(dialog, area);
-            dialog.scroll =
-                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.scroll);
+            let body = dialog.body.text();
+            dialog.scroll = scroll_for_comment_dialog_cursor(
+                body,
+                dialog.body.cursor_byte(),
+                width,
+                height,
+                dialog.scroll,
+            );
         }
     }
 
@@ -15542,7 +16109,7 @@ impl AppState {
         self.reviewer_dialog = None;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::New,
-            body: String::new(),
+            body: EditorText::empty(),
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
@@ -15576,13 +16143,14 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
+        let body = quote_comment_for_reply(&comment);
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Reply {
                 comment_index: self.selected_comment_index,
                 author: author.clone(),
                 review_comment_id,
             },
-            body: quote_comment_for_reply(&comment),
+            body: EditorText::from_text(body),
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
@@ -15619,13 +16187,14 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.assignee_dialog = None;
+        let body = comment.body;
         self.comment_dialog = Some(CommentDialog {
             mode: CommentDialogMode::Edit {
                 comment_index: self.selected_comment_index,
                 comment_id,
                 is_review: comment.review.is_some(),
             },
-            body: comment.body,
+            body: EditorText::from_text(body),
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
@@ -15673,7 +16242,7 @@ impl AppState {
             mode: CommentDialogMode::Review {
                 target: target.clone(),
             },
-            body: String::new(),
+            body: EditorText::empty(),
             scroll: 0,
         });
         self.scroll_comment_dialog_to_cursor();
@@ -15932,10 +16501,10 @@ impl AppState {
         self.reaction_dialog = None;
         self.pr_action_dialog = None;
         self.issue_dialog = Some(IssueDialog {
-            repo,
-            title: String::new(),
-            labels: String::new(),
-            body: String::new(),
+            repo: EditorText::from_text(repo),
+            title: EditorText::empty(),
+            labels: EditorText::empty(),
+            body: EditorText::empty(),
             field: IssueDialogField::Title,
             body_scroll: 0,
         });
@@ -16006,8 +16575,8 @@ impl AppState {
             repo,
             local_dir,
             branch,
-            title: String::new(),
-            body: String::new(),
+            title: EditorText::empty(),
+            body: EditorText::empty(),
             field: PrCreateField::Title,
             body_scroll: 0,
         });
@@ -16054,29 +16623,17 @@ impl AppState {
             KeyCode::BackTab => self.move_issue_dialog_field(-1),
             KeyCode::PageDown => self.scroll_issue_dialog_body(6, area),
             KeyCode::PageUp => self.scroll_issue_dialog_body(-6, area),
-            KeyCode::Enter => {
+            KeyCode::Enter
                 if self
                     .issue_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.field == IssueDialogField::Body)
-                {
-                    if let Some(dialog) = &mut self.issue_dialog {
-                        dialog.body.push('\n');
-                    }
-                    self.scroll_issue_dialog_to_cursor_in_area(area);
-                } else {
-                    self.move_issue_dialog_field(1);
-                }
+                    .is_some_and(|dialog| dialog.field != IssueDialogField::Body) =>
+            {
+                self.move_issue_dialog_field(1);
             }
-            KeyCode::Backspace => {
-                self.pop_issue_dialog_char();
-                self.scroll_issue_dialog_to_cursor_in_area(area);
+            _ => {
+                self.handle_issue_dialog_editor_key(key, area);
             }
-            KeyCode::Char(value) => {
-                self.push_issue_dialog_char(value);
-                self.scroll_issue_dialog_to_cursor_in_area(area);
-            }
-            _ => {}
         }
     }
 
@@ -16092,35 +16649,21 @@ impl AppState {
         }
     }
 
-    fn push_issue_dialog_char(&mut self, value: char) {
-        let Some(dialog) = &mut self.issue_dialog else {
-            return;
+    fn handle_issue_dialog_editor_key(&mut self, key: KeyEvent, area: Option<Rect>) {
+        let should_scroll = {
+            let Some(dialog) = &mut self.issue_dialog else {
+                return;
+            };
+            let changed = match dialog.field {
+                IssueDialogField::Repo => dialog.repo.input_key(key, false),
+                IssueDialogField::Title => dialog.title.input_key(key, false),
+                IssueDialogField::Labels => dialog.labels.input_key(key, false),
+                IssueDialogField::Body => dialog.body.input_key(key, true),
+            };
+            changed && dialog.field == IssueDialogField::Body
         };
-        match dialog.field {
-            IssueDialogField::Repo => dialog.repo.push(value),
-            IssueDialogField::Title => dialog.title.push(value),
-            IssueDialogField::Labels => dialog.labels.push(value),
-            IssueDialogField::Body => dialog.body.push(value),
-        }
-    }
-
-    fn pop_issue_dialog_char(&mut self) {
-        let Some(dialog) = &mut self.issue_dialog else {
-            return;
-        };
-        match dialog.field {
-            IssueDialogField::Repo => {
-                dialog.repo.pop();
-            }
-            IssueDialogField::Title => {
-                dialog.title.pop();
-            }
-            IssueDialogField::Labels => {
-                dialog.labels.pop();
-            }
-            IssueDialogField::Body => {
-                dialog.body.pop();
-            }
+        if should_scroll {
+            self.scroll_issue_dialog_to_cursor_in_area(area);
         }
     }
 
@@ -16129,7 +16672,8 @@ impl AppState {
             return;
         };
         let (width, height) = issue_dialog_body_editor_size(area);
-        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        let body = dialog.body.text();
+        let max_scroll = max_comment_dialog_scroll(body, width, height);
         if delta < 0 {
             dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
         } else {
@@ -16144,17 +16688,23 @@ impl AppState {
                 return;
             }
             let (width, height) = issue_dialog_body_editor_size(area);
-            dialog.body_scroll =
-                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.body_scroll);
+            let body = dialog.body.text();
+            dialog.body_scroll = scroll_for_comment_dialog_cursor(
+                body,
+                dialog.body.cursor_byte(),
+                width,
+                height,
+                dialog.body_scroll,
+            );
         }
     }
 
     fn prepare_issue_create(&mut self) -> Option<PendingIssueCreate> {
         let dialog = self.issue_dialog.take()?;
-        let repo = dialog.repo.trim().to_string();
-        let title = dialog.title.trim().to_string();
-        let body = dialog.body.trim().to_string();
-        let labels = parse_issue_labels(&dialog.labels);
+        let repo = dialog.repo.text().trim().to_string();
+        let title = dialog.title.text().trim().to_string();
+        let body = dialog.body.text().trim().to_string();
+        let labels = parse_issue_labels(dialog.labels.text());
 
         if !repo.contains('/') {
             self.issue_dialog = Some(dialog);
@@ -16220,29 +16770,17 @@ impl AppState {
             KeyCode::BackTab => self.move_pr_create_dialog_field(-1),
             KeyCode::PageDown => self.scroll_pr_create_dialog_body(6, area),
             KeyCode::PageUp => self.scroll_pr_create_dialog_body(-6, area),
-            KeyCode::Enter => {
+            KeyCode::Enter
                 if self
                     .pr_create_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.field == PrCreateField::Body)
-                {
-                    if let Some(dialog) = &mut self.pr_create_dialog {
-                        dialog.body.push('\n');
-                    }
-                    self.scroll_pr_create_dialog_to_cursor_in_area(area);
-                } else {
-                    self.move_pr_create_dialog_field(1);
-                }
+                    .is_some_and(|dialog| dialog.field != PrCreateField::Body) =>
+            {
+                self.move_pr_create_dialog_field(1);
             }
-            KeyCode::Backspace => {
-                self.pop_pr_create_dialog_char();
-                self.scroll_pr_create_dialog_to_cursor_in_area(area);
+            _ => {
+                self.handle_pr_create_dialog_editor_key(key, area);
             }
-            KeyCode::Char(value) => {
-                self.push_pr_create_dialog_char(value);
-                self.scroll_pr_create_dialog_to_cursor_in_area(area);
-            }
-            _ => {}
         }
     }
 
@@ -16256,27 +16794,19 @@ impl AppState {
         }
     }
 
-    fn push_pr_create_dialog_char(&mut self, value: char) {
-        let Some(dialog) = &mut self.pr_create_dialog else {
-            return;
+    fn handle_pr_create_dialog_editor_key(&mut self, key: KeyEvent, area: Option<Rect>) {
+        let should_scroll = {
+            let Some(dialog) = &mut self.pr_create_dialog else {
+                return;
+            };
+            let changed = match dialog.field {
+                PrCreateField::Title => dialog.title.input_key(key, false),
+                PrCreateField::Body => dialog.body.input_key(key, true),
+            };
+            changed && dialog.field == PrCreateField::Body
         };
-        match dialog.field {
-            PrCreateField::Title => dialog.title.push(value),
-            PrCreateField::Body => dialog.body.push(value),
-        }
-    }
-
-    fn pop_pr_create_dialog_char(&mut self) {
-        let Some(dialog) = &mut self.pr_create_dialog else {
-            return;
-        };
-        match dialog.field {
-            PrCreateField::Title => {
-                dialog.title.pop();
-            }
-            PrCreateField::Body => {
-                dialog.body.pop();
-            }
+        if should_scroll {
+            self.scroll_pr_create_dialog_to_cursor_in_area(area);
         }
     }
 
@@ -16285,7 +16815,8 @@ impl AppState {
             return;
         };
         let (width, height) = pr_create_dialog_body_editor_size(area);
-        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        let body = dialog.body.text();
+        let max_scroll = max_comment_dialog_scroll(body, width, height);
         if delta < 0 {
             dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
         } else {
@@ -16300,15 +16831,21 @@ impl AppState {
                 return;
             }
             let (width, height) = pr_create_dialog_body_editor_size(area);
-            dialog.body_scroll =
-                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.body_scroll);
+            let body = dialog.body.text();
+            dialog.body_scroll = scroll_for_comment_dialog_cursor(
+                body,
+                dialog.body.cursor_byte(),
+                width,
+                height,
+                dialog.body_scroll,
+            );
         }
     }
 
     fn prepare_pr_create(&mut self) -> Option<PendingPrCreate> {
         let dialog = self.pr_create_dialog.take()?;
-        let title = dialog.title.trim().to_string();
-        let body = dialog.body.trim().to_string();
+        let title = dialog.title.text().trim().to_string();
+        let body = dialog.body.text().trim().to_string();
 
         if title.is_empty() {
             self.pr_create_dialog = Some(dialog);
@@ -16358,25 +16895,13 @@ impl AppState {
                     submit(pending);
                 }
             }
-            KeyCode::Enter => {
-                if let Some(dialog) = &mut self.comment_dialog {
-                    dialog.body.push('\n');
+            _ => {
+                if let Some(dialog) = &mut self.comment_dialog
+                    && dialog.body.input_key(key, true)
+                {
+                    self.scroll_comment_dialog_to_cursor_in_area(area);
                 }
-                self.scroll_comment_dialog_to_cursor_in_area(area);
             }
-            KeyCode::Backspace => {
-                if let Some(dialog) = &mut self.comment_dialog {
-                    dialog.body.pop();
-                }
-                self.scroll_comment_dialog_to_cursor_in_area(area);
-            }
-            KeyCode::Char(value) => {
-                if let Some(dialog) = &mut self.comment_dialog {
-                    dialog.body.push(value);
-                }
-                self.scroll_comment_dialog_to_cursor_in_area(area);
-            }
-            _ => {}
         }
     }
 
@@ -16385,7 +16910,8 @@ impl AppState {
             return;
         };
         let (width, height) = comment_dialog_editor_size(dialog, area);
-        let max_scroll = max_comment_dialog_scroll(&dialog.body, width, height);
+        let body = dialog.body.text();
+        let max_scroll = max_comment_dialog_scroll(body, width, height);
         if delta < 0 {
             dialog.scroll = dialog.scroll.saturating_sub(delta.unsigned_abs());
         } else {
@@ -16401,14 +16927,20 @@ impl AppState {
     fn scroll_comment_dialog_to_cursor_in_area(&mut self, area: Option<Rect>) {
         if let Some(dialog) = &mut self.comment_dialog {
             let (width, height) = comment_dialog_editor_size(dialog, area);
-            dialog.scroll =
-                scroll_for_comment_dialog_cursor(&dialog.body, width, height, dialog.scroll);
+            let body = dialog.body.text();
+            dialog.scroll = scroll_for_comment_dialog_cursor(
+                body,
+                dialog.body.cursor_byte(),
+                width,
+                height,
+                dialog.scroll,
+            );
         }
     }
 
     fn prepare_comment_submit(&mut self) -> Option<PendingCommentSubmit> {
         let dialog = self.comment_dialog.take()?;
-        let body = dialog.body.trim().to_string();
+        let body = dialog.body.text().trim().to_string();
         let empty_status = match dialog.mode {
             CommentDialogMode::ItemMetadata {
                 field: ItemEditField::Title,
@@ -21256,7 +21788,10 @@ diff --git a/src/main.rs b/src/main.rs
         let config = Config::default();
         let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("draft");
+        }
 
         assert!(!handle_key(
             &mut app,
@@ -21314,7 +21849,10 @@ diff --git a/src/main.rs b/src/main.rs
         config.defaults.command_palette_key = "Ctrl+L".to_string();
         let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("draft");
+        }
 
         assert!(!handle_key(
             &mut app,
@@ -21903,7 +22441,7 @@ diff --git a/src/main.rs b/src/main.rs
         let config = Config::default();
         let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "draft".to_string();
+        app.comment_dialog.as_mut().unwrap().body.set_text("draft");
         app.command_palette = Some(CommandPalette {
             query: "help".to_string(),
             selected: 0,
@@ -26238,8 +26776,8 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_new_issue_dialog();
         if let Some(dialog) = &mut app.issue_dialog {
-            dialog.labels = "bug, T-compiler".to_string();
-            dialog.body = "Steps to reproduce".to_string();
+            dialog.labels.set_text("bug, T-compiler");
+            dialog.body.set_text("Steps to reproduce");
         }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -26511,8 +27049,8 @@ diff --git a/src/main.rs b/src/main.rs
             repo: "chenyukang/ghr".to_string(),
             local_dir: local_dir.clone(),
             branch: "feature/pr-body".to_string(),
-            title: "Add PR creation".to_string(),
-            body: "Created from the TUI".to_string(),
+            title: EditorText::from_text("Add PR creation"),
+            body: EditorText::from_text("Created from the TUI"),
             field: PrCreateField::Body,
             body_scroll: 0,
         });
@@ -26532,10 +27070,10 @@ diff --git a/src/main.rs b/src/main.rs
     fn issue_create_failure_restores_dialog_for_retry() {
         let mut app = AppState::new(SectionKind::Issues, vec![test_section()]);
         let dialog = IssueDialog {
-            repo: "chenyukang/ghr".to_string(),
-            title: "Crash in parser".to_string(),
-            labels: "bug, T-compiler".to_string(),
-            body: "Steps to reproduce".to_string(),
+            repo: EditorText::from_text("chenyukang/ghr"),
+            title: EditorText::from_text("Crash in parser"),
+            labels: EditorText::from_text("bug, T-compiler"),
+            body: EditorText::from_text("Steps to reproduce"),
             field: IssueDialogField::Body,
             body_scroll: 1,
         };
@@ -26574,8 +27112,8 @@ diff --git a/src/main.rs b/src/main.rs
             repo: "chenyukang/ghr".to_string(),
             local_dir: local_dir.clone(),
             branch: "feature/pr-body".to_string(),
-            title: "Add PR creation".to_string(),
-            body: "Created from the TUI".to_string(),
+            title: EditorText::from_text("Add PR creation"),
+            body: EditorText::from_text("Created from the TUI"),
             field: PrCreateField::Body,
             body_scroll: 2,
         };
@@ -27852,7 +28390,11 @@ diff --git a/src/main.rs b/src/main.rs
     fn review_submit_dialog_submits_selected_event() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
-        app.review_submit_dialog.as_mut().unwrap().body = "looks good overall".to_string();
+        app.review_submit_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("looks good overall");
         let mut submitted = None;
 
         app.handle_review_submit_dialog_key_with_submit(
@@ -27970,7 +28512,11 @@ diff --git a/src/main.rs b/src/main.rs
     fn ctrl_p_creates_pending_review_draft_from_summary() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
-        app.review_submit_dialog.as_mut().unwrap().body = "hold these notes".to_string();
+        app.review_submit_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("hold these notes");
         let mut created = None;
 
         app.handle_review_submit_dialog_key_with_submit(
@@ -28167,7 +28713,11 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_item_edit_dialog();
         app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
-        app.comment_dialog.as_mut().unwrap().body = "New title".to_string();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("New title");
         let mut submitted = None;
 
         app.handle_comment_dialog_key_with_submit(
@@ -28949,8 +29499,8 @@ diff --git a/src/main.rs b/src/main.rs
             repo: "chenyukang/ghr".to_string(),
             local_dir: PathBuf::from("/tmp/ghr"),
             branch: "dev-next".to_string(),
-            title: "Retry title".to_string(),
-            body: "Retry body".to_string(),
+            title: EditorText::from_text("Retry title"),
+            body: EditorText::from_text("Retry body"),
             field: PrCreateField::Body,
             body_scroll: 0,
         };
@@ -29052,7 +29602,10 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "hello".to_string();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("hello");
+        }
 
         app.handle_comment_dialog_key(key(KeyCode::Enter), &tx, None);
 
@@ -29066,10 +29619,185 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn comment_editor_supports_mid_text_insert_and_word_line_deletes() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_new_comment_dialog();
+        for ch in "hello world".chars() {
+            app.handle_comment_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+        }
+        for _ in 0..5 {
+            app.handle_comment_dialog_key(key(KeyCode::Left), &tx, None);
+        }
+        for ch in "brave ".chars() {
+            app.handle_comment_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+        }
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
+            Some(("hello brave world", "hello brave ".len()))
+        );
+
+        app.handle_comment_dialog_key(ctrl_key(KeyCode::Char('w')), &tx, None);
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
+            Some(("hello world", "hello ".len()))
+        );
+
+        app.handle_comment_dialog_key(ctrl_key(KeyCode::Char('k')), &tx, None);
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
+            Some(("hello ", "hello ".len()))
+        );
+    }
+
+    #[test]
+    fn comment_editor_up_down_follow_rendered_lines() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_new_comment_dialog();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("abc\ndef");
+        }
+
+        app.handle_comment_dialog_key(key(KeyCode::Up), &tx, None);
+        app.handle_comment_dialog_key(key(KeyCode::Char('!')), &tx, None);
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("abc!\ndef")
+        );
+    }
+
+    #[test]
+    fn comment_editor_can_delete_current_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_new_comment_dialog();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("one\ntwo\nthree");
+            dialog.body.set_cursor_byte("one\nt".len());
+        }
+
+        app.handle_comment_dialog_key(ctrl_key(KeyCode::Char('x')), &tx, None);
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
+            Some(("one\nthree", "one\n".len()))
+        );
+    }
+
+    #[test]
+    fn mac_command_z_undoes_editor_change() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.start_new_comment_dialog();
+        app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+
+        app.handle_comment_dialog_key(key(KeyCode::Char('!')), &tx, None);
+        app.handle_comment_dialog_key(cmd_key(KeyCode::Char('z')), &tx, None);
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("hello")
+        );
+
+        app.handle_comment_dialog_key(cmd_shift_key(KeyCode::Char('Z')), &tx, None);
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| dialog.body.as_str()),
+            Some("hello!")
+        );
+    }
+
+    #[test]
+    fn mouse_clicking_comment_editor_moves_cursor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let area = Rect::new(0, 0, 100, 30);
+        app.start_new_comment_dialog();
+        {
+            let dialog = app.comment_dialog.as_mut().unwrap();
+            dialog.body.set_text("hello world");
+        }
+        let dialog_area = comment_dialog_area(app.comment_dialog.as_ref().unwrap(), area);
+        let inner = block_inner(dialog_area);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 6,
+                row: inner.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+        app.handle_comment_dialog_key(key(KeyCode::Char('X')), &tx, Some(area));
+
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
+            Some(("hello Xworld", "hello X".len()))
+        );
+    }
+
+    #[test]
+    fn mouse_clicking_issue_title_moves_field_cursor() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let area = Rect::new(0, 0, 100, 30);
+        app.start_new_issue_dialog();
+        {
+            let dialog = app.issue_dialog.as_mut().unwrap();
+            dialog.title.set_text("hello world");
+        }
+        let dialog_area = issue_dialog_area(area);
+        let inner = block_inner(dialog_area);
+        let input_start = inner.x
+            + display_width(&issue_dialog_field_prefix("Title")).min(usize::from(u16::MAX)) as u16;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: input_start + 6,
+                row: inner.y + 2,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        );
+        for ch in "brave ".chars() {
+            app.handle_issue_dialog_key_with_submit(key(KeyCode::Char(ch)), Some(area), |_| {});
+        }
+
+        let dialog = app.issue_dialog.as_ref().unwrap();
+        assert_eq!(dialog.field, IssueDialogField::Title);
+        assert_eq!(dialog.title, "hello brave world");
+        assert_eq!(dialog.title.cursor_byte(), "hello brave ".len());
+    }
+
+    #[test]
     fn ctrl_enter_in_comment_dialog_submits() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "hello".to_string();
+        app.comment_dialog.as_mut().unwrap().body.set_text("hello");
         let mut submitted = None;
 
         app.handle_comment_dialog_key_with_submit(
@@ -29108,7 +29836,11 @@ diff --git a/src/main.rs b/src/main.rs
             DetailState::Loaded(vec![own_comment(42, "chenyukang", "old", None)]),
         );
         app.start_edit_selected_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "updated".to_string();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("updated");
         let mut submitted = None;
 
         app.handle_comment_dialog_key_with_submit(
@@ -29198,7 +29930,11 @@ diff --git a/src/main.rs b/src/main.rs
         app.details
             .insert("1".to_string(), DetailState::Loaded(vec![inline]));
         app.start_reply_to_selected_comment();
-        app.comment_dialog.as_mut().unwrap().body = "reply inline".to_string();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("reply inline");
         let mut submitted = None;
 
         app.handle_comment_dialog_key_with_submit(
@@ -29358,7 +30094,11 @@ diff --git a/src/main.rs b/src/main.rs
         );
         app.move_diff_line(1, None);
         app.start_review_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = "please tighten this".to_string();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("please tighten this");
         let mut submitted = None;
 
         app.handle_comment_dialog_key_with_submit(
@@ -29440,7 +30180,7 @@ diff --git a/src/main.rs b/src/main.rs
             mode: PendingCommentMode::Post,
             dialog: CommentDialog {
                 mode: CommentDialogMode::New,
-                body: "draft body".to_string(),
+                body: EditorText::from_text("draft body"),
                 scroll: 0,
             },
         });
@@ -29643,13 +30383,20 @@ diff --git a/src/main.rs b/src/main.rs
     fn comment_dialog_cursor_tracks_end_of_multiline_body() {
         let dialog = CommentDialog {
             mode: CommentDialogMode::New,
-            body: "hello\nworld".to_string(),
+            body: EditorText::from_text("hello\nworld"),
             scroll: 0,
         };
         let area = Rect::new(10, 5, 30, 10);
 
         assert_eq!(
-            comment_dialog_cursor_position(&dialog.body, dialog.scroll, area, 28, 6),
+            comment_dialog_cursor_position(
+                dialog.body.as_str(),
+                dialog.body.cursor_byte(),
+                dialog.scroll,
+                area,
+                28,
+                6,
+            ),
             Some(Position::new(16, 7))
         );
     }
@@ -29659,12 +30406,12 @@ diff --git a/src/main.rs b/src/main.rs
         let area = Rect::new(10, 5, 30, 10);
 
         assert_eq!(
-            comment_dialog_cursor_position("你好", 0, area, 28, 6),
+            comment_dialog_cursor_position("你好", "你好".len(), 0, area, 28, 6),
             Some(Position::new(15, 6))
         );
         assert_eq!(comment_dialog_body_lines("你好ab", 5), vec!["你好a", "b"]);
         assert_eq!(
-            comment_dialog_cursor_position("你好ab", 0, area, 5, 6),
+            comment_dialog_cursor_position("你好ab", "你好ab".len(), 0, area, 5, 6),
             Some(Position::new(12, 7))
         );
     }
@@ -29677,7 +30424,10 @@ diff --git a/src/main.rs b/src/main.rs
             .join("\n");
         let area = Rect::new(10, 5, 30, 10);
 
-        assert_eq!(comment_dialog_cursor_position(&body, 20, area, 28, 6), None);
+        assert_eq!(
+            comment_dialog_cursor_position(&body, body.len(), 20, area, 28, 6),
+            None
+        );
     }
 
     #[test]
@@ -29685,7 +30435,7 @@ diff --git a/src/main.rs b/src/main.rs
         let area = Rect::new(10, 5, 7, 10);
 
         assert_eq!(
-            comment_dialog_cursor_position("abcde", 0, area, 5, 6),
+            comment_dialog_cursor_position("abcde", "abcde".len(), 0, area, 5, 6),
             Some(Position::new(11, 7))
         );
     }
@@ -29693,10 +30443,10 @@ diff --git a/src/main.rs b/src/main.rs
     #[test]
     fn issue_dialog_single_line_cursor_uses_display_width_for_chinese_input() {
         let dialog = IssueDialog {
-            repo: "rust-lang/rust".to_string(),
-            title: "中文".to_string(),
-            labels: "标签".to_string(),
-            body: String::new(),
+            repo: EditorText::from_text("rust-lang/rust"),
+            title: EditorText::from_text("中文"),
+            labels: EditorText::from_text("标签"),
+            body: EditorText::empty(),
             field: IssueDialogField::Title,
             body_scroll: 0,
         };
@@ -29712,10 +30462,12 @@ diff --git a/src/main.rs b/src/main.rs
     fn comment_dialog_scroll_tracks_cursor_for_long_body() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = (1..=20)
+        let body = (1..=20)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let dialog = app.comment_dialog.as_mut().unwrap();
+        dialog.body.set_text(body);
 
         app.scroll_comment_dialog_to_cursor();
 
@@ -29730,10 +30482,12 @@ diff --git a/src/main.rs b/src/main.rs
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let (tx, _rx) = mpsc::unbounded_channel();
         app.start_new_comment_dialog();
-        app.comment_dialog.as_mut().unwrap().body = (1..=80)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        app.comment_dialog.as_mut().unwrap().body.set_text(
+            (1..=80)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
 
         app.handle_comment_dialog_key(key(KeyCode::PageDown), &tx, None);
         assert_eq!(
@@ -29762,23 +30516,25 @@ diff --git a/src/main.rs b/src/main.rs
         let area = Rect::new(0, 0, 120, 40);
         let short = CommentDialog {
             mode: CommentDialogMode::New,
-            body: String::new(),
+            body: EditorText::empty(),
             scroll: 0,
         };
+        let medium_body = (1..=18)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let medium = CommentDialog {
             mode: CommentDialogMode::New,
-            body: (1..=18)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            body: EditorText::from_text(medium_body),
             scroll: 0,
         };
+        let long_body = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let long = CommentDialog {
             mode: CommentDialogMode::New,
-            body: (1..=100)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            body: EditorText::from_text(long_body),
             scroll: 0,
         };
 
@@ -29791,7 +30547,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         let inner = block_inner(long_area);
         let editor_height = inner.height.max(1);
-        assert!(max_comment_dialog_scroll(&long.body, inner.width, editor_height) > 0);
+        assert!(max_comment_dialog_scroll(long.body.as_str(), inner.width, editor_height) > 0);
     }
 
     #[test]
@@ -31719,6 +32475,17 @@ diff --git a/d.rs b/d.rs
 
     fn ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::CONTROL)
+    }
+
+    fn cmd_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::SUPER)
+    }
+
+    fn cmd_shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::SUPER | crossterm::event::KeyModifiers::SHIFT,
+        )
     }
 
     fn test_paths() -> Paths {

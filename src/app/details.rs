@@ -361,6 +361,15 @@ pub(super) struct MarkdownTableRow {
     pub(super) header: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct MarkdownImage {
+    pub(super) url: String,
+    pub(super) alt: Option<String>,
+    pub(super) title: Option<String>,
+    pub(super) width: Option<String>,
+    pub(super) height: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CodeLanguage {
     Rust,
@@ -3405,6 +3414,7 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
     let mut blocks = Vec::new();
     let mut current = Vec::new();
     let mut link: Option<String> = None;
+    let mut image: Option<MarkdownImage> = None;
     let mut code_block = String::new();
     let mut in_code_block = false;
     let mut code_language = CodeLanguage::Other;
@@ -3520,6 +3530,22 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
             MarkdownEvent::End(TagEnd::Link) => {
                 link = None;
             }
+            MarkdownEvent::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
+                image = Some(MarkdownImage {
+                    url: dest_url.to_string(),
+                    alt: None,
+                    title: non_empty_inline_text(&title),
+                    width: None,
+                    height: None,
+                });
+            }
+            MarkdownEvent::End(TagEnd::Image) => {
+                if let Some(image) = image.take() {
+                    current.push(image_segment(&image));
+                }
+            }
             MarkdownEvent::Start(Tag::Strong) => {
                 strong_depth = strong_depth.saturating_add(1);
             }
@@ -3568,6 +3594,8 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
             MarkdownEvent::Text(text) => {
                 if in_code_block {
                     code_block.push_str(&text);
+                } else if let Some(image) = image.as_mut() {
+                    push_image_alt(image, &text);
                 } else {
                     append_text_segments(
                         &mut current,
@@ -3577,15 +3605,52 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                     );
                 }
             }
-            MarkdownEvent::Code(text) => current.push(DetailSegment::styled(
-                text.to_string(),
-                Style::default().fg(Color::LightGreen),
-            )),
+            MarkdownEvent::Code(text) => {
+                if let Some(image) = image.as_mut() {
+                    push_image_alt(image, &text);
+                } else {
+                    current.push(DetailSegment::styled(
+                        text.to_string(),
+                        Style::default().fg(Color::LightGreen),
+                    ));
+                }
+            }
             MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
                 if in_code_block {
                     code_block.push('\n');
+                } else if let Some(image) = image.as_mut() {
+                    push_image_alt(image, " ");
                 } else {
                     current.push(DetailSegment::raw("\n"));
+                }
+            }
+            MarkdownEvent::InlineHtml(html) => {
+                if let Some(image) = image.as_mut() {
+                    push_image_alt(image, &html);
+                    continue;
+                }
+                current.extend(html_image_segments(&html));
+            }
+            MarkdownEvent::Html(html) => {
+                if in_code_block {
+                    code_block.push_str(&html);
+                    continue;
+                }
+
+                let segments = html_image_segments(&html);
+                if !segments.is_empty() {
+                    flush_markdown_block(
+                        &mut blocks,
+                        &mut current,
+                        quote_depth,
+                        MarkdownBlockKind::Text,
+                    );
+                    push_markdown_block(
+                        &mut blocks,
+                        quote_depth,
+                        MarkdownBlockKind::Text,
+                        segments,
+                    );
                 }
             }
             MarkdownEvent::Rule => push_markdown_block(
@@ -3610,6 +3675,208 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
         MarkdownBlockKind::Text,
     );
     blocks
+}
+
+pub(super) fn push_image_alt(image: &mut MarkdownImage, text: &str) {
+    if let Some(alt) = image.alt.as_mut() {
+        alt.push_str(text);
+    } else {
+        image.alt = Some(text.to_string());
+    }
+}
+
+pub(super) fn html_image_segments(html: &str) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for image in html_images(html) {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw(" "));
+        }
+        segments.push(image_segment(&image));
+    }
+    segments
+}
+
+pub(super) fn html_images(html: &str) -> Vec<MarkdownImage> {
+    let mut images = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut search_start = 0;
+    while let Some(relative_start) = lower[search_start..].find("<img") {
+        let tag_start = search_start + relative_start;
+        let after_name = tag_start + "<img".len();
+        if !html_tag_name_boundary(html, after_name) {
+            search_start = after_name;
+            continue;
+        }
+
+        let Some(tag_end) = html_tag_end(html, after_name) else {
+            break;
+        };
+        let tag = &html[tag_start..=tag_end];
+        if let Some(url) = html_attr_value(tag, "src") {
+            images.push(MarkdownImage {
+                url,
+                alt: html_attr_value(tag, "alt").and_then(|alt| non_empty_inline_text(&alt)),
+                title: html_attr_value(tag, "title")
+                    .and_then(|title| non_empty_inline_text(&title)),
+                width: html_attr_value(tag, "width")
+                    .and_then(|width| non_empty_inline_text(&width)),
+                height: html_attr_value(tag, "height")
+                    .and_then(|height| non_empty_inline_text(&height)),
+            });
+        }
+        search_start = tag_end + 1;
+    }
+    images
+}
+
+pub(super) fn html_tag_name_boundary(html: &str, index: usize) -> bool {
+    html[index..]
+        .chars()
+        .next()
+        .is_none_or(|ch| ch.is_ascii_whitespace() || matches!(ch, '/' | '>'))
+}
+
+pub(super) fn html_tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in html[start..].char_indices() {
+        match (quote, ch) {
+            (Some(active), current) if current == active => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(super) fn html_attr_value(tag: &str, name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'<' | b'/' | b'>'))
+        {
+            index += 1;
+        }
+
+        let name_start = index;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_html_attr_name_byte(*byte))
+        {
+            index += 1;
+        }
+        if name_start == index {
+            index += 1;
+            continue;
+        }
+        let attr_name = &tag[name_start..index];
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'=') {
+            continue;
+        }
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+
+        let Some(first) = bytes.get(index).copied() else {
+            break;
+        };
+        let value_start;
+        let value_end;
+        if matches!(first, b'"' | b'\'') {
+            let quote = first;
+            index += 1;
+            value_start = index;
+            while bytes.get(index).is_some_and(|byte| *byte != quote) {
+                index += 1;
+            }
+            value_end = index;
+            if bytes.get(index) == Some(&quote) {
+                index += 1;
+            }
+        } else {
+            value_start = index;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
+            {
+                index += 1;
+            }
+            value_end = index;
+        }
+
+        if attr_name.eq_ignore_ascii_case(name) {
+            return non_empty_inline_text(&decode_basic_html_entities(
+                &tag[value_start..value_end],
+            ));
+        }
+    }
+    None
+}
+
+pub(super) fn is_html_attr_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+}
+
+pub(super) fn image_segment(image: &MarkdownImage) -> DetailSegment {
+    DetailSegment::link(image_label(image), image.url.clone())
+}
+
+pub(super) fn image_label(image: &MarkdownImage) -> String {
+    if let Some(alt) = useful_image_label(image.alt.as_deref().or(image.title.as_deref())) {
+        return format!("[image: {}]", truncate_inline(&alt, 72));
+    }
+    match (
+        image.width.as_deref().and_then(non_empty_dimension),
+        image.height.as_deref().and_then(non_empty_dimension),
+    ) {
+        (Some(width), Some(height)) => format!("[image {width}x{height}]"),
+        (Some(width), None) => format!("[image width {width}]"),
+        (None, Some(height)) => format!("[image height {height}]"),
+        (None, None) => "[image]".to_string(),
+    }
+}
+
+pub(super) fn useful_image_label(value: Option<&str>) -> Option<String> {
+    let value = non_empty_inline_text(value?)?;
+    if value.is_empty() || value.eq_ignore_ascii_case("image") {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub(super) fn non_empty_dimension(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+pub(super) fn non_empty_inline_text(value: &str) -> Option<String> {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+pub(super) fn decode_basic_html_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 pub(super) fn is_rust_code_info(info: &str) -> bool {

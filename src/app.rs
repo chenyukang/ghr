@@ -25397,6 +25397,101 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn markdown_images_render_as_clickable_image_links() {
+        let url = "https://example.com/architecture.png";
+        let mut builder = DetailsBuilder::new(80);
+        builder.push_markdown_block_indented(
+            &format!("Screenshot:\n\n![Architecture *diagram*]({url})"),
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let line_index = rendered
+            .iter()
+            .position(|line| line.contains("[image: Architecture diagram]"))
+            .expect("rendered image label");
+        let column = rendered[line_index]
+            .find("[image: Architecture diagram]")
+            .expect("image label column") as u16;
+        assert_eq!(document.link_at(line_index, column), Some(url.to_string()));
+        assert!(
+            !rendered.iter().any(|line| line.contains("![")),
+            "raw markdown image syntax should not leak: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn github_html_image_tags_render_as_clickable_image_links() {
+        let url = "https://github.com/user-attachments/assets/c84fe1a4-44bc-4b62-bc58-ca0aa3c437fd";
+        let mut builder = DetailsBuilder::new(100);
+        builder.push_markdown_block_indented(
+            &format!(r#"<img width="1403" height="988" alt="Image" src="{url}" />"#),
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let line_index = rendered
+            .iter()
+            .position(|line| line.contains("[image 1403x988]"))
+            .expect("rendered GitHub attachment label");
+        let column = rendered[line_index]
+            .find("[image 1403x988]")
+            .expect("image label column") as u16;
+        assert_eq!(document.link_at(line_index, column), Some(url.to_string()));
+        assert!(
+            !rendered.iter().any(|line| line.contains("<img")),
+            "raw html image tag should not leak: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn html_image_attrs_decode_entities_for_label_and_url() {
+        let url = "https://example.com/shot.png?one=1&two=2";
+        let mut builder = DetailsBuilder::new(100);
+        builder.push_markdown_block_indented(
+            r#"<img alt="Packet &amp; claim" src="https://example.com/shot.png?one=1&amp;two=2">"#,
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            0,
+            0,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let line_index = rendered
+            .iter()
+            .position(|line| line.contains("[image: Packet & claim]"))
+            .expect("rendered decoded image label");
+        let column = rendered[line_index]
+            .find("[image: Packet & claim]")
+            .expect("image label column") as u16;
+        assert_eq!(document.link_at(line_index, column), Some(url.to_string()));
+    }
+
+    #[test]
     fn pr_and_issue_detail_comment_authors_are_clickable() {
         let mut pr_app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         pr_app.details.insert(

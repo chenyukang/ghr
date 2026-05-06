@@ -1624,7 +1624,6 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     )?;
     let backend = CrosstermBackend::new(stdout);

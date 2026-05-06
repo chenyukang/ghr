@@ -1559,29 +1559,26 @@ pub(super) fn push_diff(
             }
         }
     }
-    if context.diff_inline_comments_visible {
-        if let Some(comments) = context.comments {
-            let unplaced_entries = diff_unplaced_review_comment_entries(
+    if context.diff_inline_comments_visible
+        && let Some(comments) = context.comments
+    {
+        let unplaced_entries =
+            diff_unplaced_review_comment_entries(comments, file, &rendered_inline_comment_indices);
+        if !unplaced_entries.is_empty() {
+            builder.push_blank();
+            builder.push_line(vec![DetailSegment::styled(
+                "Resolved/outdated comments not attached to a current diff line",
+                diff_metadata_style(),
+            )]);
+            push_diff_inline_comments(
+                builder,
+                context.item_id,
                 comments,
-                file,
-                &rendered_inline_comment_indices,
+                &unplaced_entries,
+                context.expanded_comments,
+                context.details_focused,
+                context.selected_comment_index,
             );
-            if !unplaced_entries.is_empty() {
-                builder.push_blank();
-                builder.push_line(vec![DetailSegment::styled(
-                    "Resolved/outdated comments not attached to a current diff line",
-                    diff_metadata_style(),
-                )]);
-                push_diff_inline_comments(
-                    builder,
-                    context.item_id,
-                    comments,
-                    &unplaced_entries,
-                    context.expanded_comments,
-                    context.details_focused,
-                    context.selected_comment_index,
-                );
-            }
         }
     }
 }

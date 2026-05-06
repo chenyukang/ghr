@@ -3691,12 +3691,12 @@ fn handle_left_click(
         app.open_url(&url);
         return;
     }
-    if app.details_mode == DetailsMode::Diff {
-        if let Some(comment_indices) = document.inline_comment_marker_at(line_index) {
-            debug!(comment_indices = ?comment_indices, "inline comment marker clicked");
-            app.reveal_diff_inline_comments(comment_indices.to_vec());
-            return;
-        }
+    if app.details_mode == DetailsMode::Diff
+        && let Some(comment_indices) = document.inline_comment_marker_at(line_index)
+    {
+        debug!(comment_indices = ?comment_indices, "inline comment marker clicked");
+        app.reveal_diff_inline_comments(comment_indices.to_vec());
+        return;
     }
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)

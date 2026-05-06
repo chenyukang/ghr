@@ -10720,6 +10720,10 @@ impl AppState {
                     .iter()
                     .map(|section| section.items.len())
                     .sum::<usize>();
+                let first_result_section = sections
+                    .iter()
+                    .position(|section| !section.items.is_empty())
+                    .unwrap_or(0);
                 self.invalidate_action_hints_for_sections(&sections);
                 self.replace_global_search_sections(sections);
                 self.global_search_running = false;
@@ -10731,6 +10735,8 @@ impl AppState {
                 self.search_active = false;
                 self.search_query.clear();
                 self.active_view = global_search_view_key();
+                self.set_current_section_position(first_result_section);
+                self.set_current_selected_position(0);
                 self.focus = FocusTarget::List;
                 self.details_scroll = 0;
                 self.selected_comment_index = 0;
@@ -22884,6 +22890,43 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(app.search_query.is_empty());
         assert_eq!(app.status, "search complete: 2 result(s) for 'fiber'");
         assert!(app.global_search_started_at.is_none());
+    }
+
+    #[test]
+    fn global_search_finished_selects_first_section_with_results() {
+        let mut app = AppState::new(SectionKind::Issues, vec![test_section()]);
+        app.global_search_running = true;
+        let pr_section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "#1 repo:rust-lang/rust",
+        );
+        let mut issue_section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::Issues,
+            "Issues",
+            "#1 repo:rust-lang/rust",
+        );
+        let mut issue = work_item("rust-1", "rust-lang/rust", 1, "Rust issue", None);
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/rust-lang/rust/issues/1".to_string();
+        issue_section.items = vec![issue];
+
+        app.handle_msg(AppMsg::GlobalSearchFinished {
+            query: "1".to_string(),
+            sections: vec![pr_section, issue_section],
+        });
+
+        assert_eq!(app.active_view, global_search_view_key());
+        assert_eq!(
+            app.current_section().map(|section| section.title.as_str()),
+            Some("Issues")
+        );
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("rust-1")
+        );
     }
 
     #[test]

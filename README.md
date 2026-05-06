@@ -43,7 +43,13 @@ gh auth login
 
 ## Installation
 
-Install the latest release binary on macOS or Linux:
+You can install `ghr` with Cargo:
+
+```bash
+cargo install ghr-cli
+```
+
+Or install the latest release binary on macOS or Linux:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | sh
@@ -66,12 +72,6 @@ The installers detect your OS and CPU architecture, download the matching GitHub
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.5.0 GHR_INSTALL_DIR=/usr/local/bin sh
-```
-
-You can still install from crates.io if you prefer building locally:
-
-```bash
-cargo install ghr-cli
 ```
 
 ## Usage

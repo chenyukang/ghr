@@ -276,6 +276,7 @@ struct SearchApiIssueRaw {
     labels: Option<Vec<SearchLabelRaw>>,
     milestone: Option<SearchMilestoneRaw>,
     number: u64,
+    pull_request: Option<serde_json::Value>,
     reactions: Option<ReactionSummaryRaw>,
     repository_url: String,
     state: Option<String>,
@@ -789,6 +790,13 @@ pub async fn search_global(
     repo_scope: Option<&str>,
     config: &Config,
 ) -> Vec<SectionSnapshot> {
+    if let (Some(repo), Some(number)) = (
+        repo_scope.map(str::trim).filter(|repo| !repo.is_empty()),
+        parse_number_lookup_query(query),
+    ) {
+        return search_global_number(query, repo, number, config).await;
+    }
+
     let viewer_login = match cached_viewer_login().await {
         Ok(login) => Some(login),
         Err(error) => {
@@ -838,6 +846,75 @@ pub async fn search_global(
         excludes.as_slice(),
     )
     .await;
+
+    vec![pull_requests, issues]
+}
+
+async fn search_global_number(
+    query: &str,
+    repo: &str,
+    number: u64,
+    config: &Config,
+) -> Vec<SectionSnapshot> {
+    let view = global_search_view_key();
+    let display_filters = number_lookup_display_filters(query, repo, number);
+    let mut pull_requests = SectionSnapshot::empty_for_view(
+        view.clone(),
+        SectionKind::PullRequests,
+        "Pull Requests",
+        display_filters.clone(),
+    );
+    let mut issues =
+        SectionSnapshot::empty_for_view(view, SectionKind::Issues, "Issues", display_filters);
+    let started = Instant::now();
+
+    match fetch_number_lookup_item(repo, number, config.exclude_repos.as_slice()).await {
+        Ok(item) => {
+            let now = Utc::now();
+            pull_requests.total_count = Some(0);
+            pull_requests.page = 1;
+            pull_requests.page_size = search_api_page_size(config.defaults.pr_per_page);
+            pull_requests.refreshed_at = Some(now);
+            issues.total_count = Some(0);
+            issues.page = 1;
+            issues.page_size = search_api_page_size(config.defaults.issue_per_page);
+            issues.refreshed_at = Some(now);
+
+            if let Some((kind, item)) = item {
+                match kind {
+                    SectionKind::PullRequests => {
+                        pull_requests.total_count = Some(1);
+                        pull_requests.items = vec![item];
+                    }
+                    SectionKind::Issues => {
+                        issues.total_count = Some(1);
+                        issues.items = vec![item];
+                    }
+                    SectionKind::Notifications => unreachable!("number lookup cannot return inbox"),
+                }
+            }
+
+            info!(
+                repo,
+                number,
+                pr_items = pull_requests.items.len(),
+                issue_items = issues.items.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "global number search refreshed"
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            warn!(
+                repo,
+                number,
+                error = %message,
+                "global number search failed"
+            );
+            pull_requests.error = Some(message.clone());
+            issues.error = Some(message);
+        }
+    }
 
     vec![pull_requests, issues]
 }
@@ -1193,6 +1270,44 @@ fn search_api_page_size(limit: usize) -> usize {
     limit.clamp(1, SEARCH_API_MAX_PAGE_SIZE)
 }
 
+async fn fetch_number_lookup_item(
+    repo: &str,
+    number: u64,
+    exclude_repos: &[String],
+) -> Result<Option<(SectionKind, WorkItem)>> {
+    if is_excluded_repo(repo, exclude_repos) {
+        return Ok(None);
+    }
+
+    let args = vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        format!("repos/{repo}/issues/{number}"),
+    ];
+    let output = match run_gh_json(&args).await {
+        Ok(output) => output,
+        Err(error) if is_gh_not_found_error(&error) => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to fetch {repo}#{number} by number"));
+        }
+    };
+    let raw = serde_json::from_str::<SearchApiIssueRaw>(&output)
+        .with_context(|| format!("failed to parse {repo}#{number} number lookup"))?;
+    let kind = if raw.pull_request.is_some() {
+        SectionKind::PullRequests
+    } else {
+        SectionKind::Issues
+    };
+    let item = search_api_item_to_work_item(kind, raw);
+    if is_excluded_repo(&item.repo, exclude_repos) {
+        return Ok(None);
+    }
+
+    Ok(Some((kind, item)))
+}
+
 async fn fetch_search_page(
     kind: SectionKind,
     filters: &str,
@@ -1292,6 +1407,25 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         tokens.push("sort:created-desc".to_string());
     }
     tokens.join(" ")
+}
+
+fn parse_number_lookup_query(query: &str) -> Option<u64> {
+    let query = query.trim();
+    let query = query.strip_prefix('#').unwrap_or(query);
+    if query.is_empty() || !query.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    query.parse().ok().filter(|number| *number > 0)
+}
+
+fn number_lookup_display_filters(query: &str, repo: &str, number: u64) -> String {
+    let query = query.trim();
+    let query = if query.is_empty() {
+        format!("#{number}")
+    } else {
+        query.to_string()
+    };
+    format!("{query} repo:{repo}")
 }
 
 fn should_default_global_search_to_title(tokens: &[String]) -> bool {
@@ -3420,6 +3554,13 @@ fn gh_failure_message(args: &[String], message: &str) -> String {
     format!("gh {} failed: {message}", args.join(" "))
 }
 
+fn is_gh_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("HTTP 404") || message.contains("Not Found (HTTP 404)")
+    })
+}
+
 fn pull_request_merge_blocker_message(
     repository: &str,
     number: u64,
@@ -4591,6 +4732,7 @@ mod tests {
                 title: "1.90".to_string(),
             }),
             number: 1,
+            pull_request: None,
             reactions: None,
             repository_url: "https://api.github.com/repos/rust-lang/rust".to_string(),
             state: Some("open".to_string()),
@@ -4617,6 +4759,24 @@ mod tests {
                 title: "1.90".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn search_api_issue_raw_preserves_pull_request_marker() {
+        let raw = serde_json::from_str::<SearchApiIssueRaw>(
+            r#"{
+                "html_url": "https://github.com/rust-lang/rust/pull/149468",
+                "number": 149468,
+                "pull_request": {
+                    "url": "https://api.github.com/repos/rust-lang/rust/pulls/149468"
+                },
+                "repository_url": "https://api.github.com/repos/rust-lang/rust",
+                "title": "Skipping borrowck because of trivial const"
+            }"#,
+        )
+        .expect("issue API PR response should parse");
+
+        assert!(raw.pull_request.is_some());
     }
 
     #[test]
@@ -4865,6 +5025,32 @@ mod tests {
         assert_eq!(
             global_search_filters("rpc repo:rust-lang/rust", Some("nervosnetwork/fiber")),
             "rpc repo:rust-lang/rust in:title archived:false sort:created-desc"
+        );
+    }
+
+    #[test]
+    fn number_lookup_query_accepts_only_plain_issue_numbers() {
+        assert_eq!(parse_number_lookup_query("149468"), Some(149468));
+        assert_eq!(parse_number_lookup_query("  #149468  "), Some(149468));
+        assert_eq!(parse_number_lookup_query("0"), None);
+        assert_eq!(parse_number_lookup_query("#"), None);
+        assert_eq!(parse_number_lookup_query("149468 fix"), None);
+        assert_eq!(
+            parse_number_lookup_query("repo:rust-lang/rust 149468"),
+            None
+        );
+        assert_eq!(parse_number_lookup_query("abc149468"), None);
+    }
+
+    #[test]
+    fn number_lookup_display_filters_keep_user_query_and_repo_scope() {
+        assert_eq!(
+            number_lookup_display_filters("#149468", "rust-lang/rust", 149468),
+            "#149468 repo:rust-lang/rust"
+        );
+        assert_eq!(
+            number_lookup_display_filters("", "rust-lang/rust", 149468),
+            "#149468 repo:rust-lang/rust"
         );
     }
 

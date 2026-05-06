@@ -65,7 +65,10 @@ use crate::model::{
     merge_refreshed_sections, repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
-use crate::state::{MAX_RECENT_ITEMS, RecentItemState, UiState, ViewSnapshot as SavedViewSnapshot};
+use crate::state::{
+    MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
+    ViewSnapshot as SavedViewSnapshot,
+};
 
 mod command_palette;
 mod details;
@@ -1060,6 +1063,12 @@ struct RecentItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentCommand {
+    id: String,
+    selected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DetailsVisitState {
     item: RecentItem,
     started_at: Instant,
@@ -1392,6 +1401,7 @@ struct AppState {
     project_switcher: Option<ProjectSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
+    recent_commands: Vec<RecentCommand>,
     details_visit: Option<DetailsVisitState>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
@@ -4740,7 +4750,7 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
 
     if let Some(palette) = &app.command_palette {
-        draw_command_palette(frame, palette, area, &app.command_palette_key);
+        draw_command_palette(frame, app, palette, area, &app.command_palette_key);
     }
     if let Some(switcher) = &app.project_switcher {
         draw_project_switcher(frame, app, switcher, area);
@@ -6442,12 +6452,13 @@ fn help_dialog_width(area: Rect) -> u16 {
 
 fn draw_command_palette(
     frame: &mut Frame<'_>,
+    app: &AppState,
     palette: &CommandPalette,
     area: Rect,
     command_palette_key: &str,
 ) {
     let commands = command_palette_commands(command_palette_key);
-    let matches = command_palette_filtered_indices(&commands, &palette.query);
+    let matches = app.command_palette_match_indices(&commands, &palette.query);
     let dialog_area = command_palette_area(area);
     let inner = block_inner(dialog_area);
     let result_height = usize::from(inner.height.saturating_sub(2));
@@ -10160,6 +10171,32 @@ fn recent_items_to_saved(items: &[RecentItem]) -> Vec<RecentItemState> {
         .collect()
 }
 
+fn recent_commands_from_saved(items: &[RecentCommandState]) -> Vec<RecentCommand> {
+    items
+        .iter()
+        .filter_map(|item| {
+            Some(RecentCommand {
+                id: item.id.clone(),
+                selected_at: item.selected_at?,
+            })
+        })
+        .collect()
+}
+
+fn recent_commands_to_saved(items: &[RecentCommand]) -> Vec<RecentCommandState> {
+    items
+        .iter()
+        .map(|item| RecentCommandState {
+            id: item.id.clone(),
+            selected_at: Some(item.selected_at),
+        })
+        .collect()
+}
+
+fn command_palette_command_id(command: &PaletteCommand) -> String {
+    command.title.to_string()
+}
+
 fn recent_item_state_kind(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::PullRequest => "pull_request",
@@ -10307,6 +10344,7 @@ impl AppState {
             project_switcher: None,
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
+            recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
             details_visit: None,
             project_add_dialog: None,
             project_remove_dialog: None,
@@ -10463,6 +10501,7 @@ impl AppState {
             diff_file_details_scroll,
             ignored_items: sorted_strings(&self.ignored_items),
             recent_items: recent_items_to_saved(&self.recent_items),
+            recent_commands: recent_commands_to_saved(&self.recent_commands),
         }
     }
 
@@ -12061,12 +12100,18 @@ impl AppState {
     }
 
     fn move_command_palette_selection(&mut self, delta: isize) {
-        let Some(palette) = &mut self.command_palette else {
+        let Some(query) = self
+            .command_palette
+            .as_ref()
+            .map(|palette| palette.query.clone())
+        else {
             return;
         };
         let commands = command_palette_commands(&self.command_palette_key);
-        let len = command_palette_filtered_indices(&commands, &palette.query).len();
-        palette.selected = move_wrapping(palette.selected, len, delta);
+        let len = self.command_palette_match_indices(&commands, &query).len();
+        if let Some(palette) = &mut self.command_palette {
+            palette.selected = move_wrapping(palette.selected, len, delta);
+        }
     }
 
     fn submit_command_palette_selection(
@@ -12082,6 +12127,7 @@ impl AppState {
             return false;
         };
 
+        self.remember_command_palette_selection(&command, Utc::now());
         self.command_palette = None;
         match command.action {
             PaletteAction::Key(key) => {
@@ -12170,12 +12216,54 @@ impl AppState {
     fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
         let palette = self.command_palette.as_ref()?;
         let commands = command_palette_commands(&self.command_palette_key);
-        let matches = command_palette_filtered_indices(&commands, &palette.query);
+        let matches = self.command_palette_match_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
         matches
             .get(selected)
             .and_then(|index| commands.get(*index))
             .cloned()
+    }
+
+    fn command_palette_match_indices(
+        &self,
+        commands: &[PaletteCommand],
+        query: &str,
+    ) -> Vec<usize> {
+        let mut matches = command_palette_filtered_indices(commands, query);
+        matches.sort_by(|left, right| {
+            let left_selected_at = self.command_palette_selected_at(&commands[*left]);
+            let right_selected_at = self.command_palette_selected_at(&commands[*right]);
+            match (left_selected_at, right_selected_at) {
+                (Some(left_selected_at), Some(right_selected_at)) => right_selected_at
+                    .cmp(&left_selected_at)
+                    .then_with(|| left.cmp(right)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => left.cmp(right),
+            }
+        });
+        matches
+    }
+
+    fn command_palette_selected_at(&self, command: &PaletteCommand) -> Option<DateTime<Utc>> {
+        let id = command_palette_command_id(command);
+        self.recent_commands
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.selected_at)
+    }
+
+    fn remember_command_palette_selection(
+        &mut self,
+        command: &PaletteCommand,
+        selected_at: DateTime<Utc>,
+    ) {
+        let id = command_palette_command_id(command);
+        self.recent_commands.retain(|item| item.id != id);
+        self.recent_commands.push(RecentCommand { id, selected_at });
+        self.recent_commands
+            .sort_by_key(|item| std::cmp::Reverse(item.selected_at));
+        self.recent_commands.truncate(MAX_RECENT_COMMANDS);
     }
 
     fn show_project_switcher(&mut self) {
@@ -19322,7 +19410,9 @@ deleted file mode 100644
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("✓ + new"));
+        assert!(rendered.contains("💬 + new"));
+        assert!(!rendered.contains("✓ + new"));
+        assert!(!rendered.contains("◌ + new"));
         assert!(rendered.contains("resolved"));
         assert!(rendered.contains("outdated"));
         assert!(rendered.contains("not attached to a current diff line"));
@@ -21411,6 +21501,7 @@ diff --git a/src/github.rs b/src/github.rs
             diff_file_details_scroll: HashMap::new(),
             ignored_items: Vec::new(),
             recent_items: Vec::new(),
+            recent_commands: Vec::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -22457,6 +22548,86 @@ diff --git a/src/main.rs b/src/main.rs
             Some("draft")
         );
         assert_eq!(app.command_palette_key, "Ctrl+L");
+    }
+
+    #[test]
+    fn command_palette_orders_recently_selected_commands_first() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+        app.recent_commands = vec![
+            RecentCommand {
+                id: "Refresh".to_string(),
+                selected_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+            RecentCommand {
+                id: "Info".to_string(),
+                selected_at: DateTime::from_timestamp(1_700_000_100, 0).unwrap(),
+            },
+        ];
+
+        let matches = app.command_palette_match_indices(&commands, "");
+
+        assert_eq!(commands[matches[0]].title, "Info");
+        assert_eq!(commands[matches[1]].title, "Refresh");
+    }
+
+    #[test]
+    fn command_palette_recent_ties_fall_back_to_default_order() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+        let selected_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        app.recent_commands = vec![
+            RecentCommand {
+                id: "Refresh".to_string(),
+                selected_at,
+            },
+            RecentCommand {
+                id: "Show Help".to_string(),
+                selected_at,
+            },
+        ];
+
+        let matches = app.command_palette_match_indices(&commands, "");
+
+        assert_eq!(commands[matches[0]].title, "Show Help");
+        assert_eq!(commands[matches[1]].title, "Refresh");
+    }
+
+    #[test]
+    fn command_palette_submission_records_recent_command() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        let paths = unique_test_paths("command-palette-recent");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        app.command_palette = Some(CommandPalette {
+            query: "info".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        assert_eq!(
+            app.recent_commands
+                .first()
+                .map(|command| command.id.as_str()),
+            Some("Info")
+        );
+        assert_eq!(
+            app.ui_state()
+                .recent_commands
+                .first()
+                .map(|command| command.id.as_str()),
+            Some("Info")
+        );
     }
 
     #[test]

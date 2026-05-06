@@ -85,7 +85,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 | Key | Action |
 | --- | --- |
-| `:` | Open the command palette and fuzzy search every shortcut |
+| `:` | Open the command palette and fuzzy search every shortcut; recently run commands appear first |
 | `Project Switch` | Filter configured repos by prefix and activate a project tab |
 | `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |

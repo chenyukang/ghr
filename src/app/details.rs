@@ -2155,20 +2155,19 @@ pub(super) fn diff_inline_comment_summary(
 pub(super) fn diff_inline_comment_marker(
     summary: DiffInlineCommentSummary,
 ) -> (&'static str, Style) {
-    if summary.has_outdated {
-        return ("◌ ", review_outdated_style());
-    }
-    if summary.has_resolved {
-        return ("✓ ", review_resolved_style());
-    }
-    if summary.count > 9 {
-        (
-            INLINE_COMMENT_MULTIPLE_MARKER,
-            diff_inline_comment_marker_style(),
-        )
+    let marker = if summary.count > 9 {
+        INLINE_COMMENT_MULTIPLE_MARKER
     } else {
-        (INLINE_COMMENT_MARKER, diff_inline_comment_marker_style())
-    }
+        INLINE_COMMENT_MARKER
+    };
+    let style = if summary.has_outdated {
+        review_outdated_style()
+    } else if summary.has_resolved {
+        review_resolved_style()
+    } else {
+        diff_inline_comment_marker_style()
+    };
+    (marker, style)
 }
 
 pub(super) fn diff_unplaced_review_comment_entries(
@@ -2306,12 +2305,13 @@ pub(super) fn comment_header_marker(
     let Some(review) = &comment.review else {
         return if inline { INLINE_COMMENT_MARKER } else { "  " };
     };
+    if inline {
+        return INLINE_COMMENT_MARKER;
+    }
     if review.is_outdated {
         "◌ "
     } else if review.is_resolved {
         "✓ "
-    } else if inline {
-        INLINE_COMMENT_MARKER
     } else {
         "  "
     }

@@ -11,6 +11,7 @@ pub const DEFAULT_LIST_WIDTH_PERCENT: u16 = 50;
 pub const MIN_LIST_WIDTH_PERCENT: u16 = 30;
 pub const MAX_LIST_WIDTH_PERCENT: u16 = 85;
 pub const MAX_RECENT_ITEMS: usize = 20;
+pub const MAX_RECENT_COMMANDS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -34,6 +35,7 @@ pub struct UiState {
     pub diff_file_details_scroll: HashMap<String, u16>,
     pub ignored_items: Vec<String>,
     pub recent_items: Vec<RecentItemState>,
+    pub recent_commands: Vec<RecentCommandState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +89,23 @@ impl RecentItemState {
             _ => return None,
         };
         if self.repo.is_empty() || self.number.is_none() || self.visited_at.is_none() {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecentCommandState {
+    pub id: String,
+    pub selected_at: Option<DateTime<Utc>>,
+}
+
+impl RecentCommandState {
+    fn normalized(mut self) -> Option<Self> {
+        self.id = self.id.trim().to_string();
+        if self.id.is_empty() || self.selected_at.is_none() {
             return None;
         }
         Some(self)
@@ -152,6 +171,7 @@ impl UiState {
             .retain(|key| !key.trim().is_empty() && seen_ignored.insert(key.clone()));
         self.ignored_items.sort();
         self.recent_items = normalized_recent_items(self.recent_items);
+        self.recent_commands = normalized_recent_commands(self.recent_commands);
         self
     }
 }
@@ -178,6 +198,7 @@ impl Default for UiState {
             diff_file_details_scroll: HashMap::new(),
             ignored_items: Vec::new(),
             recent_items: Vec::new(),
+            recent_commands: Vec::new(),
         }
     }
 }
@@ -206,6 +227,19 @@ fn recent_item_key(item: &RecentItemState) -> String {
         item.repo.to_ascii_lowercase(),
         item.number.unwrap_or_default()
     )
+}
+
+fn normalized_recent_commands(items: Vec<RecentCommandState>) -> Vec<RecentCommandState> {
+    let mut normalized = items
+        .into_iter()
+        .filter_map(RecentCommandState::normalized)
+        .collect::<Vec<_>>();
+    normalized.sort_by_key(|item| std::cmp::Reverse(item.selected_at));
+
+    let mut seen = HashSet::new();
+    normalized.retain(|item| seen.insert(item.id.to_ascii_lowercase()));
+    normalized.truncate(MAX_RECENT_COMMANDS);
+    normalized
 }
 
 #[cfg(test)]
@@ -278,6 +312,20 @@ mod tests {
                     visited_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
                 },
             ],
+            recent_commands: vec![
+                RecentCommandState {
+                    id: "Refresh".to_string(),
+                    selected_at: Some(DateTime::from_timestamp(1_700_000_010, 0).unwrap()),
+                },
+                RecentCommandState {
+                    id: "refresh".to_string(),
+                    selected_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
+                },
+                RecentCommandState {
+                    id: String::new(),
+                    selected_at: Some(DateTime::from_timestamp(1_700_000_020, 0).unwrap()),
+                },
+            ],
         }
         .save(&path)
         .expect("save state");
@@ -338,6 +386,13 @@ mod tests {
                 visited_at: Some(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
             }]
         );
+        assert_eq!(
+            state.recent_commands,
+            vec![RecentCommandState {
+                id: "Refresh".to_string(),
+                selected_at: Some(DateTime::from_timestamp(1_700_000_010, 0).unwrap()),
+            }]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -386,6 +441,36 @@ mod tests {
             Some(5)
         );
         assert_eq!(state.recent_items[0].kind, "pull_request");
+    }
+
+    #[test]
+    fn recent_commands_are_newest_first_deduped_and_limited() {
+        let state = UiState {
+            recent_commands: (0..105)
+                .map(|number| RecentCommandState {
+                    id: format!("Command {number}"),
+                    selected_at: Some(
+                        DateTime::from_timestamp(1_700_000_000 + number as i64, 0).unwrap(),
+                    ),
+                })
+                .chain([RecentCommandState {
+                    id: "command 104".to_string(),
+                    selected_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
+                }])
+                .collect(),
+            ..UiState::default()
+        }
+        .normalized();
+
+        assert_eq!(state.recent_commands.len(), MAX_RECENT_COMMANDS);
+        assert_eq!(
+            state.recent_commands.first().map(|item| item.id.as_str()),
+            Some("Command 104")
+        );
+        assert_eq!(
+            state.recent_commands.last().map(|item| item.id.as_str()),
+            Some("Command 5")
+        );
     }
 
     #[test]

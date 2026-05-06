@@ -1,5 +1,5 @@
 const shortcuts = [
-  ["General", ":", "Open the command palette and fuzzy-search every command"],
+  ["General", ":", "Open the command palette and fuzzy-search every command; recently run commands appear first"],
   ["General", "?", "Open the live help reference"],
   ["General", "r", "Refresh dashboard data from GitHub"],
   ["General", "q / Ctrl+C", "Save UI state and quit"],

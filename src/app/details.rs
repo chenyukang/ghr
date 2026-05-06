@@ -7,6 +7,8 @@ const DETAILS_METADATA_KEY_WIDTH: usize = 11;
 const DESCRIPTION_BODY_PADDING: usize = 2;
 const DESCRIPTION_PREVIEW_MAX_LINES: usize = 22;
 const DESCRIPTION_PREVIEW_MAX_CHARS: usize = 2_400;
+const INLINE_COMMENT_MARKER: &str = "💬 ";
+const INLINE_COMMENT_MULTIPLE_MARKER: &str = "💬* ";
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
@@ -2166,9 +2168,12 @@ pub(super) fn diff_inline_comment_marker(
         return ("✓ ", review_resolved_style());
     }
     if summary.count > 9 {
-        ("●* ", diff_inline_comment_marker_style())
+        (
+            INLINE_COMMENT_MULTIPLE_MARKER,
+            diff_inline_comment_marker_style(),
+        )
     } else {
-        ("● ", diff_inline_comment_marker_style())
+        (INLINE_COMMENT_MARKER, diff_inline_comment_marker_style())
     }
 }
 
@@ -2305,14 +2310,14 @@ pub(super) fn comment_header_marker(
         return "▸ ";
     }
     let Some(review) = &comment.review else {
-        return if inline { "● " } else { "  " };
+        return if inline { INLINE_COMMENT_MARKER } else { "  " };
     };
     if review.is_outdated {
         "◌ "
     } else if review.is_resolved {
         "✓ "
     } else if inline {
-        "● "
+        INLINE_COMMENT_MARKER
     } else {
         "  "
     }

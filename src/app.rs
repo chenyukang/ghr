@@ -3706,7 +3706,7 @@ fn handle_left_click(
         && let Some(comment_indices) = document.inline_comment_marker_at(line_index)
     {
         debug!(comment_indices = ?comment_indices, "inline comment marker clicked");
-        app.reveal_diff_inline_comments(comment_indices.to_vec());
+        app.toggle_revealed_diff_inline_comments(comment_indices);
         return;
     }
     if app.details_mode == DetailsMode::Diff
@@ -13437,18 +13437,37 @@ impl AppState {
         }
     }
 
-    fn reveal_diff_inline_comments(&mut self, comment_indices: Vec<usize>) {
+    fn toggle_revealed_diff_inline_comments(&mut self, comment_indices: &[usize]) {
         let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
             return;
         };
         if comment_indices.is_empty() {
             return;
         }
-        self.revealed_diff_inline_comments
-            .entry(item_id)
-            .or_default()
-            .extend(comment_indices);
-        self.status = "diff comment thread shown".to_string();
+        if self.diff_inline_comments_visible {
+            self.status = "diff comments already shown".to_string();
+            return;
+        }
+
+        let revealed = self
+            .revealed_diff_inline_comments
+            .entry(item_id.clone())
+            .or_default();
+        let all_revealed = comment_indices
+            .iter()
+            .all(|comment_index| revealed.contains(comment_index));
+        if all_revealed {
+            for comment_index in comment_indices {
+                revealed.remove(comment_index);
+            }
+            if revealed.is_empty() {
+                self.revealed_diff_inline_comments.remove(&item_id);
+            }
+            self.status = "diff comment thread hidden".to_string();
+        } else {
+            revealed.extend(comment_indices.iter().copied());
+            self.status = "diff comment thread shown".to_string();
+        }
     }
 
     fn show_diff(&mut self) {
@@ -13717,6 +13736,9 @@ impl AppState {
         {
             return;
         }
+        if self.move_hidden_diff_inline_comment(delta, area) {
+            return;
+        }
         if self.move_rendered_comment(delta, area) {
             return;
         }
@@ -13728,6 +13750,68 @@ impl AppState {
         } else {
             self.scroll_selected_comment_into_view(area);
         }
+    }
+
+    fn move_hidden_diff_inline_comment(&mut self, delta: isize, area: Option<Rect>) -> bool {
+        if self.details_mode != DetailsMode::Diff || self.diff_inline_comments_visible {
+            return false;
+        }
+        let Some(area) = area else {
+            return false;
+        };
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            self.status = "no comments".to_string();
+            return true;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            return true;
+        }
+        let document = build_details_document(self, inner.width);
+        let marker_order = document
+            .inline_comment_markers
+            .iter()
+            .filter(|marker| !marker.comment_indices.is_empty())
+            .map(|marker| marker.comment_indices.clone())
+            .collect::<Vec<_>>();
+        if marker_order.is_empty() {
+            self.status = "no comments".to_string();
+            return true;
+        }
+
+        let revealed = self.revealed_diff_inline_comments.get(&item_id);
+        let current_position = revealed.and_then(|revealed| {
+            marker_order.iter().position(|comment_indices| {
+                comment_indices.contains(&self.selected_comment_index)
+                    && comment_indices
+                        .iter()
+                        .any(|comment_index| revealed.contains(comment_index))
+            })
+        });
+        let next_position = match current_position {
+            Some(0) if delta < 0 => {
+                self.select_details_body();
+                return true;
+            }
+            Some(position) => move_bounded(position, marker_order.len(), delta),
+            None if delta < 0 => marker_order.len() - 1,
+            None => 0,
+        };
+
+        let comment_indices = marker_order[next_position].clone();
+        self.selected_comment_index = comment_indices[0];
+        self.revealed_diff_inline_comments.insert(
+            item_id,
+            comment_indices.iter().copied().collect::<HashSet<_>>(),
+        );
+        self.status = format!(
+            "comment {}/{} focused",
+            next_position + 1,
+            marker_order.len()
+        );
+        self.scroll_selected_comment_into_view(Some(area));
+        true
     }
 
     fn move_rendered_comment(&mut self, delta: isize, area: Option<Rect>) -> bool {
@@ -17389,7 +17473,7 @@ deleted file mode 100644
             .collect::<Vec<_>>();
 
         assert!(
-            rendered.iter().any(|line| line.contains("│ ● + new")),
+            rendered.iter().any(|line| line.contains("│ 💬 + new")),
             "target diff line should show an inline comment marker: {rendered:?}"
         );
         assert!(
@@ -17511,7 +17595,7 @@ deleted file mode 100644
             .collect::<Vec<_>>();
 
         assert!(
-            rendered.iter().any(|line| line.contains("│ ● + new")),
+            rendered.iter().any(|line| line.contains("│ 💬 + new")),
             "diff line should keep a clickable inline-comment marker when comments are hidden: {rendered:?}"
         );
         assert!(
@@ -17519,7 +17603,7 @@ deleted file mode 100644
                 .inline_comment_marker_at(
                     rendered
                         .iter()
-                        .position(|line| line.contains("│ ● + new"))
+                        .position(|line| line.contains("│ 💬 + new"))
                         .expect("marker line")
                 )
                 .is_some(),
@@ -17577,12 +17661,12 @@ deleted file mode 100644
                 build_details_document(&app, 120)
                     .lines
                     .iter()
-                    .position(|line| line.to_string().contains("│ ● + new"))
+                    .position(|line| line.to_string().contains("│ 💬 + new"))
                     .expect("marker line"),
             )
             .expect("marker indices")
             .to_vec();
-        app.reveal_diff_inline_comments(marker_indices);
+        app.toggle_revealed_diff_inline_comments(&marker_indices);
         let rendered = build_details_document(&app, 120)
             .lines
             .iter()
@@ -17598,6 +17682,100 @@ deleted file mode 100644
                 .iter()
                 .any(|line| line.contains("Revealed by marker click.")),
             "marker click should reveal the inline comment body: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn mouse_clicking_hidden_diff_inline_comment_marker_toggles_that_thread() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let mut inline = comment("alice", "Toggle me from the marker.", None);
+        inline.id = Some(1);
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+
+        app.toggle_diff_inline_comments();
+        let area = Rect::new(0, 0, 120, 32);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let marker_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("│ 💬 + new"))
+            .expect("marker line");
+
+        let click_marker = |app: &mut AppState| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: inner.x + 2,
+                    row: inner.y + marker_line as u16,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                area,
+            );
+        };
+
+        click_marker(&mut app);
+        let rendered = build_details_document(&app, inner.width)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(app.status, "diff comment thread shown");
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Toggle me from the marker.")),
+            "first marker click should reveal the inline comment body: {rendered:?}"
+        );
+
+        click_marker(&mut app);
+        let rendered = build_details_document(&app, inner.width)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(app.status, "diff comment thread hidden");
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("alice") || line.contains("Toggle me from the marker.")),
+            "second marker click should hide the inline comment thread: {rendered:?}"
+        );
+        assert!(
+            !app.revealed_diff_inline_comments.contains_key("1"),
+            "hidden thread should not leave an empty reveal set"
         );
     }
 
@@ -18139,6 +18317,148 @@ deleted file mode 100644
         ));
         assert_eq!(app.selected_comment_index, 0);
         assert_eq!(app.status, "comment 1/2 focused");
+    }
+
+    #[test]
+    fn n_and_p_reveal_hidden_diff_inline_comment_threads_one_at_a_time() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        let mut first = comment("alice", "first hidden inline", None);
+        first.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        let mut second = comment("bob", "second hidden inline", None);
+        second.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(2),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        app.show_diff();
+        app.focus_details();
+        app.clear_selected_comment();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old1
++new1
+-old2
++new2
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![first, second]));
+        app.toggle_diff_inline_comments();
+        let area = Rect::new(0, 0, 120, 36);
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 0);
+        assert_eq!(app.status, "comment 1/2 focused");
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("first hidden inline")),
+            "n should reveal the first inline thread: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("second hidden inline")),
+            "n should keep other hidden inline threads collapsed: {rendered:?}"
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('n')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 1);
+        assert_eq!(app.status, "comment 2/2 focused");
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("first hidden inline")),
+            "moving to the next hidden thread should collapse the previous one: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("second hidden inline")),
+            "n should reveal the second inline thread: {rendered:?}"
+        );
+
+        assert!(!handle_key_in_area(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &config,
+            &store,
+            &tx,
+            Some(area)
+        ));
+        assert_eq!(app.selected_comment_index, 0);
+        assert_eq!(app.status, "comment 1/2 focused");
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("first hidden inline")),
+            "p should reveal the previous inline thread: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("second hidden inline")),
+            "p should keep non-selected inline threads collapsed: {rendered:?}"
+        );
     }
 
     #[test]

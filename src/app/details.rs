@@ -15,6 +15,7 @@ pub(super) struct DetailsDocument {
     pub(super) comments: Vec<CommentRegion>,
     pub(super) diff_files: Vec<usize>,
     pub(super) diff_lines: Vec<DiffLineRegion>,
+    pub(super) inline_comment_markers: Vec<DiffInlineCommentMarkerRegion>,
     pub(super) selected_diff_line: Option<usize>,
 }
 
@@ -55,6 +56,13 @@ impl DetailsDocument {
             .iter()
             .find(|diff_line| diff_line.line == line)
             .map(|diff_line| diff_line.review_index)
+    }
+
+    pub(super) fn inline_comment_marker_at(&self, line: usize) -> Option<&[usize]> {
+        self.inline_comment_markers
+            .iter()
+            .find(|marker| marker.line == line)
+            .map(|marker| marker.comment_indices.as_slice())
     }
 }
 
@@ -128,6 +136,12 @@ pub(super) struct CommentRenderOptions {
 pub(super) struct DiffLineRegion {
     pub(super) line: usize,
     pub(super) review_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DiffInlineCommentMarkerRegion {
+    pub(super) line: usize,
+    pub(super) comment_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +231,8 @@ pub(super) struct DiffRenderContext<'a> {
     item_id: &'a str,
     comments: Option<&'a [CommentPreview]>,
     expanded_comments: &'a HashSet<String>,
+    diff_inline_comments_visible: bool,
+    revealed_diff_inline_comments: Option<&'a HashSet<usize>>,
     details_focused: bool,
     selected_comment_index: usize,
     selected_file: usize,
@@ -396,6 +412,7 @@ impl DetailsBuilder {
                 comments: Vec::new(),
                 diff_files: Vec::new(),
                 diff_lines: Vec::new(),
+                inline_comment_markers: Vec::new(),
                 selected_diff_line: None,
             },
             width: usize::from(width.max(1)),
@@ -422,6 +439,19 @@ impl DetailsBuilder {
         if selected {
             self.document.selected_diff_line = Some(line);
         }
+    }
+
+    fn mark_inline_comment_marker(&mut self, comment_indices: Vec<usize>) {
+        if comment_indices.is_empty() {
+            return;
+        }
+        let line = self.document.lines.len();
+        self.document
+            .inline_comment_markers
+            .push(DiffInlineCommentMarkerRegion {
+                line,
+                comment_indices,
+            });
     }
 
     fn push_line(&mut self, segments: Vec<DetailSegment>) {
@@ -1350,6 +1380,8 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
                     item_id: &item.id,
                     comments: inline_comments,
                     expanded_comments: &app.expanded_comments,
+                    diff_inline_comments_visible: app.diff_inline_comments_visible,
+                    revealed_diff_inline_comments: app.revealed_diff_inline_comments.get(&item.id),
                     details_focused: app.focus == FocusTarget::Details,
                     selected_comment_index: app.selected_comment_index,
                     selected_file,
@@ -1483,6 +1515,11 @@ pub(super) fn push_diff(
                 index
             });
             let inline_summary = diff_inline_comment_summary(context.comments, inline_entries);
+            if inline_summary.count > 0 {
+                builder.mark_inline_comment_marker(
+                    inline_entries.iter().map(|entry| entry.index).collect(),
+                );
+            }
             push_diff_line(
                 builder,
                 line,
@@ -1493,36 +1530,58 @@ pub(super) fn push_diff(
                 inline_summary,
             );
             if let Some(comments) = context.comments {
+                if context.diff_inline_comments_visible {
+                    push_diff_inline_comments(
+                        builder,
+                        context.item_id,
+                        comments,
+                        inline_entries,
+                        context.expanded_comments,
+                        context.details_focused,
+                        context.selected_comment_index,
+                    );
+                } else if let Some(revealed) = context.revealed_diff_inline_comments {
+                    let revealed_entries = inline_entries
+                        .iter()
+                        .filter(|entry| revealed.contains(&entry.index))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    push_diff_inline_comments(
+                        builder,
+                        context.item_id,
+                        comments,
+                        &revealed_entries,
+                        context.expanded_comments,
+                        context.details_focused,
+                        context.selected_comment_index,
+                    );
+                }
+            }
+        }
+    }
+    if context.diff_inline_comments_visible {
+        if let Some(comments) = context.comments {
+            let unplaced_entries = diff_unplaced_review_comment_entries(
+                comments,
+                file,
+                &rendered_inline_comment_indices,
+            );
+            if !unplaced_entries.is_empty() {
+                builder.push_blank();
+                builder.push_line(vec![DetailSegment::styled(
+                    "Resolved/outdated comments not attached to a current diff line",
+                    diff_metadata_style(),
+                )]);
                 push_diff_inline_comments(
                     builder,
                     context.item_id,
                     comments,
-                    inline_entries,
+                    &unplaced_entries,
                     context.expanded_comments,
                     context.details_focused,
                     context.selected_comment_index,
                 );
             }
-        }
-    }
-    if let Some(comments) = context.comments {
-        let unplaced_entries =
-            diff_unplaced_review_comment_entries(comments, file, &rendered_inline_comment_indices);
-        if !unplaced_entries.is_empty() {
-            builder.push_blank();
-            builder.push_line(vec![DetailSegment::styled(
-                "Resolved/outdated comments not attached to a current diff line",
-                diff_metadata_style(),
-            )]);
-            push_diff_inline_comments(
-                builder,
-                context.item_id,
-                comments,
-                &unplaced_entries,
-                context.expanded_comments,
-                context.details_focused,
-                context.selected_comment_index,
-            );
         }
     }
 }

@@ -1151,6 +1151,8 @@ struct AppState {
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
+    diff_inline_comments_visible: bool,
+    revealed_diff_inline_comments: HashMap<String, HashSet<usize>>,
     conversation_details_state: HashMap<String, ConversationDetailsState>,
     viewed_details_snapshot: HashMap<String, String>,
     viewed_comments_snapshot: HashMap<String, String>,
@@ -3000,6 +3002,10 @@ fn handle_key_in_area_mut(
             app.leave_diff();
             return false;
         }
+        KeyCode::Char('i') if app.details_mode == DetailsMode::Diff => {
+            app.toggle_diff_inline_comments();
+            return false;
+        }
         KeyCode::Char('q') => return true,
         KeyCode::Char('?') => app.show_help_dialog(),
         KeyCode::Char('r') => trigger_refresh(app, config, store, tx),
@@ -3684,6 +3690,13 @@ fn handle_left_click(
         }
         app.open_url(&url);
         return;
+    }
+    if app.details_mode == DetailsMode::Diff {
+        if let Some(comment_indices) = document.inline_comment_marker_at(line_index) {
+            debug!(comment_indices = ?comment_indices, "inline comment marker clicked");
+            app.reveal_diff_inline_comments(comment_indices.to_vec());
+            return;
+        }
     }
     if app.details_mode == DetailsMode::Diff
         && let Some(diff_line) = document.diff_line_at(line_index)
@@ -5128,6 +5141,7 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
                 push_footer_pair(&mut spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 push_footer_pair(&mut spans, "[ ]", "file", Color::Cyan);
+                push_footer_pair(&mut spans, "i", "comments", Color::Yellow);
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
@@ -5150,6 +5164,7 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
                 push_footer_pair(&mut spans, "tab", "files", Color::Cyan);
                 push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(&mut spans, "h/l", "page", Color::Cyan);
+                push_footer_pair(&mut spans, "i", "comments", Color::Yellow);
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
@@ -8619,6 +8634,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("[ / ]", "previous / next changed file"),
         help_key_line("Enter or 4", "focus the file diff"),
         help_key_line("c", "add review comment on selected diff line"),
+        help_key_line("i", "toggle inline review comments in diff"),
         help_key_line("a", "add a normal PR comment"),
         help_key_line("s", "submit a PR review summary"),
         help_key_line("A", "approve via the PR review summary"),
@@ -9160,6 +9176,8 @@ impl AppState {
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
+            diff_inline_comments_visible: true,
+            revealed_diff_inline_comments: HashMap::new(),
             conversation_details_state,
             viewed_details_snapshot: ui_state.viewed_details_snapshot.clone(),
             viewed_comments_snapshot: ui_state.viewed_comments_snapshot.clone(),
@@ -13289,6 +13307,30 @@ impl AppState {
         });
     }
 
+    fn toggle_diff_inline_comments(&mut self) {
+        self.diff_inline_comments_visible = !self.diff_inline_comments_visible;
+        if self.diff_inline_comments_visible {
+            self.revealed_diff_inline_comments.clear();
+            self.status = "diff comments shown".to_string();
+        } else {
+            self.status = "diff comments hidden; click markers to reveal threads".to_string();
+        }
+    }
+
+    fn reveal_diff_inline_comments(&mut self, comment_indices: Vec<usize>) {
+        let Some(item_id) = self.current_item().map(|item| item.id.clone()) else {
+            return;
+        };
+        if comment_indices.is_empty() {
+            return;
+        }
+        self.revealed_diff_inline_comments
+            .entry(item_id)
+            .or_default()
+            .extend(comment_indices);
+        self.status = "diff comment thread shown".to_string();
+    }
+
     fn show_diff(&mut self) {
         let Some(item) = self.current_item() else {
             self.status = "nothing to diff".to_string();
@@ -17300,6 +17342,142 @@ deleted file mode 100644
         assert_eq!(
             document.action_at(header_line, reply_column),
             Some(DetailAction::ReplyComment(0))
+        );
+    }
+
+    #[test]
+    fn diff_mode_can_hide_inline_review_comment_bodies_but_keeps_markers() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let mut inline = comment("alice", "Hidden until marker is opened.", None);
+        inline.id = Some(1);
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+
+        app.toggle_diff_inline_comments();
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("│ ● + new")),
+            "diff line should keep a clickable inline-comment marker when comments are hidden: {rendered:?}"
+        );
+        assert!(
+            document
+                .inline_comment_marker_at(
+                    rendered
+                        .iter()
+                        .position(|line| line.contains("│ ● + new"))
+                        .expect("marker line")
+                )
+                .is_some(),
+            "marker line should be discoverable for mouse clicks"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("alice")
+                    || line.contains("Hidden until marker is opened.")),
+            "inline comment body/header should be hidden until marker click: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_hidden_diff_inline_comment_marker_reveals_that_thread() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+        let mut inline = comment("alice", "Revealed by marker click.", None);
+        inline.id = Some(1);
+        inline.review = Some(crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        });
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+
+        app.toggle_diff_inline_comments();
+        let marker_indices = build_details_document(&app, 120)
+            .inline_comment_marker_at(
+                build_details_document(&app, 120)
+                    .lines
+                    .iter()
+                    .position(|line| line.to_string().contains("│ ● + new"))
+                    .expect("marker line"),
+            )
+            .expect("marker indices")
+            .to_vec();
+        app.reveal_diff_inline_comments(marker_indices);
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("alice")),
+            "marker click should reveal the inline comment header: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Revealed by marker click.")),
+            "marker click should reveal the inline comment body: {rendered:?}"
         );
     }
 

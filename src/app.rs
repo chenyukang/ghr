@@ -1095,6 +1095,8 @@ const DIFF_INLINE_COMMENT_GUTTER_WIDTH: usize = 11;
 const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
+const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
@@ -1163,6 +1165,8 @@ struct AppState {
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
+    comments_refresh_requested_at: HashMap<String, Instant>,
+    comments_refresh_after: HashMap<String, Instant>,
     notification_read_pending: HashSet<String>,
     notification_done_pending: HashSet<String>,
     selected_comment_index: usize,
@@ -1469,6 +1473,7 @@ async fn run_loop(
             app.handle_msg(message);
         }
         app.ensure_current_details_loading(tx);
+        app.ensure_current_comments_auto_refresh(tx);
         app.ensure_current_diff_loading(tx);
         app.dismiss_expired_message_dialog(Instant::now());
 
@@ -2069,6 +2074,10 @@ fn error_chain_message(error: anyhow::Error) -> String {
 
 fn retryable_operation_error_body(error: &str) -> String {
     operation_error_body(error)
+}
+
+fn item_supports_comments_refresh(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
 
 fn start_comment_submit(item: WorkItem, body: String, tx: UnboundedSender<AppMsg>) {
@@ -9172,6 +9181,8 @@ impl AppState {
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
             pending_details_load: None,
+            comments_refresh_requested_at: HashMap::new(),
+            comments_refresh_after: HashMap::new(),
             notification_read_pending: HashSet::new(),
             notification_done_pending: HashSet::new(),
             selected_comment_index: 0,
@@ -9751,6 +9762,7 @@ impl AppState {
                     self.selected_comment_index = index;
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.schedule_comments_refresh_after_post(item_id.clone());
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
@@ -9828,6 +9840,7 @@ impl AppState {
                     self.selected_comment_index = index;
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.schedule_comments_refresh_after_post(item_id.clone());
                     self.clamp_selected_comment();
                     self.mark_current_details_viewed_if_current(&item_id);
                     self.posting_comment = false;
@@ -12259,7 +12272,7 @@ impl AppState {
             self.pending_details_load = None;
             return;
         };
-        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) || item.number.is_none() {
+        if !item_supports_comments_refresh(&item) {
             self.pending_details_load = None;
             return;
         }
@@ -12277,6 +12290,15 @@ impl AppState {
         }
         if self.start_action_hints_load_if_needed(&item) {
             start_action_hints_load(item, tx.clone());
+        }
+    }
+
+    fn ensure_current_comments_auto_refresh(&mut self, tx: &UnboundedSender<AppMsg>) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if self.start_comments_auto_refresh_if_due(&item, Instant::now()) {
+            start_comments_load(item, tx.clone());
         }
     }
 
@@ -12482,6 +12504,10 @@ impl AppState {
     }
 
     fn start_comments_load_if_needed(&mut self, item: &WorkItem) -> bool {
+        self.start_comments_load_if_needed_at(item, Instant::now())
+    }
+
+    fn start_comments_load_if_needed_at(&mut self, item: &WorkItem, now: Instant) -> bool {
         let should_refresh = self.details_stale.remove(&item.id);
         if self.details.contains_key(&item.id) && !should_refresh {
             return false;
@@ -12492,7 +12518,47 @@ impl AppState {
         if !self.details.contains_key(&item.id) {
             self.details.insert(item.id.clone(), DetailState::Loading);
         }
+        self.comments_refresh_requested_at
+            .insert(item.id.clone(), now);
         true
+    }
+
+    fn start_comments_auto_refresh_if_due(&mut self, item: &WorkItem, now: Instant) -> bool {
+        if !self.comments_auto_refresh_due(item, now) {
+            return false;
+        }
+        self.details_refreshing.insert(item.id.clone());
+        self.comments_refresh_after.remove(&item.id);
+        self.comments_refresh_requested_at
+            .insert(item.id.clone(), now);
+        true
+    }
+
+    fn comments_auto_refresh_due(&self, item: &WorkItem, now: Instant) -> bool {
+        if self.details_mode != DetailsMode::Conversation || !item_supports_comments_refresh(item) {
+            return false;
+        }
+        if self.details_refreshing.contains(&item.id)
+            || matches!(
+                self.details.get(&item.id),
+                Some(DetailState::Loading) | None
+            )
+        {
+            return false;
+        }
+        if let Some(ready_at) = self.comments_refresh_after.get(&item.id) {
+            return now >= *ready_at;
+        }
+        self.comments_refresh_requested_at
+            .get(&item.id)
+            .is_some_and(|requested_at| {
+                now.duration_since(*requested_at) >= COMMENTS_AUTO_REFRESH_INTERVAL
+            })
+    }
+
+    fn schedule_comments_refresh_after_post(&mut self, item_id: String) {
+        self.comments_refresh_after
+            .insert(item_id, Instant::now() + COMMENTS_POST_REFRESH_DELAY);
     }
 
     fn start_action_hints_load_if_needed(&mut self, item: &WorkItem) -> bool {
@@ -30459,6 +30525,62 @@ diff --git a/d.rs b/d.rs
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn comments_auto_refresh_starts_after_interval_when_details_loaded() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item = app.current_item().expect("current item").clone();
+        let now = Instant::now();
+        app.details
+            .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
+        app.comments_refresh_requested_at
+            .insert(item.id.clone(), now - COMMENTS_AUTO_REFRESH_INTERVAL);
+
+        assert!(app.start_comments_auto_refresh_if_due(&item, now));
+
+        assert!(app.details_refreshing.contains(&item.id));
+        assert_eq!(app.comments_refresh_requested_at.get(&item.id), Some(&now));
+    }
+
+    #[test]
+    fn comments_auto_refresh_waits_until_interval_and_skips_in_flight_loads() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item = app.current_item().expect("current item").clone();
+        let now = Instant::now();
+        app.details
+            .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
+        app.comments_refresh_requested_at.insert(
+            item.id.clone(),
+            now - COMMENTS_AUTO_REFRESH_INTERVAL + Duration::from_millis(1),
+        );
+
+        assert!(!app.start_comments_auto_refresh_if_due(&item, now));
+
+        app.comments_refresh_requested_at
+            .insert(item.id.clone(), now - COMMENTS_AUTO_REFRESH_INTERVAL);
+        app.details_refreshing.insert(item.id.clone());
+        assert!(!app.start_comments_auto_refresh_if_due(&item, now));
+    }
+
+    #[test]
+    fn comments_auto_refresh_honors_post_refresh_delay() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item = app.current_item().expect("current item").clone();
+        let now = Instant::now();
+        app.details
+            .insert(item.id.clone(), DetailState::Loaded(Vec::new()));
+        app.comments_refresh_requested_at
+            .insert(item.id.clone(), now);
+        app.comments_refresh_after
+            .insert(item.id.clone(), now + COMMENTS_POST_REFRESH_DELAY);
+
+        assert!(!app.start_comments_auto_refresh_if_due(
+            &item,
+            now + COMMENTS_POST_REFRESH_DELAY - Duration::from_millis(1)
+        ));
+        assert!(app.start_comments_auto_refresh_if_due(&item, now + COMMENTS_POST_REFRESH_DELAY));
+        assert!(!app.comments_refresh_after.contains_key(&item.id));
     }
 
     fn test_section() -> SectionSnapshot {

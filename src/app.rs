@@ -5686,6 +5686,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let mut document = build_details_document(app, area.width.saturating_sub(2));
     apply_details_text_selection(app, &mut document.lines);
 
+    frame.render_widget(Clear, area);
     let details = Paragraph::new(Text::from(document.lines))
         .block(
             Block::default()
@@ -24210,6 +24211,49 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(rendered.contains("A body with useful context"));
         assert!(!rendered.contains("Funding state"));
         assert!(!rendered.contains("Updated"));
+    }
+
+    #[test]
+    fn details_render_clears_stale_cells_when_scrolling_short_lines() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("item").id.clone();
+        let mut comment = comment("chenyukang", "short body", None);
+        comment.reactions.heart = 1;
+        app.details
+            .insert(item_id, DetailState::Loaded(vec![comment]));
+        app.focus_details();
+        app.selected_comment_index = 0;
+        let area = Rect::new(0, 0, 120, 32);
+        let details_area = details_area_for(&app, area);
+        let inner = block_inner(details_area);
+        let document = build_details_document(&app, inner.width);
+        let header_line = document
+            .lines
+            .iter()
+            .position(|line| {
+                let text = line.to_string();
+                text.contains("+ react") && text.contains("reply")
+            })
+            .expect("comment header");
+        let paths = test_paths();
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        app.details_scroll = header_line.min(usize::from(u16::MAX)) as u16;
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw header");
+
+        app.details_scroll = header_line.saturating_add(1).min(usize::from(u16::MAX)) as u16;
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw following short line");
+
+        let top_details_line = &buffer_lines(terminal.backend().buffer())[inner.y as usize];
+        assert!(
+            !top_details_line.contains("+ react") && !top_details_line.contains("reply"),
+            "stale comment header cells leaked after scroll: {top_details_line:?}"
+        );
     }
 
     #[test]

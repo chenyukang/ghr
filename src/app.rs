@@ -60,8 +60,8 @@ use crate::github::{
 use crate::model::CommentPreviewKind;
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, EditorDraft, FailedCheckRunSummary, ItemKind,
-    Milestone, PullRequestBranch, ReactionSummary, SectionKind, SectionSnapshot, WorkItem,
-    builtin_view_key, configured_sections, global_search_view_key,
+    Milestone, PullRequestBranch, PullRequestReviewActor, ReactionSummary, SectionKind,
+    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
     mark_all_notifications_read_in_section, mark_notification_done_in_section,
     mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
     repo_view_key, section_view_key,
@@ -21905,6 +21905,7 @@ diff --git a/src/github.rs b/src/github.rs
                 failed_check_runs: Vec::new(),
                 note: Some("Merge blocked: GitHub is still computing mergeability".to_string()),
                 head: None,
+                ..ActionHints::default()
             }),
         );
 
@@ -21998,6 +21999,7 @@ diff --git a/src/github.rs b/src/github.rs
                 failed_check_runs: Vec::new(),
                 note: None,
                 head: None,
+                ..ActionHints::default()
             }),
         );
 
@@ -22924,6 +22926,7 @@ diff --git a/src/main.rs b/src/main.rs
                     repository: "rust-lang/rust".to_string(),
                     branch: "feature/no-flicker".to_string(),
                 }),
+                ..ActionHints::default()
             }),
         );
         app.action_hints_stale.insert("1".to_string());
@@ -22956,6 +22959,7 @@ diff --git a/src/main.rs b/src/main.rs
             failed_check_runs: Vec::new(),
             note: None,
             head: None,
+            ..ActionHints::default()
         };
         app.action_hints
             .insert("1".to_string(), ActionHintState::Loaded(hints.clone()));
@@ -25903,6 +25907,7 @@ diff --git a/src/main.rs b/src/main.rs
                     repository: "chenyukang/ghr".to_string(),
                     branch: "feature/checks".to_string(),
                 }),
+                ..ActionHints::default()
             }),
         );
 
@@ -26469,6 +26474,7 @@ diff --git a/src/main.rs b/src/main.rs
                     repository: "chenyukang/ghr".to_string(),
                     branch: "feature/checks".to_string(),
                 }),
+                ..ActionHints::default()
             }),
         );
 
@@ -26522,6 +26528,78 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn pr_details_render_merge_queue_and_review_summary() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                labels: vec!["In merge queue".to_string()],
+                checks: Some(CheckSummary {
+                    passed: 43,
+                    failed: 0,
+                    pending: 0,
+                    skipped: 2,
+                    total: 45,
+                    incomplete: false,
+                }),
+                queue: Some(Box::new(crate::model::MergeQueueInfo {
+                    state: "AWAITING_CHECKS".to_string(),
+                    position: Some(1),
+                    enqueued_at: None,
+                    estimated_time_to_merge: None,
+                    url: Some("https://github.com/nervosnetwork/ckb/queue/develop".to_string()),
+                })),
+                reviews: Some(Box::new(crate::model::PullRequestReviewSummary {
+                    decision: Some("APPROVED".to_string()),
+                    approved: 1,
+                    changes_requested: 0,
+                    pending: 1,
+                    latest_reviews: vec![crate::model::PullRequestReviewActorState {
+                        actor: PullRequestReviewActor {
+                            label: "eval-exec".to_string(),
+                            url: Some("https://github.com/eval-exec".to_string()),
+                        },
+                        state: "APPROVED".to_string(),
+                    }],
+                    pending_reviewers: vec![PullRequestReviewActor {
+                        label: "zhangsoledad".to_string(),
+                        url: Some("https://github.com/zhangsoledad".to_string()),
+                    }],
+                })),
+                ..ActionHints::default()
+            }),
+        );
+
+        let document = build_details_document(&app, 120);
+        let lines = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("queue: #1 awaiting checks"));
+        assert!(rendered.contains("action: In merge queue"));
+        assert!(rendered.contains("checks: 43 pass, 0 fail, 2 skipped"));
+        assert!(rendered.contains("reviews: approved 1, pending 1"));
+        assert!(rendered.contains("reviewers: eval-exec approved, zhangsoledad pending"));
+
+        let queue_line = lines
+            .iter()
+            .position(|line| line.contains("queue: #1 awaiting checks"))
+            .expect("queue line");
+        let queue_column =
+            display_width(&lines[queue_line][..lines[queue_line].find("#1").expect("queue link")])
+                as u16;
+        assert_eq!(
+            document.link_at(queue_line, queue_column).as_deref(),
+            Some("https://github.com/nervosnetwork/ckb/queue/develop")
+        );
+        assert_document_link_for_text(&document, "eval-exec", "https://github.com/eval-exec");
+        assert_document_link_for_text(&document, "zhangsoledad", "https://github.com/zhangsoledad");
+    }
+
+    #[test]
     fn failed_check_count_is_rendered_red() {
         let segments = check_summary_segments(&CheckSummary {
             passed: 3,
@@ -26547,10 +26625,17 @@ diff --git a/src/main.rs b/src/main.rs
             "Mergeable".to_string(),
             "Auto-mergeable".to_string(),
             "Auto-merge on".to_string(),
+            "In merge queue".to_string(),
             "Update branch".to_string(),
         ]);
 
-        for label in ["Approvable", "Mergeable", "Auto-mergeable", "Auto-merge on"] {
+        for label in [
+            "Approvable",
+            "Mergeable",
+            "Auto-mergeable",
+            "Auto-merge on",
+            "In merge queue",
+        ] {
             let segment = segments
                 .iter()
                 .find(|segment| segment.text == label)
@@ -29684,6 +29769,7 @@ diff --git a/src/main.rs b/src/main.rs
                     repository: "chenyukang/ghr".to_string(),
                     branch: "codex/pr-checkout-local".to_string(),
                 }),
+                ..ActionHints::default()
             }),
         );
 
@@ -29772,6 +29858,7 @@ diff --git a/src/main.rs b/src/main.rs
                     repository: "chenyukang/ghr".to_string(),
                     branch: "codex/pr-checkout-local".to_string(),
                 }),
+                ..ActionHints::default()
             }),
         );
         app.start_pr_checkout_dialog(&config);

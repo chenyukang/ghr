@@ -16,8 +16,9 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, SearchSection};
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, FailedCheckRunSummary, ItemKind,
-    Milestone, PullRequestBranch, ReactionSummary, ReviewCommentPreview, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
+    MergeQueueInfo, Milestone, PullRequestBranch, PullRequestReviewActor,
+    PullRequestReviewActorState, PullRequestReviewSummary, ReactionSummary, ReviewCommentPreview,
+    SectionKind, SectionSnapshot, WorkItem, builtin_view_key, global_search_view_key,
     repo_section_filters_with_labels, repo_view_key,
 };
 
@@ -592,10 +593,14 @@ struct PullRequestActionRaw {
     commits: Option<PullRequestCommitConnectionRaw>,
     head_ref_name: Option<String>,
     head_repository: Option<PullRequestHeadRepositoryRaw>,
+    is_in_merge_queue: Option<bool>,
     is_draft: Option<bool>,
     mergeable: Option<String>,
+    merge_queue_entry: Option<PullRequestMergeQueueEntryRaw>,
     merge_state_status: Option<String>,
     review_decision: Option<String>,
+    review_requests: Option<PullRequestReviewRequestConnectionRaw>,
+    latest_opinionated_reviews: Option<PullRequestReviewConnectionRaw>,
     state: Option<String>,
     status_check_rollup: Option<PullRequestStatusRollupRaw>,
     viewer_can_enable_auto_merge: Option<bool>,
@@ -616,6 +621,70 @@ struct PullRequestCommitConnectionRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestHeadRepositoryRaw {
     name_with_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestMergeQueueEntryRaw {
+    state: Option<String>,
+    position: Option<usize>,
+    enqueued_at: Option<DateTime<Utc>>,
+    estimated_time_to_merge: Option<usize>,
+    merge_queue: Option<PullRequestMergeQueueRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestMergeQueueRaw {
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewRequestConnectionRaw {
+    total_count: usize,
+    nodes: Option<Vec<PullRequestReviewRequestRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewRequestRaw {
+    requested_reviewer: Option<PullRequestRequestedReviewerRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum PullRequestRequestedReviewerRaw {
+    User {
+        login: String,
+        url: Option<String>,
+    },
+    Team {
+        name: Option<String>,
+        #[serde(rename = "combinedSlug")]
+        combined_slug: Option<String>,
+        url: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestReviewConnectionRaw {
+    nodes: Option<Vec<PullRequestLatestReviewRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLatestReviewRaw {
+    state: Option<String>,
+    author: Option<PullRequestReviewAuthorRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewAuthorRaw {
+    login: String,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1721,10 +1790,46 @@ query($owner: String!, $name: String!, $number: Int!) {
       headRepository {
         nameWithOwner
       }
+      isInMergeQueue
       isDraft
       mergeable
+      mergeQueueEntry {
+        state
+        position
+        enqueuedAt
+        estimatedTimeToMerge
+        mergeQueue {
+          url
+        }
+      }
       mergeStateStatus
       reviewDecision
+      reviewRequests(first: 20) {
+        totalCount
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User {
+              login
+              url
+            }
+            ... on Team {
+              name
+              combinedSlug
+              url
+            }
+          }
+        }
+      }
+      latestOpinionatedReviews(first: 20) {
+        nodes {
+          state
+          author {
+            login
+            url
+          }
+        }
+      }
       viewerCanUpdate
       viewerCanUpdateBranch
       viewerCanEnableAutoMerge
@@ -3661,7 +3766,13 @@ fn push_unique_blocker(blockers: &mut Vec<String>, blocker: String) {
 
 fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
     let mut labels = Vec::new();
-    let blockers = pull_request_action_blockers(pr);
+    let queue = pull_request_merge_queue(pr);
+    let in_merge_queue = queue.is_some();
+    let blockers = if in_merge_queue {
+        Vec::new()
+    } else {
+        pull_request_action_blockers(pr)
+    };
     let checks = pr
         .status_check_rollup
         .as_ref()
@@ -3683,28 +3794,32 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         .as_ref()
         .and_then(|review| review.state.as_deref());
 
-    if open && auto_merge_enabled {
-        labels.push("Auto-merge on".to_string());
-    }
+    if in_merge_queue {
+        labels.push("In merge queue".to_string());
+    } else {
+        if open && auto_merge_enabled {
+            labels.push("Auto-merge on".to_string());
+        }
 
-    if open
-        && !draft
-        && !did_author
-        && can_update
-        && latest_review != Some("APPROVED")
-        && !matches!(pr.review_decision.as_deref(), Some("APPROVED"))
-    {
-        labels.push("Approvable".to_string());
-    }
+        if open
+            && !draft
+            && !did_author
+            && can_update
+            && latest_review != Some("APPROVED")
+            && !matches!(pr.review_decision.as_deref(), Some("APPROVED"))
+        {
+            labels.push("Approvable".to_string());
+        }
 
-    if blockers.is_empty() && can_merge {
-        labels.push("Mergeable".to_string());
-    } else if open && !draft && can_auto_merge && !auto_merge_enabled {
-        labels.push("Auto-mergeable".to_string());
-    }
+        if blockers.is_empty() && can_merge {
+            labels.push("Mergeable".to_string());
+        } else if open && !draft && can_auto_merge && !auto_merge_enabled {
+            labels.push("Auto-mergeable".to_string());
+        }
 
-    if open && pr.viewer_can_update_branch.unwrap_or(false) && merge_state(pr) == "BEHIND" {
-        labels.push("Update branch".to_string());
+        if open && pr.viewer_can_update_branch.unwrap_or(false) && merge_state(pr) == "BEHIND" {
+            labels.push("Update branch".to_string());
+        }
     }
 
     let note = if blockers.is_empty() {
@@ -3713,6 +3828,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         Some(format!("Merge blocked: {}", blockers.join("; ")))
     };
     let head = pull_request_branch(pr);
+    let reviews = pull_request_review_summary(pr);
 
     ActionHints {
         labels,
@@ -3721,6 +3837,120 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         failed_check_runs,
         note,
         head,
+        queue: queue.map(Box::new),
+        reviews: reviews.map(Box::new),
+    }
+}
+
+fn pull_request_merge_queue(pr: &PullRequestActionRaw) -> Option<MergeQueueInfo> {
+    if pr.is_in_merge_queue != Some(true) {
+        return None;
+    }
+    let entry = pr.merge_queue_entry.as_ref()?;
+    Some(MergeQueueInfo {
+        state: entry.state.clone().unwrap_or_else(|| "QUEUED".to_string()),
+        position: entry.position,
+        enqueued_at: entry.enqueued_at,
+        estimated_time_to_merge: entry.estimated_time_to_merge,
+        url: entry
+            .merge_queue
+            .as_ref()
+            .and_then(|queue| queue.url.clone()),
+    })
+}
+
+fn pull_request_review_summary(pr: &PullRequestActionRaw) -> Option<PullRequestReviewSummary> {
+    let latest_reviews = pr
+        .latest_opinionated_reviews
+        .as_ref()
+        .and_then(|reviews| reviews.nodes.as_ref())
+        .map(|reviews| {
+            reviews
+                .iter()
+                .filter_map(pull_request_review_actor_state)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let pending_reviewers = pr
+        .review_requests
+        .as_ref()
+        .and_then(|requests| requests.nodes.as_ref())
+        .map(|requests| {
+            requests
+                .iter()
+                .filter_map(pull_request_pending_reviewer)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let pending = pr
+        .review_requests
+        .as_ref()
+        .map(|requests| requests.total_count)
+        .unwrap_or(pending_reviewers.len());
+    let approved = latest_reviews
+        .iter()
+        .filter(|review| review.state == "APPROVED")
+        .count();
+    let changes_requested = latest_reviews
+        .iter()
+        .filter(|review| review.state == "CHANGES_REQUESTED")
+        .count();
+    let decision = pr.review_decision.clone();
+
+    if decision.is_none()
+        && approved == 0
+        && changes_requested == 0
+        && pending == 0
+        && latest_reviews.is_empty()
+    {
+        return None;
+    }
+
+    Some(PullRequestReviewSummary {
+        decision,
+        approved,
+        changes_requested,
+        pending,
+        latest_reviews,
+        pending_reviewers,
+    })
+}
+
+fn pull_request_review_actor_state(
+    review: &PullRequestLatestReviewRaw,
+) -> Option<PullRequestReviewActorState> {
+    let state = review.state.as_ref()?.trim().to_ascii_uppercase();
+    let author = review.author.as_ref()?;
+    Some(PullRequestReviewActorState {
+        actor: PullRequestReviewActor {
+            label: author.login.clone(),
+            url: author.url.clone(),
+        },
+        state,
+    })
+}
+
+fn pull_request_pending_reviewer(
+    request: &PullRequestReviewRequestRaw,
+) -> Option<PullRequestReviewActor> {
+    match request.requested_reviewer.as_ref()? {
+        PullRequestRequestedReviewerRaw::User { login, url } => Some(PullRequestReviewActor {
+            label: login.clone(),
+            url: url.clone(),
+        }),
+        PullRequestRequestedReviewerRaw::Team {
+            name,
+            combined_slug,
+            url,
+        } => Some(PullRequestReviewActor {
+            label: combined_slug
+                .as_ref()
+                .or(name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "team".to_string()),
+            url: url.clone(),
+        }),
+        PullRequestRequestedReviewerRaw::Other => None,
     }
 }
 
@@ -5679,10 +5909,14 @@ mod tests {
             head_repository: Some(PullRequestHeadRepositoryRaw {
                 name_with_owner: "rust-lang/rust".to_string(),
             }),
+            is_in_merge_queue: Some(false),
             is_draft: Some(false),
             mergeable: Some("MERGEABLE".to_string()),
+            merge_queue_entry: None,
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: Some("REVIEW_REQUIRED".to_string()),
+            review_requests: None,
+            latest_opinionated_reviews: None,
             state: Some("OPEN".to_string()),
             status_check_rollup: Some(PullRequestStatusRollupRaw {
                 state: Some("FAILURE".to_string()),
@@ -5747,10 +5981,14 @@ mod tests {
             commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
             head_ref_name: None,
             head_repository: None,
+            is_in_merge_queue: Some(false),
             is_draft: Some(false),
             mergeable: Some("MERGEABLE".to_string()),
+            merge_queue_entry: None,
             merge_state_status: Some("CLEAN".to_string()),
             review_decision: Some("APPROVED".to_string()),
+            review_requests: None,
+            latest_opinionated_reviews: None,
             state: Some("OPEN".to_string()),
             status_check_rollup: Some(PullRequestStatusRollupRaw {
                 state: Some("SUCCESS".to_string()),
@@ -5791,16 +6029,121 @@ mod tests {
     }
 
     #[test]
+    fn action_hints_prefer_merge_queue_status_when_pr_is_queued() {
+        let hints = pull_request_action_hints(&PullRequestActionRaw {
+            auto_merge_request: None,
+            commits: Some(PullRequestCommitConnectionRaw { total_count: 1 }),
+            head_ref_name: None,
+            head_repository: None,
+            is_in_merge_queue: Some(true),
+            is_draft: Some(false),
+            mergeable: Some("MERGEABLE".to_string()),
+            merge_queue_entry: Some(PullRequestMergeQueueEntryRaw {
+                state: Some("AWAITING_CHECKS".to_string()),
+                position: Some(1),
+                enqueued_at: None,
+                estimated_time_to_merge: None,
+                merge_queue: Some(PullRequestMergeQueueRaw {
+                    url: Some("https://github.com/owner/repo/queue/main".to_string()),
+                }),
+            }),
+            merge_state_status: Some("CLEAN".to_string()),
+            review_decision: Some("APPROVED".to_string()),
+            review_requests: None,
+            latest_opinionated_reviews: None,
+            state: Some("OPEN".to_string()),
+            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                state: Some("SUCCESS".to_string()),
+                contexts: None,
+            }),
+            viewer_can_enable_auto_merge: Some(false),
+            viewer_can_merge_as_admin: Some(true),
+            viewer_can_update: Some(true),
+            viewer_can_update_branch: Some(false),
+            viewer_did_author: Some(false),
+            viewer_latest_review: None,
+        });
+
+        assert_eq!(hints.labels, vec!["In merge queue"]);
+        assert_eq!(
+            hints.queue,
+            Some(Box::new(MergeQueueInfo {
+                state: "AWAITING_CHECKS".to_string(),
+                position: Some(1),
+                enqueued_at: None,
+                estimated_time_to_merge: None,
+                url: Some("https://github.com/owner/repo/queue/main".to_string()),
+            }))
+        );
+        assert!(hints.note.is_none());
+    }
+
+    #[test]
+    fn action_hints_collect_review_summary_and_pending_requests() {
+        let hints = pull_request_action_hints(&PullRequestActionRaw {
+            auto_merge_request: None,
+            commits: None,
+            head_ref_name: None,
+            head_repository: None,
+            is_in_merge_queue: Some(false),
+            is_draft: Some(false),
+            mergeable: Some("MERGEABLE".to_string()),
+            merge_queue_entry: None,
+            merge_state_status: Some("CLEAN".to_string()),
+            review_decision: Some("APPROVED".to_string()),
+            review_requests: Some(PullRequestReviewRequestConnectionRaw {
+                total_count: 1,
+                nodes: Some(vec![PullRequestReviewRequestRaw {
+                    requested_reviewer: Some(PullRequestRequestedReviewerRaw::User {
+                        login: "zhangsoledad".to_string(),
+                        url: Some("https://github.com/zhangsoledad".to_string()),
+                    }),
+                }]),
+            }),
+            latest_opinionated_reviews: Some(PullRequestReviewConnectionRaw {
+                nodes: Some(vec![PullRequestLatestReviewRaw {
+                    state: Some("APPROVED".to_string()),
+                    author: Some(PullRequestReviewAuthorRaw {
+                        login: "eval-exec".to_string(),
+                        url: Some("https://github.com/eval-exec".to_string()),
+                    }),
+                }]),
+            }),
+            state: Some("OPEN".to_string()),
+            status_check_rollup: None,
+            viewer_can_enable_auto_merge: Some(false),
+            viewer_can_merge_as_admin: Some(true),
+            viewer_can_update: Some(true),
+            viewer_can_update_branch: Some(false),
+            viewer_did_author: Some(true),
+            viewer_latest_review: None,
+        });
+
+        let reviews = hints.reviews.expect("review summary");
+        assert_eq!(reviews.decision.as_deref(), Some("APPROVED"));
+        assert_eq!(reviews.approved, 1);
+        assert_eq!(reviews.changes_requested, 0);
+        assert_eq!(reviews.pending, 1);
+        assert_eq!(reviews.latest_reviews[0].actor.label, "eval-exec");
+        assert_eq!(reviews.latest_reviews[0].state, "APPROVED");
+        assert_eq!(reviews.pending_reviewers[0].label, "zhangsoledad");
+    }
+
+    #[test]
     fn action_hints_show_conflicts_when_mergeable_is_conflicting() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
             commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
             head_ref_name: None,
             head_repository: None,
+            is_in_merge_queue: Some(false),
             is_draft: Some(true),
             mergeable: Some("CONFLICTING".to_string()),
+            merge_queue_entry: None,
             merge_state_status: Some("UNKNOWN".to_string()),
             review_decision: None,
+            review_requests: None,
+            latest_opinionated_reviews: None,
             state: Some("OPEN".to_string()),
             status_check_rollup: None,
             viewer_can_enable_auto_merge: Some(false),
@@ -5824,10 +6167,14 @@ mod tests {
             commits: None,
             head_ref_name: None,
             head_repository: None,
+            is_in_merge_queue: Some(false),
             is_draft: Some(false),
             mergeable: None,
+            merge_queue_entry: None,
             merge_state_status: Some("BLOCKED".to_string()),
             review_decision: None,
+            review_requests: None,
+            latest_opinionated_reviews: None,
             state: Some("OPEN".to_string()),
             status_check_rollup: Some(PullRequestStatusRollupRaw {
                 state: Some("FAILURE".to_string()),

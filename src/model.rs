@@ -178,6 +178,8 @@ pub struct ActionHints {
     pub failed_check_runs: Vec<FailedCheckRunSummary>,
     pub note: Option<String>,
     pub head: Option<PullRequestBranch>,
+    pub queue: Option<Box<MergeQueueInfo>>,
+    pub reviews: Option<Box<PullRequestReviewSummary>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +193,37 @@ pub struct FailedCheckRunSummary {
 pub struct PullRequestBranch {
     pub repository: String,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeQueueInfo {
+    pub state: String,
+    pub position: Option<usize>,
+    pub enqueued_at: Option<DateTime<Utc>>,
+    pub estimated_time_to_merge: Option<usize>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReviewSummary {
+    pub decision: Option<String>,
+    pub approved: usize,
+    pub changes_requested: usize,
+    pub pending: usize,
+    pub latest_reviews: Vec<PullRequestReviewActorState>,
+    pub pending_reviewers: Vec<PullRequestReviewActor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReviewActorState {
+    pub actor: PullRequestReviewActor,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReviewActor {
+    pub label: String,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

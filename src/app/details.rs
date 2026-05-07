@@ -1162,8 +1162,10 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     let mut secondary_meta = Vec::new();
     let mut branch_meta = None;
+    let mut queue_meta = None;
     let mut action_meta = Vec::new();
     let mut action_note = None;
+    let mut reviewer_meta = None;
     if let Some(author) = useful_meta_value(item.author.as_deref()) {
         secondary_meta.push((
             "author",
@@ -1199,12 +1201,17 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
     if matches!(item.kind, ItemKind::PullRequest) {
         let (action_segments, note) = action_hint_segments(app.action_hints.get(&item.id));
         branch_meta = Some(branch_hint_segments(app.action_hints.get(&item.id)));
+        queue_meta = merge_queue_hint_segments(app.action_hints.get(&item.id));
         action_meta.push(("action", action_segments));
         action_meta.push((
             "checks",
             check_hint_segments(app.action_hints.get(&item.id)),
         ));
+        if let Some(review_segments) = review_hint_segments(app.action_hints.get(&item.id)) {
+            action_meta.push(("reviews", review_segments));
+        }
         action_note = note;
+        reviewer_meta = review_actor_hint_segments(app.action_hints.get(&item.id));
     }
     if !secondary_meta.is_empty() {
         builder.push_meta_line(secondary_meta);
@@ -1212,11 +1219,17 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
     if let Some(branch_segments) = branch_meta {
         builder.push_styled_key_value("branch", branch_segments);
     }
+    if let Some(queue_segments) = queue_meta {
+        builder.push_styled_key_value("queue", queue_segments);
+    }
     if !action_meta.is_empty() {
         builder.push_meta_line(action_meta);
     }
     if let Some(note) = action_note {
         builder.push_styled_key_value("action note", action_note_segments(&note));
+    }
+    if let Some(reviewer_segments) = reviewer_meta {
+        builder.push_styled_key_value_limited("reviewers", reviewer_segments, 2);
     }
     builder.push_link_value("url", &item.url);
 
@@ -3405,6 +3418,204 @@ pub(super) fn action_hint_segments(
             vec![DetailSegment::raw("unavailable")],
             Some(format!("Failed to load action hints: {error}")),
         ),
+    }
+}
+
+pub(super) fn merge_queue_hint_segments(
+    state: Option<&ActionHintState>,
+) -> Option<Vec<DetailSegment>> {
+    let Some(ActionHintState::Loaded(hints)) = state else {
+        return None;
+    };
+    let queue = hints.queue.as_ref()?;
+    let mut segments = Vec::new();
+    if let Some(position) = queue.position {
+        let label = format!("#{position}");
+        if let Some(url) = &queue.url {
+            segments.push(DetailSegment::link(label, url.clone()));
+        } else {
+            segments.push(DetailSegment::styled(
+                label,
+                queue_state_style(&queue.state),
+            ));
+        }
+        segments.push(DetailSegment::raw(" ".to_string()));
+    }
+    segments.push(DetailSegment::styled(
+        queue_state_label(&queue.state),
+        queue_state_style(&queue.state),
+    ));
+    if let Some(enqueued_at) = queue.enqueued_at {
+        segments.push(DetailSegment::raw(format!(
+            ", queued {}",
+            relative_time(Some(enqueued_at))
+        )));
+    }
+    if let Some(seconds) = queue.estimated_time_to_merge {
+        segments.push(DetailSegment::raw(format!(
+            ", eta {}",
+            merge_queue_eta_label(seconds)
+        )));
+    }
+    Some(segments)
+}
+
+pub(super) fn review_hint_segments(state: Option<&ActionHintState>) -> Option<Vec<DetailSegment>> {
+    let Some(ActionHintState::Loaded(hints)) = state else {
+        return None;
+    };
+    let reviews = hints.reviews.as_ref()?;
+    let mut segments = Vec::new();
+    if reviews.approved > 0 {
+        push_review_part(
+            &mut segments,
+            format!("approved {}", reviews.approved),
+            review_state_style("APPROVED"),
+        );
+    }
+    if reviews.changes_requested > 0 {
+        push_review_part(
+            &mut segments,
+            format!("changes requested {}", reviews.changes_requested),
+            review_state_style("CHANGES_REQUESTED"),
+        );
+    }
+    if reviews.pending > 0 {
+        push_review_part(
+            &mut segments,
+            format!("pending {}", reviews.pending),
+            review_state_style("PENDING"),
+        );
+    }
+    if segments.is_empty()
+        && let Some(decision) = reviews.decision.as_deref()
+    {
+        push_review_part(
+            &mut segments,
+            review_decision_label(decision),
+            review_state_style(decision),
+        );
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+pub(super) fn review_actor_hint_segments(
+    state: Option<&ActionHintState>,
+) -> Option<Vec<DetailSegment>> {
+    let Some(ActionHintState::Loaded(hints)) = state else {
+        return None;
+    };
+    let reviews = hints.reviews.as_ref()?;
+    let mut segments = Vec::new();
+    for review in &reviews.latest_reviews {
+        push_review_actor_state(&mut segments, &review.actor, &review.state);
+    }
+    for actor in &reviews.pending_reviewers {
+        push_review_actor_state(&mut segments, actor, "PENDING");
+    }
+    if reviews.pending > reviews.pending_reviewers.len() {
+        push_review_part(
+            &mut segments,
+            format!(
+                "+{} more pending",
+                reviews.pending - reviews.pending_reviewers.len()
+            ),
+            review_state_style("PENDING"),
+        );
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn push_review_actor_state(
+    segments: &mut Vec<DetailSegment>,
+    actor: &PullRequestReviewActor,
+    state: &str,
+) {
+    if !segments.is_empty() {
+        segments.push(DetailSegment::raw(", "));
+    }
+    if let Some(url) = &actor.url {
+        segments.push(DetailSegment::link(actor.label.clone(), url.clone()));
+    } else {
+        segments.push(DetailSegment::raw(actor.label.clone()));
+    }
+    segments.push(DetailSegment::raw(" "));
+    segments.push(DetailSegment::styled(
+        review_state_label(state),
+        review_state_style(state),
+    ));
+}
+
+fn push_review_part(segments: &mut Vec<DetailSegment>, text: String, style: Style) {
+    if !segments.is_empty() {
+        segments.push(DetailSegment::raw(", "));
+    }
+    segments.push(DetailSegment::styled(text, style));
+}
+
+fn queue_state_label(state: &str) -> String {
+    state.to_ascii_lowercase().replace('_', " ")
+}
+
+fn queue_state_style(state: &str) -> Style {
+    match state {
+        "MERGEABLE" => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        "UNMERGEABLE" => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        "LOCKED" => Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+        "QUEUED" | "AWAITING_CHECKS" => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::Yellow),
+    }
+}
+
+fn merge_queue_eta_label(seconds: usize) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
+fn review_decision_label(decision: &str) -> String {
+    match decision {
+        "APPROVED" => "approved".to_string(),
+        "CHANGES_REQUESTED" => "changes requested".to_string(),
+        "REVIEW_REQUIRED" => "review required".to_string(),
+        other => other.to_ascii_lowercase().replace('_', " "),
+    }
+}
+
+fn review_state_label(state: &str) -> String {
+    match state {
+        "APPROVED" => "approved".to_string(),
+        "CHANGES_REQUESTED" => "changes requested".to_string(),
+        "COMMENTED" => "commented".to_string(),
+        "PENDING" => "pending".to_string(),
+        other => other.to_ascii_lowercase().replace('_', " "),
+    }
+}
+
+fn review_state_style(state: &str) -> Style {
+    match state {
+        "APPROVED" => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        "CHANGES_REQUESTED" => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        "REVIEW_REQUIRED" | "PENDING" => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::Gray),
     }
 }
 

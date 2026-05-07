@@ -10,7 +10,7 @@ use tracing::warn;
 pub const DEFAULT_LIST_WIDTH_PERCENT: u16 = 50;
 pub const MIN_LIST_WIDTH_PERCENT: u16 = 30;
 pub const MAX_LIST_WIDTH_PERCENT: u16 = 85;
-pub const MAX_RECENT_ITEMS: usize = 20;
+pub const MAX_RECENT_ITEMS: usize = 200;
 pub const MAX_RECENT_COMMANDS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn recent_items_are_newest_first_deduped_and_limited() {
         let state = UiState {
-            recent_items: (0..25)
+            recent_items: (0..205)
                 .map(|number| RecentItemState {
                     id: format!("pr-{number}"),
                     kind: "pr".to_string(),
@@ -421,9 +421,9 @@ mod tests {
                     id: "duplicate".to_string(),
                     kind: "pull_request".to_string(),
                     repo: "CHENYUKANG/GHR".to_string(),
-                    number: Some(24),
+                    number: Some(204),
                     title: "older duplicate".to_string(),
-                    url: "https://github.com/chenyukang/ghr/pull/24".to_string(),
+                    url: "https://github.com/chenyukang/ghr/pull/204".to_string(),
                     visited_at: Some(DateTime::from_timestamp(1_600_000_000, 0).unwrap()),
                 }])
                 .collect(),
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(state.recent_items.len(), MAX_RECENT_ITEMS);
         assert_eq!(
             state.recent_items.first().and_then(|item| item.number),
-            Some(24)
+            Some(204)
         );
         assert_eq!(
             state.recent_items.last().and_then(|item| item.number),

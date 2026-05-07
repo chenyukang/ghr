@@ -1,6 +1,7 @@
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 
 use super::*;
+use crate::theme::active_theme;
 
 const DETAILS_METADATA_PADDING: usize = 2;
 const DETAILS_METADATA_KEY_WIDTH: usize = 11;
@@ -1041,7 +1042,7 @@ fn metadata_padding_prefix(key: &str) -> Vec<DetailSegment> {
 }
 
 fn metadata_key_segment(key: &str) -> DetailSegment {
-    DetailSegment::styled(format!("{key}: "), Style::default().fg(Color::Gray))
+    DetailSegment::styled(format!("{key}: "), active_theme().muted())
 }
 
 fn metadata_inline_key_padding(key: &str) -> Option<DetailSegment> {
@@ -1057,15 +1058,17 @@ fn pull_request_status_segments(item: &WorkItem) -> Vec<DetailSegment> {
     if item_is_draft_pull_request(item) {
         vec![DetailSegment::styled(
             "DRAFT",
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         )]
     } else {
         vec![DetailSegment::styled(
             "READY",
-            Style::default()
-                .fg(Color::LightGreen)
+            active_theme()
+                .panel()
+                .fg(active_theme().success)
                 .add_modifier(Modifier::BOLD),
         )]
     }
@@ -1075,18 +1078,21 @@ fn item_state_segments(item: &WorkItem) -> Vec<DetailSegment> {
     let state = item.state.clone().unwrap_or_else(|| "-".to_string());
     let style = match state.to_ascii_lowercase().as_str() {
         "open" => Some(
-            Style::default()
-                .fg(Color::LightGreen)
+            active_theme()
+                .panel()
+                .fg(active_theme().success)
                 .add_modifier(Modifier::BOLD),
         ),
         "merged" => Some(
-            Style::default()
-                .fg(Color::LightBlue)
+            active_theme()
+                .panel()
+                .fg(active_theme().link)
                 .add_modifier(Modifier::BOLD),
         ),
         "closed" => Some(
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         ),
         _ => None,
@@ -1120,8 +1126,9 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
     builder.push_wrapped_limited(
         vec![DetailSegment::styled(
             item.title.clone(),
-            Style::default()
-                .fg(Color::Cyan)
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
                 .add_modifier(Modifier::BOLD),
         )],
         3,
@@ -1414,8 +1421,9 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
     builder.push_wrapped_limited(
         vec![DetailSegment::styled(
             item.title.clone(),
-            Style::default()
-                .fg(Color::Cyan)
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
                 .add_modifier(Modifier::BOLD),
         )],
         3,
@@ -1480,17 +1488,18 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
 pub(super) fn push_details_mode_tabs(builder: &mut DetailsBuilder, active: DetailsMode) {
     let tab = |label: &'static str, mode: DetailsMode| {
         let style = if active == mode {
-            Style::default()
-                .fg(Color::Yellow)
+            active_theme()
+                .panel()
+                .fg(active_theme().warning)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            active_theme().muted()
         };
         DetailSegment::styled(label, style)
     };
     builder.push_line(vec![
         tab("Conversation", DetailsMode::Conversation),
-        DetailSegment::styled(" | ", Style::default().fg(Color::DarkGray)),
+        DetailSegment::styled(" | ", active_theme().subtle()),
         tab("Diff", DetailsMode::Diff),
     ]);
 }
@@ -1826,15 +1835,18 @@ pub(super) fn push_diff_line(
         DiffLineKind::Metadata => ("\\", diff_metadata_style()),
     };
     let gutter_style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
+        active_theme()
+            .panel()
+            .fg(active_theme().highlight_fg)
+            .bg(active_theme().focus_alt)
             .add_modifier(Modifier::BOLD)
     } else {
         diff_gutter_style()
     };
     if selected {
-        style = style.bg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        style = style
+            .bg(active_theme().selected_bg)
+            .add_modifier(Modifier::BOLD);
     }
     let inline_comment_marker = if inline_comment_summary.count > 0 {
         Some(diff_inline_comment_marker(inline_comment_summary))
@@ -2551,10 +2563,7 @@ pub(super) fn push_reactions_line(
         return;
     }
     builder.push_blank();
-    let mut segments = vec![DetailSegment::styled(
-        "reactions: ",
-        Style::default().fg(Color::Gray),
-    )];
+    let mut segments = vec![DetailSegment::styled("reactions: ", active_theme().muted())];
     if !reactions.is_empty() {
         for (index, segment) in reaction_segments(reactions).into_iter().enumerate() {
             if index > 0 {
@@ -3223,11 +3232,14 @@ pub(super) fn push_inline_diff_line(
         DiffLineKind::Metadata => diff_metadata_style(),
     };
     if focused {
-        style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        style = style
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD);
     }
     let gutter_style = if focused {
-        Style::default()
-            .fg(Color::Yellow)
+        active_theme()
+            .panel()
+            .fg(active_theme().warning)
             .add_modifier(Modifier::BOLD)
     } else {
         diff_gutter_style()
@@ -3559,19 +3571,20 @@ fn queue_state_label(state: &str) -> String {
 
 fn queue_state_style(state: &str) -> Style {
     match state {
-        "MERGEABLE" => Style::default()
-            .fg(Color::LightGreen)
+        "MERGEABLE" => active_theme()
+            .panel()
+            .fg(active_theme().success)
             .add_modifier(Modifier::BOLD),
-        "UNMERGEABLE" => Style::default()
-            .fg(Color::LightRed)
+        "UNMERGEABLE" => active_theme()
+            .panel()
+            .fg(active_theme().error)
             .add_modifier(Modifier::BOLD),
-        "LOCKED" => Style::default()
-            .fg(Color::Gray)
+        "LOCKED" => active_theme().muted().add_modifier(Modifier::BOLD),
+        "QUEUED" | "AWAITING_CHECKS" => active_theme()
+            .panel()
+            .fg(active_theme().warning)
             .add_modifier(Modifier::BOLD),
-        "QUEUED" | "AWAITING_CHECKS" => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Yellow),
+        _ => active_theme().panel().fg(active_theme().warning),
     }
 }
 
@@ -3606,16 +3619,19 @@ fn review_state_label(state: &str) -> String {
 
 fn review_state_style(state: &str) -> Style {
     match state {
-        "APPROVED" => Style::default()
-            .fg(Color::LightGreen)
+        "APPROVED" => active_theme()
+            .panel()
+            .fg(active_theme().success)
             .add_modifier(Modifier::BOLD),
-        "CHANGES_REQUESTED" => Style::default()
-            .fg(Color::LightRed)
+        "CHANGES_REQUESTED" => active_theme()
+            .panel()
+            .fg(active_theme().error)
             .add_modifier(Modifier::BOLD),
-        "REVIEW_REQUIRED" | "PENDING" => Style::default()
-            .fg(Color::Yellow)
+        "REVIEW_REQUIRED" | "PENDING" => active_theme()
+            .panel()
+            .fg(active_theme().warning)
             .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Gray),
+        _ => active_theme().muted(),
     }
 }
 
@@ -3626,8 +3642,9 @@ pub(super) fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
             segments.push(DetailSegment::raw(", "));
         }
         let style = if positive_action_label(label) {
-            Style::default()
-                .fg(Color::LightGreen)
+            active_theme()
+                .panel()
+                .fg(active_theme().success)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -3751,38 +3768,39 @@ pub(super) fn check_summary_segments(summary: &CheckSummary) -> Vec<DetailSegmen
     push_check_part(
         &mut segments,
         format!("{} pass", summary.passed),
-        Style::default().fg(Color::LightGreen),
+        active_theme().panel().fg(active_theme().success),
     );
     push_check_part(
         &mut segments,
         format!("{} fail", summary.failed),
         if summary.failed > 0 {
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            active_theme().muted()
         },
     );
     if summary.pending > 0 {
         push_check_part(
             &mut segments,
             format!("{} pending", summary.pending),
-            Style::default().fg(Color::Yellow),
+            active_theme().panel().fg(active_theme().warning),
         );
     }
     if summary.skipped > 0 {
         push_check_part(
             &mut segments,
             format!("{} skipped", summary.skipped),
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         );
     }
     if summary.incomplete {
         push_check_part(
             &mut segments,
             format!("{} total", summary.total),
-            Style::default().fg(Color::Gray),
+            active_theme().muted(),
         );
     }
     segments
@@ -3935,10 +3953,7 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 quote_depth = quote_depth.saturating_sub(1);
             }
             MarkdownEvent::Start(Tag::Item) => {
-                current.push(DetailSegment::styled(
-                    "- ",
-                    Style::default().fg(Color::Gray),
-                ));
+                current.push(DetailSegment::styled("- ", active_theme().muted()));
             }
             MarkdownEvent::End(TagEnd::Item) => flush_markdown_block(
                 &mut blocks,
@@ -4033,7 +4048,7 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 } else {
                     current.push(DetailSegment::styled(
                         text.to_string(),
-                        Style::default().fg(Color::LightGreen),
+                        active_theme().panel().fg(active_theme().success),
                     ));
                 }
             }
@@ -4081,7 +4096,7 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 MarkdownBlockKind::Text,
                 vec![DetailSegment::styled(
                     "─".repeat(24),
-                    Style::default().fg(Color::DarkGray),
+                    active_theme().subtle(),
                 )],
             ),
             MarkdownEvent::TaskListMarker(checked) => {
@@ -4742,7 +4757,7 @@ pub(super) fn markdown_gap_before(
 
 pub(super) fn muted_quote_segments(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
     for segment in &mut segments {
-        segment.style = segment.style.fg(Color::Gray);
+        segment.style = segment.style.fg(active_theme().muted);
     }
     segments
 }
@@ -4929,7 +4944,7 @@ pub(super) fn inline_style(strong_depth: u8, emphasis_depth: u8, is_link: bool) 
     let mut style = if is_link {
         link_style()
     } else {
-        Style::default()
+        active_theme().panel()
     };
     if strong_depth > 0 {
         style = style.add_modifier(Modifier::BOLD);
@@ -4941,98 +4956,100 @@ pub(super) fn inline_style(strong_depth: u8, emphasis_depth: u8, is_link: bool) 
 }
 
 pub(super) fn heading_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
+    active_theme()
+        .panel()
+        .fg(active_theme().warning)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn link_style() -> Style {
-    Style::default()
-        .fg(Color::LightBlue)
-        .add_modifier(Modifier::UNDERLINED)
+    active_theme().link()
 }
 
 pub(super) fn table_separator_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }
 
 pub(super) fn action_style() -> Style {
-    Style::default()
-        .fg(Color::LightMagenta)
-        .add_modifier(Modifier::UNDERLINED)
+    active_theme().action()
 }
 
 pub(super) fn label_style() -> Style {
-    Style::default()
-        .fg(Color::LightBlue)
+    active_theme()
+        .panel()
+        .fg(active_theme().label)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn reaction_style() -> Style {
-    Style::default().fg(Color::LightYellow)
+    active_theme().panel().fg(active_theme().reaction)
 }
 
 pub(super) fn new_since_last_read_style() -> Style {
-    Style::default()
-        .fg(Color::LightGreen)
+    active_theme()
+        .panel()
+        .fg(active_theme().success)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn quote_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().panel().fg(active_theme().quote)
 }
 
 pub(super) fn code_plain_style() -> Style {
-    Style::default().fg(Color::Gray)
+    active_theme().panel().fg(active_theme().code)
 }
 
 pub(super) fn rust_keyword_style() -> Style {
-    Style::default()
-        .fg(Color::LightMagenta)
+    active_theme()
+        .panel()
+        .fg(active_theme().action)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn rust_type_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    active_theme().panel().fg(active_theme().info)
 }
 
 pub(super) fn rust_string_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    active_theme().panel().fg(active_theme().warning)
 }
 
 pub(super) fn rust_comment_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().panel().fg(active_theme().quote)
 }
 
 pub(super) fn rust_macro_style() -> Style {
-    Style::default().fg(Color::LightBlue)
+    active_theme().panel().fg(active_theme().link)
 }
 
 pub(super) fn rust_number_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    active_theme().panel().fg(active_theme().warning)
 }
 
 pub(super) fn log_error_style() -> Style {
-    Style::default()
-        .fg(Color::LightRed)
+    active_theme()
+        .panel()
+        .fg(active_theme().error)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn log_warning_style() -> Style {
-    Style::default().fg(Color::Yellow)
+    active_theme().panel().fg(active_theme().warning)
 }
 
 pub(super) fn log_info_style() -> Style {
-    Style::default().fg(Color::LightBlue)
+    active_theme().panel().fg(active_theme().info)
 }
 
 pub(super) fn log_meta_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }
 
 pub(super) fn diff_file_style() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -5041,104 +5058,113 @@ pub(super) fn diff_file_link_style() -> Style {
 }
 
 pub(super) fn diff_hunk_style() -> Style {
-    Style::default().fg(Color::LightBlue)
+    active_theme().panel().fg(active_theme().link)
 }
 
 pub(super) fn diff_gutter_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }
 
 pub(super) fn diff_added_style() -> Style {
-    Style::default().fg(Color::LightGreen)
+    active_theme().panel().fg(active_theme().added)
 }
 
 pub(super) fn diff_removed_style() -> Style {
-    Style::default().fg(Color::LightRed)
+    active_theme().panel().fg(active_theme().removed)
 }
 
 pub(super) fn diff_context_style() -> Style {
-    Style::default().fg(Color::Gray)
+    active_theme().panel().fg(active_theme().code)
 }
 
 pub(super) fn diff_metadata_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }
 
 pub(super) fn diff_inline_comment_marker_style() -> Style {
-    Style::default()
-        .fg(Color::LightMagenta)
+    active_theme()
+        .panel()
+        .fg(active_theme().action)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn review_resolved_style() -> Style {
-    Style::default()
-        .fg(Color::LightGreen)
+    active_theme()
+        .panel()
+        .fg(active_theme().success)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn review_outdated_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }
 
 pub(super) fn comment_author_style(selected: bool) -> Style {
     let style = if selected {
-        Style::default().fg(Color::Yellow)
+        active_theme().panel().fg(active_theme().warning)
     } else {
-        Style::default().fg(Color::Cyan)
+        active_theme().panel().fg(active_theme().focus)
     };
     style.add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn comment_marker_style(selected: bool) -> Style {
     if selected {
-        Style::default()
-            .fg(Color::Yellow)
+        active_theme()
+            .panel()
+            .fg(active_theme().warning)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        active_theme().subtle()
     }
 }
 
 pub(super) fn comment_separator_style(selected: bool) -> Style {
     if selected {
-        Style::default()
-            .fg(Color::LightYellow)
+        active_theme()
+            .panel()
+            .fg(active_theme().reaction)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        active_theme().subtle()
     }
 }
 
 pub(super) fn comment_search_match_style() -> Style {
-    Style::default()
-        .fg(Color::LightMagenta)
+    active_theme()
+        .panel()
+        .fg(active_theme().action)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn description_selected_heading_style() -> Style {
-    Style::default()
-        .fg(Color::LightCyan)
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn description_selected_separator_style() -> Style {
-    Style::default()
-        .fg(Color::LightCyan)
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn description_selected_rail_style() -> Style {
-    Style::default()
-        .fg(Color::LightCyan)
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn comment_selected_rail_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
+    active_theme()
+        .panel()
+        .fg(active_theme().warning)
         .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn comment_thread_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    active_theme().subtle()
 }

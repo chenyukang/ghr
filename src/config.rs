@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::model::SectionKind;
+use crate::theme::ThemeName;
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
@@ -26,6 +27,7 @@ pub struct Config {
 pub struct Defaults {
     pub view: SectionKind,
     pub command_palette_key: String,
+    pub theme: ThemeName,
     pub log_level: String,
     pub pr_per_page: usize,
     pub issue_per_page: usize,
@@ -402,6 +404,7 @@ impl Default for Defaults {
         Self {
             view: SectionKind::PullRequests,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
+            theme: ThemeName::Dark,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             pr_per_page: 50,
             issue_per_page: 50,
@@ -764,6 +767,7 @@ mod tests {
             [defaults]
             view = "pull_requests"
             command_palette_key = ":"
+            theme = "dark"
             log_level = "debug"
             pr_per_page = 50
             issue_per_page = 50
@@ -788,6 +792,7 @@ mod tests {
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
         assert_eq!(config.defaults.command_palette_key, ":");
+        assert_eq!(config.defaults.theme, ThemeName::Dark);
         assert_eq!(config.defaults.log_level, "debug");
         assert_eq!(config.defaults.pr_per_page, 50);
         assert_eq!(config.defaults.issue_per_page, 50);
@@ -837,6 +842,19 @@ mod tests {
         .expect("custom command palette key should parse");
 
         assert_eq!(config.defaults.command_palette_key, "Ctrl+L");
+    }
+
+    #[test]
+    fn parses_light_theme() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            theme = "light"
+            "#,
+        )
+        .expect("light theme should parse");
+
+        assert_eq!(config.defaults.theme, ThemeName::Light);
     }
 
     #[test]

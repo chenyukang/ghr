@@ -5,6 +5,7 @@ mod github;
 mod model;
 mod snapshot;
 mod state;
+mod theme;
 
 use std::path::PathBuf;
 

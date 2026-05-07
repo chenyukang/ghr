@@ -71,6 +71,7 @@ use crate::state::{
     MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
     ViewSnapshot as SavedViewSnapshot,
 };
+use crate::theme::{ThemeName, active_theme, set_active_theme};
 
 mod command_palette;
 mod details;
@@ -418,8 +419,8 @@ impl EditorText {
         let mut textarea = TextArea::new(lines);
         textarea.set_wrap_mode(WrapMode::Glyph);
         textarea.set_style(modal_text_style());
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default().bg(Color::LightMagenta).fg(Color::Black));
+        textarea.set_cursor_line_style(active_theme().panel());
+        textarea.set_cursor_style(active_theme().active());
         let text = textarea.lines().join("\n");
         Self { textarea, text }
     }
@@ -1421,6 +1422,7 @@ const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 
 struct AppState {
+    theme_name: ThemeName,
     active_view: String,
     sections: Vec<SectionSnapshot>,
     section_index: HashMap<String, usize>,
@@ -1722,6 +1724,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
             RefreshScope::View(app.active_view.clone()),
         );
     }
+    app.set_theme(config.defaults.theme);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -4870,7 +4873,9 @@ fn tab_index_at(labels: &[String], area: Rect, column: u16, row: u16) -> Option<
 }
 
 fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
+    set_active_theme(app.theme_name);
     let area = frame.area();
+    frame.buffer_mut().set_style(area, active_theme().base());
     let chunks = page_areas(area);
 
     draw_view_tabs(frame, app, chunks[0]);
@@ -4958,11 +4963,9 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .unwrap_or(0);
     let ghr_focused = app.focus == FocusTarget::Ghr;
     let border_style = if ghr_focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        active_theme().focus_border()
     } else {
-        Style::default().fg(Color::DarkGray)
+        active_theme().border()
     };
     let border_type = if ghr_focused {
         BorderType::Thick
@@ -4979,9 +4982,10 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(border_type)
                 .border_style(border_style)
+                .style(active_theme().panel())
                 .title(Span::styled(title, title_style)),
         )
-        .style(Style::default().fg(Color::Gray))
+        .style(active_theme().muted())
         .highlight_style(active_view_tab_style());
     frame.render_widget(tabs, area);
 }
@@ -5010,11 +5014,9 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .collect::<Vec<_>>();
     let sections_focused = app.focus == FocusTarget::Sections;
     let border_style = if sections_focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        active_theme().focus_border()
     } else {
-        Style::default().fg(Color::DarkGray)
+        active_theme().border()
     };
     let border_type = if sections_focused {
         BorderType::Thick
@@ -5034,9 +5036,10 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(border_type)
                 .border_style(border_style)
+                .style(active_theme().panel())
                 .title(Span::styled(title, border_style)),
         )
-        .style(Style::default().fg(Color::Gray))
+        .style(active_theme().muted())
         .highlight_style(active_section_tab_style());
     frame.render_widget(tabs, area);
 }
@@ -5050,10 +5053,7 @@ fn active_section_tab_style() -> Style {
 }
 
 fn active_navigation_tab_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD)
+    active_theme().active()
 }
 
 fn section_tab_label(app: &AppState, section: &SectionSnapshot) -> String {
@@ -5180,13 +5180,9 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     let list_focused = app.focus == FocusTarget::List;
     let header_style = if list_focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        active_theme().focus_border()
     } else {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
+        active_theme().subtle().add_modifier(Modifier::BOLD)
     };
     let header = Row::new(list_table_header(section.kind))
         .style(header_style)
@@ -5230,53 +5226,53 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let input_prompt = active_list_input_prompt(app);
     let (border_style, title_style, border_type, highlight_style) = if app.dragging_split {
         (
-            Style::default()
-                .fg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
             BorderType::Thick,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
         )
     } else if let Some((_, color)) = &input_prompt {
         (
-            Style::default().fg(*color).add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
+            active_theme()
+                .panel()
+                .fg(*color)
+                .add_modifier(Modifier::BOLD),
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
                 .bg(*color)
                 .add_modifier(Modifier::BOLD),
             BorderType::Thick,
-            Style::default()
-                .fg(Color::Black)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
                 .bg(*color)
                 .add_modifier(Modifier::BOLD),
         )
     } else if list_focused {
         (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            active_theme().focus_border(),
+            active_theme().active(),
             BorderType::Thick,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            active_theme().active(),
         )
     } else {
         (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::Gray),
+            active_theme().border(),
+            active_theme().muted(),
             BorderType::Plain,
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            active_theme().selected(),
         )
     };
     if let Some((prompt, _)) = input_prompt {
@@ -5286,6 +5282,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     let table = Table::new(rows, list_table_constraints(section.kind))
         .header(header)
+        .style(active_theme().panel())
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -5355,12 +5352,15 @@ fn list_table_constraints(kind: SectionKind) -> Vec<Constraint> {
 
 fn list_item_row_style(app: &AppState, item: &WorkItem) -> Style {
     match item.unread {
-        Some(true) => Style::default()
-            .fg(Color::White)
+        Some(true) => active_theme()
+            .panel()
+            .fg(active_theme().text)
             .add_modifier(Modifier::BOLD),
-        Some(false) => Style::default().fg(Color::DarkGray),
-        None if app.item_has_unseen_details(item) => Style::default().add_modifier(Modifier::BOLD),
-        None => Style::default(),
+        Some(false) => active_theme().subtle(),
+        None if app.item_has_unseen_details(item) => {
+            active_theme().panel().add_modifier(Modifier::BOLD)
+        }
+        None => active_theme().panel(),
     }
 }
 
@@ -5397,7 +5397,7 @@ fn list_empty_state_message(
     if let Some(error) = &section.error {
         return Some((
             format!("Error: {}", compact_error_label(error)),
-            Style::default().fg(Color::LightRed),
+            active_theme().panel().fg(active_theme().error),
         ));
     }
     if section.items.is_empty() && section.refreshed_at.is_none() {
@@ -5407,30 +5407,27 @@ fn list_empty_state_message(
             } else {
                 "GitHub data is loading ..."
             };
-            return Some((message.to_string(), Style::default().fg(Color::Gray)));
+            return Some((message.to_string(), active_theme().muted()));
         }
         return Some((
             "No cached data yet. Press r to refresh.".to_string(),
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         ));
     }
     if section.items.is_empty() {
-        return Some((
-            "No items found.".to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
+        return Some(("No items found.".to_string(), active_theme().subtle()));
     }
     if app.ignored_count_for_section(section) == section.items.len() {
         return Some((
             "All loaded items are ignored. Use the command palette to clear ignored items."
                 .to_string(),
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         ));
     }
     if !app.search_query.is_empty() {
         return Some((
             "No items match the current search.".to_string(),
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         ));
     }
     None
@@ -5440,40 +5437,35 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let files_focused = app.focus == FocusTarget::List;
     let (border_style, title_style, border_type, highlight_style) = if app.dragging_split {
         (
-            Style::default()
-                .fg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
             BorderType::Thick,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
         )
     } else if files_focused {
         (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            active_theme().focus_border(),
+            active_theme().active(),
             BorderType::Thick,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            active_theme().active(),
         )
     } else {
         (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::Green),
+            active_theme().border(),
+            active_theme().panel().fg(active_theme().success),
             BorderType::Plain,
-            Style::default().fg(Color::White).bg(Color::DarkGray),
+            active_theme().selected(),
         )
     };
 
@@ -5502,9 +5494,9 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .map(|entry| {
                     let indent = "  ".repeat(entry.depth);
                     let (marker, style) = if entry.file_index.is_some() {
-                        (" ", Style::default().fg(Color::White))
+                        (" ", active_theme().panel())
                     } else {
-                        ("▾ ", Style::default().fg(Color::Green))
+                        ("▾ ", active_theme().panel().fg(active_theme().success))
                     };
                     let label = format!("{indent}{marker}{}", entry.label);
                     Row::new(diff_tree_row_cells(label, entry.stats)).style(style)
@@ -5515,14 +5507,14 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             title = "Files | error".to_string();
             vec![
                 Row::new(diff_tree_row_cells(compact_error_label(error), None))
-                    .style(Style::default().fg(Color::LightRed)),
+                    .style(active_theme().panel().fg(active_theme().error)),
             ]
         }
         Some(DiffState::Loading) | None => {
             title = "Files | loading".to_string();
             vec![
                 Row::new(diff_tree_row_cells("loading diff...".to_string(), None))
-                    .style(Style::default().fg(Color::Gray)),
+                    .style(active_theme().muted()),
             ]
         }
     };
@@ -5539,6 +5531,7 @@ fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             Constraint::Length(8),
         ],
     )
+    .style(active_theme().panel())
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -5585,13 +5578,14 @@ fn right_aligned_cell(text: String) -> Cell<'static> {
 }
 
 fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
+    let theme = active_theme();
     if app.filter_input_active {
         return Some((
             format!(
                 "Filter: f{}_  Enter apply  empty/clear resets  Esc cancel",
                 app.filter_input_query
             ),
-            Color::LightCyan,
+            theme.focus,
         ));
     }
 
@@ -5607,14 +5601,14 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
                 "Repo Search{scope}: S{}_  Enter search  Esc cancel",
                 app.global_search_query
             ),
-            Color::LightMagenta,
+            theme.action,
         ));
     }
 
     if app.is_global_search_results_view() {
         return Some((
             format!("Search results: {}  Esc back", app.global_search_query),
-            Color::LightMagenta,
+            theme.action,
         ));
     }
 
@@ -5624,7 +5618,7 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
                 "Local Search: /{}_  Enter search  Esc clear",
                 app.search_query
             ),
-            Color::Yellow,
+            theme.search,
         ));
     }
 
@@ -5632,13 +5626,14 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
 }
 
 fn active_details_input_prompt(app: &AppState) -> Option<(String, Color)> {
+    let theme = active_theme();
     if app.comment_search_active {
         return Some((
             format!(
                 "Comment Search: /{}_  Enter keep  Esc clear",
                 app.comment_search_query
             ),
-            Color::Yellow,
+            theme.search,
         ));
     }
 
@@ -5653,31 +5648,33 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let title = focus_panel_title("Details", &raw_title, details_focused);
     let (border_style, title_style, border_type) = if app.dragging_split {
         (
-            Style::default()
-                .fg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
             BorderType::Thick,
         )
     } else if details_focused {
         (
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
+            active_theme().focus_alt_border(),
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().focus_alt)
                 .add_modifier(Modifier::BOLD),
             BorderType::Thick,
         )
     } else {
         (
-            Style::default().fg(Color::DarkGray),
-            Style::default()
-                .fg(Color::LightMagenta)
+            active_theme().border(),
+            active_theme()
+                .panel()
+                .fg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
             BorderType::Plain,
         )
@@ -5688,6 +5685,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     frame.render_widget(Clear, area);
     let details = Paragraph::new(Text::from(document.lines))
+        .style(active_theme().panel())
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -5781,8 +5779,8 @@ fn highlight_details_text_spans(
 }
 
 fn details_text_selection_style(base: Style) -> Style {
-    base.fg(Color::Black)
-        .bg(Color::LightCyan)
+    base.fg(active_theme().highlight_fg)
+        .bg(active_theme().highlight_bg)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -5945,7 +5943,7 @@ fn repo_token_value(token: &str) -> Option<String> {
 
 fn draw_footer(frame: &mut Frame<'_>, app: &AppState, paths: &Paths, area: Rect) {
     let footer = Paragraph::new(footer_line_for_width(app, paths, usize::from(area.width)))
-        .style(Style::default().fg(Color::Gray));
+        .style(active_theme().muted());
     frame.render_widget(footer, area);
 }
 
@@ -5956,7 +5954,9 @@ fn draw_top_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let line = top_status_line(app, usize::from(status_area.width));
     frame.render_widget(Clear, status_area);
     frame.render_widget(
-        Paragraph::new(line).alignment(Alignment::Right),
+        Paragraph::new(line)
+            .style(active_theme().panel())
+            .alignment(Alignment::Right),
         status_area,
     );
 }
@@ -6241,16 +6241,17 @@ fn push_footer_group(spans: &mut Vec<Span<'static>>, group: Vec<Span<'static>>) 
 
 fn append_footer_more_marker(spans: &mut Vec<Span<'static>>, width: usize) {
     let marker = vec![
-        Span::styled("...", Style::default().fg(Color::DarkGray)),
+        Span::styled("...", active_theme().subtle()),
         Span::raw(" "),
         Span::styled(
             "?",
-            Style::default()
-                .fg(Color::Yellow)
+            active_theme()
+                .panel()
+                .fg(active_theme().warning)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled("help", Style::default().fg(Color::Gray)),
+        Span::styled("help", active_theme().muted()),
     ];
     let separator_width = if spans.is_empty() {
         0
@@ -6297,7 +6298,7 @@ fn footer_spans_width(spans: &[Span<'static>]) -> usize {
 }
 
 fn push_footer_separator(spans: &mut Vec<Span<'static>>) {
-    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(" | ", active_theme().subtle()));
 }
 
 fn push_status_spans(spans: &mut Vec<Span<'static>>, value: impl Into<String>) {
@@ -6306,14 +6307,15 @@ fn push_status_spans(spans: &mut Vec<Span<'static>>, value: impl Into<String>) {
     }
     spans.push(Span::styled(
         "status:",
-        Style::default()
-            .fg(Color::Cyan)
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         value.into(),
-        Style::default().fg(Color::Green),
+        active_theme().panel().fg(themed_status_value_color()),
     ));
 }
 
@@ -6323,15 +6325,19 @@ fn push_footer_pair(
     label: impl Into<String>,
     key_color: Color,
 ) {
+    let key_color = themed_hint_color(key_color);
     if !spans.is_empty() && !footer_ends_with_separator(spans) {
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(
         key.into(),
-        Style::default().fg(key_color).add_modifier(Modifier::BOLD),
+        active_theme()
+            .panel()
+            .fg(key_color)
+            .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(label.into(), Style::default().fg(Color::Gray)));
+    spans.push(Span::styled(label.into(), active_theme().muted()));
 }
 
 fn push_footer_state(
@@ -6340,17 +6346,51 @@ fn push_footer_state(
     value: impl Into<String>,
     value_color: Color,
 ) {
+    let value_color = themed_hint_color(value_color);
     if !spans.is_empty() && !footer_ends_with_separator(spans) {
         spans.push(Span::raw("  "));
     }
     spans.push(Span::styled(
         key,
-        Style::default()
-            .fg(Color::DarkGray)
+        active_theme()
+            .panel()
+            .fg(active_theme().subtle)
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(value.into(), Style::default().fg(value_color)));
+    spans.push(Span::styled(
+        value.into(),
+        active_theme().panel().fg(value_color),
+    ));
+}
+
+fn themed_hint_color(color: Color) -> Color {
+    let theme = active_theme();
+    match color {
+        Color::Cyan | Color::LightCyan => theme.focus,
+        Color::LightBlue => theme.link,
+        Color::LightMagenta => theme.action,
+        Color::Yellow | Color::LightYellow => theme.warning,
+        Color::LightRed | Color::Red => theme.error,
+        Color::Green | Color::LightGreen => theme.success,
+        _ => color,
+    }
+}
+
+fn themed_fg_style(color: Color) -> Style {
+    active_theme().panel().fg(themed_hint_color(color))
+}
+
+fn themed_bold_style(color: Color) -> Style {
+    themed_fg_style(color).add_modifier(Modifier::BOLD)
+}
+
+fn themed_status_value_color() -> Color {
+    if active_theme().background == Color::Reset {
+        Color::Green
+    } else {
+        active_theme().success
+    }
 }
 
 fn footer_ends_with_separator(spans: &[Span<'static>]) -> bool {
@@ -6365,16 +6405,17 @@ fn item_supports_metadata_edit(item: &WorkItem) -> bool {
 }
 
 fn modal_surface_style() -> Style {
-    Style::default()
+    active_theme().panel()
 }
 
 fn modal_text_style() -> Style {
-    Style::default().fg(Color::White)
+    active_theme().panel()
 }
 
 fn modal_footer_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
+    active_theme()
+        .panel()
+        .fg(active_theme().warning)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -6420,13 +6461,17 @@ fn draw_startup_dialog(
         StartupDialog::Initializing => Color::Cyan,
         StartupDialog::Ready => Color::LightGreen,
     };
+    let accent = themed_hint_color(accent);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(active_theme().panel().fg(accent))
         .style(modal_surface_style())
         .title(Span::styled(
             title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            active_theme()
+                .panel()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -6438,9 +6483,10 @@ fn draw_startup_dialog(
 
     if show_ok {
         let ok = Paragraph::new("[ OK ]").alignment(Alignment::Center).style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightGreen)
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(active_theme().success)
                 .add_modifier(Modifier::BOLD),
         );
         frame.render_widget(ok, startup_dialog_ok_area(dialog_area));
@@ -6494,12 +6540,7 @@ fn startup_dialog_content(
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled(
-                        "?",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled("?", themed_bold_style(Color::Yellow)),
                     Span::raw(" anytime for the shortcut reference."),
                 ]),
                 Line::from("Click OK or press Enter/Esc to close this dialog."),
@@ -6517,15 +6558,10 @@ fn startup_loading_line(elapsed_secs: u64) -> Line<'static> {
         _ => "...",
     };
     Line::from(vec![
-        Span::styled(
-            format!("Loading{dots:<3}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("Loading{dots:<3}"), themed_bold_style(Color::Cyan)),
         Span::styled(
             format!("  {elapsed_secs}s"),
-            Style::default().fg(Color::DarkGray),
+            themed_fg_style(Color::DarkGray),
         ),
     ])
 }
@@ -6549,7 +6585,7 @@ fn startup_progress_line(elapsed_secs: u64) -> Line<'static> {
 
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(bar, Style::default().fg(Color::Cyan)),
+        Span::styled(bar, themed_fg_style(Color::Cyan)),
     ])
 }
 
@@ -6577,12 +6613,13 @@ fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area: Rect) {
     let dialog_area = centered_rect(90, 17, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(active_theme().panel().fg(active_theme().warning))
         .style(modal_surface_style())
         .title(Span::styled(
             title,
-            Style::default()
-                .fg(Color::Yellow)
+            active_theme()
+                .panel()
+                .fg(active_theme().warning)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -6601,12 +6638,13 @@ fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect, command_palette_key: &str
     let dialog_area = centered_rect_with_size(width, height, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(active_theme().panel().fg(active_theme().action))
         .style(modal_surface_style())
         .title(Span::styled(
             "Help",
-            Style::default()
-                .fg(Color::LightMagenta)
+            active_theme()
+                .panel()
+                .fg(active_theme().action)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -6651,7 +6689,7 @@ fn draw_command_palette(
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
             "No commands found",
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         )));
     } else {
         for (position, command_index) in matches.iter().enumerate().skip(start).take(result_height)
@@ -6667,12 +6705,13 @@ fn draw_command_palette(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(active_theme().panel().fg(active_theme().focus))
         .style(modal_surface_style())
         .title(Span::styled(
             "Command Palette",
-            Style::default()
-                .fg(Color::Cyan)
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -6721,7 +6760,7 @@ fn draw_project_switcher(
     if candidates.is_empty() {
         lines.push(Line::from(Span::styled(
             "No projects found",
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         )));
     } else {
         for (position, candidate) in candidates
@@ -6741,12 +6780,13 @@ fn draw_project_switcher(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(active_theme().panel().fg(active_theme().focus))
         .style(modal_surface_style())
         .title(Span::styled(
             "Project Switch",
-            Style::default()
-                .fg(Color::Cyan)
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -6784,17 +6824,17 @@ fn project_switcher_area(area: Rect) -> Rect {
 fn project_switcher_input_line(query: &str, width: usize) -> Line<'static> {
     if query.is_empty() {
         return Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Type a project prefix",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+            Span::styled("Type a project prefix", active_theme().subtle()),
         ]);
     }
 
     Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+        Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            active_theme().panel(),
+        ),
     ])
 }
 
@@ -6811,16 +6851,14 @@ fn project_switcher_candidate_line(
         width,
     );
     let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        active_theme().active()
     } else if current {
-        Style::default()
-            .fg(Color::LightCyan)
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        active_theme().panel()
     };
     Line::from(Span::styled(text, style))
 }
@@ -6849,10 +6887,7 @@ fn draw_recent_items_dialog(
         } else {
             "No recent items found"
         };
-        lines.push(Line::from(Span::styled(
-            message,
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled(message, active_theme().subtle())));
     } else {
         for (position, candidate) in candidates
             .iter()
@@ -6870,12 +6905,13 @@ fn draw_recent_items_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(active_theme().panel().fg(active_theme().focus))
         .style(modal_surface_style())
         .title(Span::styled(
             "Recent Items",
-            Style::default()
-                .fg(Color::Cyan)
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -6913,17 +6949,20 @@ fn recent_items_area(area: Rect) -> Rect {
 fn recent_items_input_line(query: &str, width: usize) -> Line<'static> {
     if query.is_empty() {
         return Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
             Span::styled(
                 "Type to search recent PRs and issues",
-                Style::default().fg(Color::DarkGray),
+                active_theme().subtle(),
             ),
         ]);
     }
 
     Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+        Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            active_theme().panel(),
+        ),
     ])
 }
 
@@ -6931,12 +6970,9 @@ fn recent_item_candidate_line(item: &RecentItem, selected: bool, width: usize) -
     let marker = if selected { "> " } else { "  " };
     let text = truncate_inline(&format!("{marker}{}", recent_item_label(item)), width);
     let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        active_theme().active()
     } else {
-        Style::default().fg(Color::White)
+        active_theme().panel()
     };
     Line::from(Span::styled(text, style))
 }
@@ -6972,18 +7008,19 @@ fn draw_project_add_dialog(frame: &mut Frame<'_>, dialog: &ProjectAddDialog, are
         Line::from(""),
         Line::from(Span::styled(
             "Title and local_dir may be empty. Empty local_dir is saved as local_dir = \"\".",
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         )),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightGreen))
+        .border_style(active_theme().panel().fg(active_theme().success))
         .style(modal_surface_style())
         .title(Span::styled(
             "Project Add",
-            Style::default()
-                .fg(Color::LightGreen)
+            active_theme()
+                .panel()
+                .fg(active_theme().success)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -7022,18 +7059,19 @@ fn project_add_dialog_field_input_line(
         Span::styled(prefix, project_add_dialog_field_label_style(field, current)),
         Span::styled(
             issue_dialog_input_text(value, value_width),
-            Style::default().fg(Color::White),
+            active_theme().panel(),
         ),
     ])
 }
 
 fn project_add_dialog_field_label_style(field: ProjectAddField, current: ProjectAddField) -> Style {
     if field == current {
-        Style::default()
-            .fg(Color::Cyan)
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        active_theme().muted()
     }
 }
 
@@ -7087,7 +7125,7 @@ fn draw_project_remove_picker(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialo
     if candidates.is_empty() {
         lines.push(Line::from(Span::styled(
             "No projects found",
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         )));
     } else {
         for (position, candidate) in candidates
@@ -7106,12 +7144,13 @@ fn draw_project_remove_picker(frame: &mut Frame<'_>, dialog: &ProjectRemoveDialo
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightRed))
+        .border_style(active_theme().panel().fg(active_theme().error))
         .style(modal_surface_style())
         .title(Span::styled(
             "Project Remove",
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -7156,12 +7195,13 @@ fn draw_project_remove_confirmation(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightRed))
+        .border_style(active_theme().panel().fg(active_theme().error))
         .style(modal_surface_style())
         .title(Span::styled(
             "Confirm Project Remove",
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -7199,17 +7239,18 @@ fn draw_cache_clear_dialog(frame: &mut Frame<'_>, dialog: &CacheClearDialog, are
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Config, logs, and saved UI preferences are not touched.",
-        Style::default().fg(Color::DarkGray),
+        active_theme().subtle(),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightRed))
+        .border_style(active_theme().panel().fg(active_theme().error))
         .style(modal_surface_style())
         .title(Span::styled(
             "Clear Cache",
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -7237,18 +7278,19 @@ fn draw_cache_clear_confirmation(frame: &mut Frame<'_>, target: CacheClearTarget
         Line::from(""),
         Line::from(Span::styled(
             "This only affects local cache. GitHub data can be fetched again.",
-            Style::default().fg(Color::DarkGray),
+            active_theme().subtle(),
         )),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightRed))
+        .border_style(active_theme().panel().fg(active_theme().error))
         .style(modal_surface_style())
         .title(Span::styled(
             "Confirm Clear Cache",
-            Style::default()
-                .fg(Color::LightRed)
+            active_theme()
+                .panel()
+                .fg(active_theme().error)
                 .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -7302,12 +7344,13 @@ fn project_remove_candidate_line(
     let marker = if selected { "> " } else { "  " };
     let text = format!("{marker}{:<20} {}", candidate.name, candidate.repo);
     let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightRed)
+        active_theme()
+            .panel()
+            .fg(active_theme().highlight_fg)
+            .bg(active_theme().error)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        active_theme().panel()
     };
     Line::from(Span::styled(truncate_inline(&text, width), style))
 }
@@ -7378,12 +7421,13 @@ fn cache_clear_target_line(
     let label = cache_clear_target_label(target);
     let text = format!("{marker}{label:<28} {}", cache_clear_target_detail(target));
     let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightRed)
+        active_theme()
+            .panel()
+            .fg(active_theme().highlight_fg)
+            .bg(active_theme().error)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        active_theme().panel()
     };
     Line::from(Span::styled(truncate_inline(&text, width), style))
 }
@@ -7485,7 +7529,7 @@ fn draw_pr_action_dialog(
     lines.push(Line::from(""));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(themed_fg_style(Color::Yellow))
         .style(modal_surface_style())
         .title(Span::styled(
             match dialog.action {
@@ -7507,9 +7551,7 @@ fn draw_pr_action_dialog(
                 PrAction::ConvertToDraft => "Convert to Draft",
                 PrAction::MarkReadyForReview => "Ready for Review",
             },
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::Yellow),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -7527,18 +7569,16 @@ fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running:
         Line::from("Target"),
         Line::from(vec![Span::styled(
             truncate_inline(&dialog.target_label, 54),
-            Style::default().fg(Color::Cyan),
+            themed_fg_style(Color::Cyan),
         )]),
         Line::from(""),
     ];
     for (index, reaction) in ReactionContent::ALL.iter().copied().enumerate() {
         let selected = index == dialog.selected;
         let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+            themed_bold_style(Color::Yellow)
         } else {
-            Style::default().fg(Color::White)
+            themed_fg_style(Color::White)
         };
         lines.push(Line::from(vec![Span::styled(
             format!(
@@ -7559,13 +7599,11 @@ fn draw_reaction_dialog(frame: &mut Frame<'_>, dialog: &ReactionDialog, running:
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             "Add Reaction",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -7599,24 +7637,22 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
             let mut lines = vec![
                 key_value_line("repo", repo.clone()),
                 Line::from("Label prefix"),
-                Line::from(vec![Span::styled(input, Style::default().fg(Color::Cyan))]),
+                Line::from(vec![Span::styled(input, themed_fg_style(Color::Cyan))]),
                 Line::from(""),
             ];
             if dialog.suggestions_loading {
                 lines.push(Line::from(vec![Span::styled(
                     "Suggestions: loading...",
-                    Style::default().fg(Color::Gray),
+                    themed_fg_style(Color::Gray),
                 )]));
             } else if let Some(error) = &dialog.suggestions_error {
                 lines.push(Line::from(vec![Span::styled(
                     "Suggestions unavailable",
-                    Style::default()
-                        .fg(Color::LightRed)
-                        .add_modifier(Modifier::BOLD),
+                    themed_bold_style(Color::LightRed),
                 )]));
                 lines.push(Line::from(vec![Span::styled(
                     truncate_text(error, 68),
-                    Style::default().fg(Color::Gray),
+                    themed_fg_style(Color::Gray),
                 )]));
             } else if matches.is_empty() {
                 let message = if dialog.input.trim().is_empty() {
@@ -7626,14 +7662,12 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
                 };
                 lines.push(Line::from(vec![Span::styled(
                     message,
-                    Style::default().fg(Color::Gray),
+                    themed_fg_style(Color::Gray),
                 )]));
             } else {
                 lines.push(Line::from(vec![Span::styled(
                     "Suggestions",
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::BOLD),
+                    themed_bold_style(Color::Gray),
                 )]));
                 let start =
                     label_suggestion_window_start(matches.len(), dialog.selected_suggestion);
@@ -7645,11 +7679,9 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
                 {
                     let selected = index == dialog.selected_suggestion;
                     let style = if selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        themed_bold_style(Color::Yellow)
                     } else {
-                        Style::default().fg(Color::Cyan)
+                        themed_fg_style(Color::Cyan)
                     };
                     lines.push(Line::from(vec![
                         Span::styled(if selected { "> " } else { "  " }, style),
@@ -7687,13 +7719,17 @@ fn draw_label_dialog(frame: &mut Frame<'_>, dialog: &LabelDialog, running: bool,
             )
         }
     };
+    let accent = themed_hint_color(accent);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(active_theme().panel().fg(accent))
         .style(modal_surface_style())
         .title(Span::styled(
             title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            active_theme()
+                .panel()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -7769,13 +7805,11 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             "New Issue",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -7839,13 +7873,11 @@ fn draw_pr_create_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             "New Pull Request",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -7926,7 +7958,7 @@ fn issue_dialog_field_input_line(
         Span::styled(prefix, issue_dialog_field_label_style(field, current)),
         Span::styled(
             issue_dialog_input_text(value, value_width),
-            Style::default().fg(Color::White),
+            themed_fg_style(Color::White),
         ),
     ])
 }
@@ -7945,7 +7977,7 @@ fn pr_create_dialog_field_input_line(
         Span::styled(prefix, pr_create_dialog_field_label_style(field, current)),
         Span::styled(
             issue_dialog_input_text(value, value_width),
-            Style::default().fg(Color::White),
+            themed_fg_style(Color::White),
         ),
     ])
 }
@@ -7974,21 +8006,17 @@ fn pr_create_dialog_field_label(
 
 fn issue_dialog_field_label_style(field: IssueDialogField, current: IssueDialogField) -> Style {
     if field == current {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        themed_bold_style(Color::Cyan)
     } else {
-        Style::default().fg(Color::Gray)
+        themed_fg_style(Color::Gray)
     }
 }
 
 fn pr_create_dialog_field_label_style(field: PrCreateField, current: PrCreateField) -> Style {
     if field == current {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        themed_bold_style(Color::Cyan)
     } else {
-        Style::default().fg(Color::Gray)
+        themed_fg_style(Color::Gray)
     }
 }
 
@@ -8003,7 +8031,7 @@ fn issue_dialog_field_label_text(label: &'static str) -> String {
 fn issue_dialog_separator_line(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(usize::from(width.max(1))),
-        Style::default().fg(Color::DarkGray),
+        themed_fg_style(Color::DarkGray),
     ))
 }
 
@@ -8322,7 +8350,7 @@ fn remote_branch_line(branch: Option<&PullRequestBranch>) -> Line<'static> {
         return key_value_line("remote branch", "unavailable".to_string());
     };
     Line::from(vec![
-        Span::styled("remote branch: ", Style::default().fg(Color::Gray)),
+        Span::styled("remote branch: ", themed_fg_style(Color::Gray)),
         Span::styled(pull_request_branch_label(branch), link_style()),
     ])
 }
@@ -8389,7 +8417,7 @@ fn draw_milestone_dialog(
         MilestoneDialogState::Error(error) => {
             lines.push(Line::from(vec![Span::styled(
                 operation_error_body(error),
-                Style::default().fg(Color::LightRed),
+                themed_fg_style(Color::LightRed),
             )]));
         }
         MilestoneDialogState::Loaded(_) => {
@@ -8400,9 +8428,7 @@ fn draw_milestone_dialog(
                 for (index, choice) in choices.iter().take(9).enumerate() {
                     let marker = if index == dialog.selected { "> " } else { "  " };
                     let style = if index == dialog.selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        themed_bold_style(Color::Yellow)
                     } else {
                         modal_text_style()
                     };
@@ -8426,13 +8452,11 @@ fn draw_milestone_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(themed_fg_style(Color::Yellow))
         .style(modal_surface_style())
         .title(Span::styled(
             "Change Milestone",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::Yellow),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -8476,18 +8500,16 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
     if dialog.suggestions_loading {
         lines.push(Line::from(vec![Span::styled(
             "Candidates: loading assignable users...",
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else if let Some(error) = &dialog.suggestions_error {
         lines.push(Line::from(vec![Span::styled(
             "Candidates unavailable",
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightRed),
         )]));
         lines.push(Line::from(vec![Span::styled(
             truncate_text(error, 64),
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else if matches.is_empty() {
         let message = match dialog.action {
@@ -8499,14 +8521,12 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
         };
         lines.push(Line::from(vec![Span::styled(
             message,
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else {
         lines.push(Line::from(vec![Span::styled(
             "Candidates",
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::Gray),
         )]));
         let start = assignee_suggestion_window_start(matches.len(), dialog.selected_suggestion);
         for (index, login) in matches
@@ -8517,11 +8537,9 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
         {
             let selected = index == dialog.selected_suggestion;
             let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                themed_bold_style(Color::Yellow)
             } else {
-                Style::default().fg(Color::Cyan)
+                themed_fg_style(Color::Cyan)
             };
             lines.push(Line::from(vec![
                 Span::styled(if selected { "> " } else { "  " }, style),
@@ -8538,14 +8556,9 @@ fn draw_assignee_dialog(frame: &mut Frame<'_>, dialog: &AssigneeDialog, running:
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(themed_fg_style(Color::Yellow))
         .style(modal_surface_style())
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled(title, themed_bold_style(Color::Yellow)));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .style(modal_text_style())
@@ -8591,18 +8604,16 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
     if dialog.suggestions_loading {
         lines.push(Line::from(vec![Span::styled(
             "Candidates: loading reviewable users...",
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else if let Some(error) = &dialog.suggestions_error {
         lines.push(Line::from(vec![Span::styled(
             "Candidates unavailable",
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightRed),
         )]));
         lines.push(Line::from(vec![Span::styled(
             truncate_text(error, 68),
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else if matches.is_empty() {
         let message = if dialog.input.trim().is_empty() {
@@ -8612,14 +8623,12 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
         };
         lines.push(Line::from(vec![Span::styled(
             message,
-            Style::default().fg(Color::Gray),
+            themed_fg_style(Color::Gray),
         )]));
     } else {
         lines.push(Line::from(vec![Span::styled(
             "Candidates",
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::Gray),
         )]));
         let start = reviewer_suggestion_window_start(matches.len(), dialog.selected_suggestion);
         for (index, login) in matches
@@ -8630,11 +8639,9 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
         {
             let selected = index == dialog.selected_suggestion;
             let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                themed_bold_style(Color::Yellow)
             } else {
-                Style::default().fg(Color::Cyan)
+                themed_fg_style(Color::Cyan)
             };
             lines.push(Line::from(vec![
                 Span::styled(if selected { "> " } else { "  " }, style),
@@ -8648,14 +8655,9 @@ fn draw_reviewer_dialog(frame: &mut Frame<'_>, dialog: &ReviewerDialog, running:
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(themed_fg_style(Color::Yellow))
         .style(modal_surface_style())
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled(title, themed_bold_style(Color::Yellow)));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .style(modal_text_style())
@@ -8687,13 +8689,11 @@ fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDialog, area: R
     ];
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             "Edit Item",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -8776,11 +8776,14 @@ fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect
     let accent = message_dialog_accent(dialog);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
+        .border_style(active_theme().panel().fg(accent))
         .style(modal_surface_style())
         .title(Span::styled(
             dialog.title.clone(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            active_theme()
+                .panel()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let paragraph = Paragraph::new(dialog.body.clone())
         .block(block)
@@ -8800,10 +8803,11 @@ fn message_dialog_height(dialog: &MessageDialog, area: Rect) -> u16 {
 }
 
 fn message_dialog_accent(dialog: &MessageDialog) -> Color {
+    let theme = active_theme();
     match dialog.kind {
-        MessageDialogKind::Info => Color::Yellow,
-        MessageDialogKind::Success => Color::LightGreen,
-        MessageDialogKind::Error | MessageDialogKind::RetryableError => Color::LightRed,
+        MessageDialogKind::Info => theme.warning,
+        MessageDialogKind::Success => theme.success,
+        MessageDialogKind::Error | MessageDialogKind::RetryableError => theme.error,
     }
 }
 
@@ -8816,13 +8820,11 @@ fn draw_global_search_loading_dialog(frame: &mut Frame<'_>, app: &AppState, area
     let lines = global_search_loading_content(app, elapsed_secs);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             "Searching",
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -8843,14 +8845,9 @@ fn draw_section_page_loading_dialog(
     let lines = section_page_loading_content(loading, elapsed_secs);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(themed_fg_style(Color::Cyan))
         .style(modal_surface_style())
-        .title(Span::styled(
-            "Loading Page",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled("Loading Page", themed_bold_style(Color::Cyan)));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .style(modal_text_style())
@@ -8898,7 +8895,7 @@ fn global_search_loading_content(app: &AppState, elapsed_secs: u64) -> Vec<Line<
 
 fn key_value_line(key: &'static str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key}: "), Style::default().fg(Color::Gray)),
+        Span::styled(format!("{key}: "), themed_fg_style(Color::Gray)),
         Span::raw(value),
     ])
 }
@@ -9354,14 +9351,9 @@ fn draw_review_submit_dialog(frame: &mut Frame<'_>, dialog: &ReviewSubmitDialog,
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled(title, themed_bold_style(Color::LightMagenta)));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .style(modal_text_style());
@@ -9443,13 +9435,11 @@ fn draw_comment_editor(frame: &mut Frame<'_>, title: &str, dialog: &CommentDialo
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightMagenta))
+        .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
             title.to_string(),
-            Style::default()
-                .fg(Color::LightMagenta)
-                .add_modifier(Modifier::BOLD),
+            themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
@@ -9773,12 +9763,7 @@ fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>
 fn command_line(command: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            command,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(command, themed_bold_style(Color::Cyan)),
     ])
 }
 
@@ -10196,12 +10181,7 @@ fn spans_display_width(spans: &[Span<'static>]) -> usize {
 }
 
 fn help_heading(text: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ))
+    Line::from(Span::styled(text, themed_bold_style(Color::Yellow)))
 }
 
 fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static> {
@@ -10211,12 +10191,7 @@ fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static>
 fn help_key_line_owned(keys: String, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            format!("{keys:<24}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{keys:<24}"), themed_bold_style(Color::Cyan)),
         Span::raw(description),
     ])
 }
@@ -10587,6 +10562,7 @@ impl AppState {
             .map(|(view, snapshot)| (view.clone(), ViewSnapshotState::from_saved(snapshot)))
             .collect::<HashMap<_, _>>();
         let mut state = Self {
+            theme_name: ThemeName::Dark,
             active_view,
             sections,
             section_index: ui_state.section_index.clone(),
@@ -10724,6 +10700,29 @@ impl AppState {
             }
         }
         state
+    }
+
+    fn set_theme(&mut self, theme_name: ThemeName) {
+        self.theme_name = theme_name;
+        set_active_theme(theme_name);
+    }
+
+    fn toggle_theme(&mut self, config: &mut Config, paths: &Paths) {
+        let previous_app_theme = self.theme_name;
+        let previous_config_theme = config.defaults.theme;
+        let next = self.theme_name.toggled();
+
+        self.set_theme(next);
+        config.defaults.theme = next;
+
+        if let Err(error) = config.save(&paths.config_path) {
+            self.set_theme(previous_app_theme);
+            config.defaults.theme = previous_config_theme;
+            self.status = format!("theme toggle failed: {error}");
+            return;
+        }
+
+        self.status = format!("theme: {}", next.as_str());
     }
 
     fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
@@ -12770,6 +12769,10 @@ impl AppState {
             }
             PaletteAction::RecentItems => {
                 self.show_recent_items_dialog();
+                false
+            }
+            PaletteAction::ToggleTheme => {
+                self.toggle_theme(config, paths);
                 false
             }
             PaletteAction::SearchCurrentRepo => {
@@ -23501,6 +23504,39 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn command_palette_toggle_theme_switches_and_saves_config() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Dark);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = Config::default();
+        let paths = unique_test_paths("toggle-theme");
+        config.save(&paths.config_path).expect("save config");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        app.command_palette = Some(CommandPalette {
+            query: "toggle theme".to_string(),
+            selected: 0,
+        });
+
+        assert!(!handle_key_in_area_mut(
+            &mut app,
+            key(KeyCode::Enter),
+            &mut config,
+            &paths,
+            &store,
+            &tx,
+            None,
+        ));
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.theme_name, ThemeName::Light);
+        assert_eq!(config.defaults.theme, ThemeName::Light);
+        assert_eq!(app.status, "theme: light");
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.defaults.theme, ThemeName::Light);
+    }
+
+    #[test]
     fn recent_items_only_records_details_visits_after_ten_seconds() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
@@ -24215,6 +24251,40 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(rendered.contains("A body with useful context"));
         assert!(!rendered.contains("Funding state"));
         assert!(!rendered.contains("Updated"));
+    }
+
+    #[test]
+    fn light_theme_renders_background_and_active_tabs_from_palette() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Light);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let theme = crate::theme::Theme::from_name(ThemeName::Light);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((0, 0)).expect("top-left cell").bg,
+            theme.surface
+        );
+
+        let lines = buffer_lines(buffer);
+        let (row, column) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("Pull Requests").map(|column| (row, column)))
+            .expect("active pull requests tab");
+        let tab_cell = buffer
+            .cell((column as u16, row as u16))
+            .expect("active tab cell");
+
+        assert_eq!(tab_cell.fg, theme.highlight_fg);
+        assert_eq!(tab_cell.bg, theme.highlight_bg);
+        assert!(tab_cell.modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -25379,7 +25449,7 @@ diff --git a/src/main.rs b/src/main.rs
             vec![test_section(), notification_section],
         );
         app.focus_list();
-        let base = Style::default().fg(Color::DarkGray);
+        let base = themed_fg_style(Color::DarkGray);
 
         assert!(app.has_unread_notifications());
         assert!(

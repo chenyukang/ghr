@@ -21,7 +21,7 @@
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
-- Recent Items command for jumping back to the last 20 PRs and issues where you spent at least 10 seconds in Details.
+- Recent Items command for jumping back to the last 200 PRs and issues where you spent at least 10 seconds in Details.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
@@ -29,6 +29,7 @@
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
 - Mouse support for tabs, lists, links, descriptions, comments, editor cursor placement, details drag-copy, scrolling, text selection mode, and split resizing.
+- Built-in `dark` and `light` themes configured through `defaults.theme`.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
 - Uses the GitHub CLI for authentication, API access, and browser opening behavior.
@@ -90,6 +91,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `Recent Items` | Fuzzy search recently viewed PRs/issues and jump back to the selected item |
+| `Toggle Theme` | Switch between dark and light themes and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
@@ -242,6 +244,7 @@ issue_labels = ["E-easy"]
 [defaults]
 view = "pull_requests"
 command_palette_key = ":"
+theme = "dark"
 log_level = "info"
 pr_per_page = 50
 issue_per_page = 50
@@ -275,6 +278,8 @@ Use `[[repos]]` to add repository tabs to the top bar. Each configured repo show
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 
 Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
+
+Set `theme` to `"dark"` or `"light"` to switch the TUI palette.
 
 Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
 

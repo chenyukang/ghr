@@ -1,11 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::layout::{centered_rect_width, centered_rect_with_size};
 use super::text::{display_width, truncate_inline};
 use super::{InboxThreadAction, ReactionContent};
+use crate::theme::active_theme;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct CommandPalette {
@@ -31,6 +31,7 @@ pub(super) enum PaletteAction {
     ShowCommandPalette,
     Refresh,
     RecentItems,
+    ToggleTheme,
     SearchCurrentRepo,
     SwitchProject,
     ProjectAdd,
@@ -62,19 +63,20 @@ pub(super) fn command_palette_visible_start(selected: usize, len: usize, height:
 }
 
 pub(super) fn command_palette_input_line(query: &str, width: usize) -> Line<'static> {
+    let theme = active_theme();
     if query.is_empty() {
         return Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Type to search commands",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("> ", theme.panel().fg(theme.focus)),
+            Span::styled("Type to search commands", theme.subtle()),
         ]);
     }
 
     Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Cyan)),
-        Span::raw(truncate_inline(query, width.saturating_sub(2))),
+        Span::styled("> ", theme.panel().fg(theme.focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            theme.panel(),
+        ),
     ])
 }
 
@@ -83,23 +85,21 @@ pub(super) fn command_palette_result_line(
     selected: bool,
     width: usize,
 ) -> Line<'static> {
+    let theme = active_theme();
     let marker = if selected { "> " } else { "  " };
     let text = format!(
         "{marker}{:<34} {:<16} {}",
         command.title, command.keys, command.scope
     );
     let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        theme.active()
     } else {
-        Style::default().fg(Color::White)
+        theme.panel()
     };
     let detail_style = if selected {
-        Style::default().fg(Color::Black).bg(Color::Cyan)
+        theme.active()
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.subtle()
     };
 
     Line::from(vec![
@@ -171,6 +171,13 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "General",
             "Find recently viewed pull requests and issues",
             PaletteAction::RecentItems,
+        ),
+        palette_command(
+            "Toggle Theme",
+            "",
+            "General",
+            "Switch between dark and light themes and save config.toml",
+            PaletteAction::ToggleTheme,
         ),
         palette_command(
             "Mark Done",

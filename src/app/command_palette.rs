@@ -635,6 +635,13 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             palette_key(KeyCode::Enter),
         ),
         palette_command(
+            "Save Editor Draft",
+            "Ctrl+S / Cmd+S",
+            "Editor",
+            "Save the active comment, issue, or pull request draft",
+            palette_ctrl_key(KeyCode::Char('s')),
+        ),
+        palette_command(
             "Delete Previous Character",
             "Backspace",
             "Editor",

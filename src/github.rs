@@ -276,7 +276,7 @@ struct SearchApiIssueRaw {
     labels: Option<Vec<SearchLabelRaw>>,
     milestone: Option<SearchMilestoneRaw>,
     number: u64,
-    pull_request: Option<serde_json::Value>,
+    pull_request: Option<IssuePullRequestRaw>,
     reactions: Option<ReactionSummaryRaw>,
     repository_url: String,
     state: Option<String>,
@@ -286,12 +286,18 @@ struct SearchApiIssueRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct IssuePullRequestRaw {
+    merged_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IssueDetailsRaw {
     title: Option<String>,
     body: Option<String>,
     user: Option<SearchAuthorRaw>,
     state: Option<String>,
     html_url: Option<String>,
+    pull_request: Option<IssuePullRequestRaw>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     labels: Option<Vec<SearchLabelRaw>>,
@@ -2904,6 +2910,10 @@ impl IssueDetailsRaw {
             || self.body.is_some()
             || self.user.is_some()
             || self.state.is_some()
+            || self
+                .pull_request
+                .as_ref()
+                .is_some_and(|pull_request| pull_request.merged_at.is_some())
             || self.html_url.is_some()
             || self.created_at.is_some()
             || self.updated_at.is_some()
@@ -2914,7 +2924,7 @@ impl IssueDetailsRaw {
             title: self.title.take(),
             body: self.body.take().filter(|body| !body.trim().is_empty()),
             author: self.user.take().map(|author| author.login),
-            state: self.state.take(),
+            state: state_with_pull_request_merge(self.state.take(), self.pull_request.as_ref()),
             url: self.html_url.take(),
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -4052,6 +4062,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         SectionKind::Notifications => ItemKind::Notification,
     };
     let repo = repo_from_repository_url(&item.repository_url);
+    let state = state_with_pull_request_merge(item.state, item.pull_request.as_ref());
     let labels = item
         .labels
         .unwrap_or_default()
@@ -4068,7 +4079,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         title: item.title,
         body: item.body.filter(|body| !body.trim().is_empty()),
         author: item.user.map(|author| author.login),
-        state: item.state,
+        state,
         url: item.html_url,
         created_at: item.created_at,
         updated_at: item.updated_at,
@@ -4090,6 +4101,17 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
             .draft
             .filter(|is_draft| *is_draft)
             .map(|_| "draft".to_string()),
+    }
+}
+
+fn state_with_pull_request_merge(
+    state: Option<String>,
+    pull_request: Option<&IssuePullRequestRaw>,
+) -> Option<String> {
+    if pull_request.is_some_and(|pull_request| pull_request.merged_at.is_some()) {
+        Some("merged".to_string())
+    } else {
+        state
     }
 }
 
@@ -4780,6 +4802,28 @@ mod tests {
     }
 
     #[test]
+    fn search_api_item_marks_merged_pull_request_state() {
+        let raw = serde_json::from_str::<SearchApiIssueRaw>(
+            r#"{
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "number": 42,
+                "pull_request": {
+                    "url": "https://api.github.com/repos/owner/repo/pulls/42",
+                    "merged_at": "2026-05-01T00:00:00Z"
+                },
+                "repository_url": "https://api.github.com/repos/owner/repo",
+                "state": "closed",
+                "title": "Merged PR"
+            }"#,
+        )
+        .expect("merged PR issue response should parse");
+
+        let item = search_api_item_to_work_item(SectionKind::PullRequests, raw);
+
+        assert_eq!(item.state.as_deref(), Some("merged"));
+    }
+
+    #[test]
     fn open_milestones_args_use_paginated_issue_metadata_api() {
         assert_eq!(
             open_milestones_args("owner/repo"),
@@ -4955,6 +4999,24 @@ mod tests {
         let comments = parse_issue_comments_output(output, "owner/repo", 1, None).unwrap();
         assert_eq!(comments[0].reactions.plus_one, 2);
         assert_eq!(comments[0].reactions.rocket, 1);
+    }
+
+    #[test]
+    fn issue_details_marks_merged_pull_request_state() {
+        let issue = r#"{
+          "title": "Merged PR",
+          "state": "closed",
+          "html_url": "https://github.com/owner/repo/pull/42",
+          "pull_request": {
+            "url": "https://api.github.com/repos/owner/repo/pulls/42",
+            "merged_at": "2026-05-01T00:00:00Z"
+          }
+        }"#;
+
+        let details = parse_issue_details_output(issue, "owner/repo", 42).unwrap();
+        let metadata = details.item_metadata.expect("issue metadata");
+
+        assert_eq!(metadata.state.as_deref(), Some("merged"));
     }
 
     #[test]

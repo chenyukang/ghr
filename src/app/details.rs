@@ -240,6 +240,13 @@ pub(super) struct DiffRenderContext<'a> {
     selected_file: usize,
     selected_line: usize,
     selected_range: Option<(usize, usize)>,
+    file_link_base: Option<DiffFileLinkBase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffFileLinkBase {
+    repository: String,
+    branch: String,
 }
 
 impl DiffReviewTarget {
@@ -1046,6 +1053,51 @@ fn metadata_key_alignment_padding(key: &str) -> usize {
     DETAILS_METADATA_KEY_WIDTH.saturating_sub(display_width(key))
 }
 
+fn pull_request_status_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    if item_is_draft_pull_request(item) {
+        vec![DetailSegment::styled(
+            "DRAFT",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else {
+        vec![DetailSegment::styled(
+            "READY",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        )]
+    }
+}
+
+fn item_state_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    let state = item.state.clone().unwrap_or_else(|| "-".to_string());
+    let style = match state.to_ascii_lowercase().as_str() {
+        "open" => Some(
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "merged" => Some(
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "closed" => Some(
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ),
+        _ => None,
+    };
+
+    match style {
+        Some(style) => vec![DetailSegment::styled(state, style)],
+        None => vec![DetailSegment::raw(state)],
+    }
+}
+
 pub(super) fn build_details_document(app: &AppState, width: u16) -> DetailsDocument {
     if app.details_mode == DetailsMode::Diff {
         return build_diff_document(app, width);
@@ -1079,7 +1131,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_wrapped_limited(notification_new_since_last_read_segments(item), 2);
     }
 
-    let identity_meta = vec![
+    let mut identity_meta = vec![
         ("repo", vec![DetailSegment::raw(item.repo.clone())]),
         (
             "number",
@@ -1090,14 +1142,12 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
             )],
         ),
     ];
+    if matches!(item.kind, ItemKind::PullRequest) {
+        identity_meta.push(("status", pull_request_status_segments(item)));
+    }
     builder.push_meta_line(identity_meta);
 
-    let mut state_meta = vec![(
-        "state",
-        vec![DetailSegment::raw(
-            item.state.clone().unwrap_or_else(|| "-".to_string()),
-        )],
-    )];
+    let mut state_meta = vec![("state", item_state_segments(item))];
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         state_meta.push((
             "created",
@@ -1257,7 +1307,6 @@ pub(super) fn push_label_controls(builder: &mut DetailsBuilder, labels: &[String
                 segments.push(DetailSegment::raw("  "));
             }
             segments.push(DetailSegment::styled(label.clone(), label_style()));
-            segments.push(DetailSegment::raw(" "));
             segments.push(DetailSegment::action(
                 "×",
                 DetailAction::RemoveLabel(label.clone()),
@@ -1398,6 +1447,7 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
                     selected_file,
                     selected_line,
                     selected_range: app.diff_mark_range_for(&item.id),
+                    file_link_base: diff_file_link_base(item, app.action_hints.get(&item.id)),
                 },
             );
         }
@@ -1498,7 +1548,12 @@ pub(super) fn push_diff(
 
     builder.push_blank();
     builder.mark_diff_file();
-    push_diff_file_header(builder, file);
+    push_diff_file_header(
+        builder,
+        file,
+        context.file_link_base.as_ref(),
+        context.selected_line,
+    );
     for metadata in &file.metadata {
         builder.push_line(vec![DetailSegment::styled(
             truncate_inline(metadata, builder.width),
@@ -1594,23 +1649,150 @@ pub(super) fn push_diff(
     }
 }
 
-pub(super) fn push_diff_file_header(builder: &mut DetailsBuilder, file: &DiffFile) {
+fn push_diff_file_header(
+    builder: &mut DetailsBuilder,
+    file: &DiffFile,
+    link_base: Option<&DiffFileLinkBase>,
+    selected_line: usize,
+) {
     let path = if file.old_path == file.new_path {
         file.new_path.clone()
     } else {
         format!("{} -> {}", file.old_path, file.new_path)
     };
+    let path = truncate_inline(&path, builder.width.saturating_sub(16).max(1));
+    let path_segment = diff_file_blob_url(file, link_base, selected_line)
+        .map(|url| DetailSegment::styled_link(path.clone(), url, diff_file_link_style()))
+        .unwrap_or_else(|| DetailSegment::styled(path, diff_file_style()));
     builder.push_line(vec![
         DetailSegment::styled("▾ ", diff_file_style()),
-        DetailSegment::styled(
-            truncate_inline(&path, builder.width.saturating_sub(16).max(1)),
-            diff_file_style(),
-        ),
+        path_segment,
         DetailSegment::raw("  "),
         DetailSegment::styled(format!("+{}", file.additions), diff_added_style()),
         DetailSegment::raw(" "),
         DetailSegment::styled(format!("-{}", file.deletions), diff_removed_style()),
     ]);
+}
+
+fn diff_file_link_base(
+    item: &WorkItem,
+    action_hints: Option<&ActionHintState>,
+) -> Option<DiffFileLinkBase> {
+    if let Some(ActionHintState::Loaded(hints)) = action_hints
+        && let Some(head) = &hints.head
+    {
+        return Some(DiffFileLinkBase {
+            repository: head.repository.clone(),
+            branch: head.branch.clone(),
+        });
+    }
+
+    (!item.repo.trim().is_empty()).then(|| DiffFileLinkBase {
+        repository: item.repo.clone(),
+        branch: "HEAD".to_string(),
+    })
+}
+
+fn diff_file_blob_url(
+    file: &DiffFile,
+    link_base: Option<&DiffFileLinkBase>,
+    selected_line: usize,
+) -> Option<String> {
+    let link_base = link_base?;
+    let path = diff_display_path(file);
+    if path == "/dev/null" {
+        return None;
+    }
+    let line = diff_file_nearby_line(file, selected_line)
+        .map(|line| format!("#L{line}"))
+        .unwrap_or_default();
+    Some(format!(
+        "https://github.com/{}/blob/{}/{}{}",
+        link_base.repository,
+        github_url_path(&link_base.branch),
+        github_url_path(&path),
+        line
+    ))
+}
+
+fn diff_file_nearby_line(file: &DiffFile, selected_line: usize) -> Option<usize> {
+    let lines = diff_reviewable_lines(file);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let selected_line = selected_line.min(lines.len().saturating_sub(1));
+    let changed = if file.new_path == "/dev/null" {
+        nearest_diff_line(&lines, selected_line, |line| {
+            matches!(line.kind, DiffLineKind::Removed)
+        })
+        .and_then(|line| line.old_line)
+    } else {
+        nearest_diff_line(&lines, selected_line, |line| {
+            matches!(line.kind, DiffLineKind::Added)
+        })
+        .and_then(|line| line.new_line)
+    };
+    if changed.is_some() {
+        return changed;
+    }
+
+    lines[selected_line]
+        .new_line
+        .or(lines[selected_line].old_line)
+}
+
+fn diff_reviewable_lines(file: &DiffFile) -> Vec<&DiffLine> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .filter(|line| !matches!(line.kind, DiffLineKind::Metadata))
+        .collect()
+}
+
+fn nearest_diff_line<'a>(
+    lines: &'a [&DiffLine],
+    selected_line: usize,
+    matches: impl Fn(&DiffLine) -> bool,
+) -> Option<&'a DiffLine> {
+    if matches(lines[selected_line]) {
+        return Some(lines[selected_line]);
+    }
+
+    let max_distance = selected_line.max(lines.len().saturating_sub(selected_line + 1));
+    for distance in 1..=max_distance {
+        if let Some(line) = lines.get(selected_line + distance)
+            && matches(line)
+        {
+            return Some(line);
+        }
+        if let Some(index) = selected_line.checked_sub(distance)
+            && let Some(line) = lines.get(index)
+            && matches(line)
+        {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn github_url_path(path: &str) -> String {
+    path.split('/')
+        .map(github_url_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn github_url_component(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 pub(super) fn push_diff_line(
@@ -3232,8 +3414,10 @@ pub(super) fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
         if !segments.is_empty() {
             segments.push(DetailSegment::raw(", "));
         }
-        let style = if label == "Mergeable" {
-            Style::default().fg(Color::LightGreen)
+        let style = if positive_action_label(label) {
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -3242,19 +3426,20 @@ pub(super) fn action_label_segments(labels: &[String]) -> Vec<DetailSegment> {
     segments
 }
 
+fn positive_action_label(label: &str) -> bool {
+    label == "Approvable" || label.to_ascii_lowercase().contains("merge")
+}
+
 pub(super) fn action_note_segments(note: &str) -> Vec<DetailSegment> {
-    const CONFLICTS: &str = "merge conflicts must be resolved";
     let mut segments = Vec::new();
     let mut rest = note;
-    while let Some(index) = rest.find(CONFLICTS) {
+
+    while let Some((index, text, style)) = next_action_note_highlight(rest) {
         if index > 0 {
             segments.push(DetailSegment::raw(rest[..index].to_string()));
         }
-        segments.push(DetailSegment::styled(
-            CONFLICTS,
-            log_error_style().add_modifier(Modifier::BOLD),
-        ));
-        rest = &rest[index + CONFLICTS.len()..];
+        segments.push(DetailSegment::styled(text, style));
+        rest = &rest[index + text.len()..];
     }
     if !rest.is_empty() {
         segments.push(DetailSegment::raw(rest.to_string()));
@@ -3263,6 +3448,32 @@ pub(super) fn action_note_segments(note: &str) -> Vec<DetailSegment> {
         segments.push(DetailSegment::raw(note.to_string()));
     }
     segments
+}
+
+fn next_action_note_highlight(rest: &str) -> Option<(usize, &'static str, Style)> {
+    const MERGE_BLOCKED: &str = "Merge blocked";
+    const CONFLICTS: &str = "merge conflicts must be resolved";
+    let mut next = rest.find(MERGE_BLOCKED).map(|index| {
+        (
+            index,
+            MERGE_BLOCKED,
+            log_warning_style().add_modifier(Modifier::BOLD),
+        )
+    });
+    if let Some(index) = rest.find(CONFLICTS) {
+        let conflict = (
+            index,
+            CONFLICTS,
+            log_error_style().add_modifier(Modifier::BOLD),
+        );
+        if next
+            .as_ref()
+            .is_none_or(|(next_index, _, _)| index < *next_index)
+        {
+            next = Some(conflict);
+        }
+    }
+    next
 }
 
 pub(super) fn branch_hint_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
@@ -4612,6 +4823,10 @@ pub(super) fn diff_file_style() -> Style {
     Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
+}
+
+pub(super) fn diff_file_link_style() -> Style {
+    diff_file_style().add_modifier(Modifier::UNDERLINED)
 }
 
 pub(super) fn diff_hunk_style() -> Style {

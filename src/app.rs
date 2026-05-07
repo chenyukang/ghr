@@ -28,6 +28,7 @@ use ratatui::widgets::{
     Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
@@ -398,6 +399,7 @@ impl PartialEq<&str> for EditorText {
 }
 
 impl EditorText {
+    #[cfg(test)]
     fn empty() -> Self {
         Self::from_text("")
     }
@@ -810,6 +812,7 @@ struct PendingIssueCreate {
     body: String,
     labels: Vec<String>,
     dialog: IssueDialog,
+    draft_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,6 +849,22 @@ struct PendingPrCreate {
     title: String,
     body: String,
     dialog: PrCreateDialog,
+    draft_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct NewIssueDraft {
+    repo: String,
+    title: String,
+    labels: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct NewPrDraft {
+    repo: String,
+    title: String,
+    body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1488,9 +1507,15 @@ struct AppState {
     label_dialog: Option<LabelDialog>,
     label_updating: bool,
     issue_dialog: Option<IssueDialog>,
+    issue_draft_key: Option<String>,
+    issue_draft_last_saved_body: String,
+    issue_draft_last_auto_save_at: Instant,
     issue_creating: bool,
     pending_issue_create: Option<PendingIssueCreate>,
     pr_create_dialog: Option<PrCreateDialog>,
+    pr_create_draft_key: Option<String>,
+    pr_create_draft_last_saved_body: String,
+    pr_create_draft_last_auto_save_at: Instant,
     pr_creating: bool,
     pending_pr_create: Option<PendingPrCreate>,
     review_submit_dialog: Option<ReviewSubmitDialog>,
@@ -1789,7 +1814,7 @@ async fn run_loop(
         app.ensure_current_comments_auto_refresh(tx);
         app.ensure_current_diff_loading(tx);
         app.sync_recent_details_visit(Instant::now());
-        app.auto_save_active_comment_draft(store, Instant::now());
+        app.auto_save_active_editor_drafts(store, Instant::now());
         app.dismiss_expired_message_dialog(Instant::now());
 
         if !app.refreshing
@@ -2795,7 +2820,11 @@ fn start_reviewer_suggestions_load(
     true
 }
 
-fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) {
+fn start_issue_create(
+    pending: PendingIssueCreate,
+    draft_clear: Option<DraftClearTask>,
+    tx: UnboundedSender<AppMsg>,
+) {
     tokio::spawn(async move {
         let result = create_issue(
             &pending.repo,
@@ -2805,11 +2834,18 @@ fn start_issue_create(pending: PendingIssueCreate, tx: UnboundedSender<AppMsg>) 
         )
         .await
         .map_err(error_chain_message);
+        if result.is_ok() {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::IssueCreated { result });
     });
 }
 
-fn start_pr_create(pending: PendingPrCreate, tx: UnboundedSender<AppMsg>) {
+fn start_pr_create(
+    pending: PendingPrCreate,
+    draft_clear: Option<DraftClearTask>,
+    tx: UnboundedSender<AppMsg>,
+) {
     tokio::spawn(async move {
         let result = create_pull_request(
             &pending.repo,
@@ -2820,6 +2856,9 @@ fn start_pr_create(pending: PendingPrCreate, tx: UnboundedSender<AppMsg>) {
         )
         .await
         .map_err(error_chain_message);
+        if result.is_ok() {
+            clear_editor_draft_after_success(draft_clear);
+        }
         let _ = tx.send(AppMsg::PullRequestCreated { result });
     });
 }
@@ -3267,12 +3306,20 @@ fn handle_key_in_area_mut(
     }
 
     if app.issue_dialog.is_some() {
-        app.handle_issue_dialog_key(key, tx, area);
+        if editor_save_draft_key(key) {
+            app.save_active_issue_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.handle_issue_dialog_key_with_store(key, Some(store), tx, area);
+        }
         return false;
     }
 
     if app.pr_create_dialog.is_some() {
-        app.handle_pr_create_dialog_key(key, tx, area);
+        if editor_save_draft_key(key) {
+            app.save_active_pr_create_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.handle_pr_create_dialog_key_with_store(key, Some(store), tx, area);
+        }
         return false;
     }
 
@@ -3838,11 +3885,11 @@ fn handle_mouse_with_sync(
         return false;
     }
     if app.issue_dialog.is_some() {
-        handle_issue_dialog_mouse(app, mouse, area);
+        handle_issue_dialog_mouse(app, mouse, area, store);
         return false;
     }
     if app.pr_create_dialog.is_some() {
-        handle_pr_create_dialog_mouse(app, mouse, area);
+        handle_pr_create_dialog_mouse(app, mouse, area, store);
         return false;
     }
     if app.reaction_dialog.is_some() {
@@ -4060,11 +4107,27 @@ fn handle_review_submit_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area
     }
 }
 
-fn handle_issue_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+fn handle_issue_dialog_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    store: Option<&SnapshotStore>,
+) {
     let Some(dialog) = app.issue_dialog.clone() else {
         return;
     };
     let dialog_area = issue_dialog_area(area);
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && modal_footer_area(area, dialog_area)
+            .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
+    {
+        if let Some(store) = store {
+            app.save_active_issue_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.status = "draft store unavailable".to_string();
+        }
+        return;
+    }
     if !rect_contains(dialog_area, mouse.column, mouse.row) {
         return;
     }
@@ -4144,11 +4207,27 @@ fn handle_issue_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) 
     }
 }
 
-fn handle_pr_create_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+fn handle_pr_create_dialog_mouse(
+    app: &mut AppState,
+    mouse: MouseEvent,
+    area: Rect,
+    store: Option<&SnapshotStore>,
+) {
     let Some(dialog) = app.pr_create_dialog.clone() else {
         return;
     };
     let dialog_area = pr_create_dialog_area(area);
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && modal_footer_area(area, dialog_area)
+            .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
+    {
+        if let Some(store) = store {
+            app.save_active_pr_create_draft(store, DraftSaveTrigger::Manual, Instant::now());
+        } else {
+            app.status = "draft store unavailable".to_string();
+        }
+        return;
+    }
     if !rect_contains(dialog_area, mouse.column, mouse.row) {
         return;
     }
@@ -7684,7 +7763,7 @@ fn draw_issue_dialog(frame: &mut Frame<'_>, dialog: &IssueDialog, running: bool,
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create  arrows/Home/End edit  Ctrl+W/U/K/X word/line  click cursor"
+        "Tab: field  Ctrl+Enter: create  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
     };
 
     let block = Block::default()
@@ -7754,7 +7833,7 @@ fn draw_pr_create_dialog(
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create PR  arrows/Home/End edit  Ctrl+W/U/K/X word/line  click cursor"
+        "Tab: field  Ctrl+Enter: create PR  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
     };
 
     let block = Block::default()
@@ -10420,6 +10499,45 @@ fn item_metadata_draft_key(item: &WorkItem, field: ItemEditField) -> String {
     format!("metadata:{}:{}", editor_draft_item_key(item), field.label())
 }
 
+fn new_issue_draft_key(repo: &str) -> String {
+    format!("issue:new:{}", repo.trim())
+}
+
+fn new_pr_draft_key(repo: &str) -> String {
+    format!("pull:new:{}", repo.trim())
+}
+
+fn issue_dialog_draft_payload(dialog: &IssueDialog) -> NewIssueDraft {
+    NewIssueDraft {
+        repo: dialog.repo.text().to_string(),
+        title: dialog.title.text().to_string(),
+        labels: dialog.labels.text().to_string(),
+        body: dialog.body.text().to_string(),
+    }
+}
+
+fn pr_create_dialog_draft_payload(dialog: &PrCreateDialog) -> NewPrDraft {
+    NewPrDraft {
+        repo: dialog.repo.clone(),
+        title: dialog.title.text().to_string(),
+        body: dialog.body.text().to_string(),
+    }
+}
+
+fn encode_editor_draft<T: Serialize>(payload: &T) -> Result<String> {
+    serde_json::to_string(payload).map_err(Into::into)
+}
+
+fn issue_draft_has_content(payload: &NewIssueDraft) -> bool {
+    !payload.title.trim().is_empty()
+        || !payload.labels.trim().is_empty()
+        || !payload.body.trim().is_empty()
+}
+
+fn pr_draft_has_content(payload: &NewPrDraft) -> bool {
+    !payload.title.trim().is_empty() || !payload.body.trim().is_empty()
+}
+
 impl AppState {
     #[cfg(test)]
     fn new(active_view: SectionKind, sections: Vec<SectionSnapshot>) -> Self {
@@ -10554,9 +10672,15 @@ impl AppState {
             label_dialog: None,
             label_updating: false,
             issue_dialog: None,
+            issue_draft_key: None,
+            issue_draft_last_saved_body: String::new(),
+            issue_draft_last_auto_save_at: Instant::now(),
             issue_creating: false,
             pending_issue_create: None,
             pr_create_dialog: None,
+            pr_create_draft_key: None,
+            pr_create_draft_last_saved_body: String::new(),
+            pr_create_draft_last_auto_save_at: Instant::now(),
             pr_creating: false,
             pending_pr_create: None,
             review_submit_dialog: None,
@@ -10641,23 +10765,58 @@ impl AppState {
         now: Instant,
     ) {
         match self.save_active_comment_draft_result(store, now) {
-            Ok(DraftSaveOutcome::Saved) if trigger == DraftSaveTrigger::Manual => {
-                self.status = "draft saved".to_string();
-            }
-            Ok(DraftSaveOutcome::Cleared) if trigger == DraftSaveTrigger::Manual => {
-                self.status = "draft cleared".to_string();
-            }
-            Ok(DraftSaveOutcome::Unchanged) if trigger == DraftSaveTrigger::Manual => {
-                self.status = "draft already saved".to_string();
-            }
-            Ok(DraftSaveOutcome::MissingTarget) if trigger == DraftSaveTrigger::Manual => {
-                self.status = "drafts unavailable here".to_string();
-            }
-            Ok(_) => {}
+            Ok(outcome) => self.apply_draft_save_status(outcome, trigger),
             Err(error) => {
                 self.status = format!("draft save failed: {error}");
             }
         }
+    }
+
+    fn save_active_issue_draft(
+        &mut self,
+        store: &SnapshotStore,
+        trigger: DraftSaveTrigger,
+        now: Instant,
+    ) {
+        match self.save_active_issue_draft_result(store, now) {
+            Ok(outcome) => self.apply_draft_save_status(outcome, trigger),
+            Err(error) => {
+                self.status = format!("draft save failed: {error}");
+            }
+        }
+    }
+
+    fn save_active_pr_create_draft(
+        &mut self,
+        store: &SnapshotStore,
+        trigger: DraftSaveTrigger,
+        now: Instant,
+    ) {
+        match self.save_active_pr_create_draft_result(store, now) {
+            Ok(outcome) => self.apply_draft_save_status(outcome, trigger),
+            Err(error) => {
+                self.status = format!("draft save failed: {error}");
+            }
+        }
+    }
+
+    fn apply_draft_save_status(&mut self, outcome: DraftSaveOutcome, trigger: DraftSaveTrigger) {
+        if trigger != DraftSaveTrigger::Manual {
+            return;
+        }
+        self.status = match outcome {
+            DraftSaveOutcome::Saved => "draft saved",
+            DraftSaveOutcome::Cleared => "draft cleared",
+            DraftSaveOutcome::Unchanged => "draft already saved",
+            DraftSaveOutcome::MissingTarget => "drafts unavailable here",
+        }
+        .to_string();
+    }
+
+    fn auto_save_active_editor_drafts(&mut self, store: &SnapshotStore, now: Instant) {
+        self.auto_save_active_comment_draft(store, now);
+        self.auto_save_active_issue_draft(store, now);
+        self.auto_save_active_pr_create_draft(store, now);
     }
 
     fn auto_save_active_comment_draft(&mut self, store: &SnapshotStore, now: Instant) {
@@ -10671,6 +10830,188 @@ impl AppState {
         }
         self.comment_draft_last_auto_save_at = now;
         self.save_active_comment_draft(store, DraftSaveTrigger::Auto, now);
+    }
+
+    fn auto_save_active_issue_draft(&mut self, store: &SnapshotStore, now: Instant) {
+        if self.issue_dialog.is_none() {
+            return;
+        }
+        if now.saturating_duration_since(self.issue_draft_last_auto_save_at)
+            < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
+        {
+            return;
+        }
+        self.issue_draft_last_auto_save_at = now;
+        self.save_active_issue_draft(store, DraftSaveTrigger::Auto, now);
+    }
+
+    fn auto_save_active_pr_create_draft(&mut self, store: &SnapshotStore, now: Instant) {
+        if self.pr_create_dialog.is_none() {
+            return;
+        }
+        if now.saturating_duration_since(self.pr_create_draft_last_auto_save_at)
+            < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
+        {
+            return;
+        }
+        self.pr_create_draft_last_auto_save_at = now;
+        self.save_active_pr_create_draft(store, DraftSaveTrigger::Auto, now);
+    }
+
+    fn open_issue_dialog_with_draft(&mut self, repo: String) -> bool {
+        let draft_key = new_issue_draft_key(&repo);
+        let loaded_payload = self
+            .editor_drafts
+            .get(&draft_key)
+            .and_then(|draft| serde_json::from_str::<NewIssueDraft>(&draft.body).ok());
+        let loaded = loaded_payload.is_some();
+        let payload = loaded_payload.unwrap_or_else(|| NewIssueDraft {
+            repo,
+            ..NewIssueDraft::default()
+        });
+        let dialog = IssueDialog {
+            repo: EditorText::from_text(payload.repo),
+            title: EditorText::from_text(payload.title),
+            labels: EditorText::from_text(payload.labels),
+            body: EditorText::from_text(payload.body),
+            field: IssueDialogField::Title,
+            body_scroll: 0,
+        };
+        self.issue_draft_last_saved_body =
+            encode_editor_draft(&issue_dialog_draft_payload(&dialog)).unwrap_or_default();
+        self.issue_draft_last_auto_save_at = Instant::now();
+        self.issue_draft_key = Some(draft_key);
+        self.issue_dialog = Some(dialog);
+        loaded
+    }
+
+    fn open_pr_create_dialog_with_draft(
+        &mut self,
+        repo: String,
+        local_dir: PathBuf,
+        branch: String,
+    ) -> bool {
+        let draft_key = new_pr_draft_key(&repo);
+        let loaded_payload = self
+            .editor_drafts
+            .get(&draft_key)
+            .and_then(|draft| serde_json::from_str::<NewPrDraft>(&draft.body).ok());
+        let loaded = loaded_payload.is_some();
+        let payload = loaded_payload.unwrap_or_else(|| NewPrDraft {
+            repo: repo.clone(),
+            ..NewPrDraft::default()
+        });
+        let dialog = PrCreateDialog {
+            repo,
+            local_dir,
+            branch,
+            title: EditorText::from_text(payload.title),
+            body: EditorText::from_text(payload.body),
+            field: PrCreateField::Title,
+            body_scroll: 0,
+        };
+        self.pr_create_draft_last_saved_body =
+            encode_editor_draft(&pr_create_dialog_draft_payload(&dialog)).unwrap_or_default();
+        self.pr_create_draft_last_auto_save_at = Instant::now();
+        self.pr_create_draft_key = Some(draft_key);
+        self.pr_create_dialog = Some(dialog);
+        loaded
+    }
+
+    fn save_active_issue_draft_result(
+        &mut self,
+        store: &SnapshotStore,
+        _now: Instant,
+    ) -> Result<DraftSaveOutcome> {
+        let Some(mut key) = self.issue_draft_key.clone() else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        let Some(payload) = self.issue_dialog.as_ref().map(issue_dialog_draft_payload) else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        let repo = payload.repo.trim();
+        if repo.contains('/') {
+            let next_key = new_issue_draft_key(repo);
+            if next_key != key {
+                if let Some(old_key) = self.issue_draft_key.replace(next_key.clone()) {
+                    self.editor_drafts.remove(&old_key);
+                    store.delete_editor_draft(&old_key)?;
+                }
+                self.issue_draft_last_saved_body.clear();
+                key = next_key;
+            }
+        }
+        let encoded = encode_editor_draft(&payload)?;
+        if encoded == self.issue_draft_last_saved_body {
+            return Ok(DraftSaveOutcome::Unchanged);
+        }
+
+        if !issue_draft_has_content(&payload) {
+            store.delete_editor_draft(&key)?;
+            self.editor_drafts.remove(&key);
+            self.issue_draft_last_saved_body = encoded;
+            return Ok(DraftSaveOutcome::Cleared);
+        }
+
+        let draft = store.save_editor_draft(&key, &encoded)?;
+        self.issue_draft_last_saved_body = draft.body.clone();
+        self.editor_drafts.insert(key, draft);
+        Ok(DraftSaveOutcome::Saved)
+    }
+
+    fn save_active_pr_create_draft_result(
+        &mut self,
+        store: &SnapshotStore,
+        _now: Instant,
+    ) -> Result<DraftSaveOutcome> {
+        let Some(key) = self.pr_create_draft_key.clone() else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        let Some(payload) = self
+            .pr_create_dialog
+            .as_ref()
+            .map(pr_create_dialog_draft_payload)
+        else {
+            return Ok(DraftSaveOutcome::MissingTarget);
+        };
+        let encoded = encode_editor_draft(&payload)?;
+        if encoded == self.pr_create_draft_last_saved_body {
+            return Ok(DraftSaveOutcome::Unchanged);
+        }
+
+        if !pr_draft_has_content(&payload) {
+            store.delete_editor_draft(&key)?;
+            self.editor_drafts.remove(&key);
+            self.pr_create_draft_last_saved_body = encoded;
+            return Ok(DraftSaveOutcome::Cleared);
+        }
+
+        let draft = store.save_editor_draft(&key, &encoded)?;
+        self.pr_create_draft_last_saved_body = draft.body.clone();
+        self.editor_drafts.insert(key, draft);
+        Ok(DraftSaveOutcome::Saved)
+    }
+
+    fn clear_pending_issue_draft_local(&mut self) {
+        if let Some(key) = self
+            .pending_issue_create
+            .as_ref()
+            .and_then(|pending| pending.draft_key.as_deref())
+        {
+            self.editor_drafts.remove(key);
+            self.issue_draft_last_saved_body.clear();
+        }
+    }
+
+    fn clear_pending_pr_create_draft_local(&mut self) {
+        if let Some(key) = self
+            .pending_pr_create
+            .as_ref()
+            .and_then(|pending| pending.draft_key.as_deref())
+        {
+            self.editor_drafts.remove(key);
+            self.pr_create_draft_last_saved_body.clear();
+        }
     }
 
     fn save_active_comment_draft_result(
@@ -11559,6 +11900,7 @@ impl AppState {
                             "Issue Created",
                             format!("Created {number}: {}", item.title),
                         ));
+                        self.clear_pending_issue_draft_local();
                         self.pending_issue_create = None;
                     }
                     Err(error) => {
@@ -11599,6 +11941,7 @@ impl AppState {
                             "Pull Request Created",
                             format!("Created {number}: {}", item.title),
                         ));
+                        self.clear_pending_pr_create_draft_local();
                         self.pending_pr_create = None;
                     }
                     Err(error) => {
@@ -17336,16 +17679,13 @@ impl AppState {
         self.pr_create_dialog = None;
         self.reaction_dialog = None;
         self.pr_action_dialog = None;
-        self.issue_dialog = Some(IssueDialog {
-            repo: EditorText::from_text(repo),
-            title: EditorText::empty(),
-            labels: EditorText::empty(),
-            body: EditorText::empty(),
-            field: IssueDialogField::Title,
-            body_scroll: 0,
-        });
+        let loaded = self.open_issue_dialog_with_draft(repo);
         self.issue_creating = false;
-        self.status = "new issue".to_string();
+        self.status = if loaded {
+            "loaded issue draft".to_string()
+        } else {
+            "new issue".to_string()
+        };
     }
 
     fn start_new_issue_or_pull_request_dialog(&mut self, config: &Config) {
@@ -17375,18 +17715,24 @@ impl AppState {
             return;
         };
         let Some(local_dir) = configured_local_dir_for_repo(config, &repo) else {
-            self.status =
-                format!("repo {repo} has no local_dir; set [[repos]].local_dir to create a PR");
+            self.show_new_pull_request_unavailable(format!(
+                "repo {repo} has no local_dir.\n\nSet [[repos]].local_dir to create a pull request from this repository."
+            ));
             return;
         };
         if let Err(error) = ensure_directory_tracks_repo(&local_dir, &repo) {
-            self.status = format!("local_dir cannot create PR: {error}");
+            self.show_new_pull_request_unavailable(format!(
+                "Configured local_dir for {repo} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repo}."
+            ));
             return;
         }
         let branch = match current_git_branch_for_directory(&local_dir) {
             Ok(branch) => branch,
             Err(error) => {
-                self.status = error;
+                self.show_new_pull_request_unavailable(format!(
+                    "Cannot create a pull request from {repo}.\n\n{error}\n\nCheck out a branch in {} and retry.",
+                    local_dir.display()
+                ));
                 return;
             }
         };
@@ -17408,27 +17754,35 @@ impl AppState {
         self.milestone_dialog = None;
         self.assignee_dialog = None;
         self.reviewer_dialog = None;
-        self.pr_create_dialog = Some(PrCreateDialog {
-            repo,
-            local_dir,
-            branch,
-            title: EditorText::empty(),
-            body: EditorText::empty(),
-            field: PrCreateField::Title,
-            body_scroll: 0,
-        });
+        let loaded = self.open_pr_create_dialog_with_draft(repo, local_dir, branch);
         self.pr_creating = false;
-        self.status = "new pull request".to_string();
+        self.status = if loaded {
+            "loaded pull request draft".to_string()
+        } else {
+            "new pull request".to_string()
+        };
     }
 
-    fn handle_issue_dialog_key(
+    fn show_new_pull_request_unavailable(&mut self, body: String) {
+        self.message_dialog = Some(message_dialog(
+            "New Pull Request Unavailable",
+            truncate_text(&body, 900),
+        ));
+        self.status = "pull request creation unavailable".to_string();
+    }
+
+    fn handle_issue_dialog_key_with_store(
         &mut self,
         key: KeyEvent,
+        store: Option<&SnapshotStore>,
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        self.handle_issue_dialog_key_with_submit(key, area, |pending| {
-            start_issue_create(pending, tx.clone());
+        let tx = tx.clone();
+        let store = store.cloned();
+        self.handle_issue_dialog_key_with_submit(key, area, move |pending| {
+            let draft_clear = draft_clear_task(pending.draft_key.clone(), store.clone());
+            start_issue_create(pending, draft_clear, tx.clone());
         });
     }
 
@@ -17563,19 +17917,24 @@ impl AppState {
             body,
             labels,
             dialog,
+            draft_key: self.issue_draft_key.clone(),
         };
         self.pending_issue_create = Some(pending.clone());
         Some(pending)
     }
 
-    fn handle_pr_create_dialog_key(
+    fn handle_pr_create_dialog_key_with_store(
         &mut self,
         key: KeyEvent,
+        store: Option<&SnapshotStore>,
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        self.handle_pr_create_dialog_key_with_submit(key, area, |pending| {
-            start_pr_create(pending, tx.clone());
+        let tx = tx.clone();
+        let store = store.cloned();
+        self.handle_pr_create_dialog_key_with_submit(key, area, move |pending| {
+            let draft_clear = draft_clear_task(pending.draft_key.clone(), store.clone());
+            start_pr_create(pending, draft_clear, tx.clone());
         });
     }
 
@@ -17703,6 +18062,7 @@ impl AppState {
             title,
             body,
             dialog,
+            draft_key: self.pr_create_draft_key.clone(),
         };
         self.pending_pr_create = Some(pending.clone());
         Some(pending)
@@ -18811,10 +19171,17 @@ impl AppState {
                 .iter()
                 .any(|section| section_view_key(section) == key)
             {
-                tabs.push(ViewTab {
-                    key,
-                    label: kind.label().to_string(),
-                });
+                let label = if matches!(kind, SectionKind::Notifications) {
+                    let unread = self.unread_notification_count();
+                    if unread == 0 {
+                        kind.label().to_string()
+                    } else {
+                        format!("{} ({unread})", kind.label())
+                    }
+                } else {
+                    kind.label().to_string()
+                };
+                tabs.push(ViewTab { key, label });
             }
         }
 
@@ -18845,14 +19212,20 @@ impl AppState {
         tabs
     }
 
+    fn unread_notification_count(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.sections
+            .iter()
+            .filter(|section| matches!(section.kind, SectionKind::Notifications))
+            .flat_map(|section| section.items.iter())
+            .filter(|item| !self.ignored_items.contains(&item.id))
+            .filter(|item| item.unread.unwrap_or(false))
+            .filter(|item| seen.insert(item.id.clone()))
+            .count()
+    }
+
     fn has_unread_notifications(&self) -> bool {
-        self.sections.iter().any(|section| {
-            matches!(section.kind, SectionKind::Notifications)
-                && section
-                    .items
-                    .iter()
-                    .any(|item| item.unread.unwrap_or(false))
-        })
+        self.unread_notification_count() > 0
     }
 }
 
@@ -19206,8 +19579,58 @@ deleted file mode 100644
             .position(|line| line.contains("        1 │ + new"))
             .expect("added diff line");
         assert_eq!(document.diff_files, vec![file_line]);
+        assert_document_link_for_text(
+            &document,
+            "src/lib.rs",
+            "https://github.com/rust-lang/rust/blob/HEAD/src/lib.rs#L1",
+        );
         assert_eq!(document.diff_line_at(removed_line), Some(0));
         assert_eq!(document.diff_line_at(added_line), Some(1));
+    }
+
+    #[test]
+    fn diff_file_header_links_to_head_branch_near_selected_line() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.action_hints.insert(
+            "1".to_string(),
+            ActionHintState::Loaded(ActionHints {
+                head: Some(PullRequestBranch {
+                    repository: "nervosnetwork/fiber".to_string(),
+                    branch: "feature/diff-links".to_string(),
+                }),
+                ..ActionHints::default()
+            }),
+        );
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/fiber-js/README.md b/fiber-js/README.md
+--- a/fiber-js/README.md
++++ b/fiber-js/README.md
+@@ -315,3 +315,9 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+ context
++[[package]]
++name = "base32"
++version = "0.4.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23ce669cd6c8588f79e15cf450314f9638f967fc5770ff1c7c1deb0925ea7cfa"
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let document = build_details_document(&app, 120);
+
+        assert_document_link_for_text(
+            &document,
+            "fiber-js/README.md",
+            "https://github.com/nervosnetwork/fiber/blob/feature/diff-links/fiber-js/README.md#L318",
+        );
     }
 
     #[test]
@@ -24777,6 +25200,105 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn inbox_top_tab_label_shows_unread_notification_count() {
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![
+                notification_item("thread-1", true),
+                notification_item("thread-2", false),
+                notification_item("thread-3", true),
+            ],
+            total_count: Some(50),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        let inbox = app
+            .view_tabs()
+            .into_iter()
+            .find(|view| view.key == builtin_view_key(SectionKind::Notifications))
+            .expect("inbox tab");
+
+        assert_eq!(inbox.label, "Inbox (2)");
+    }
+
+    #[test]
+    fn inbox_top_tab_label_deduplicates_unread_threads() {
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: "is:all".to_string(),
+                items: vec![
+                    notification_item("thread-1", true),
+                    notification_item("thread-2", true),
+                ],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:review-requested".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Review Requested".to_string(),
+                filters: "reason:review-requested".to_string(),
+                items: vec![
+                    notification_item("thread-1", true),
+                    notification_item("thread-3", true),
+                ],
+                total_count: Some(50),
+                page: 1,
+                page_size: 50,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let app = AppState::new(SectionKind::Notifications, sections);
+
+        let inbox = app
+            .view_tabs()
+            .into_iter()
+            .find(|view| view.key == builtin_view_key(SectionKind::Notifications))
+            .expect("inbox tab");
+
+        assert_eq!(inbox.label, "Inbox (3)");
+    }
+
+    #[test]
+    fn inbox_top_tab_label_hides_zero_unread_count() {
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", false)],
+            total_count: Some(50),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        let inbox = app
+            .view_tabs()
+            .into_iter()
+            .find(|view| view.key == builtin_view_key(SectionKind::Notifications))
+            .expect("inbox tab");
+
+        assert_eq!(inbox.label, "Inbox");
+    }
+
+    #[test]
     fn top_tab_highlights_use_high_contrast_blocks() {
         let view = active_view_tab_style();
         assert_eq!(view.fg, Some(Color::Black));
@@ -25175,12 +25697,13 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(rendered.contains("repo: chenyukang/ghr"));
         assert!(rendered.contains("number: #1"));
+        assert!(rendered.contains("status: READY"));
         assert!(rendered.contains("state: open"));
         assert!(rendered.contains(&format!("created: {}", local_datetime(Some(created_at)))));
         assert!(rendered.contains("author: chenyukang"));
         assert!(rendered.contains("comments: 3"));
         assert!(rendered.contains("milestone: -"));
-        assert!(rendered.contains("labels: T-compiler ×  +"));
+        assert!(rendered.contains("labels: T-compiler×  +"));
         assert!(!rendered.contains("reason: -"));
 
         let author_line = lines
@@ -25197,6 +25720,108 @@ diff --git a/src/main.rs b/src/main.rs
             "×",
             DetailAction::RemoveLabel("T-compiler".to_string()),
         );
+    }
+
+    #[test]
+    fn pr_details_meta_places_status_after_number() {
+        let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let identity_line = rendered
+            .lines()
+            .find(|line| line.contains("repo:") && line.contains("number:"))
+            .expect("identity metadata line");
+
+        assert!(identity_line.contains("status: READY"));
+        assert!(
+            identity_line.find("number:").expect("number key")
+                < identity_line.find("status:").expect("status key")
+        );
+    }
+
+    #[test]
+    fn pr_details_meta_renders_ready_status_green() {
+        let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let style = details_status_value_style(&app, "READY");
+
+        assert_eq!(style.fg, Some(Color::LightGreen));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pr_details_meta_renders_draft_status_red() {
+        let mut section = test_section();
+        section.items[0].extra = Some("draft".to_string());
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let style = details_status_value_style(&app, "DRAFT");
+
+        assert_eq!(style.fg, Some(Color::LightRed));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn details_state_renders_open_green_bold() {
+        let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let style = details_state_value_style(&app, "open");
+
+        assert_eq!(style.fg, Some(Color::LightGreen));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn pr_details_state_renders_merged_blue_bold() {
+        let mut section = test_section();
+        section.items[0].state = Some("merged".to_string());
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let style = details_state_value_style(&app, "merged");
+
+        assert_eq!(style.fg, Some(Color::LightBlue));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn details_state_renders_closed_red_bold() {
+        let mut section = test_section();
+        section.items[0].state = Some("closed".to_string());
+        let app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let style = details_state_value_style(&app, "closed");
+
+        assert_eq!(style.fg, Some(Color::LightRed));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    fn details_state_value_style(app: &AppState, value: &str) -> Style {
+        let document = build_details_document(app, 120);
+        let state_line = document
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(&format!("state: {value}")))
+            .expect("state metadata line");
+        state_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == value)
+            .expect("state value span")
+            .style
+    }
+
+    fn details_status_value_style(app: &AppState, value: &str) -> Style {
+        let document = build_details_document(app, 120);
+        let status_line = document
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(&format!("status: {value}")))
+            .expect("status metadata line");
+        status_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == value)
+            .expect("status value span")
+            .style
     }
 
     #[test]
@@ -25872,26 +26497,42 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn mergeable_action_label_is_rendered_green() {
-        let segments = action_label_segments(&["Approvable".to_string(), "Mergeable".to_string()]);
+    fn positive_action_labels_are_rendered_green_bold() {
+        let segments = action_label_segments(&[
+            "Approvable".to_string(),
+            "Mergeable".to_string(),
+            "Auto-mergeable".to_string(),
+            "Auto-merge on".to_string(),
+            "Update branch".to_string(),
+        ]);
 
-        let approvable = segments
-            .iter()
-            .find(|segment| segment.text == "Approvable")
-            .expect("approvable segment");
-        assert_eq!(approvable.style, Style::default());
+        for label in ["Approvable", "Mergeable", "Auto-mergeable", "Auto-merge on"] {
+            let segment = segments
+                .iter()
+                .find(|segment| segment.text == label)
+                .unwrap_or_else(|| panic!("{label} segment"));
+            assert_eq!(segment.style.fg, Some(Color::LightGreen));
+            assert!(segment.style.add_modifier.contains(Modifier::BOLD));
+        }
 
-        let mergeable = segments
+        let update_branch = segments
             .iter()
-            .find(|segment| segment.text == "Mergeable")
-            .expect("mergeable segment");
-        assert_eq!(mergeable.style.fg, Some(Color::LightGreen));
+            .find(|segment| segment.text == "Update branch")
+            .expect("update branch segment");
+        assert_eq!(update_branch.style, Style::default());
     }
 
     #[test]
     fn merge_conflict_action_note_is_rendered_red() {
         let segments =
             action_note_segments("Merge blocked: draft; merge conflicts must be resolved");
+
+        let merge_blocked = segments
+            .iter()
+            .find(|segment| segment.text == "Merge blocked")
+            .expect("merge blocked segment");
+        assert_eq!(merge_blocked.style.fg, Some(Color::Yellow));
+        assert!(merge_blocked.style.add_modifier.contains(Modifier::BOLD));
 
         let conflict = segments
             .iter()
@@ -28309,7 +28950,57 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(app.pr_create_dialog.is_none());
         assert!(app.issue_dialog.is_none());
-        assert!(app.status.contains("has no local_dir"));
+        assert_eq!(app.status, "pull request creation unavailable");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "New Pull Request Unavailable");
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert!(dialog.body.contains("repo chenyukang/ghr has no local_dir"));
+        assert!(dialog.body.contains("[[repos]].local_dir"));
+    }
+
+    #[test]
+    fn capital_n_in_pr_repo_with_invalid_local_dir_opens_message_dialog() {
+        let section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:ghr".to_string();
+        let local_dir =
+            std::env::temp_dir().join(format!("ghr-missing-pr-local-dir-{}", std::process::id()));
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "ghr".to_string(),
+            repo: "chenyukang/ghr".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        app.start_new_issue_or_pull_request_dialog(&config);
+
+        assert!(app.pr_create_dialog.is_none());
+        assert_eq!(app.status, "pull request creation unavailable");
+        let dialog = app.message_dialog.as_ref().expect("message dialog");
+        assert_eq!(dialog.title, "New Pull Request Unavailable");
+        assert_eq!(dialog.kind, MessageDialogKind::Error);
+        assert!(
+            dialog
+                .body
+                .contains("Configured local_dir for chenyukang/ghr cannot be used")
+        );
+        assert!(dialog.body.contains("is not a directory"));
     }
 
     #[test]
@@ -28504,6 +29195,7 @@ diff --git a/src/main.rs b/src/main.rs
             body: "Steps to reproduce".to_string(),
             labels: vec!["bug".to_string(), "T-compiler".to_string()],
             dialog,
+            draft_key: None,
         });
 
         app.handle_msg(AppMsg::IssueCreated {
@@ -28545,6 +29237,7 @@ diff --git a/src/main.rs b/src/main.rs
             title: "Add PR creation".to_string(),
             body: "Created from the TUI".to_string(),
             dialog,
+            draft_key: None,
         });
 
         app.handle_msg(AppMsg::PullRequestCreated {
@@ -31346,6 +32039,194 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn new_issue_dialog_loads_existing_repo_draft() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let key = new_issue_draft_key("rust-lang/rust");
+        let body = encode_editor_draft(&NewIssueDraft {
+            repo: "rust-lang/rust".to_string(),
+            title: "draft issue".to_string(),
+            labels: "bug, help wanted".to_string(),
+            body: "draft body".to_string(),
+        })
+        .expect("encode draft");
+        app.load_editor_drafts(HashMap::from([(
+            key.clone(),
+            EditorDraft {
+                key,
+                body,
+                updated_at: Utc::now(),
+            },
+        )]));
+
+        app.start_new_issue_dialog();
+
+        let dialog = app.issue_dialog.as_ref().expect("issue dialog");
+        assert_eq!(dialog.repo, "rust-lang/rust");
+        assert_eq!(dialog.title, "draft issue");
+        assert_eq!(dialog.labels, "bug, help wanted");
+        assert_eq!(dialog.body, "draft body");
+        assert_eq!(app.status, "loaded issue draft");
+    }
+
+    #[test]
+    fn saving_new_issue_draft_uses_repo_key() {
+        let paths = unique_test_paths("issue-draft-save");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_new_issue_dialog();
+        {
+            let dialog = app.issue_dialog.as_mut().expect("issue dialog");
+            dialog.title.set_text("draft issue");
+            dialog.labels.set_text("bug");
+            dialog.body.set_text("draft body");
+        }
+        app.save_active_issue_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+
+        let drafts = store.load_editor_drafts().expect("load drafts");
+        let draft = drafts
+            .get(&new_issue_draft_key("rust-lang/rust"))
+            .expect("repo issue draft");
+        let payload: NewIssueDraft = serde_json::from_str(&draft.body).expect("decode draft");
+        assert_eq!(app.status, "draft saved");
+        assert_eq!(payload.repo, "rust-lang/rust");
+        assert_eq!(payload.title, "draft issue");
+        assert_eq!(payload.labels, "bug");
+        assert_eq!(payload.body, "draft body");
+    }
+
+    #[test]
+    fn new_pr_dialog_loads_existing_repo_draft() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let key = new_pr_draft_key("rust-lang/rust");
+        let body = encode_editor_draft(&NewPrDraft {
+            repo: "rust-lang/rust".to_string(),
+            title: "draft PR".to_string(),
+            body: "draft PR body".to_string(),
+        })
+        .expect("encode draft");
+        app.load_editor_drafts(HashMap::from([(
+            key.clone(),
+            EditorDraft {
+                key,
+                body,
+                updated_at: Utc::now(),
+            },
+        )]));
+
+        let loaded = app.open_pr_create_dialog_with_draft(
+            "rust-lang/rust".to_string(),
+            PathBuf::from("/tmp/rust"),
+            "feature/draft".to_string(),
+        );
+
+        let dialog = app.pr_create_dialog.as_ref().expect("pr create dialog");
+        assert!(loaded);
+        assert_eq!(dialog.repo, "rust-lang/rust");
+        assert_eq!(dialog.title, "draft PR");
+        assert_eq!(dialog.body, "draft PR body");
+    }
+
+    #[test]
+    fn saving_new_pr_draft_uses_repo_key() {
+        let paths = unique_test_paths("pr-draft-save");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.open_pr_create_dialog_with_draft(
+            "rust-lang/rust".to_string(),
+            PathBuf::from("/tmp/rust"),
+            "feature/draft".to_string(),
+        );
+        {
+            let dialog = app.pr_create_dialog.as_mut().expect("pr create dialog");
+            dialog.title.set_text("draft PR");
+            dialog.body.set_text("draft PR body");
+        }
+        app.save_active_pr_create_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+
+        let drafts = store.load_editor_drafts().expect("load drafts");
+        let draft = drafts
+            .get(&new_pr_draft_key("rust-lang/rust"))
+            .expect("repo PR draft");
+        let payload: NewPrDraft = serde_json::from_str(&draft.body).expect("decode draft");
+        assert_eq!(app.status, "draft saved");
+        assert_eq!(payload.repo, "rust-lang/rust");
+        assert_eq!(payload.title, "draft PR");
+        assert_eq!(payload.body, "draft PR body");
+    }
+
+    #[test]
+    fn successful_issue_create_clears_saved_draft_state() {
+        let paths = unique_test_paths("issue-draft-clear");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.start_new_issue_dialog();
+        app.issue_dialog
+            .as_mut()
+            .unwrap()
+            .title
+            .set_text("draft issue");
+        app.save_active_issue_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+        let key = app.issue_draft_key.clone().expect("draft key");
+        app.handle_issue_dialog_key_with_submit(ctrl_key(KeyCode::Enter), None, |_| {});
+
+        let mut item = work_item(
+            "rust-lang/rust#99",
+            "rust-lang/rust",
+            99,
+            "draft issue",
+            None,
+        );
+        item.kind = ItemKind::Issue;
+        item.url = "https://github.com/rust-lang/rust/issues/99".to_string();
+        app.handle_msg(AppMsg::IssueCreated { result: Ok(item) });
+        clear_editor_draft_after_success(draft_clear_task(Some(key.clone()), Some(store.clone())));
+
+        assert!(!app.editor_drafts.contains_key(&key));
+        assert!(store.load_editor_drafts().expect("load drafts").is_empty());
+    }
+
+    #[test]
+    fn successful_pr_create_clears_saved_draft_state() {
+        let paths = unique_test_paths("pr-draft-clear");
+        let store = SnapshotStore::new(paths.db_path.clone());
+        store.init().expect("init store");
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+        app.open_pr_create_dialog_with_draft(
+            "rust-lang/rust".to_string(),
+            PathBuf::from("/tmp/rust"),
+            "feature/draft".to_string(),
+        );
+        app.pr_create_dialog
+            .as_mut()
+            .unwrap()
+            .title
+            .set_text("draft PR");
+        app.save_active_pr_create_draft(&store, DraftSaveTrigger::Manual, Instant::now());
+        let key = app.pr_create_draft_key.clone().expect("draft key");
+        app.prepare_pr_create().expect("pending PR create");
+
+        let item = work_item(
+            "rust-lang/rust#100",
+            "rust-lang/rust",
+            100,
+            "draft PR",
+            None,
+        );
+        app.handle_msg(AppMsg::PullRequestCreated { result: Ok(item) });
+        clear_editor_draft_after_success(draft_clear_task(Some(key.clone()), Some(store.clone())));
+
+        assert!(!app.editor_drafts.contains_key(&key));
+        assert!(store.load_editor_drafts().expect("load drafts").is_empty());
+    }
+
+    #[test]
     fn mouse_clicking_issue_title_moves_field_cursor() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let area = Rect::new(0, 0, 100, 30);
@@ -32853,7 +33734,10 @@ diff --git a/d.rs b/d.rs
         let details = details_area_for(&app, area);
         let inner = block_inner(details);
 
-        for _ in 0..80 {
+        let scroll_attempts = usize::from(max_details_scroll(&app, details_area_for(&app, area)))
+            + usize::from(inner.height)
+            + 16;
+        for _ in 0..scroll_attempts {
             handle_mouse(
                 &mut app,
                 MouseEvent {

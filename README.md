@@ -21,7 +21,7 @@
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
-- Recent Items command for jumping back to the last 200 PRs and issues where you spent at least 10 seconds in Details.
+- Recent Items command for jumping back to the last 200 PRs and issues, including linked inbox notifications, where you spent at least 10 seconds in Details.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
@@ -68,6 +68,10 @@ Then authenticate GitHub CLI and run ghr:
 ```bash
 gh auth login
 ghr
+
+## by default, ghr starts in the Inbox/Issues/Pull Requests view
+## go to some dir with a GitHub remote and run ghr to see the repo tab show up
+## command palette (press `:`) and then type "Project Add" to add new repos
 ```
 
 The installers detect your OS and CPU architecture, download the matching GitHub release asset with visible progress, verify its `.sha256`, and install `ghr` into `~/.local/bin` by default. Use `GHR_INSTALL_DIR` to choose another install directory, or `GHR_VERSION` to pin a release tag:
@@ -90,7 +94,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Project Switch` | Filter configured repos by prefix and activate a project tab |
 | `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
-| `Recent Items` | Fuzzy search recently viewed PRs/issues and jump back to the selected item |
+| `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
 | `Toggle Theme` | Switch between dark and light themes and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |

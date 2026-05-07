@@ -78,7 +78,7 @@ const shortcuts = [
   ["Project", "Palette", "Project Switch: filter configured repositories and switch tabs"],
   ["Project", "Palette", "Project Add: add a repo project to config.toml"],
   ["Project", "Palette", "Project Remove: remove a repo project from config.toml"],
-  ["Navigation", "Palette", "Recent Items: fuzzy search recently viewed PRs/issues and jump back"],
+  ["Navigation", "Palette", "Recent Items: fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back"],
   ["Theme", "Palette", "Toggle Theme: switch between dark and light themes and save config.toml"],
   ["Cache", "Palette", "Clear Cache: choose which local cache layer to clear"],
   ["Inbox", "Palette", "Mark Done: move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless muted"],

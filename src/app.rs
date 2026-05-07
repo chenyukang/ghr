@@ -23565,6 +23565,38 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn recent_items_record_linked_inbox_notifications_as_pr_or_issue() {
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: "is:all".to_string(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+
+        app.focus_details();
+        app.details_visit
+            .as_mut()
+            .expect("details visit")
+            .started_at = Instant::now() - RECENT_ITEM_DWELL - Duration::from_millis(100);
+        app.sync_recent_details_visit(Instant::now());
+
+        assert_eq!(app.recent_items.len(), 1);
+        assert_eq!(app.recent_items[0].id, "thread-1");
+        assert_eq!(app.recent_items[0].kind, ItemKind::PullRequest);
+        assert_eq!(
+            recent_item_label(&app.recent_items[0]),
+            "[pr] #1 Notification thread-1.  rust-lang/rust"
+        );
+    }
+
+    #[test]
     fn recent_items_filter_keeps_recent_order() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.recent_items = vec![

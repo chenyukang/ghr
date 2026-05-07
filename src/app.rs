@@ -2262,10 +2262,10 @@ fn start_filtered_section_load(
     app.refreshing = true;
     app.section_page_loading = None;
     app.last_refresh_request = Instant::now();
+    app.save_current_conversation_details_state();
     app.set_current_selected_position(0);
     app.clear_current_list_scroll_offset();
-    app.details_scroll = 0;
-    app.selected_comment_index = 0;
+    app.reset_or_restore_current_conversation_details_state();
     app.comment_dialog = None;
     app.pr_action_dialog = None;
     app.status = match status_filter {
@@ -6882,11 +6882,12 @@ fn draw_recent_items_dialog(
     lines.push(Line::from(""));
 
     if candidates.is_empty() {
-        let message = if app.recent_items.is_empty() {
-            "No recent PRs or issues yet"
-        } else {
-            "No recent items found"
-        };
+        let message =
+            if app.recent_items.is_empty() || app.recent_item_candidates_for_query("").is_empty() {
+                "No other recent PRs or issues yet"
+            } else {
+                "No recent items found"
+            };
         lines.push(Line::from(Span::styled(message, active_theme().subtle())));
     } else {
         for (position, candidate) in candidates
@@ -10368,12 +10369,34 @@ fn recent_item_display_kind(kind: ItemKind) -> &'static str {
 }
 
 fn recent_item_key(item: &RecentItem) -> String {
+    details_memory_key(item.kind, &item.repo, item.number)
+}
+
+fn details_memory_key(kind: ItemKind, repo: &str, number: u64) -> String {
     format!(
         "{}:{}:{}",
-        recent_item_state_kind(item.kind),
-        item.repo.to_ascii_lowercase(),
-        item.number
+        recent_item_state_kind(kind),
+        repo.to_ascii_lowercase(),
+        number
     )
+}
+
+fn work_item_details_memory_key(item: &WorkItem) -> Option<String> {
+    if !item_supports_details_memory(item) {
+        return None;
+    }
+    Some(details_memory_key(item.kind, &item.repo, item.number?))
+}
+
+fn work_item_details_memory_keys(item: &WorkItem) -> Vec<String> {
+    let Some(primary) = work_item_details_memory_key(item) else {
+        return Vec::new();
+    };
+    if item.id.is_empty() || item.id == primary {
+        vec![primary]
+    } else {
+        vec![primary, item.id.clone()]
+    }
 }
 
 fn recent_item_label(item: &RecentItem) -> String {
@@ -11201,6 +11224,9 @@ impl AppState {
         let selected_comment_index = self.selected_comment_index;
         self.clamp_positions();
         self.selected_comment_index = selected_comment_index;
+        if self.details_mode == DetailsMode::Conversation {
+            self.restore_current_conversation_details_state();
+        }
         if self.current_comments().is_some() {
             self.clamp_selected_comment();
         }
@@ -11372,8 +11398,7 @@ impl AppState {
             self.selected_comment_index = previous_comment_index;
             self.clamp_selected_comment();
         } else {
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
+            self.reset_or_restore_current_conversation_details_state();
         }
 
         if self.setup_dialog.is_none() {
@@ -11459,8 +11484,7 @@ impl AppState {
                     }
                     self.clamp_selected_comment();
                 } else {
-                    self.details_scroll = 0;
-                    self.selected_comment_index = 0;
+                    self.reset_or_restore_current_conversation_details_state();
                 }
                 self.refreshing = false;
                 self.last_refresh_request = Instant::now();
@@ -12535,8 +12559,7 @@ impl AppState {
                 self.set_current_section_position(first_result_section);
                 self.set_current_selected_position(0);
                 self.focus = FocusTarget::List;
-                self.details_scroll = 0;
-                self.selected_comment_index = 0;
+                self.reset_or_restore_current_conversation_details_state();
                 self.comment_dialog = None;
                 self.label_dialog = None;
                 self.pr_action_dialog = None;
@@ -13072,9 +13095,15 @@ impl AppState {
     fn recent_item_candidates_for_query(&self, query: &str) -> Vec<RecentItem> {
         self.recent_items
             .iter()
+            .filter(|item| !self.recent_item_matches_current_item(item))
             .filter(|item| recent_item_matches_query(item, query))
             .cloned()
             .collect()
+    }
+
+    fn recent_item_matches_current_item(&self, item: &RecentItem) -> bool {
+        self.current_item()
+            .is_some_and(|current| recent_item_matches_work_item(item, current))
     }
 
     fn show_project_add_dialog(&mut self) {
@@ -13592,6 +13621,7 @@ impl AppState {
     }
 
     fn clear_list_sections_by_keys(&mut self, keys: &[String]) -> usize {
+        self.save_current_conversation_details_state();
         let keys = keys.iter().cloned().collect::<HashSet<_>>();
         let mut item_count = 0;
         for section in &mut self.sections {
@@ -13607,11 +13637,10 @@ impl AppState {
             section.error = None;
             self.list_scroll_offset.remove(&section.key);
         }
-        if item_count > 0 {
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
-        }
         self.clamp_positions();
+        if item_count > 0 {
+            self.reset_or_restore_current_conversation_details_state();
+        }
         item_count
     }
 
@@ -13626,6 +13655,7 @@ impl AppState {
     }
 
     fn clear_loaded_details_local(&mut self) -> usize {
+        self.save_current_conversation_details_state();
         let count = self.details.len() + self.diffs.len() + self.action_hints.len();
         self.details.clear();
         self.diffs.clear();
@@ -13635,8 +13665,7 @@ impl AppState {
         self.details_stale.clear();
         self.details_refreshing.clear();
         self.pending_details_load = None;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        self.reset_or_restore_current_conversation_details_state();
         count
     }
 
@@ -13838,11 +13867,10 @@ impl AppState {
                 self.set_current_section_position(section_position);
             }
             self.set_current_selected_position(0);
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
             self.focus = FocusTarget::Details;
             self.details
                 .insert(item_id, DetailState::Loaded(Vec::new()));
+            self.reset_or_restore_current_conversation_details_state();
         }
 
         self.clamp_positions();
@@ -13877,11 +13905,10 @@ impl AppState {
                 self.set_current_section_position(section_position);
             }
             self.set_current_selected_position(0);
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
             self.focus = FocusTarget::Details;
             self.details
                 .insert(item_id, DetailState::Loaded(Vec::new()));
+            self.reset_or_restore_current_conversation_details_state();
         }
 
         self.clamp_positions();
@@ -14063,6 +14090,9 @@ impl AppState {
         let was_current = self
             .current_section()
             .is_some_and(|section| section.key == section_key);
+        if was_current {
+            self.save_current_conversation_details_state();
+        }
         let Some(index) = self
             .sections
             .iter()
@@ -14075,8 +14105,7 @@ impl AppState {
             self.sections[index] = refreshed;
             if was_current {
                 self.set_current_selected_position(0);
-                self.details_scroll = 0;
-                self.selected_comment_index = 0;
+                self.reset_or_restore_current_conversation_details_state();
                 self.comment_dialog = None;
                 self.label_dialog = None;
                 self.issue_dialog = None;
@@ -14214,6 +14243,7 @@ impl AppState {
         if !self.is_global_search_results_view() {
             return;
         }
+        self.save_current_conversation_details_state();
 
         let search_view = global_search_view_key();
         self.sections
@@ -14235,13 +14265,12 @@ impl AppState {
         self.search_active = false;
         self.search_query.clear();
         self.comment_search_active = false;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.focus = FocusTarget::List;
         self.status = "search results cleared".to_string();
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
     }
 
     fn section_view_exists(&self, view: &str) -> bool {
@@ -14609,6 +14638,7 @@ impl AppState {
             } else {
                 fallback_focus
             };
+            self.reset_or_restore_current_conversation_details_state();
             false
         };
         debug!(
@@ -14658,8 +14688,7 @@ impl AppState {
         self.save_current_conversation_details_state();
         self.focus = FocusTarget::List;
         if self.details_mode != DetailsMode::Diff {
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
+            self.reset_or_restore_current_conversation_details_state();
         }
         self.comment_dialog = None;
         self.pr_action_dialog = None;
@@ -14727,8 +14756,7 @@ impl AppState {
         self.set_current_selected_position(0);
         self.clear_current_list_scroll_offset();
         self.focus = FocusTarget::Sections;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        self.reset_or_restore_current_conversation_details_state();
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
@@ -14755,8 +14783,7 @@ impl AppState {
         self.set_current_selected_position(0);
         self.clear_current_list_scroll_offset();
         self.focus = FocusTarget::Sections;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        self.reset_or_restore_current_conversation_details_state();
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.search_active = false;
@@ -14785,8 +14812,7 @@ impl AppState {
         let next = move_bounded(current, len, delta);
         self.set_current_selected_position(next);
         self.clear_current_list_scroll_offset();
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        self.reset_or_restore_current_conversation_details_state();
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
@@ -14807,14 +14833,13 @@ impl AppState {
         let previous = self.current_selected_position();
         self.set_current_selected_position(index);
         self.clear_current_list_scroll_offset();
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.global_search_active = false;
         self.comment_search_active = false;
         self.comment_search_query.clear();
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
         debug!(
             from_index = previous,
             to_index = self.current_selected_position(),
@@ -15326,8 +15351,7 @@ impl AppState {
         if len > 0 {
             self.save_current_conversation_details_state();
             self.set_current_selected_position(len - 1);
-            self.details_scroll = 0;
-            self.selected_comment_index = 0;
+            self.reset_or_restore_current_conversation_details_state();
             self.comment_dialog = None;
             self.pr_action_dialog = None;
             self.global_search_active = false;
@@ -15504,13 +15528,14 @@ impl AppState {
             self.focus = previous.focus;
             self.details_scroll = previous.details_scroll;
             self.selected_comment_index = previous.selected_comment_index;
+            self.restore_current_conversation_details_state();
             self.clamp_selected_comment();
             if self.focus == FocusTarget::Details && self.current_item().is_none() {
                 self.focus = FocusTarget::List;
             }
         } else {
             self.focus = FocusTarget::Details;
-            self.details_scroll = 0;
+            self.reset_or_restore_current_conversation_details_state();
         }
         self.status = "returned from diff".to_string();
         debug!(
@@ -15564,7 +15589,7 @@ impl AppState {
         self.details_mode = DetailsMode::Conversation;
         self.diff_return_state = None;
         self.focus = FocusTarget::Details;
-        self.details_scroll = 0;
+        self.reset_or_restore_current_conversation_details_state();
         self.status = "conversation focused".to_string();
     }
 
@@ -18368,25 +18393,25 @@ impl AppState {
         self.filter_input_active = false;
         self.search_query.clear();
         self.focus = FocusTarget::List;
-        self.details_scroll = 0;
         self.status = "search cleared".to_string();
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
     }
 
     fn push_search_char(&mut self, value: char) {
         self.save_current_conversation_details_state();
         self.search_query.push(value);
         self.set_current_selected_position(0);
-        self.details_scroll = 0;
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
     }
 
     fn pop_search_char(&mut self) {
         self.save_current_conversation_details_state();
         self.search_query.pop();
         self.set_current_selected_position(0);
-        self.details_scroll = 0;
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
     }
 
     fn start_comment_search(&mut self) {
@@ -18806,8 +18831,7 @@ impl AppState {
         self.recent_items_dialog = None;
         self.details_mode = DetailsMode::Conversation;
         self.diff_return_state = None;
-        self.details_scroll = 0;
-        self.selected_comment_index = 0;
+        self.reset_or_restore_current_conversation_details_state();
         self.focus_details();
         self.status = format!("recent item opened: {}", recent_item_label(item));
         true
@@ -18874,14 +18898,14 @@ impl AppState {
         if !item_supports_details_memory(item) {
             return;
         }
-        let item_id = item.id.clone();
-        self.conversation_details_state.insert(
-            item_id,
-            ConversationDetailsState {
-                details_scroll: self.details_scroll,
-                selected_comment_index: self.selected_comment_index,
-            },
-        );
+        let keys = work_item_details_memory_keys(item);
+        let state = ConversationDetailsState {
+            details_scroll: self.details_scroll,
+            selected_comment_index: self.selected_comment_index,
+        };
+        for key in keys {
+            self.conversation_details_state.insert(key, state);
+        }
     }
 
     fn restore_current_conversation_details_state(&mut self) {
@@ -18891,13 +18915,22 @@ impl AppState {
         let Some(item) = self.current_item() else {
             return;
         };
-        if let Some(state) = self.conversation_details_state.get(&item.id).copied() {
+        let state = work_item_details_memory_keys(item)
+            .into_iter()
+            .find_map(|key| self.conversation_details_state.get(&key).copied());
+        if let Some(state) = state {
             self.details_scroll = state.details_scroll;
             self.selected_comment_index = state.selected_comment_index;
             if self.current_comments().is_some() {
                 self.clamp_selected_comment();
             }
         }
+    }
+
+    fn reset_or_restore_current_conversation_details_state(&mut self) {
+        self.details_scroll = 0;
+        self.selected_comment_index = 0;
+        self.restore_current_conversation_details_state();
     }
 
     fn current_selected_comment(&self) -> Option<&CommentPreview> {
@@ -19148,6 +19181,7 @@ impl AppState {
         self.pr_action_dialog = None;
         self.item_edit_dialog = None;
         self.clamp_positions();
+        self.reset_or_restore_current_conversation_details_state();
         self.status = format!("ignored {label}{number}; use Info to inspect ignored state");
     }
 
@@ -22424,9 +22458,93 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(app.selected_comment_index, 0);
 
         app.move_selection(-1);
-        app.focus_details();
 
         assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+
+        app.focus_details();
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn selecting_current_list_item_keeps_conversation_details_position() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+
+        app.set_selection(0);
+
+        assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn section_switch_restores_conversation_details_position_for_current_item() {
+        let mut other_notification = notification_item("thread-2", true);
+        other_notification.number = Some(2);
+        other_notification.url = "https://github.com/rust-lang/rust/pull/2".to_string();
+        let sections = vec![
+            SectionSnapshot {
+                key: "notifications:all".to_string(),
+                kind: SectionKind::Notifications,
+                title: "All".to_string(),
+                filters: String::new(),
+                items: vec![notification_item("thread-1", true)],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+            SectionSnapshot {
+                key: "notifications:others".to_string(),
+                kind: SectionKind::Notifications,
+                title: "Others".to_string(),
+                filters: String::new(),
+                items: vec![other_notification],
+                total_count: None,
+                page: 1,
+                page_size: 0,
+                refreshed_at: None,
+                error: None,
+            },
+        ];
+        let mut app = AppState::new(SectionKind::Notifications, sections);
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+
+        app.select_section(1);
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-2")
+        );
+        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.selected_comment_index, 0);
+
+        app.select_section(0);
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-1")
+        );
         assert_eq!(app.details_scroll, 9);
         assert_eq!(app.selected_comment_index, 1);
     }
@@ -23639,6 +23757,181 @@ diff --git a/src/main.rs b/src/main.rs
                 "[issue] #1 Fix fuzzy search.  chenyukang/ghr",
             ]
         );
+    }
+
+    #[test]
+    fn recent_items_candidates_omit_current_item() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.recent_items = vec![
+            recent_item(
+                "current-pr",
+                ItemKind::PullRequest,
+                "rust-lang/rust",
+                1,
+                "Compiler diagnostics",
+                300,
+            ),
+            recent_item(
+                "pr-2",
+                ItemKind::PullRequest,
+                "nervosnetwork/fiber",
+                2,
+                "Fix funding state",
+                200,
+            ),
+        ];
+
+        let matches = app
+            .recent_item_candidates_for_query("")
+            .into_iter()
+            .map(|item| recent_item_label(&item))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            matches,
+            vec!["[pr] #2 Fix funding state.  nervosnetwork/fiber"]
+        );
+    }
+
+    #[test]
+    fn recent_item_jump_restores_position_across_inbox_and_pr_list_ids() {
+        let notification_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: String::new(),
+            items: vec![notification_item("thread-1", true)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let pr = work_item(
+            "regular-pr-1",
+            "rust-lang/rust",
+            1,
+            "Compiler diagnostics",
+            None,
+        );
+        let other = work_item(
+            "regular-pr-2",
+            "nervosnetwork/fiber",
+            2,
+            "Funding state",
+            None,
+        );
+        let pull_request_section = SectionSnapshot {
+            key: "pull_requests:test".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Test".to_string(),
+            filters: String::new(),
+            items: vec![other, pr.clone()],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::Notifications,
+            vec![notification_section, pull_request_section],
+        );
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+        app.save_current_conversation_details_state();
+
+        app.switch_view(builtin_view_key(SectionKind::PullRequests));
+        app.set_selection(0);
+        app.recent_items = vec![recent_item_from_work_item(&pr, Utc::now()).unwrap()];
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("regular-pr-1")
+        );
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn view_switch_restores_shared_position_for_same_pr_across_inbox_and_repo_view() {
+        let mut inbox_item = notification_item("thread-ghr-34", true);
+        inbox_item.repo = "chenyukang/ghr".to_string();
+        inbox_item.number = Some(34);
+        inbox_item.url = "https://github.com/chenyukang/ghr/pull/34".to_string();
+        let inbox_section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: String::new(),
+            items: vec![inbox_item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let repo_pr = work_item(
+            "repo-ghr-pr-34",
+            "chenyukang/ghr",
+            34,
+            "Restore details state",
+            None,
+        );
+        let repo_section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: String::new(),
+            items: vec![repo_pr],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::Notifications,
+            vec![inbox_section, repo_section],
+        );
+        app.details.insert(
+            "thread-ghr-34".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.focus_details();
+        app.details_scroll = 0;
+        app.selected_comment_index = 0;
+        app.remember_current_view_snapshot();
+
+        app.switch_view(repo_view_key("ghr"));
+        app.focus_details();
+        app.details_scroll = 9;
+        app.selected_comment_index = 1;
+        app.save_current_conversation_details_state();
+
+        app.switch_view(builtin_view_key(SectionKind::Notifications));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("thread-ghr-34")
+        );
+        assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
     }
 
     #[test]
@@ -35124,7 +35417,7 @@ diff --git a/d.rs b/d.rs
         assert_eq!(app.current_section_position(), 0);
         assert_eq!(app.current_selected_position(), 0);
         assert_eq!(app.focus, FocusTarget::List);
-        assert_eq!(app.details_scroll, 0);
+        assert_eq!(app.details_scroll, 3);
         assert_eq!(
             app.current_section().map(|section| section.title.as_str()),
             Some("Test")

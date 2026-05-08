@@ -827,14 +827,16 @@ impl DetailsBuilder {
 
         for segment in segments {
             for ch in segment.text.chars() {
-                if column >= self.width {
+                let char_width = display_width_char(ch);
+                if column > prefix_width && column.saturating_add(char_width) > self.width {
                     if !self.flush_wrapped_line(&mut current, emitted, max_lines) {
                         return false;
                     }
                     current = prefix.to_vec();
+                    column = prefix_width;
                 }
                 push_char_segment(&mut current, segment, ch);
-                column = segments_width(&current);
+                column = column.saturating_add(char_width);
             }
         }
 
@@ -852,18 +854,21 @@ impl DetailsBuilder {
         emitted: &mut usize,
         max_lines: usize,
     ) -> bool {
+        let prefix_width = segments_width(prefix);
         for segment in &token.segments {
             for ch in segment.text.chars() {
-                if *column >= self.width {
+                let char_width = display_width_char(ch);
+                if *column > prefix_width && (*column).saturating_add(char_width) > self.width {
                     if !self.flush_wrapped_line(current, emitted, max_lines) {
                         return false;
                     }
                     *current = prefix.to_vec();
+                    *column = prefix_width;
                     *wrote_content = false;
                 }
 
                 push_char_segment(current, segment, ch);
-                *column = segments_width(current);
+                *column = (*column).saturating_add(char_width);
                 *wrote_content = true;
             }
         }
@@ -921,13 +926,13 @@ pub(super) fn push_wrap_token_char(
         && last.kind == kind
     {
         push_char_segment(&mut last.segments, template, ch);
-        last.width = segments_width(&last.segments);
+        last.width = last.width.saturating_add(display_width_char(ch));
         return;
     }
 
     let mut segments = Vec::new();
     push_char_segment(&mut segments, template, ch);
-    let width = segments_width(&segments);
+    let width = display_width_char(ch);
     tokens.push(WrapToken {
         kind,
         segments,

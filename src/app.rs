@@ -1411,10 +1411,11 @@ const DIFF_INLINE_COMMENT_GUTTER_WIDTH: usize = 11;
 const SEARCH_RESULT_WINDOW: usize = 1000;
 const DIFF_DOUBLE_CLICK_MAX: Duration = Duration::from_millis(450);
 const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
-const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
 const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
+const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
@@ -1809,16 +1810,17 @@ async fn run_loop(
     rx: &mut UnboundedReceiver<AppMsg>,
 ) -> Result<()> {
     let mut mouse_capture_enabled = true;
+    let initial_size = terminal.size()?;
+    let mut last_area = Rect::new(0, 0, initial_size.width, initial_size.height);
+    let mut needs_draw = true;
     loop {
-        while let Ok(message) = rx.try_recv() {
-            app.handle_msg(message);
-        }
-        app.ensure_current_details_loading(tx);
-        app.ensure_current_comments_auto_refresh(tx);
-        app.ensure_current_diff_loading(tx);
+        needs_draw |= drain_app_messages(app, rx);
+        needs_draw |= app.ensure_current_details_loading(tx);
+        needs_draw |= app.ensure_current_comments_auto_refresh(tx);
+        needs_draw |= app.ensure_current_diff_loading(tx);
         app.sync_recent_details_visit(Instant::now());
-        app.auto_save_active_editor_drafts(store, Instant::now());
-        app.dismiss_expired_message_dialog(Instant::now());
+        needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
+        needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
 
         if !app.refreshing
             && config.defaults.refetch_interval_seconds > 0
@@ -1842,14 +1844,25 @@ async fn run_loop(
             );
         }
 
-        terminal.draw(|frame| draw(frame, app, paths))?;
+        needs_draw |= drain_app_messages(app, rx);
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        if area != last_area {
+            last_area = area;
+            needs_draw = true;
+        }
+        if needs_draw {
+            terminal.draw(|frame| draw(frame, app, paths))?;
+            needs_draw = false;
+        }
 
         let mut should_quit = false;
-        if event::poll(Duration::from_millis(120))? {
+        if event::poll(EVENT_POLL_TIMEOUT)? {
             let events = read_event_batch(event::read()?)?;
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             should_quit = handle_event_batch_mut(app, events, area, config, paths, store, tx);
+            needs_draw = true;
         }
         sync_mouse_capture(terminal, app, &mut mouse_capture_enabled)?;
         if should_quit {
@@ -1859,6 +1872,15 @@ async fn run_loop(
 
     save_ui_state(app, paths);
     Ok(())
+}
+
+fn drain_app_messages(app: &mut AppState, rx: &mut UnboundedReceiver<AppMsg>) -> bool {
+    let mut handled = false;
+    while let Ok(message) = rx.try_recv() {
+        app.handle_msg(message);
+        handled = true;
+    }
+    handled
 }
 
 fn read_event_batch(first: Event) -> Result<Vec<Event>> {
@@ -10836,49 +10858,53 @@ impl AppState {
         .to_string();
     }
 
-    fn auto_save_active_editor_drafts(&mut self, store: &SnapshotStore, now: Instant) {
-        self.auto_save_active_comment_draft(store, now);
-        self.auto_save_active_issue_draft(store, now);
-        self.auto_save_active_pr_create_draft(store, now);
+    fn auto_save_active_editor_drafts(&mut self, store: &SnapshotStore, now: Instant) -> bool {
+        let comment_saved = self.auto_save_active_comment_draft(store, now);
+        let issue_saved = self.auto_save_active_issue_draft(store, now);
+        let pr_saved = self.auto_save_active_pr_create_draft(store, now);
+        comment_saved || issue_saved || pr_saved
     }
 
-    fn auto_save_active_comment_draft(&mut self, store: &SnapshotStore, now: Instant) {
+    fn auto_save_active_comment_draft(&mut self, store: &SnapshotStore, now: Instant) -> bool {
         if self.comment_dialog.is_none() {
-            return;
+            return false;
         }
         if now.saturating_duration_since(self.comment_draft_last_auto_save_at)
             < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
         {
-            return;
+            return false;
         }
         self.comment_draft_last_auto_save_at = now;
         self.save_active_comment_draft(store, DraftSaveTrigger::Auto, now);
+        true
     }
 
-    fn auto_save_active_issue_draft(&mut self, store: &SnapshotStore, now: Instant) {
+    fn auto_save_active_issue_draft(&mut self, store: &SnapshotStore, now: Instant) -> bool {
         if self.issue_dialog.is_none() {
-            return;
+            return false;
         }
         if now.saturating_duration_since(self.issue_draft_last_auto_save_at)
             < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
         {
-            return;
+            return false;
         }
         self.issue_draft_last_auto_save_at = now;
         self.save_active_issue_draft(store, DraftSaveTrigger::Auto, now);
+        true
     }
 
-    fn auto_save_active_pr_create_draft(&mut self, store: &SnapshotStore, now: Instant) {
+    fn auto_save_active_pr_create_draft(&mut self, store: &SnapshotStore, now: Instant) -> bool {
         if self.pr_create_dialog.is_none() {
-            return;
+            return false;
         }
         if now.saturating_duration_since(self.pr_create_draft_last_auto_save_at)
             < EDITOR_DRAFT_AUTO_SAVE_INTERVAL
         {
-            return;
+            return false;
         }
         self.pr_create_draft_last_auto_save_at = now;
         self.save_active_pr_create_draft(store, DraftSaveTrigger::Auto, now);
+        true
     }
 
     fn open_issue_dialog_with_draft(&mut self, repo: String) -> bool {
@@ -12603,7 +12629,7 @@ impl AppState {
         }
     }
 
-    fn dismiss_expired_message_dialog(&mut self, now: Instant) {
+    fn dismiss_expired_message_dialog(&mut self, now: Instant) -> bool {
         if self
             .message_dialog
             .as_ref()
@@ -12611,6 +12637,9 @@ impl AppState {
             .is_some_and(|deadline| now >= deadline)
         {
             self.message_dialog = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -14279,39 +14308,44 @@ impl AppState {
             .any(|section| same_view_key(&section_view_key(section), view))
     }
 
-    fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
+    fn ensure_current_details_loading(&mut self, tx: &UnboundedSender<AppMsg>) -> bool {
         let Some(item) = self.current_item().cloned() else {
             self.pending_details_load = None;
-            return;
+            return false;
         };
         if !item_supports_comments_refresh(&item) {
             self.pending_details_load = None;
-            return;
+            return false;
         }
         if !self.details_load_needed(&item) {
             self.pending_details_load = None;
-            return;
+            return false;
         }
         if !self.details_load_ready(&item.id) {
-            return;
+            return false;
         }
 
         self.pending_details_load = None;
+        let mut started = false;
         if self.start_comments_load_if_needed(&item) {
             start_comments_load(item.clone(), tx.clone());
+            started = true;
         }
         if self.start_action_hints_load_if_needed(&item) {
             start_action_hints_load(item, tx.clone());
+            started = true;
         }
+        started
     }
 
-    fn ensure_current_comments_auto_refresh(&mut self, tx: &UnboundedSender<AppMsg>) {
+    fn ensure_current_comments_auto_refresh(&mut self, tx: &UnboundedSender<AppMsg>) -> bool {
         let Some(item) = self.current_item().cloned() else {
-            return;
+            return false;
         };
         if self.start_comments_auto_refresh_if_due(&item, Instant::now()) {
             start_comments_load(item, tx.clone());
         }
+        false
     }
 
     fn details_load_needed(&self, item: &WorkItem) -> bool {
@@ -14346,22 +14380,23 @@ impl AppState {
         }
     }
 
-    fn ensure_current_diff_loading(&mut self, tx: &UnboundedSender<AppMsg>) {
+    fn ensure_current_diff_loading(&mut self, tx: &UnboundedSender<AppMsg>) -> bool {
         if self.details_mode != DetailsMode::Diff {
-            return;
+            return false;
         }
         let Some(item) = self.current_item().cloned() else {
-            return;
+            return false;
         };
         if !matches!(item.kind, ItemKind::PullRequest) || item.number.is_none() {
-            return;
+            return false;
         }
         if self.diffs.contains_key(&item.id) {
-            return;
+            return false;
         }
 
         self.diffs.insert(item.id.clone(), DiffState::Loading);
         start_diff_load(item, tx.clone());
+        true
     }
 
     fn current_diff(&self) -> Option<&DiffState> {

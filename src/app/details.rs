@@ -14,6 +14,8 @@ pub(super) struct DetailsDocument {
     pub(super) lines: Vec<Line<'static>>,
     pub(super) links: Vec<LinkRegion>,
     pub(super) actions: Vec<ActionRegion>,
+    pub(super) copy_exclusions: Vec<CopyExclusionRegion>,
+    pub(super) copy_skip_lines: Vec<usize>,
     pub(super) description: Option<DescriptionRegion>,
     pub(super) comments: Vec<CommentRegion>,
     pub(super) diff_files: Vec<usize>,
@@ -83,6 +85,13 @@ pub(super) struct ActionRegion {
     pub(super) start: u16,
     pub(super) end: u16,
     pub(super) action: DetailAction,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CopyExclusionRegion {
+    pub(super) line: usize,
+    pub(super) start: u16,
+    pub(super) end: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +251,7 @@ pub(super) struct DiffRenderContext<'a> {
     selected_line: usize,
     selected_range: Option<(usize, usize)>,
     file_link_base: Option<DiffFileLinkBase>,
+    show_thread_markers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +303,7 @@ pub(super) struct DetailSegment {
     pub(super) style: Style,
     pub(super) link: Option<String>,
     pub(super) action: Option<DetailAction>,
+    pub(super) copyable: bool,
 }
 
 impl DetailSegment {
@@ -302,6 +313,7 @@ impl DetailSegment {
             style: Style::default(),
             link: None,
             action: None,
+            copyable: true,
         }
     }
 
@@ -311,6 +323,27 @@ impl DetailSegment {
             style,
             link: None,
             action: None,
+            copyable: true,
+        }
+    }
+
+    fn chrome(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::default(),
+            link: None,
+            action: None,
+            copyable: false,
+        }
+    }
+
+    fn styled_chrome(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link: None,
+            action: None,
+            copyable: false,
         }
     }
 
@@ -320,6 +353,7 @@ impl DetailSegment {
             style: link_style(),
             link: Some(url.into()),
             action: None,
+            copyable: true,
         }
     }
 
@@ -329,6 +363,7 @@ impl DetailSegment {
             style,
             link: Some(url.into()),
             action: None,
+            copyable: true,
         }
     }
 
@@ -338,6 +373,7 @@ impl DetailSegment {
             style: action_style(),
             link: None,
             action: Some(action),
+            copyable: true,
         }
     }
 }
@@ -427,6 +463,8 @@ impl DetailsBuilder {
                 lines: Vec::new(),
                 links: Vec::new(),
                 actions: Vec::new(),
+                copy_exclusions: Vec::new(),
+                copy_skip_lines: Vec::new(),
                 description: None,
                 comments: Vec::new(),
                 diff_files: Vec::new(),
@@ -495,10 +533,23 @@ impl DetailsBuilder {
                     action: action.clone(),
                 });
             }
+            if !segment.copyable && width > 0 {
+                self.document.copy_exclusions.push(CopyExclusionRegion {
+                    line: line_index,
+                    start: column,
+                    end: column.saturating_add(width),
+                });
+            }
             column = column.saturating_add(width);
             spans.push(Span::styled(segment.text, segment.style));
         }
         self.document.lines.push(Line::from(spans));
+    }
+
+    fn push_chrome_line(&mut self, segments: Vec<DetailSegment>) {
+        let line_index = self.document.lines.len();
+        self.push_line(segments);
+        self.document.copy_skip_lines.push(line_index);
     }
 
     fn push_plain(&mut self, text: impl Into<String>) {
@@ -976,6 +1027,7 @@ pub(super) fn truncated_clickable_token_segments(
         style: first.style,
         link: first.link.clone(),
         action: first.action.clone(),
+        copyable: first.copyable,
     }])
 }
 
@@ -992,6 +1044,7 @@ pub(super) fn push_text_segment(
         && last.style == template.style
         && last.link == template.link
         && last.action == template.action
+        && last.copyable == template.copyable
     {
         last.text.push_str(text);
         return;
@@ -1002,6 +1055,7 @@ pub(super) fn push_text_segment(
         style: template.style,
         link: template.link.clone(),
         action: template.action.clone(),
+        copyable: template.copyable,
     });
 }
 
@@ -1299,10 +1353,15 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                         index,
                         comment,
                         CommentRenderOptions {
-                            selected: app.focus == FocusTarget::Details
+                            selected: app.mouse_capture_enabled
+                                && app.focus == FocusTarget::Details
                                 && index == app.selected_comment_index,
                             search_match,
-                            depth: entry.depth,
+                            depth: if app.mouse_capture_enabled {
+                                entry.depth
+                            } else {
+                                0
+                            },
                             collapse,
                             new_since_last_read: comment_new_since_last_read(
                                 comment,
@@ -1352,7 +1411,9 @@ pub(super) fn push_description_block(
     app: &AppState,
     item: &WorkItem,
 ) {
-    let selected = app.focus == FocusTarget::Details && app.comment_selection_cleared();
+    let selected = app.mouse_capture_enabled
+        && app.focus == FocusTarget::Details
+        && app.comment_selection_cleared();
     let start_line = builder.document.lines.len();
     if !selected {
         builder.push_heading("Description");
@@ -1474,6 +1535,7 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
                     selected_line,
                     selected_range: app.diff_mark_range_for(&item.id),
                     file_link_base: diff_file_link_base(item, app.action_hints.get(&item.id)),
+                    show_thread_markers: app.mouse_capture_enabled,
                 },
             );
         }
@@ -1632,6 +1694,7 @@ pub(super) fn push_diff(
                         context.expanded_comments,
                         context.details_focused,
                         context.selected_comment_index,
+                        context.show_thread_markers,
                     );
                 } else if let Some(revealed) = context.revealed_diff_inline_comments {
                     let revealed_entries = inline_entries
@@ -1647,6 +1710,7 @@ pub(super) fn push_diff(
                         context.expanded_comments,
                         context.details_focused,
                         context.selected_comment_index,
+                        context.show_thread_markers,
                     );
                 }
             }
@@ -1671,6 +1735,7 @@ pub(super) fn push_diff(
                 context.expanded_comments,
                 context.details_focused,
                 context.selected_comment_index,
+                context.show_thread_markers,
             );
         }
     }
@@ -1884,6 +1949,7 @@ pub(super) fn push_diff_inline_comments(
     expanded_comments: &HashSet<String>,
     details_focused: bool,
     selected_comment_index: usize,
+    show_thread_markers: bool,
 ) {
     for entry in entries {
         let Some(comment) = comments.get(entry.index) else {
@@ -1891,14 +1957,8 @@ pub(super) fn push_diff_inline_comments(
         };
         let selected = details_focused && entry.index == selected_comment_index;
         let collapse = comment_collapse_state_for(item_id, entry.index, comment, expanded_comments);
-        push_diff_inline_comment(
-            builder,
-            entry.index,
-            comment,
-            selected,
-            entry.depth,
-            collapse,
-        );
+        let depth = if show_thread_markers { entry.depth } else { 0 };
+        push_diff_inline_comment(builder, entry.index, comment, selected, depth, collapse);
     }
 }
 
@@ -2030,11 +2090,11 @@ pub(super) fn push_diff_inline_comment_separator(
         .saturating_sub(prefix_width + comment_right_padding(selected))
         .max(12);
     let line = if selected { "━" } else { "─" };
-    segments.push(DetailSegment::styled(
+    segments.push(DetailSegment::styled_chrome(
         line.repeat(width),
         comment_separator_style(selected),
     ));
-    builder.push_line(segments);
+    builder.push_chrome_line(segments);
 }
 
 pub(super) fn push_selected_comment_box_edge(
@@ -2051,14 +2111,14 @@ pub(super) fn push_selected_comment_box_edge(
     let style = comment_separator_style(true);
     let mut segments = Vec::new();
     if left_padding > 0 {
-        segments.push(DetailSegment::raw(" ".repeat(left_padding)));
+        segments.push(DetailSegment::chrome(" ".repeat(left_padding)));
     }
     segments.extend([
-        DetailSegment::styled(left_corner, style),
-        DetailSegment::styled("━".repeat(horizontal_width), style),
-        DetailSegment::styled(right_corner, style),
+        DetailSegment::styled_chrome(left_corner, style),
+        DetailSegment::styled_chrome("━".repeat(horizontal_width), style),
+        DetailSegment::styled_chrome(right_corner, style),
     ]);
-    builder.push_line(segments);
+    builder.push_chrome_line(segments);
 }
 
 pub(super) fn push_diff_inline_comment_expand_line(
@@ -2097,7 +2157,7 @@ pub(super) fn diff_inline_comment_prefix(selected: bool, depth: usize) -> Vec<De
         prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
         prefix.push_str("↳ ");
     }
-    vec![DetailSegment::styled(
+    vec![DetailSegment::styled_chrome(
         prefix,
         if selected {
             comment_selected_rail_style()
@@ -2860,10 +2920,10 @@ pub(super) fn push_selected_description_box_edge(
     let border_column = comment_right_border_column(builder.width);
     let horizontal_width = border_column.saturating_sub(1).max(1);
     let style = description_selected_separator_style();
-    builder.push_line(vec![
-        DetailSegment::styled(left_corner, style),
-        DetailSegment::styled("━".repeat(horizontal_width), style),
-        DetailSegment::styled(right_corner, style),
+    builder.push_chrome_line(vec![
+        DetailSegment::styled_chrome(left_corner, style),
+        DetailSegment::styled_chrome("━".repeat(horizontal_width), style),
+        DetailSegment::styled_chrome(right_corner, style),
     ]);
 }
 
@@ -3328,11 +3388,11 @@ pub(super) fn push_comment_separator(
         .max(12);
     let line = if selected { "━" } else { "─" };
     let mut segments = prefix;
-    segments.push(DetailSegment::styled(
+    segments.push(DetailSegment::styled_chrome(
         line.repeat(width),
         comment_separator_style(selected),
     ));
-    builder.push_line(segments);
+    builder.push_chrome_line(segments);
 }
 
 pub(super) fn comment_line_prefix(selected: bool, depth: usize) -> Vec<DetailSegment> {
@@ -3344,19 +3404,22 @@ pub(super) fn comment_line_prefix(selected: bool, depth: usize) -> Vec<DetailSeg
             prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
             prefix.push_str("↳ ");
         }
-        vec![DetailSegment::styled(prefix, comment_selected_rail_style())]
+        vec![DetailSegment::styled_chrome(
+            prefix,
+            comment_selected_rail_style(),
+        )]
     } else if depth > 0 {
         let mut prefix = "    ".to_string();
         prefix.push_str(&"  ".repeat(depth.saturating_sub(1)));
         prefix.push_str("↳ ");
-        vec![DetailSegment::styled(prefix, comment_thread_style())]
+        vec![DetailSegment::styled_chrome(prefix, comment_thread_style())]
     } else {
         padding_prefix(COMMENT_LEFT_PADDING)
     }
 }
 
 pub(super) fn selected_description_prefix() -> Vec<DetailSegment> {
-    vec![DetailSegment::styled(
+    vec![DetailSegment::styled_chrome(
         "┃ ".to_string(),
         description_selected_rail_style(),
     )]
@@ -3368,13 +3431,8 @@ pub(super) fn add_comment_right_border(
     end_line: usize,
 ) {
     let border_column = comment_right_border_column(builder.width);
-    for line in builder
-        .document
-        .lines
-        .iter_mut()
-        .take(end_line)
-        .skip(start_line)
-    {
+    for line_index in start_line..end_line.min(builder.document.lines.len()) {
+        let line = &mut builder.document.lines[line_index];
         let width = display_width(&line.to_string());
         if width < border_column {
             line.spans
@@ -3382,6 +3440,11 @@ pub(super) fn add_comment_right_border(
         }
         line.spans
             .push(Span::styled("┃", comment_selected_rail_style()));
+        builder.document.copy_exclusions.push(CopyExclusionRegion {
+            line: line_index,
+            start: width.min(usize::from(u16::MAX)) as u16,
+            end: border_column.saturating_add(1).min(usize::from(u16::MAX)) as u16,
+        });
     }
 }
 
@@ -3391,13 +3454,8 @@ pub(super) fn add_description_right_border(
     end_line: usize,
 ) {
     let border_column = comment_right_border_column(builder.width);
-    for line in builder
-        .document
-        .lines
-        .iter_mut()
-        .take(end_line)
-        .skip(start_line)
-    {
+    for line_index in start_line..end_line.min(builder.document.lines.len()) {
+        let line = &mut builder.document.lines[line_index];
         let width = display_width(&line.to_string());
         if width < border_column {
             line.spans
@@ -3405,6 +3463,11 @@ pub(super) fn add_description_right_border(
         }
         line.spans
             .push(Span::styled("┃", description_selected_rail_style()));
+        builder.document.copy_exclusions.push(CopyExclusionRegion {
+            line: line_index,
+            start: width.min(usize::from(u16::MAX)) as u16,
+            end: border_column.saturating_add(1).min(usize::from(u16::MAX)) as u16,
+        });
     }
 }
 
@@ -4790,6 +4853,7 @@ pub(super) fn append_text_segments(
             style,
             link: Some(url),
             action: None,
+            copyable: true,
         });
         return;
     }
@@ -4932,6 +4996,7 @@ pub(super) fn push_char_segment(
         && last.style == template.style
         && last.link == template.link
         && last.action == template.action
+        && last.copyable == template.copyable
     {
         last.text.push(ch);
         return;
@@ -4942,6 +5007,7 @@ pub(super) fn push_char_segment(
         style: template.style,
         link: template.link.clone(),
         action: template.action.clone(),
+        copyable: template.copyable,
     });
 }
 

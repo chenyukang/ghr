@@ -4583,6 +4583,9 @@ fn selected_details_text(document: &DetailsDocument, selection: &DetailsTextSele
 
     let mut lines = Vec::new();
     for line_index in start_line..=last_line {
+        if document.copy_skip_lines.contains(&line_index) {
+            continue;
+        }
         let line = document.lines[line_index].to_string();
         let line_width = display_width(&line);
         let start = if line_index == start_line {
@@ -4595,28 +4598,65 @@ fn selected_details_text(document: &DetailsDocument, selection: &DetailsTextSele
         } else {
             line_width
         };
-        lines.push(slice_display_columns(&line, start, end));
+        if let Some(selected) =
+            selected_copyable_details_text_line(document, line_index, start, end)
+        {
+            lines.push(selected);
+        }
     }
 
     lines.join("\n").trim_end_matches('\n').to_string()
 }
 
-fn slice_display_columns(text: &str, start: usize, end: usize) -> String {
+fn selected_copyable_details_text_line(
+    document: &DetailsDocument,
+    line_index: usize,
+    start: usize,
+    end: usize,
+) -> Option<String> {
     if start >= end {
-        return String::new();
+        return Some(String::new());
     }
 
+    let text = document.lines[line_index].to_string();
     let mut output = String::new();
     let mut column = 0_usize;
+    let mut selected_visible = false;
+    let mut selected_copyable = false;
     for ch in text.chars() {
         let width = display_width_char(ch);
         let next_column = column.saturating_add(width);
         if next_column > start && column < end {
-            output.push(ch);
+            selected_visible = true;
+            if !details_copy_excluded(document, line_index, column, next_column) {
+                output.push(ch);
+                selected_copyable = true;
+            }
         }
         column = next_column;
+        if column >= end {
+            break;
+        }
     }
-    output
+
+    if selected_visible && !selected_copyable {
+        Some(String::new())
+    } else {
+        Some(output)
+    }
+}
+
+fn details_copy_excluded(
+    document: &DetailsDocument,
+    line_index: usize,
+    start: usize,
+    end: usize,
+) -> bool {
+    document.copy_exclusions.iter().any(|region| {
+        region.line == line_index
+            && end > usize::from(region.start)
+            && start < usize::from(region.end)
+    })
 }
 
 fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
@@ -5663,6 +5703,7 @@ fn active_details_input_prompt(app: &AppState) -> Option<(String, Color)> {
 }
 
 fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let text_selection_mode = !app.mouse_capture_enabled;
     let details_focused = app.focus == FocusTarget::Details;
     let raw_title = active_details_input_prompt(app)
         .map(|(prompt, _)| format!("{} {prompt}", details_title()))
@@ -5702,10 +5743,23 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let mut document = build_details_document(app, area.width.saturating_sub(2));
-    apply_details_text_selection(app, &mut document.lines);
+    let document_width = if text_selection_mode {
+        area.width
+    } else {
+        area.width.saturating_sub(2)
+    };
+    let mut document = build_details_document(app, document_width);
+    apply_details_text_selection(app, &mut document);
 
     frame.render_widget(Clear, area);
+    if text_selection_mode {
+        let details = Paragraph::new(Text::from(document.lines))
+            .style(active_theme().panel())
+            .scroll((app.details_scroll, 0));
+        frame.render_widget(details, area);
+        return;
+    }
+
     let details = Paragraph::new(Text::from(document.lines))
         .style(active_theme().panel())
         .block(
@@ -5719,7 +5773,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     frame.render_widget(details, area);
 }
 
-fn apply_details_text_selection(app: &AppState, lines: &mut [Line<'static>]) {
+fn apply_details_text_selection(app: &AppState, document: &mut DetailsDocument) {
     let Some(item_id) = app.current_item().map(|item| item.id.as_str()) else {
         return;
     };
@@ -5734,17 +5788,19 @@ fn apply_details_text_selection(app: &AppState, lines: &mut [Line<'static>]) {
     if start_line == end_line && start_col == end_col {
         return;
     }
-    if lines.is_empty() {
+    if document.lines.is_empty() {
         return;
     }
 
-    let last_line = end_line.min(lines.len().saturating_sub(1));
-    for (line_index, line) in lines
-        .iter_mut()
-        .enumerate()
-        .take(last_line.saturating_add(1))
-        .skip(start_line)
-    {
+    let last_line = end_line.min(document.lines.len().saturating_sub(1));
+    for line_index in start_line..=last_line {
+        let line_exclusions = document
+            .copy_exclusions
+            .iter()
+            .filter(|region| region.line == line_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        let line = &mut document.lines[line_index];
         let line_width = display_width(&line.to_string());
         let selection_start = if line_index == start_line {
             usize::from(start_col).min(line_width)
@@ -5761,7 +5817,8 @@ fn apply_details_text_selection(app: &AppState, lines: &mut [Line<'static>]) {
         }
 
         let spans = std::mem::take(&mut line.spans);
-        line.spans = highlight_details_text_spans(spans, selection_start, selection_end);
+        line.spans =
+            highlight_details_text_spans(spans, selection_start, selection_end, &line_exclusions);
     }
 }
 
@@ -5779,6 +5836,7 @@ fn highlight_details_text_spans(
     spans: Vec<Span<'static>>,
     selection_start: usize,
     selection_end: usize,
+    exclusions: &[CopyExclusionRegion],
 ) -> Vec<Span<'static>> {
     let mut highlighted = Vec::new();
     let mut column = 0_usize;
@@ -5788,7 +5846,9 @@ fn highlight_details_text_spans(
         for ch in span.content.as_ref().chars() {
             let width = display_width_char(ch);
             let next_column = column.saturating_add(width);
-            let selected = next_column > selection_start && column < selection_end;
+            let selected = next_column > selection_start
+                && column < selection_end
+                && !selection_highlight_excluded(exclusions, column, next_column);
             push_span_text(
                 &mut highlighted,
                 ch.to_string(),
@@ -5798,6 +5858,16 @@ fn highlight_details_text_spans(
         }
     }
     highlighted
+}
+
+fn selection_highlight_excluded(
+    exclusions: &[CopyExclusionRegion],
+    start: usize,
+    end: usize,
+) -> bool {
+    exclusions
+        .iter()
+        .any(|region| end > usize::from(region.start) && start < usize::from(region.end))
 }
 
 fn details_text_selection_style(base: Style) -> Style {
@@ -19886,6 +19956,67 @@ deleted file mode 100644
     }
 
     #[test]
+    fn text_selection_mode_omits_inline_thread_markers() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.show_diff();
+        app.focus_details();
+        app.mouse_capture_enabled = false;
+        app.diffs.insert(
+            "1".to_string(),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-old
++new
+ context
+"#,
+                )
+                .expect("parse diff"),
+            ),
+        );
+
+        let review = crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        };
+        let mut parent = comment("alice", "Please keep this inline.", None);
+        parent.id = Some(1);
+        parent.review = Some(review.clone());
+        let mut child = comment("bob", "Thread reply", None);
+        child.id = Some(2);
+        child.parent_id = Some(1);
+        child.review = Some(review);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![parent, child]));
+
+        let rendered = build_details_document(&app, 120)
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("bob")),
+            "reply should still be visible: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains('↳')),
+            "text selection mode should not render thread marker prefixes: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn diff_mode_can_hide_inline_review_comment_bodies_but_keeps_markers() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.show_diff();
@@ -24606,9 +24737,10 @@ diff --git a/src/main.rs b/src/main.rs
 
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
-        assert!(rendered.contains("Details:"));
         assert!(rendered.contains("Compiler diagnostics"));
         assert!(rendered.contains("A body with useful context"));
+        assert!(!rendered.contains("Details:"));
+        assert!(!rendered.contains('┃'));
         assert!(!rendered.contains("Funding state"));
         assert!(!rendered.contains("Updated"));
     }
@@ -27509,9 +27641,9 @@ diff --git a/src/main.rs b/src/main.rs
             "alpha beta gamma"
         );
 
-        let mut highlighted = build_details_document(&app, inner.width).lines;
+        let mut highlighted = build_details_document(&app, inner.width);
         apply_details_text_selection(&app, &mut highlighted);
-        let selected_line = &highlighted[line_index];
+        let selected_line = &highlighted.lines[line_index];
         assert!(
             selected_line
                 .spans
@@ -27543,6 +27675,185 @@ diff --git a/src/main.rs b/src/main.rs
                     .expect("selection remains visible after copy")
             ),
             "alpha beta gamma"
+        );
+    }
+
+    #[test]
+    fn selected_details_text_strips_selection_rails_from_copy() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.sections[0].items[0].body =
+            Some("trait Trait2: Sized {}\n\nimpl Trait2 for () {}".to_string());
+        app.focus_details();
+        app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let details = details_area_for(&app, area);
+        let inner = block_inner(details);
+        let document = build_details_document(&app, inner.width);
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("trait Trait2"))
+            .expect("description code line");
+        let rendered = document.lines[line_index].to_string();
+        assert!(
+            rendered.trim_start().starts_with('┃'),
+            "focused description should render a selection rail: {rendered:?}"
+        );
+        let selection = DetailsTextSelection {
+            item_id: app.current_item().expect("current item").id.clone(),
+            start: DetailsTextPosition {
+                line: line_index,
+                column: 0,
+            },
+            end: DetailsTextPosition {
+                line: line_index,
+                column: display_width(&rendered) as u16,
+            },
+        };
+
+        assert_eq!(
+            selected_details_text(&document, &selection),
+            "trait Trait2: Sized {}"
+        );
+
+        app.details_text_selection = Some(selection);
+        let mut highlighted = document.clone();
+        apply_details_text_selection(&app, &mut highlighted);
+        let highlighted_selection = highlighted.lines[line_index]
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(Color::LightCyan))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            !highlighted_selection.contains('┃'),
+            "selection highlight should skip copy-excluded rails: {highlighted_selection:?}"
+        );
+        assert!(
+            highlighted_selection.contains("trait Trait2"),
+            "selection highlight should keep real content: {highlighted_selection:?}"
+        );
+    }
+
+    #[test]
+    fn selected_details_text_uses_segment_copy_metadata() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("current item").id.clone();
+        let mut parent = comment("alice", "Parent comment", None);
+        parent.id = Some(1);
+        let mut child = comment("bob", "Thread reply with read | write", None);
+        child.id = Some(2);
+        child.parent_id = Some(1);
+        let review = crate::model::ReviewCommentPreview {
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            diff_hunk: None,
+            is_resolved: false,
+            is_outdated: false,
+        };
+        parent.review = Some(review.clone());
+        child.review = Some(review);
+        app.details
+            .insert(item_id.clone(), DetailState::Loaded(vec![parent, child]));
+        app.focus_details();
+        app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+        let document = build_details_document(&app, 120);
+        let line_index = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("Thread reply"))
+            .expect("thread reply line");
+        let rendered = document.lines[line_index].to_string();
+        assert!(
+            rendered.contains('↳'),
+            "nested comment should render a thread marker: {rendered:?}"
+        );
+        let selection = DetailsTextSelection {
+            item_id,
+            start: DetailsTextPosition {
+                line: line_index,
+                column: 0,
+            },
+            end: DetailsTextPosition {
+                line: line_index,
+                column: display_width(&rendered) as u16,
+            },
+        };
+
+        assert_eq!(
+            selected_details_text(&document, &selection),
+            "Thread reply with read | write"
+        );
+    }
+
+    #[test]
+    fn selected_details_text_preserves_blank_comment_body_lines() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("current item").id.clone();
+        let body = "rustbot has assigned @fmease.\n\
+They will have a look at your PR within the next two weeks and either review your PR or reassign to another reviewer.\n\
+\n\
+Use r? to explicitly pick a reviewer\n\
+\n\
+The reviewer was selected based on:\n\
+\n\
+- Owners of files modified in this PR: compiler\n\
+- compiler expanded to 69 candidates\n\
+- Random selection from 11 candidates";
+        app.details.insert(
+            item_id.clone(),
+            DetailState::Loaded(vec![comment("rustbot", body, None)]),
+        );
+        app.focus_details();
+        app.selected_comment_index = 0;
+
+        let document = build_details_document(&app, 180);
+        let start_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("rustbot has assigned"))
+            .expect("first body line");
+        let end_line = document
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("Random selection"))
+            .expect("last body line");
+        let end_column = display_width(&document.lines[end_line].to_string()) as u16;
+        let selection = DetailsTextSelection {
+            item_id,
+            start: DetailsTextPosition {
+                line: start_line,
+                column: 0,
+            },
+            end: DetailsTextPosition {
+                line: end_line,
+                column: end_column,
+            },
+        };
+
+        let copied = selected_details_text(&document, &selection);
+        assert!(
+            copied.contains("reviewer.\n\nUse r?"),
+            "blank line before reviewer command should be preserved: {copied:?}"
+        );
+        assert!(
+            copied.contains("reviewer\n\nThe reviewer"),
+            "blank line before reviewer explanation should be preserved: {copied:?}"
+        );
+        assert!(
+            copied.contains("based on:\n\n- Owners"),
+            "blank line before list should be preserved: {copied:?}"
+        );
+        assert!(
+            !copied.contains('┃'),
+            "selection rails should still be excluded from copied text: {copied:?}"
         );
     }
 

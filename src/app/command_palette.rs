@@ -218,7 +218,7 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "Search Current Repo",
             "S",
             "General",
-            "Search matching PRs and issues in the current repo",
+            "Search PRs and issues with structured fields",
             PaletteAction::SearchCurrentRepo,
         ),
         palette_command(
@@ -393,7 +393,7 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "Search Current List",
             "/",
             "List",
-            "Fuzzy filter the current list",
+            "Open repo search in PR/issue lists, or fuzzy filter other lists",
             palette_key(KeyCode::Char('/')),
         ),
         palette_command(

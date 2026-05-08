@@ -117,9 +117,9 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `h` / `l` in diff Details | Page down/up through the file diff; at file edges, jump to the next/previous file |
 | `g` / `G` | Jump to top/bottom in list, details, or diff; in conversation details, top clears comment focus and bottom focuses the last comment |
 | `[` / `]` in diff mode | Switch diff files |
-| `/` | Fuzzy filter the current list |
+| `/` | In PR/issue lists, open the repo search dialog; in other lists, fuzzy filter the loaded list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
-| `S` | Search matching PRs and issues in the current repo |
+| `S` | Search matching PRs and issues with title/number, status, label, author, assignee, and sort fields; use `Tab` to switch fields, `↑`/`↓` to move candidates, and `Enter` to choose or search |
 | `i` | Ignore the selected PR or issue and hide it from future lists |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |

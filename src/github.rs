@@ -1326,10 +1326,7 @@ fn search_args(subcommand: &str, fields: &str, filters: &str, limit: usize) -> V
         "--limit".to_string(),
         limit.to_string(),
     ];
-    let query_tokens = filters
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let query_tokens = search_filter_tokens(filters);
     if !query_tokens.is_empty() {
         args.push("--".to_string());
         args.extend(query_tokens);
@@ -1441,16 +1438,15 @@ fn search_query(kind: SectionKind, filters: &str) -> String {
         SectionKind::Notifications => unreachable!("notifications are not fetched via search"),
     }];
     query_tokens.extend(
-        filters
-            .split_whitespace()
-            .filter(|token| !token.starts_with("sort:"))
-            .map(str::to_string),
+        search_filter_tokens(filters)
+            .into_iter()
+            .filter(|token| !token.starts_with("sort:")),
     );
     query_tokens.join(" ")
 }
 
 fn search_sort(filters: &str) -> Option<(String, String)> {
-    filters.split_whitespace().find_map(|token| {
+    search_filter_tokens(filters).into_iter().find_map(|token| {
         let value = token.strip_prefix("sort:")?;
         match value.rsplit_once('-') {
             Some((field, order)) if matches!(order, "asc" | "desc") && !field.is_empty() => {
@@ -1463,10 +1459,7 @@ fn search_sort(filters: &str) -> Option<(String, String)> {
 }
 
 fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
-    let mut tokens = query
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let mut tokens = search_filter_tokens(query);
     if should_default_global_search_to_title(&tokens) {
         tokens.push("in:title".to_string());
     }
@@ -1482,6 +1475,41 @@ fn global_search_filters(query: &str, repo_scope: Option<&str>) -> String {
         tokens.push("sort:created-desc".to_string());
     }
     tokens.join(" ")
+}
+
+fn search_filter_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape = false;
+    for ch in input.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            current.push(ch);
+            escape = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn parse_number_lookup_query(query: &str) -> Option<u64> {
@@ -5317,6 +5345,22 @@ mod tests {
         assert_eq!(
             global_search_filters("rpc repo:rust-lang/rust", Some("nervosnetwork/fiber")),
             "rpc repo:rust-lang/rust in:title archived:false sort:created-desc"
+        );
+    }
+
+    #[test]
+    fn global_search_filters_keep_quoted_label_tokens_together() {
+        assert_eq!(
+            global_search_filters("borrow label:\"good first issue\"", Some("rust-lang/rust")),
+            "borrow label:\"good first issue\" in:title repo:rust-lang/rust archived:false sort:created-desc"
+        );
+        assert_eq!(
+            search_filter_tokens("borrow label:\"good first issue\" sort:updated-asc"),
+            vec![
+                "borrow".to_string(),
+                "label:\"good first issue\"".to_string(),
+                "sort:updated-asc".to_string()
+            ]
         );
     }
 

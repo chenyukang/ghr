@@ -92,11 +92,24 @@ fn detect_macos_system_theme() -> Option<ThemeName> {
         .args(["read", "-g", "AppleInterfaceStyle"])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return Some(ThemeName::Light);
+    macos_system_theme_from_defaults_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_theme_from_defaults_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<ThemeName> {
+    if !success {
+        let error = String::from_utf8_lossy(stderr);
+        if error.contains("does not exist") {
+            return Some(ThemeName::Light);
+        }
+        return None;
     }
-    let style = String::from_utf8_lossy(&output.stdout);
-    if style.trim().eq_ignore_ascii_case("dark") {
+    let style = String::from_utf8_lossy(stdout).to_ascii_lowercase();
+    if style.trim().contains("dark") {
         Some(ThemeName::Dark)
     } else {
         Some(ThemeName::Light)
@@ -299,6 +312,34 @@ mod tests {
         assert_eq!(
             ThemePreference::Auto.effective_with(|| None),
             ThemeName::Dark
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_theme_detection_failure_uses_auto_fallback() {
+        assert_eq!(
+            macos_system_theme_from_defaults_output(false, b"", b"permission denied"),
+            None
+        );
+        assert_eq!(
+            ThemePreference::Auto.effective_with(|| {
+                macos_system_theme_from_defaults_output(false, b"", b"permission denied")
+            }),
+            ThemeName::Dark
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_missing_interface_style_means_light_theme() {
+        assert_eq!(
+            macos_system_theme_from_defaults_output(
+                false,
+                b"",
+                b"The domain/default pair of (kCFPreferencesAnyApplication, AppleInterfaceStyle) does not exist",
+            ),
+            Some(ThemeName::Light)
         );
     }
 

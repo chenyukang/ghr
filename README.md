@@ -95,6 +95,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Project Add` | Add a repo project to the menu and save it to `config.toml` |
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
+| `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
 | `Toggle Theme` | Switch between dark and light themes and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
@@ -119,7 +120,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `[` / `]` in diff mode | Switch diff files |
 | `/` | In PR/issue lists, open the repo search dialog; in other lists, fuzzy filter the loaded list |
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
-| `S` | Search matching PRs and issues with title/number, status, label, author, assignee, and sort fields; use `Tab` to switch fields, `↑`/`↓` to move candidates, and `Enter` to choose or search |
+| `S` | Search matching PRs and issues with remembered per-repo fields for title/number, type, status, label, author, assignee, and sort; use `Tab` to switch fields, `↑`/`↓` to move candidates, `Enter` to choose or search, `Ctrl+S` to save reusable conditions, and `Ctrl+U` to clear conditions |
 | `i` | Ignore the selected PR or issue and hide it from future lists |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
@@ -272,12 +273,22 @@ filters = "is:open author:@me archived:false sort:updated-desc"
 title = "Reviewed"
 filters = "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
 
+[[saved_search_filters]]
+name = "my rust prs"
+repo = "rust-lang/rust"
+kind = "pull_requests"
+status = "open"
+author = "chenyukang"
+sort = "created_at"
+
 exclude_repos = ["some-org/archive-*"]
 ```
 
 Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:updated-desc"` or `label:"good first issue"` for labels with spaces.
 
 Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_issues` and `show_prs` control whether the sections are shown as `Issues` and `Pull Requests`. Repo tabs default to open issues and open PRs, with `Issues` shown first. Set `labels` to filter both repo issue and PR lists, or use `issue_labels` / `pr_labels` for kind-specific filters.
+
+Use `[[saved_search_filters]]` for named PR/issue searches that should be editable in `config.toml`. From the search dialog, `Ctrl+S` prompts for a name and saves the current repo, PR/issue kind, and filter fields back to the active config file.
 
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 

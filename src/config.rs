@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::model::SectionKind;
+use crate::state::{GlobalSearchSavedState, GlobalSearchState};
 use crate::theme::ThemeName;
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
@@ -20,6 +21,8 @@ pub struct Config {
     pub pr_sections: Vec<SearchSection>,
     pub issue_sections: Vec<SearchSection>,
     pub notification_sections: Vec<SearchSection>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub saved_search_filters: Vec<SavedSearchFilterConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +66,62 @@ pub struct RepoConfig {
     pub pr_labels: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issue_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SavedSearchFilterConfig {
+    pub name: String,
+    pub repo: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub author: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub assignee: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sort: String,
+}
+
+impl SavedSearchFilterConfig {
+    pub fn from_saved_state(saved: GlobalSearchSavedState) -> Option<Self> {
+        let saved = saved.normalized()?;
+        Some(Self {
+            name: saved.name,
+            repo: saved.repo,
+            kind: saved.kind,
+            title: saved.search.title,
+            status: saved.search.status,
+            label: saved.search.label,
+            author: saved.search.author,
+            assignee: saved.search.assignee,
+            sort: saved.search.sort,
+        })
+    }
+
+    pub fn into_saved_state(self) -> Option<GlobalSearchSavedState> {
+        let search = GlobalSearchState {
+            title: self.title,
+            status: self.status,
+            label: self.label,
+            author: self.author,
+            assignee: self.assignee,
+            sort: self.sort,
+            field: String::new(),
+        };
+        GlobalSearchSavedState {
+            name: self.name,
+            repo: self.repo,
+            kind: self.kind,
+            search,
+        }
+        .normalized()
+    }
 }
 
 impl SearchSection {
@@ -316,6 +375,7 @@ impl Default for Config {
                 },
             ],
             notification_sections: default_notification_sections(),
+            saved_search_filters: Vec::new(),
         }
     }
 }
@@ -465,6 +525,33 @@ mod tests {
         assert!(!decoded.pr_sections.is_empty());
         assert!(!decoded.issue_sections.is_empty());
         assert!(!decoded.notification_sections.is_empty());
+    }
+
+    #[test]
+    fn saved_search_filters_round_trip_through_config_toml() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [[saved_search_filters]]
+            name = "my rust prs"
+            repo = "rust-lang/rust"
+            kind = "pull_requests"
+            status = "open"
+            author = "chenyukang"
+            sort = "created_at"
+            "#,
+        )
+        .expect("saved search filters should parse from config");
+
+        assert_eq!(config.saved_search_filters.len(), 1);
+        assert_eq!(config.saved_search_filters[0].name, "my rust prs");
+        assert_eq!(config.saved_search_filters[0].repo, "rust-lang/rust");
+        assert_eq!(config.saved_search_filters[0].author, "chenyukang");
+
+        let encoded = toml::to_string_pretty(&config).expect("encode config");
+        assert!(encoded.contains("[[saved_search_filters]]"));
+        assert!(!encoded.contains("[saved_search_filters.search]"));
+        assert!(encoded.contains(r#"author = "chenyukang""#));
+        assert!(!encoded.contains("field ="));
     }
 
     #[test]

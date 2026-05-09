@@ -865,11 +865,19 @@ pub async fn search_global(
     repo_scope: Option<&str>,
     config: &Config,
 ) -> Vec<SectionSnapshot> {
+    let initial_kind_filter = search_kind_filter(query);
+    let number_query = search_filter_tokens(query)
+        .into_iter()
+        .filter(|token| !is_search_kind_filter_token(token))
+        .collect::<Vec<_>>()
+        .join(" ");
     if let (Some(repo), Some(number)) = (
         repo_scope.map(str::trim).filter(|repo| !repo.is_empty()),
-        parse_number_lookup_query(query),
+        parse_number_lookup_query(&number_query),
     ) {
-        return search_global_number(query, repo, number, config).await;
+        let mut sections = search_global_number(&number_query, repo, number, config).await;
+        sections.retain(|section| initial_kind_filter.matches(section.kind));
+        return sections;
     }
 
     let viewer_login = match cached_viewer_login().await {
@@ -880,49 +888,61 @@ pub async fn search_global(
         }
     };
     let filters = global_search_filters(query, repo_scope);
-    let pr_section = resolve_me_section(
-        SearchSection {
-            title: "Pull Requests".to_string(),
-            filters: filters.clone(),
-            queries: Vec::new(),
-            limit: None,
-        },
-        viewer_login.as_deref(),
-    );
-    let issue_section = resolve_me_section(
-        SearchSection {
-            title: "Issues".to_string(),
-            filters,
-            queries: Vec::new(),
-            limit: None,
-        },
-        viewer_login.as_deref(),
-    );
+    let kind_filter = search_kind_filter(&filters);
     let view = global_search_view_key();
     let excludes = config.exclude_repos.clone();
     let pr_per_page = config.defaults.pr_per_page;
     let issue_per_page = config.defaults.issue_per_page;
-    let pull_requests = refresh_search_section(
-        view.clone(),
-        SectionKind::PullRequests,
-        pr_section,
-        pr_per_page,
-        1,
-        excludes.as_slice(),
-    )
-    .await;
-    pace_search_refresh().await;
-    let issues = refresh_search_section(
-        view,
-        SectionKind::Issues,
-        issue_section,
-        issue_per_page,
-        1,
-        excludes.as_slice(),
-    )
-    .await;
+    let mut sections = Vec::new();
+    if kind_filter.matches(SectionKind::PullRequests) {
+        let pr_section = resolve_me_section(
+            SearchSection {
+                title: "Pull Requests".to_string(),
+                filters: filters.clone(),
+                queries: Vec::new(),
+                limit: None,
+            },
+            viewer_login.as_deref(),
+        );
+        sections.push(
+            refresh_search_section(
+                view.clone(),
+                SectionKind::PullRequests,
+                pr_section,
+                pr_per_page,
+                1,
+                excludes.as_slice(),
+            )
+            .await,
+        );
+    }
+    if kind_filter == SearchKindFilter::All {
+        pace_search_refresh().await;
+    }
+    if kind_filter.matches(SectionKind::Issues) {
+        let issue_section = resolve_me_section(
+            SearchSection {
+                title: "Issues".to_string(),
+                filters,
+                queries: Vec::new(),
+                limit: None,
+            },
+            viewer_login.as_deref(),
+        );
+        sections.push(
+            refresh_search_section(
+                view,
+                SectionKind::Issues,
+                issue_section,
+                issue_per_page,
+                1,
+                excludes.as_slice(),
+            )
+            .await,
+        );
+    }
 
-    vec![pull_requests, issues]
+    sections
 }
 
 async fn search_global_number(
@@ -1367,11 +1387,7 @@ async fn fetch_number_lookup_item(
     };
     let raw = serde_json::from_str::<SearchApiIssueRaw>(&output)
         .with_context(|| format!("failed to parse {repo}#{number} number lookup"))?;
-    let kind = if raw.pull_request.is_some() {
-        SectionKind::PullRequests
-    } else {
-        SectionKind::Issues
-    };
+    let kind = search_api_item_kind(&raw);
     let item = search_api_item_to_work_item(kind, raw);
     if is_excluded_repo(&item.repo, exclude_repos) {
         return Ok(None);
@@ -1396,6 +1412,7 @@ async fn fetch_search_page(
     let items = raw
         .items
         .into_iter()
+        .filter(|item| search_api_item_kind(item) == kind)
         .map(|item| search_api_item_to_work_item(kind, item))
         .filter(|item| !is_excluded_repo(&item.repo, exclude_repos))
         .collect::<Vec<_>>();
@@ -1431,6 +1448,24 @@ fn search_page_args(kind: SectionKind, filters: &str, page: usize, per_page: usi
     args
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchKindFilter {
+    All,
+    PullRequests,
+    Issues,
+}
+
+impl SearchKindFilter {
+    fn matches(self, kind: SectionKind) -> bool {
+        match (self, kind) {
+            (Self::All, SectionKind::PullRequests | SectionKind::Issues) => true,
+            (Self::PullRequests, SectionKind::PullRequests) => true,
+            (Self::Issues, SectionKind::Issues) => true,
+            _ => false,
+        }
+    }
+}
+
 fn search_query(kind: SectionKind, filters: &str) -> String {
     let mut query_tokens = vec![match kind {
         SectionKind::PullRequests => "is:pr".to_string(),
@@ -1440,9 +1475,35 @@ fn search_query(kind: SectionKind, filters: &str) -> String {
     query_tokens.extend(
         search_filter_tokens(filters)
             .into_iter()
-            .filter(|token| !token.starts_with("sort:")),
+            .filter(|token| !token.starts_with("sort:") && !is_search_kind_filter_token(token)),
     );
     query_tokens.join(" ")
+}
+
+fn search_kind_filter(filters: &str) -> SearchKindFilter {
+    search_filter_tokens(filters)
+        .into_iter()
+        .filter_map(|token| search_kind_filter_token(&token))
+        .last()
+        .unwrap_or(SearchKindFilter::All)
+}
+
+fn is_search_kind_filter_token(token: &str) -> bool {
+    search_kind_filter_token(token).is_some()
+}
+
+fn search_kind_filter_token(token: &str) -> Option<SearchKindFilter> {
+    let token = token.trim().to_ascii_lowercase();
+    let value = token
+        .strip_prefix("type:")
+        .or_else(|| token.strip_prefix("is:"))?;
+    match value {
+        "pr" | "prs" | "pull_request" | "pull_requests" | "pull-request" | "pull-requests" => {
+            Some(SearchKindFilter::PullRequests)
+        }
+        "issue" | "issues" => Some(SearchKindFilter::Issues),
+        _ => None,
+    }
 }
 
 fn search_sort(filters: &str) -> Option<(String, String)> {
@@ -4362,6 +4423,14 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
     }
 }
 
+fn search_api_item_kind(item: &SearchApiIssueRaw) -> SectionKind {
+    if item.pull_request.is_some() {
+        SectionKind::PullRequests
+    } else {
+        SectionKind::Issues
+    }
+}
+
 fn state_with_pull_request_merge(
     state: Option<String>,
     pull_request: Option<&IssuePullRequestRaw>,
@@ -4992,6 +5061,40 @@ mod tests {
     }
 
     #[test]
+    fn search_page_args_strip_explicit_kind_filter_from_section_query() {
+        let args = search_page_args(
+            SectionKind::PullRequests,
+            "repo:rust-lang/rust type:pr is:open archived:false sort:created-desc",
+            1,
+            50,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "--method",
+                "GET",
+                "search/issues",
+                "-f",
+                "q=is:pr repo:rust-lang/rust is:open archived:false",
+                "-f",
+                "per_page=50",
+                "-f",
+                "page=1",
+                "-f",
+                "sort=created",
+                "-f",
+                "order=desc"
+            ]
+        );
+        assert_eq!(
+            search_kind_filter("repo:rust-lang/rust type:issue"),
+            SearchKindFilter::Issues
+        );
+    }
+
+    #[test]
     fn search_api_item_maps_repository_url() {
         let item = SearchApiIssueRaw {
             assignees: Some(vec![SearchAuthorRaw {
@@ -5057,6 +5160,37 @@ mod tests {
         .expect("issue API PR response should parse");
 
         assert!(raw.pull_request.is_some());
+    }
+
+    #[test]
+    fn search_api_item_kind_uses_pull_request_marker() {
+        let issue = serde_json::from_str::<SearchApiIssueRaw>(
+            r#"{
+                "html_url": "https://github.com/nervosnetwork/fiber/issues/911",
+                "number": 911,
+                "repository_url": "https://api.github.com/repos/nervosnetwork/fiber",
+                "title": "Atomic MPP design"
+            }"#,
+        )
+        .expect("issue response should parse");
+        let pull_request = serde_json::from_str::<SearchApiIssueRaw>(
+            r#"{
+                "html_url": "https://github.com/nervosnetwork/fiber/pull/914",
+                "number": 914,
+                "pull_request": {
+                    "url": "https://api.github.com/repos/nervosnetwork/fiber/pulls/914"
+                },
+                "repository_url": "https://api.github.com/repos/nervosnetwork/fiber",
+                "title": "chore(deps): bump serde from 1.0.219 to 1.0.228"
+            }"#,
+        )
+        .expect("pull request issue response should parse");
+
+        assert_eq!(search_api_item_kind(&issue), SectionKind::Issues);
+        assert_eq!(
+            search_api_item_kind(&pull_request),
+            SectionKind::PullRequests
+        );
     }
 
     #[test]

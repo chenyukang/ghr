@@ -33,7 +33,10 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 use tui_textarea::{CursorMove, TextArea, WrapMode};
 
-use crate::config::{Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, github_repo_from_remote_url};
+use crate::config::{
+    Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, SavedSearchFilterConfig,
+    github_repo_from_remote_url,
+};
 use crate::dirs::Paths;
 use crate::github::{
     AssigneeAction, CommentFetchResult, ItemDetailsMetadata, ItemMetadataUpdate, MergeMethod,
@@ -68,6 +71,7 @@ use crate::model::{
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
+    GlobalSearchSavedState, GlobalSearchState, MAX_GLOBAL_SAVED_SEARCHES_PER_REPO,
     MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
     ViewSnapshot as SavedViewSnapshot,
 };
@@ -1081,6 +1085,12 @@ struct ProjectSwitcher {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TopMenuSwitcher {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RecentItemsDialog {
     query: String,
     selected: usize,
@@ -1114,6 +1124,28 @@ impl GlobalSearchField {
             Self::Author => "Author",
             Self::Assignee => "Assignee",
             Self::Sort => "Sort",
+        }
+    }
+
+    fn as_state_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Status => "status",
+            Self::Label => "label",
+            Self::Author => "author",
+            Self::Assignee => "assignee",
+            Self::Sort => "sort",
+        }
+    }
+
+    fn from_state_str(value: &str) -> Self {
+        match value {
+            "status" => Self::Status,
+            "label" => Self::Label,
+            "author" => Self::Author,
+            "assignee" => Self::Assignee,
+            "sort" => Self::Sort,
+            _ => Self::Title,
         }
     }
 
@@ -1201,6 +1233,28 @@ impl GlobalSearchDialog {
             GlobalSearchField::Sort => &self.sort,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveSearchDialog {
+    name: EditorText,
+    repo: String,
+    kind: SectionKind,
+    search: GlobalSearchState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SavedSearchDialog {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedSearchCandidate {
+    name: String,
+    repo: String,
+    kind: SectionKind,
+    search: GlobalSearchState,
 }
 
 fn global_search_dialog_query(dialog: &GlobalSearchDialog) -> std::result::Result<String, String> {
@@ -1497,7 +1551,7 @@ fn global_search_dialog_sort_suggestion_prefix(dialog: &GlobalSearchDialog) -> S
 
 fn global_search_dialog_current_suggestion_prefix(dialog: &GlobalSearchDialog) -> String {
     match dialog.field {
-        GlobalSearchField::Title => String::new(),
+        GlobalSearchField::Title => dialog.title.text().trim().to_string(),
         GlobalSearchField::Status => global_search_dialog_status_suggestion_prefix(dialog),
         GlobalSearchField::Label => global_search_dialog_label_suggestion_prefix(dialog),
         GlobalSearchField::Author => global_search_dialog_author_suggestion_prefix(dialog),
@@ -1552,6 +1606,292 @@ fn prefix_filter_candidates(candidates: &[String], prefix: String) -> Vec<String
         })
         .cloned()
         .collect()
+}
+
+fn global_search_state_display(state: &GlobalSearchState) -> String {
+    let mut parts = Vec::new();
+    if !state.title.is_empty() {
+        parts.push(format!("title:{}", state.title));
+    }
+    if !state.status.is_empty() {
+        parts.push(format!("status:{}", state.status));
+    }
+    if !state.label.is_empty() {
+        parts.push(format!("label:{}", state.label));
+    }
+    if !state.author.is_empty() {
+        parts.push(format!("author:{}", state.author));
+    }
+    if !state.assignee.is_empty() {
+        parts.push(format!("assignee:{}", state.assignee));
+    }
+    if state.sort != "created_at" {
+        parts.push(format!("sort:{}", state.sort));
+    }
+    if parts.is_empty() {
+        "default search".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn saved_search_active_filter_label(candidate: &SavedSearchCandidate) -> String {
+    let details = global_search_state_display(&candidate.search);
+    if details == "default search" {
+        format!("saved: {}", candidate.name)
+    } else {
+        format!("saved: {} ({details})", candidate.name)
+    }
+}
+
+fn saved_search_kind_value(kind: SectionKind) -> Option<&'static str> {
+    match kind {
+        SectionKind::PullRequests => Some("pull_requests"),
+        SectionKind::Issues => Some("issues"),
+        SectionKind::Notifications => None,
+    }
+}
+
+fn section_kind_from_saved_search_kind(value: &str) -> Option<SectionKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pr" | "prs" | "pull_request" | "pull_requests" => Some(SectionKind::PullRequests),
+        "issue" | "issues" => Some(SectionKind::Issues),
+        _ => None,
+    }
+}
+
+fn saved_search_kind_label(kind: SectionKind) -> &'static str {
+    match kind {
+        SectionKind::PullRequests => "PR",
+        SectionKind::Issues => "Issue",
+        SectionKind::Notifications => "Notification",
+    }
+}
+
+fn global_search_kind_token(kind: SectionKind) -> Option<&'static str> {
+    match kind {
+        SectionKind::PullRequests => Some("type:pr"),
+        SectionKind::Issues => Some("type:issue"),
+        SectionKind::Notifications => None,
+    }
+}
+
+fn scoped_global_search_query(query: &str, kind: Option<SectionKind>) -> String {
+    let query = query.trim();
+    match kind.and_then(global_search_kind_token) {
+        Some(token) if !query.split_whitespace().any(is_search_type_token) => {
+            format!("{query} {token}")
+        }
+        _ => query.to_string(),
+    }
+}
+
+fn is_search_type_token(token: &str) -> bool {
+    let token = token.trim().to_ascii_lowercase();
+    matches!(
+        token.as_str(),
+        "type:pr"
+            | "type:prs"
+            | "is:pr"
+            | "type:pull-request"
+            | "type:pull_request"
+            | "type:issue"
+            | "type:issues"
+            | "is:issue"
+    )
+}
+
+fn saved_search_default_name(repo: &str, kind: SectionKind, state: &GlobalSearchState) -> String {
+    let mut name = format!("{repo} {}", saved_search_kind_label(kind));
+    let display = global_search_state_display(state);
+    if display != "default search" {
+        name.push(' ');
+        name.push_str(&display.replace(" | ", " "));
+    }
+    truncate_inline(&name, 64)
+}
+
+fn upsert_named_saved_search(
+    saved_by_repo: &mut HashMap<String, Vec<GlobalSearchSavedState>>,
+    name: String,
+    repo: String,
+    kind: SectionKind,
+    search: GlobalSearchState,
+) {
+    let key = name.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    for searches in saved_by_repo.values_mut() {
+        searches.retain(|saved| saved.name.trim().to_ascii_lowercase() != key);
+    }
+    let repo_key = global_search_repo_state_key(Some(&repo));
+    let Some(kind) = saved_search_kind_value(kind) else {
+        return;
+    };
+    let searches = saved_by_repo.entry(repo_key).or_default();
+    searches.insert(
+        0,
+        GlobalSearchSavedState {
+            name,
+            repo,
+            kind: kind.to_string(),
+            search,
+        },
+    );
+    searches.truncate(MAX_GLOBAL_SAVED_SEARCHES_PER_REPO);
+}
+
+fn saved_search_map_from_config(config: &Config) -> HashMap<String, Vec<GlobalSearchSavedState>> {
+    let mut saved_by_repo: HashMap<String, Vec<GlobalSearchSavedState>> = HashMap::new();
+    for saved in &config.saved_search_filters {
+        let Some(saved) = saved.clone().into_saved_state() else {
+            continue;
+        };
+        let repo_key = global_search_repo_state_key(Some(&saved.repo));
+        saved_by_repo.entry(repo_key).or_default().push(saved);
+    }
+    normalize_saved_search_map(saved_by_repo)
+}
+
+fn saved_search_filters_from_map(
+    saved_by_repo: &HashMap<String, Vec<GlobalSearchSavedState>>,
+) -> Vec<SavedSearchFilterConfig> {
+    let mut saved = normalize_saved_search_map(saved_by_repo.clone())
+        .into_values()
+        .flatten()
+        .filter_map(SavedSearchFilterConfig::from_saved_state)
+        .collect::<Vec<_>>();
+    saved.sort_by(|left, right| {
+        left.repo
+            .cmp(&right.repo)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+    saved
+}
+
+fn normalize_saved_search_map(
+    saved_by_repo: HashMap<String, Vec<GlobalSearchSavedState>>,
+) -> HashMap<String, Vec<GlobalSearchSavedState>> {
+    saved_by_repo
+        .into_iter()
+        .filter_map(|(repo_key, searches)| {
+            let repo_key = global_search_repo_state_key(Some(&repo_key));
+            let mut normalized = searches
+                .into_iter()
+                .filter_map(|mut saved| {
+                    if saved.repo.trim().is_empty() {
+                        saved.repo = repo_key.clone();
+                    }
+                    saved.normalized()
+                })
+                .collect::<Vec<_>>();
+            normalized.sort_by(|left, right| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            });
+
+            let mut seen = HashSet::new();
+            normalized.retain(|saved| seen.insert(saved.name.to_ascii_lowercase()));
+            normalized.truncate(MAX_GLOBAL_SAVED_SEARCHES_PER_REPO);
+            (!normalized.is_empty()).then_some((repo_key, normalized))
+        })
+        .collect()
+}
+
+fn saved_search_filter_query(
+    base_filters: &str,
+    search: &GlobalSearchState,
+) -> std::result::Result<String, String> {
+    if base_filters.contains(" | ") {
+        return base_filters
+            .split(" | ")
+            .map(|filters| saved_search_filter_query(filters, search))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|queries| queries.join(" | "));
+    }
+
+    let overlay_tokens = saved_search_filter_tokens(search)?;
+    let base_tokens = base_filters
+        .split_whitespace()
+        .filter(|token| !saved_search_replaces_token(token, search))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(insert_search_tokens_before_sort(base_tokens, overlay_tokens).join(" "))
+}
+
+fn saved_search_filter_tokens(
+    search: &GlobalSearchState,
+) -> std::result::Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let title = search.title.trim();
+    if !title.is_empty() {
+        tokens.push(title.trim_start_matches('#').to_string());
+        if !is_plain_number_lookup_title(title) {
+            tokens.push("in:title".to_string());
+        }
+    }
+    if let Some(token) = global_search_status_token(&search.status)? {
+        tokens.push(token);
+    }
+    for label in parse_global_search_labels(&search.label) {
+        tokens.push(format!(
+            "label:{}",
+            quote_global_search_value_if_needed(&label)
+        ));
+    }
+    if let Some(author) = global_search_login_value(&search.author) {
+        tokens.push(format!("author:{author}"));
+    }
+    if let Some(assignee) = global_search_login_value(&search.assignee) {
+        tokens.push(format!("assignee:{assignee}"));
+    }
+    if let Some(token) = global_search_sort_token(&search.sort)? {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn saved_search_replaces_token(token: &str, search: &GlobalSearchState) -> bool {
+    (!search.status.trim().is_empty() && is_saved_search_state_token(token))
+        || (!search.label.trim().is_empty()
+            && (token.starts_with("label:") || token.starts_with("labels:")))
+        || (!search.author.trim().is_empty() && token.starts_with("author:"))
+        || (!search.assignee.trim().is_empty() && token.starts_with("assignee:"))
+        || (!search.title.trim().is_empty() && token == "in:title")
+        || (global_search_sort_token(&search.sort)
+            .ok()
+            .flatten()
+            .is_some()
+            && token.starts_with("sort:"))
+}
+
+fn is_saved_search_state_token(token: &str) -> bool {
+    matches!(
+        token,
+        "is:open" | "is:closed" | "is:merged" | "is:draft" | "draft:true" | "draft:false"
+    ) || token.starts_with("state:")
+}
+
+fn insert_search_tokens_before_sort(
+    mut base_tokens: Vec<String>,
+    overlay_tokens: Vec<String>,
+) -> Vec<String> {
+    if overlay_tokens.is_empty() {
+        return base_tokens;
+    }
+    let sort_index = base_tokens
+        .iter()
+        .position(|token| token.starts_with("sort:"))
+        .unwrap_or(base_tokens.len());
+    base_tokens.splice(sort_index..sort_index, overlay_tokens);
+    base_tokens
 }
 
 fn normalized_global_search_status_prefix(value: &str) -> String {
@@ -1614,6 +1954,48 @@ fn apply_global_search_dialog_suggestion(dialog: &mut GlobalSearchDialog, sugges
         GlobalSearchField::Assignee => dialog.assignee.set_text(suggestion),
         GlobalSearchField::Sort => dialog.sort.set_text(suggestion),
     }
+}
+
+fn apply_global_search_state(dialog: &mut GlobalSearchDialog, state: &GlobalSearchState) {
+    dialog.title.set_text(&state.title);
+    dialog.status.set_text(&state.status);
+    dialog.label.set_text(&state.label);
+    dialog.author.set_text(&state.author);
+    dialog.assignee.set_text(&state.assignee);
+    dialog.sort.set_text(&state.sort);
+    dialog.field = GlobalSearchField::from_state_str(&state.field);
+    reset_global_search_dialog_suggestions(dialog);
+}
+
+fn clear_global_search_dialog_conditions(dialog: &mut GlobalSearchDialog) {
+    dialog.title.set_text("");
+    dialog.status.set_text("");
+    dialog.label.set_text("");
+    dialog.author.set_text("");
+    dialog.assignee.set_text("");
+    dialog.sort.set_text("created_at");
+    dialog.field = GlobalSearchField::Title;
+    reset_global_search_dialog_suggestions(dialog);
+}
+
+fn global_search_dialog_state(dialog: &GlobalSearchDialog) -> Option<GlobalSearchState> {
+    GlobalSearchState {
+        title: dialog.title.text().to_string(),
+        status: dialog.status.text().to_string(),
+        label: dialog.label.text().to_string(),
+        author: dialog.author.text().to_string(),
+        assignee: dialog.assignee.text().to_string(),
+        sort: dialog.sort.text().to_string(),
+        field: dialog.field.as_state_str().to_string(),
+    }
+    .normalized()
+}
+
+fn global_search_repo_state_key(repo: Option<&str>) -> String {
+    repo.map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(|repo| repo.to_ascii_lowercase())
+        .unwrap_or_else(|| "__global__".to_string())
 }
 
 fn replace_last_comma_component(value: &str, replacement: &str) -> String {
@@ -1998,6 +2380,7 @@ struct AppState {
     section_index: HashMap<String, usize>,
     base_section_filters: HashMap<String, String>,
     quick_filters: HashMap<String, QuickFilter>,
+    section_filter_overrides: HashMap<String, SectionFilterOverride>,
     selected_index: HashMap<String, usize>,
     list_scroll_offset: HashMap<String, usize>,
     view_snapshots: HashMap<String, ViewSnapshotState>,
@@ -2014,14 +2397,20 @@ struct AppState {
     global_search_active: bool,
     global_search_query: String,
     global_search_dialog: Option<GlobalSearchDialog>,
+    save_search_dialog: Option<SaveSearchDialog>,
+    saved_search_dialog: Option<SavedSearchDialog>,
+    global_search_by_repo: HashMap<String, GlobalSearchState>,
+    global_search_saved_by_repo: HashMap<String, Vec<GlobalSearchSavedState>>,
     global_search_running: bool,
     global_search_return_view: Option<String>,
     global_search_scope: Option<String>,
+    global_search_preferred_kind: Option<SectionKind>,
     global_search_started_at: Option<Instant>,
     filter_input_active: bool,
     filter_input_query: String,
     command_palette: Option<CommandPalette>,
     project_switcher: Option<ProjectSwitcher>,
+    top_menu_switcher: Option<TopMenuSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
     recent_commands: Vec<RecentCommand>,
@@ -2261,6 +2650,23 @@ struct SectionPageRequest {
     total_is_capped: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SectionFilterOverride {
+    display: String,
+    filters: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedSearchSectionTarget {
+    section_key: String,
+    section_position: usize,
+    view: String,
+    kind: SectionKind,
+    title: String,
+    filters: String,
+    page_size: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshPriority {
     User,
@@ -2274,7 +2680,20 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
     let repo_candidate_cache = store.load_repo_candidate_cache()?;
     let editor_drafts = store.load_editor_drafts()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
+    let migrated_saved_search_filters =
+        saved_search_filters_from_map(&ui_state.global_search_saved_by_repo);
+    if config.saved_search_filters.is_empty() && !migrated_saved_search_filters.is_empty() {
+        config.saved_search_filters = migrated_saved_search_filters;
+        if let Err(error) = config.save(&paths.config_path) {
+            warn!(
+                error = %error,
+                path = %paths.config_path.display(),
+                "failed to migrate saved search filters to config"
+            );
+        }
+    }
     let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    app.load_saved_search_filters(&config);
     app.load_repo_candidate_cache(repo_candidate_cache);
     app.load_editor_drafts(editor_drafts);
     app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
@@ -2609,7 +3028,10 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.startup_dialog.is_some()
         || app.command_palette.is_some()
         || app.project_switcher.is_some()
+        || app.top_menu_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.saved_search_dialog.is_some()
+        || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.cache_clear_dialog.is_some()
@@ -2844,10 +3266,12 @@ fn start_filtered_section_load(
 
     match filter {
         Some(filter) => {
+            app.section_filter_overrides.remove(&section_key);
             app.quick_filters.insert(section_key.clone(), filter);
         }
         None => {
             app.quick_filters.remove(&section_key);
+            app.section_filter_overrides.remove(&section_key);
         }
     }
 
@@ -2879,13 +3303,17 @@ fn start_filtered_section_load(
 
 fn start_global_search(
     query: String,
+    display_query: String,
     repo_scope: Option<String>,
     config: Config,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let sections = search_global(&query, repo_scope.as_deref(), &config).await;
-        let _ = tx.send(AppMsg::GlobalSearchFinished { query, sections });
+        let _ = tx.send(AppMsg::GlobalSearchFinished {
+            query: display_query,
+            sections,
+        });
     });
 }
 
@@ -3861,8 +4289,23 @@ fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.top_menu_switcher.is_some() {
+        app.handle_top_menu_switcher_key(key);
+        return false;
+    }
+
     if app.recent_items_dialog.is_some() {
         app.handle_recent_items_key(key);
+        return false;
+    }
+
+    if app.saved_search_dialog.is_some() {
+        app.handle_saved_search_key(key, config, tx);
+        return false;
+    }
+
+    if app.save_search_dialog.is_some() {
+        app.handle_save_search_key(key, config, paths);
         return false;
     }
 
@@ -4070,6 +4513,13 @@ fn handle_key_in_area_mut(
             KeyCode::Esc if app.is_global_search_results_view() => {
                 app.leave_global_search_results()
             }
+            KeyCode::Esc
+                if app
+                    .current_section()
+                    .is_some_and(|section| app.has_active_section_filter(&section.key)) =>
+            {
+                start_filtered_section_load(app, config, tx, None)
+            }
             KeyCode::Esc => {}
             KeyCode::Char('/') => {
                 if app.current_section().is_some_and(|section| {
@@ -4268,10 +4718,10 @@ fn handle_diff_focus_toggle_key(app: &mut AppState, key: KeyEvent) -> bool {
         return false;
     }
 
-    if app.focus == FocusTarget::Details {
-        app.focus_list();
-    } else {
-        app.focus_details();
+    match app.focus {
+        FocusTarget::List => app.focus_details(),
+        FocusTarget::Details => app.focus_list(),
+        _ => return false,
     }
     true
 }
@@ -4472,7 +4922,10 @@ fn handle_mouse_with_sync(
     }
     if app.command_palette.is_some()
         || app.project_switcher.is_some()
+        || app.top_menu_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.saved_search_dialog.is_some()
+        || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.cache_clear_dialog.is_some()
@@ -5584,8 +6037,17 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     if let Some(switcher) = &app.project_switcher {
         draw_project_switcher(frame, app, switcher, area);
     }
+    if let Some(switcher) = &app.top_menu_switcher {
+        draw_top_menu_switcher(frame, app, switcher, area);
+    }
     if let Some(dialog) = &app.recent_items_dialog {
         draw_recent_items_dialog(frame, app, dialog, area);
+    }
+    if let Some(dialog) = &app.saved_search_dialog {
+        draw_saved_search_dialog(frame, app, dialog, area);
+    }
+    if let Some(dialog) = &app.save_search_dialog {
+        draw_save_search_dialog(frame, dialog, area);
     }
     if let Some(dialog) = &app.project_add_dialog {
         draw_project_add_dialog(frame, dialog, area);
@@ -6244,7 +6706,9 @@ fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)> {
             .map(|repo| format!(" in {repo}"))
             .unwrap_or_default();
         return Some((
-            format!("Repo Search{scope}: dialog open  Enter choose/search  Esc cancel"),
+            format!(
+                "Repo Search{scope}: dialog open  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel"
+            ),
             theme.action,
         ));
     }
@@ -6281,17 +6745,31 @@ fn active_details_input_prompt(app: &AppState) -> Option<(String, Color)> {
         ));
     }
 
+    let query = app.comment_search_query.trim();
+    if app.focus == FocusTarget::Details
+        && app.details_mode == DetailsMode::Conversation
+        && !query.is_empty()
+    {
+        return Some((
+            format!("Comment Search: /{query}  n/p results  Esc clear"),
+            theme.search,
+        ));
+    }
+
     None
 }
 
 fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let text_selection_mode = !app.mouse_capture_enabled;
     let details_focused = app.focus == FocusTarget::Details;
-    let raw_title = active_details_input_prompt(app)
+    let details_prompt = active_details_input_prompt(app);
+    let raw_title = details_prompt
+        .as_ref()
         .map(|(prompt, _)| format!("{} {prompt}", details_title()))
         .unwrap_or_else(|| details_title().to_string());
+    let prompt_color = details_prompt.as_ref().map(|(_, color)| *color);
     let title = focus_panel_title("Details", &raw_title, details_focused);
-    let (border_style, title_style, border_type) = if app.dragging_split {
+    let (border_style, mut title_style, border_type) = if app.dragging_split {
         (
             active_theme()
                 .panel()
@@ -6324,6 +6802,12 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             BorderType::Plain,
         )
     };
+    if let Some(color) = prompt_color {
+        title_style = active_theme()
+            .panel()
+            .fg(color)
+            .add_modifier(Modifier::BOLD);
+    }
 
     let document_width = if text_selection_mode {
         area.width
@@ -6459,7 +6943,7 @@ fn details_text_selection_style(base: Style) -> Style {
 }
 
 fn details_title() -> &'static str {
-    "Details:"
+    "Details"
 }
 
 fn focus_panel_title(_label: &str, title: &str, focused: bool) -> String {
@@ -7493,6 +7977,81 @@ fn draw_project_switcher(
     ));
 }
 
+fn draw_top_menu_switcher(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    switcher: &TopMenuSwitcher,
+    area: Rect,
+) {
+    let candidates = app.top_menu_switcher_candidates_for_query(&switcher.query);
+    let dialog_area = project_switcher_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(top_menu_switcher_input_line(&switcher.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No top menu items found",
+            active_theme().subtle(),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(project_switcher_candidate_line(
+                candidate,
+                candidate.key == app.active_view,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Top Menu Switch",
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: switch    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&switcher.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
 fn project_switcher_area(area: Rect) -> Rect {
     let width = centered_rect_width(52, area).max(32).min(area.width);
     let max_height = area.height.saturating_sub(2).max(3);
@@ -7505,6 +8064,23 @@ fn project_switcher_input_line(query: &str, width: usize) -> Line<'static> {
         return Line::from(vec![
             Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
             Span::styled("Type a project prefix", active_theme().subtle()),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            active_theme().panel(),
+        ),
+    ])
+}
+
+fn top_menu_switcher_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+            Span::styled("Type a top menu label", active_theme().subtle()),
         ]);
     }
 
@@ -7655,6 +8231,189 @@ fn recent_item_candidate_line(item: &RecentItem, selected: bool, width: usize) -
         active_theme().panel()
     };
     Line::from(Span::styled(text, style))
+}
+
+fn draw_saved_search_dialog(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    dialog: &SavedSearchDialog,
+    area: Rect,
+) {
+    let candidates = app.saved_search_candidates_for_query(&dialog.query);
+    let dialog_area = saved_search_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = dialog.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(saved_search_input_line(&dialog.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved search filters found",
+            active_theme().subtle(),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(saved_search_candidate_line(
+                candidate,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Saved Search Filter",
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: run    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&dialog.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
+fn saved_search_area(area: Rect) -> Rect {
+    let width = centered_rect_width(104, area).max(48).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 18.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn saved_search_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+            Span::styled(
+                "Type a saved search name, repo, or filter",
+                active_theme().subtle(),
+            ),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            active_theme().panel(),
+        ),
+    ])
+}
+
+fn saved_search_candidate_line(
+    candidate: &SavedSearchCandidate,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let text = truncate_inline(
+        &format!(
+            "{marker}{:<24} {:<28} {:<5} {}",
+            candidate.name,
+            candidate.repo,
+            saved_search_kind_label(candidate.kind),
+            global_search_state_display(&candidate.search)
+        ),
+        width,
+    );
+    let style = if selected {
+        active_theme().active()
+    } else {
+        active_theme().panel()
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn draw_save_search_dialog(frame: &mut Frame<'_>, dialog: &SaveSearchDialog, area: Rect) {
+    let dialog_area = centered_rect(80, 9, area);
+    let inner = block_inner(dialog_area);
+    let width = inner.width.max(1);
+    let name_prefix = "Name: ";
+    let name_width =
+        width.saturating_sub(display_width(name_prefix).min(usize::from(u16::MAX)) as u16);
+    let lines = vec![
+        key_value_line("repo", dialog.repo.clone()),
+        key_value_line("type", saved_search_kind_label(dialog.kind).to_string()),
+        key_value_line("filter", global_search_state_display(&dialog.search)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(name_prefix, active_theme().panel().fg(active_theme().focus)),
+            Span::styled(
+                issue_dialog_input_text(dialog.name.text(), name_width),
+                active_theme().panel(),
+            ),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Save Search Filter",
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: save    Esc: cancel"),
+    );
+
+    let cursor =
+        text_before_cursor_width(dialog.name.text(), dialog.name.cursor_byte()).min(name_width);
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(display_width(name_prefix).min(usize::from(u16::MAX)) as u16)
+            .saturating_add(cursor)
+            .min(inner.right().saturating_sub(1)),
+        inner.y.saturating_add(4),
+    ));
 }
 
 fn draw_project_add_dialog(frame: &mut Frame<'_>, dialog: &ProjectAddDialog, area: Rect) {
@@ -9404,12 +10163,16 @@ fn draw_global_search_dialog(
     let inner = block_inner(dialog_area);
     let width = inner.width.max(1);
     let current_scope = app.current_repo_scope();
-    let scope = app
+    let repo_scope = app
         .global_search_scope
         .as_deref()
         .or(current_scope.as_deref())
         .map(|repo| format!("scope: {repo}"))
         .unwrap_or_else(|| "scope: GitHub".to_string());
+    let scope = app
+        .global_search_preferred_kind
+        .map(|kind| format!("{repo_scope} | {}", saved_search_kind_label(kind)))
+        .unwrap_or(repo_scope);
     let mut lines = vec![
         Line::from(vec![Span::styled(
             scope,
@@ -9474,7 +10237,9 @@ fn draw_global_search_dialog(
         frame,
         area,
         dialog_area,
-        modal_footer_line("Tab field  ↑/↓ move  Enter choose/search  Esc cancel"),
+        modal_footer_line(
+            "Tab field  ↑/↓ move  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel",
+        ),
     );
     if let Some(position) = global_search_dialog_cursor_position(dialog, dialog_area, width) {
         frame.set_cursor_position(position);
@@ -9510,7 +10275,7 @@ fn push_global_search_suggestion_lines(
         GlobalSearchField::Label | GlobalSearchField::Author | GlobalSearchField::Assignee => {
             "Candidates"
         }
-        GlobalSearchField::Title => return,
+        GlobalSearchField::Title => "Candidates",
     };
     lines.push(Line::from(vec![Span::styled(
         title,
@@ -9526,9 +10291,9 @@ fn push_global_search_suggestion_lines(
     {
         let selected = index == selected;
         let style = if selected {
-            themed_bold_style(Color::Yellow)
+            active_theme().active()
         } else {
-            themed_fg_style(Color::Cyan)
+            active_theme().panel().fg(active_theme().focus)
         };
         let marker = if selected { "> " } else { "  " };
         let text_width = width.saturating_sub(display_width(marker));
@@ -9555,7 +10320,7 @@ fn global_search_dialog_field_input_line(
         ),
         Span::styled(
             issue_dialog_input_text(value, value_width),
-            themed_fg_style(Color::White),
+            active_theme().panel().fg(active_theme().text),
         ),
     ])
 }
@@ -9567,7 +10332,7 @@ fn global_search_dialog_field_label_style(
     if field == current {
         themed_bold_style(Color::LightMagenta)
     } else {
-        themed_fg_style(Color::Gray)
+        active_theme().muted()
     }
 }
 
@@ -10664,6 +11429,8 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("1 / 2 / 3 / 4", "focus ghr / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("Ctrl+U in Search", "clear remembered search conditions"),
+        help_key_line("Ctrl+S in Search", "save current search conditions"),
         help_key_line("f", "filter current PR/issue section"),
         help_key_line(
             "Esc in Search results",
@@ -11124,6 +11891,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.recent_items_dialog.is_some()
+        || app.top_menu_switcher.is_some()
         || app.cache_clear_dialog.is_some()
 }
 
@@ -11475,6 +12243,7 @@ impl AppState {
             section_index: ui_state.section_index.clone(),
             base_section_filters,
             quick_filters: HashMap::new(),
+            section_filter_overrides: HashMap::new(),
             selected_index: ui_state.selected_index.clone(),
             list_scroll_offset: HashMap::new(),
             view_snapshots,
@@ -11491,14 +12260,20 @@ impl AppState {
             global_search_active: false,
             global_search_query: String::new(),
             global_search_dialog: None,
+            save_search_dialog: None,
+            saved_search_dialog: None,
+            global_search_by_repo: ui_state.global_search_by_repo.clone(),
+            global_search_saved_by_repo: HashMap::new(),
             global_search_running: false,
             global_search_return_view: None,
             global_search_scope: None,
+            global_search_preferred_kind: None,
             global_search_started_at: None,
             filter_input_active: false,
             filter_input_query: String::new(),
             command_palette: None,
             project_switcher: None,
+            top_menu_switcher: None,
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
@@ -11608,6 +12383,10 @@ impl AppState {
             }
         }
         state
+    }
+
+    fn load_saved_search_filters(&mut self, config: &Config) {
+        self.global_search_saved_by_repo = saved_search_map_from_config(config);
     }
 
     fn set_theme(&mut self, theme_name: ThemeName) {
@@ -11994,6 +12773,17 @@ impl AppState {
         if view_supports_snapshot(&self.active_view) {
             view_snapshots.insert(self.active_view.clone(), self.current_view_snapshot());
         }
+        let mut global_search_by_repo = self.global_search_by_repo.clone();
+        if self.global_search_active
+            && let Some(dialog) = &self.global_search_dialog
+        {
+            let key = global_search_repo_state_key(dialog.repo.as_deref());
+            if let Some(state) = global_search_dialog_state(dialog) {
+                global_search_by_repo.insert(key, state);
+            } else {
+                global_search_by_repo.remove(&key);
+            }
+        }
 
         UiState {
             list_width_percent: self.list_width_percent,
@@ -12025,6 +12815,8 @@ impl AppState {
             ignored_items: sorted_strings(&self.ignored_items),
             recent_items: recent_items_to_saved(&self.recent_items),
             recent_commands: recent_commands_to_saved(&self.recent_commands),
+            global_search_by_repo,
+            global_search_saved_by_repo: HashMap::new(),
         }
     }
 
@@ -12229,7 +13021,7 @@ impl AppState {
         let sections = sections
             .into_iter()
             .filter(|section| !same_view_key(&section_view_key(section), &active_view))
-            .filter(|section| !self.quick_filters.contains_key(&section.key))
+            .filter(|section| !self.has_active_section_filter(&section.key))
             .collect::<Vec<_>>();
 
         if sections.is_empty() {
@@ -12252,12 +13044,12 @@ impl AppState {
         let section_error = section.error.clone();
         let setup_dialog = section_error.as_deref().and_then(setup_dialog_from_error);
         self.remember_base_filters(&section);
-        if self.quick_filters.contains_key(&section.key) {
+        if self.has_active_section_filter(&section.key) {
             if self.setup_dialog.is_none() {
                 self.setup_dialog = setup_dialog;
             }
             self.status = match (section_error.as_deref(), save_error) {
-                (None, None) => format!("loaded {title}; quick filter still active"),
+                (None, None) => format!("loaded {title}; filter still active"),
                 (Some(error), None) => refresh_error_status(1, Some(error)),
                 (_, Some(error)) => format!("snapshot save failed: {error}"),
             };
@@ -12359,7 +13151,7 @@ impl AppState {
                 }
                 let sections = sections
                     .into_iter()
-                    .filter(|section| !self.quick_filters.contains_key(&section.key))
+                    .filter(|section| !self.has_active_section_filter(&section.key))
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
                 let current = std::mem::take(&mut self.sections);
@@ -13437,10 +14229,7 @@ impl AppState {
                 section,
             } => {
                 let error = section.error.clone();
-                let filter_label = self
-                    .quick_filters
-                    .get(&section_key)
-                    .map(QuickFilter::display);
+                let filter_label = self.section_filter_label_for_key(&section_key);
                 if self.setup_dialog.is_none() {
                     self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
                 }
@@ -13455,7 +14244,14 @@ impl AppState {
                     (Some(error), _) => refresh_error_status(1, Some(error)),
                 };
             }
-            AppMsg::GlobalSearchFinished { query, sections } => {
+            AppMsg::GlobalSearchFinished {
+                query,
+                mut sections,
+            } => {
+                let preferred_kind = self.global_search_preferred_kind;
+                if let Some(kind) = preferred_kind {
+                    sections.sort_by_key(|section| if section.kind == kind { 0 } else { 1 });
+                }
                 let errors = sections
                     .iter()
                     .filter(|section| section.error.is_some())
@@ -13472,15 +14268,24 @@ impl AppState {
                     .iter()
                     .map(|section| section.items.len())
                     .sum::<usize>();
-                let first_result_section = sections
-                    .iter()
-                    .position(|section| !section.items.is_empty())
+                let first_result_section = preferred_kind
+                    .and_then(|kind| {
+                        sections
+                            .iter()
+                            .position(|section| section.kind == kind && !section.items.is_empty())
+                    })
+                    .or_else(|| {
+                        sections
+                            .iter()
+                            .position(|section| !section.items.is_empty())
+                    })
                     .unwrap_or(0);
                 self.invalidate_action_hints_for_sections(&sections);
                 self.replace_global_search_sections(sections);
                 self.global_search_running = false;
                 self.global_search_started_at = None;
                 self.global_search_scope = None;
+                self.global_search_preferred_kind = None;
                 self.global_search_active = false;
                 self.global_search_dialog = None;
                 self.global_search_query = query.clone();
@@ -13587,6 +14392,7 @@ impl AppState {
         self.global_search_active = false;
         self.command_palette = None;
         self.recent_items_dialog = None;
+        self.top_menu_switcher = None;
         self.cache_clear_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
@@ -13603,6 +14409,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = Some(CommandPalette::default());
         self.project_switcher = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -13733,8 +14540,16 @@ impl AppState {
                 self.toggle_theme(config, paths);
                 false
             }
+            PaletteAction::TopMenuSwitch => {
+                self.show_top_menu_switcher();
+                false
+            }
             PaletteAction::SearchCurrentRepo => {
                 self.start_global_search_input_with_store(Some(store), Some(tx));
+                false
+            }
+            PaletteAction::SavedSearchFilter => {
+                self.show_saved_search_dialog(config);
                 false
             }
             PaletteAction::SwitchProject => {
@@ -13845,6 +14660,107 @@ impl AppState {
         self.recent_commands.truncate(MAX_RECENT_COMMANDS);
     }
 
+    fn show_top_menu_switcher(&mut self) {
+        let candidates = self.top_menu_switcher_candidates();
+        if candidates.is_empty() {
+            self.top_menu_switcher = None;
+            self.status = "no top menu items".to_string();
+            return;
+        }
+
+        let selected = candidates
+            .iter()
+            .position(|candidate| candidate.key == self.active_view)
+            .unwrap_or(0);
+        self.finish_details_visit(Instant::now());
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.recent_items_dialog = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
+        self.top_menu_switcher = Some(TopMenuSwitcher {
+            query: String::new(),
+            selected,
+        });
+        self.status = "top menu switch".to_string();
+    }
+
+    fn dismiss_top_menu_switcher(&mut self) {
+        self.top_menu_switcher = None;
+        self.status = "top menu switch cancelled".to_string();
+    }
+
+    fn handle_top_menu_switcher_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_top_menu_switcher(),
+            KeyCode::Enter => self.submit_top_menu_switcher_selection(),
+            KeyCode::Down | KeyCode::Tab => self.move_top_menu_switcher_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_top_menu_switcher_selection(-1),
+            KeyCode::PageDown => self.move_top_menu_switcher_selection(8),
+            KeyCode::PageUp => self.move_top_menu_switcher_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(switcher) = &mut self.top_menu_switcher {
+                    switcher.query.pop();
+                    switcher.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(switcher) = &mut self.top_menu_switcher {
+                    switcher.query.push(value);
+                    switcher.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_top_menu_switcher_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .top_menu_switcher
+            .as_ref()
+            .map(|switcher| switcher.query.clone())
+        else {
+            return;
+        };
+        let len = self.top_menu_switcher_candidates_for_query(&query).len();
+        if let Some(switcher) = &mut self.top_menu_switcher {
+            switcher.selected = move_wrapping(switcher.selected, len, delta);
+        }
+    }
+
+    fn submit_top_menu_switcher_selection(&mut self) {
+        let Some(switcher) = &self.top_menu_switcher else {
+            return;
+        };
+        let candidates = self.top_menu_switcher_candidates_for_query(&switcher.query);
+        let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+        let Some(candidate) = candidates.get(selected) else {
+            self.status = "no matching top menu item".to_string();
+            return;
+        };
+
+        let key = candidate.key.clone();
+        let label = candidate.label.clone();
+        self.top_menu_switcher = None;
+        self.switch_top_menu_view(key);
+        self.status = format!("top menu switched: {label}");
+    }
+
+    fn top_menu_switcher_candidates(&self) -> Vec<ViewTab> {
+        self.view_tabs()
+    }
+
+    fn top_menu_switcher_candidates_for_query(&self, query: &str) -> Vec<ViewTab> {
+        self.top_menu_switcher_candidates()
+            .into_iter()
+            .filter(|view| project_switcher_candidate_matches(view, query))
+            .collect()
+    }
+
     fn show_project_switcher(&mut self) {
         let candidates = self.project_switcher_candidates();
         if candidates.is_empty() {
@@ -13859,6 +14775,7 @@ impl AppState {
             .unwrap_or(0);
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -13954,6 +14871,7 @@ impl AppState {
         self.finish_details_visit(now);
         self.command_palette = None;
         self.project_switcher = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -14045,6 +14963,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
@@ -14249,6 +15168,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.cache_clear_dialog = None;
@@ -14387,6 +15307,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.top_menu_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -15136,11 +16057,20 @@ impl AppState {
     }
 
     fn effective_filters_for_section(&self, section: &SectionSnapshot) -> String {
+        if let Some(override_filter) = self.section_filter_overrides.get(&section.key) {
+            return override_filter.filters.clone();
+        }
+
         let base_filters = self.base_filters_for_section(section);
         self.quick_filters
             .get(&section.key)
             .map(|filter| quick_filter_query(&base_filters, filter))
             .unwrap_or(base_filters)
+    }
+
+    fn has_active_section_filter(&self, section_key: &str) -> bool {
+        self.quick_filters.contains_key(section_key)
+            || self.section_filter_overrides.contains_key(section_key)
     }
 
     fn current_filter_label(&self) -> Option<String> {
@@ -15149,9 +16079,18 @@ impl AppState {
     }
 
     fn quick_filter_label_for_section(&self, section: &SectionSnapshot) -> Option<String> {
-        self.quick_filters
-            .get(&section.key)
-            .map(QuickFilter::display)
+        self.section_filter_label_for_key(&section.key)
+    }
+
+    fn section_filter_label_for_key(&self, section_key: &str) -> Option<String> {
+        self.section_filter_overrides
+            .get(section_key)
+            .map(|filter| filter.display.clone())
+            .or_else(|| {
+                self.quick_filters
+                    .get(section_key)
+                    .map(QuickFilter::display)
+            })
             .filter(|label| !label.is_empty())
     }
 
@@ -15162,6 +16101,8 @@ impl AppState {
         self.base_section_filters
             .retain(|key, _| !key.starts_with("search:"));
         self.quick_filters
+            .retain(|key, _| !key.starts_with("search:"));
+        self.section_filter_overrides
             .retain(|key, _| !key.starts_with("search:"));
         for section in &sections {
             self.base_section_filters
@@ -15538,6 +16479,12 @@ impl AppState {
 
     fn switch_project_view(&mut self, view: impl Into<String>) -> bool {
         self.switch_view_with_fallback(view, FocusTarget::Ghr)
+    }
+
+    fn switch_top_menu_view(&mut self, view: impl Into<String>) -> bool {
+        let restored = self.switch_view_with_fallback(view, FocusTarget::Ghr);
+        self.focus = FocusTarget::Ghr;
+        restored
     }
 
     fn switch_view_with_fallback(
@@ -19183,6 +20130,13 @@ impl AppState {
         if !self.is_global_search_results_view() {
             self.global_search_return_view = Some(self.active_view.clone());
         }
+        self.global_search_preferred_kind = self.current_section().and_then(|section| {
+            matches!(
+                section.kind,
+                SectionKind::PullRequests | SectionKind::Issues
+            )
+            .then_some(section.kind)
+        });
         let repo_scope = self.current_repo_scope();
         let mut dialog = self.global_search_dialog_for_repo(repo_scope.clone());
         let labels_refreshing = repo_scope
@@ -19246,6 +20200,10 @@ impl AppState {
         } else {
             dialog.author_candidates =
                 global_search_author_candidates_from_sections(&self.sections, None);
+        }
+        let state_key = global_search_repo_state_key(repo.as_deref());
+        if let Some(state) = self.global_search_by_repo.get(&state_key) {
+            apply_global_search_state(&mut dialog, state);
         }
         dialog
     }
@@ -19319,20 +20277,34 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
     ) {
         let repo_scope = self.current_repo_scope();
-        self.handle_global_search_key_with_submit(key, |query| {
-            start_global_search(query, repo_scope.clone(), config.clone(), tx.clone());
+        self.handle_global_search_key_with_submit(key, |query, display_query| {
+            start_global_search(
+                query,
+                display_query,
+                repo_scope.clone(),
+                config.clone(),
+                tx.clone(),
+            );
         });
     }
 
     fn handle_global_search_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
     where
-        F: FnMut(String),
+        F: FnMut(String, String),
     {
         match key.code {
             KeyCode::Esc => {
+                self.remember_current_global_search_dialog();
                 self.global_search_active = false;
                 self.global_search_dialog = None;
+                self.global_search_preferred_kind = None;
                 self.status = "search cancelled".to_string();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_current_global_search_dialog_conditions();
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_save_search_dialog();
             }
             KeyCode::Enter => {
                 if self.accept_global_search_suggestion() {
@@ -19353,12 +20325,15 @@ impl AppState {
                     self.status = "search already running".to_string();
                     return;
                 }
+                self.remember_current_global_search_dialog();
                 let repo_scope = self.current_repo_scope();
                 self.global_search_active = false;
                 self.global_search_dialog = None;
                 self.global_search_running = true;
                 self.global_search_started_at = Some(Instant::now());
                 self.global_search_scope = repo_scope.clone();
+                let request_query =
+                    scoped_global_search_query(&query, self.global_search_preferred_kind);
                 self.global_search_query = query.clone();
                 self.search_active = false;
                 self.search_query.clear();
@@ -19368,19 +20343,21 @@ impl AppState {
                     Some(repo) => format!("searching {repo} for '{query}'"),
                     None => format!("searching GitHub for '{query}'"),
                 };
-                submit(query);
+                submit(request_query, query);
             }
             KeyCode::Tab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
                     dialog.field = dialog.field.next(1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
+                self.remember_current_global_search_dialog();
             }
             KeyCode::BackTab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
                     dialog.field = dialog.field.next(-1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
+                self.remember_current_global_search_dialog();
             }
             KeyCode::Down => self.move_global_search_suggestion(1),
             KeyCode::Up => self.move_global_search_suggestion(-1),
@@ -19388,10 +20365,64 @@ impl AppState {
                 if let Some(dialog) = &mut self.global_search_dialog {
                     if dialog.active_editor_mut().input_key(key, false) {
                         reset_global_search_dialog_suggestions(dialog);
+                        self.remember_current_global_search_dialog();
                     }
                 }
             }
         }
+    }
+
+    fn remember_current_global_search_dialog(&mut self) {
+        let Some(dialog) = &self.global_search_dialog else {
+            return;
+        };
+        let key = global_search_repo_state_key(dialog.repo.as_deref());
+        if let Some(state) = global_search_dialog_state(dialog) {
+            self.global_search_by_repo.insert(key, state);
+        } else {
+            self.global_search_by_repo.remove(&key);
+        }
+    }
+
+    fn clear_current_global_search_dialog_conditions(&mut self) {
+        let Some(dialog) = &mut self.global_search_dialog else {
+            return;
+        };
+        let key = global_search_repo_state_key(dialog.repo.as_deref());
+        clear_global_search_dialog_conditions(dialog);
+        self.global_search_by_repo.remove(&key);
+        self.status = "search conditions cleared".to_string();
+    }
+
+    fn start_save_search_dialog(&mut self) {
+        let Some(dialog) = &self.global_search_dialog else {
+            return;
+        };
+        let Some(state) = global_search_dialog_state(dialog) else {
+            self.status = "nothing to save".to_string();
+            return;
+        };
+        let Some(repo) = dialog.repo.clone() else {
+            self.status = "saved search filters need a repo scope".to_string();
+            return;
+        };
+        let Some(kind) = self.global_search_preferred_kind else {
+            self.status = "saved search filters work from PR or issue lists".to_string();
+            return;
+        };
+        if saved_search_kind_value(kind).is_none() {
+            self.status = "saved search filters work from PR or issue lists".to_string();
+            return;
+        }
+        let name = saved_search_default_name(&repo, kind, &state);
+        self.remember_current_global_search_dialog();
+        self.save_search_dialog = Some(SaveSearchDialog {
+            name: EditorText::from_text(name),
+            repo,
+            kind,
+            search: state,
+        });
+        self.status = "name saved search filter".to_string();
     }
 
     fn accept_global_search_suggestion(&mut self) -> bool {
@@ -19412,9 +20443,11 @@ impl AppState {
                 return false;
             }
         }
+        let selected_field = dialog.field;
         apply_global_search_dialog_suggestion(dialog, &selected);
         reset_global_search_dialog_suggestions(dialog);
-        self.status = format!("selected {}: {selected}", dialog.field.label());
+        self.status = format!("selected {}: {selected}", selected_field.label());
+        self.remember_current_global_search_dialog();
         true
     }
 
@@ -19456,6 +20489,287 @@ impl AppState {
             .unwrap_or_default();
         clamp_global_search_dialog_selection(dialog);
         self.status = format!("candidate {}: {selected}", dialog.field.label());
+    }
+
+    fn handle_save_search_key(&mut self, key: KeyEvent, config: &mut Config, paths: &Paths) {
+        match key.code {
+            KeyCode::Esc => {
+                self.save_search_dialog = None;
+                self.status = "saved search cancelled".to_string();
+            }
+            KeyCode::Enter => self.finish_save_search_dialog(config, paths),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.finish_save_search_dialog(config, paths)
+            }
+            _ => {
+                if let Some(dialog) = &mut self.save_search_dialog
+                    && dialog.name.input_key(key, false)
+                {
+                    self.status = "name saved search filter".to_string();
+                }
+            }
+        }
+    }
+
+    fn finish_save_search_dialog(&mut self, config: &mut Config, paths: &Paths) {
+        let Some(dialog) = self.save_search_dialog.take() else {
+            return;
+        };
+        let name = dialog.name.text().trim().to_string();
+        if name.is_empty() {
+            self.save_search_dialog = Some(dialog);
+            self.status = "saved search name is empty".to_string();
+            return;
+        }
+        let previous_saved_searches = self.global_search_saved_by_repo.clone();
+        let previous_config_filters = config.saved_search_filters.clone();
+        upsert_named_saved_search(
+            &mut self.global_search_saved_by_repo,
+            name.clone(),
+            dialog.repo,
+            dialog.kind,
+            dialog.search,
+        );
+        config.saved_search_filters =
+            saved_search_filters_from_map(&self.global_search_saved_by_repo);
+        if let Err(error) = config.save(&paths.config_path) {
+            self.global_search_saved_by_repo = previous_saved_searches;
+            config.saved_search_filters = previous_config_filters;
+            self.status = format!("saved search filter save failed: {error}");
+            return;
+        }
+
+        self.status = format!(
+            "saved search filter '{name}' saved to {}",
+            paths.config_path.display()
+        );
+    }
+
+    fn show_saved_search_dialog(&mut self, config: &Config) {
+        self.load_saved_search_filters(config);
+        if self.saved_search_candidates().is_empty() {
+            self.status = "no saved search filters".to_string();
+            return;
+        }
+        self.saved_search_dialog = Some(SavedSearchDialog::default());
+        self.search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.comment_search_active = false;
+        self.comment_dialog = None;
+        self.status = "saved search filters".to_string();
+    }
+
+    fn handle_saved_search_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.saved_search_dialog = None;
+                self.status = "saved search cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                self.submit_saved_search_selection(config, tx);
+            }
+            KeyCode::Down | KeyCode::Tab => self.move_saved_search_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_saved_search_selection(-1),
+            KeyCode::PageDown => self.move_saved_search_selection(8),
+            KeyCode::PageUp => self.move_saved_search_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.saved_search_dialog {
+                    dialog.query.pop();
+                    dialog.selected = 0;
+                }
+            }
+            KeyCode::Char(value) => {
+                if let Some(dialog) = &mut self.saved_search_dialog {
+                    dialog.query.push(value);
+                    dialog.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_saved_search_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .saved_search_dialog
+            .as_ref()
+            .map(|dialog| dialog.query.clone())
+        else {
+            return;
+        };
+        let len = self.saved_search_candidates_for_query(&query).len();
+        if let Some(dialog) = &mut self.saved_search_dialog {
+            dialog.selected = move_wrapping(dialog.selected, len, delta);
+        }
+    }
+
+    fn submit_saved_search_selection(&mut self, config: &Config, tx: &UnboundedSender<AppMsg>) {
+        let Some(dialog) = &self.saved_search_dialog else {
+            return;
+        };
+        let candidates = self.saved_search_candidates_for_query(&dialog.query);
+        let Some(candidate) = candidates.get(dialog.selected).cloned() else {
+            self.status = "no saved search filter selected".to_string();
+            return;
+        };
+        self.saved_search_dialog = None;
+        self.run_saved_search_filter(candidate, config, tx);
+    }
+
+    fn saved_search_candidates(&self) -> Vec<SavedSearchCandidate> {
+        let mut candidates = self
+            .global_search_saved_by_repo
+            .iter()
+            .flat_map(|(_repo_key, searches)| {
+                searches.iter().filter_map(move |saved| {
+                    let saved = saved.clone().normalized()?;
+                    let kind = section_kind_from_saved_search_kind(&saved.kind)?;
+                    Some(SavedSearchCandidate {
+                        name: saved.name,
+                        repo: saved.repo,
+                        kind,
+                        search: saved.search,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.repo.cmp(&right.repo))
+                .then_with(|| {
+                    saved_search_kind_label(left.kind).cmp(saved_search_kind_label(right.kind))
+                })
+        });
+        candidates
+    }
+
+    fn saved_search_candidates_for_query(&self, query: &str) -> Vec<SavedSearchCandidate> {
+        let query = command_palette_normalized_text(query);
+        self.saved_search_candidates()
+            .into_iter()
+            .filter(|candidate| {
+                if query.is_empty() {
+                    return true;
+                }
+                let haystack = command_palette_normalized_text(&format!(
+                    "{} {} {} {}",
+                    candidate.name,
+                    candidate.repo,
+                    saved_search_kind_label(candidate.kind),
+                    global_search_state_display(&candidate.search)
+                ));
+                haystack.contains(&query) || fuzzy_score(&query, &haystack).is_some()
+            })
+            .collect()
+    }
+
+    fn run_saved_search_filter(
+        &mut self,
+        candidate: SavedSearchCandidate,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(target) = self.saved_search_section_target(&candidate, config) else {
+            self.status = format!(
+                "repo section not found for {} {}",
+                candidate.repo,
+                saved_search_kind_label(candidate.kind)
+            );
+            return;
+        };
+        self.save_current_conversation_details_state();
+        self.switch_view(target.view.clone());
+        self.set_current_section_position(target.section_position);
+        self.set_current_selected_position(0);
+        self.clear_current_list_scroll_offset();
+        self.focus = FocusTarget::List;
+        self.reset_or_restore_current_conversation_details_state();
+        let filter_label = saved_search_active_filter_label(&candidate);
+        self.quick_filters.remove(&target.section_key);
+        self.section_filter_overrides.insert(
+            target.section_key.clone(),
+            SectionFilterOverride {
+                display: filter_label.clone(),
+                filters: target.filters.clone(),
+            },
+        );
+        self.refreshing = true;
+        self.section_page_loading = Some(SectionPageLoading {
+            section_key: target.section_key.clone(),
+            title: format!(
+                "{} {}",
+                candidate.repo,
+                saved_search_kind_label(candidate.kind)
+            ),
+            page_label: "1".to_string(),
+            started_at: Instant::now(),
+        });
+        self.last_refresh_request = Instant::now();
+        self.status = format!("applying {filter_label}; Esc or f Enter clears it");
+
+        let config = config.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let section = refresh_section_page(
+                target.view,
+                target.kind,
+                target.title,
+                target.filters,
+                1,
+                target.page_size,
+                &config,
+            )
+            .await;
+            let _ = tx.send(AppMsg::FilterSectionLoaded {
+                section_key: target.section_key,
+                section,
+            });
+        });
+    }
+
+    fn saved_search_section_target(
+        &self,
+        candidate: &SavedSearchCandidate,
+        config: &Config,
+    ) -> Option<SavedSearchSectionTarget> {
+        let repo_key = candidate.repo.to_ascii_lowercase();
+        self.sections
+            .iter()
+            .filter(|section| section.kind == candidate.kind)
+            .find(|section| {
+                section_repo_scope(section).is_some_and(|repo| repo.eq_ignore_ascii_case(&repo_key))
+            })
+            .and_then(|section| {
+                let view = section_view_key(section);
+                let section_position = self
+                    .sections
+                    .iter()
+                    .filter(|candidate_section| {
+                        same_view_key(&section_view_key(candidate_section), &view)
+                    })
+                    .position(|candidate_section| candidate_section.key == section.key)?;
+                let filters = saved_search_filter_query(
+                    &self.base_filters_for_section(section),
+                    &candidate.search,
+                )
+                .ok()?;
+                Some(SavedSearchSectionTarget {
+                    section_key: section.key.clone(),
+                    section_position,
+                    view,
+                    kind: section.kind,
+                    title: section.title.clone(),
+                    filters,
+                    page_size: section_page_size(section, config),
+                })
+            })
     }
 
     fn start_search(&mut self) {
@@ -19832,6 +21146,7 @@ impl AppState {
             || self.help_dialog
             || self.command_palette.is_some()
             || self.project_switcher.is_some()
+            || self.top_menu_switcher.is_some()
             || self.recent_items_dialog.is_some()
             || self.project_add_dialog.is_some()
             || self.project_remove_dialog.is_some()
@@ -23457,6 +24772,8 @@ diff --git a/src/github.rs b/src/github.rs
             ignored_items: Vec::new(),
             recent_items: Vec::new(),
             recent_commands: Vec::new(),
+            global_search_by_repo: HashMap::new(),
+            global_search_saved_by_repo: HashMap::new(),
         };
 
         let app = AppState::with_ui_state(SectionKind::PullRequests, sections, state);
@@ -25303,6 +26620,86 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn top_menu_switcher_lists_all_top_tabs_and_filters() {
+        let sections = vec![
+            SectionSnapshot::empty(
+                SectionKind::Notifications,
+                "All",
+                "is:unread reason:subscribed",
+            ),
+            test_section(),
+            SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+            SectionSnapshot::empty_for_view(
+                "repo:Fiber",
+                SectionKind::PullRequests,
+                "Pull Requests",
+                "repo:nervosnetwork/fiber is:open",
+            ),
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+
+        app.show_top_menu_switcher();
+
+        assert_eq!(
+            app.top_menu_switcher_candidates_for_query("")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["Inbox", "Pull Requests", "Issues", "Fiber"]
+        );
+        assert_eq!(
+            app.top_menu_switcher_candidates_for_query("fi")
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>(),
+            vec!["Fiber"]
+        );
+    }
+
+    #[test]
+    fn command_palette_top_menu_switch_opens_top_menu_switcher() {
+        let config = Config::default();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.command_palette = Some(CommandPalette {
+            query: "top menu switch".to_string(),
+            selected: 0,
+        });
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &config,
+            &store,
+            &tx,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.top_menu_switcher, Some(TopMenuSwitcher::default()));
+        assert_eq!(app.status, "top menu switch");
+    }
+
+    #[test]
+    fn top_menu_switcher_enter_switches_view_and_focuses_top_menu() {
+        let sections = vec![
+            test_section(),
+            SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+        ];
+        let mut app = AppState::new(SectionKind::PullRequests, sections);
+
+        app.focus_details();
+        app.show_top_menu_switcher();
+        app.handle_top_menu_switcher_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_top_menu_switcher_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+        assert!(app.top_menu_switcher.is_none());
+        assert_eq!(app.status, "top menu switched: Issues");
+    }
+
+    #[test]
     fn command_palette_project_add_opens_project_add_dialog() {
         let mut config = Config::default();
         let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
@@ -25764,6 +27161,69 @@ diff --git a/src/main.rs b/src/main.rs
         assert_eq!(tab_cell.fg, theme.highlight_fg);
         assert_eq!(tab_cell.bg, theme.highlight_bg);
         assert!(tab_cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn light_theme_global_search_modal_uses_contrast_styles() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Light);
+        app.start_global_search_input();
+        {
+            let dialog = app.global_search_dialog.as_mut().expect("search dialog");
+            dialog.field = GlobalSearchField::Status;
+            reset_global_search_dialog_suggestions(dialog);
+        }
+        let backend = ratatui::backend::TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let theme = crate::theme::Theme::from_name(ThemeName::Light);
+        let buffer = terminal.backend().buffer();
+        let lines = buffer_lines(buffer);
+
+        let (sort_row, sort_col) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("created_at").map(|column| (row, column)))
+            .expect("sort value");
+        let sort_cell = buffer
+            .cell((sort_col as u16, sort_row as u16))
+            .expect("sort value cell");
+        assert_eq!(sort_cell.fg, theme.text);
+        assert_eq!(sort_cell.bg, theme.surface);
+
+        let (label_row, label_col) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("Label").map(|column| (row, column)))
+            .expect("inactive label");
+        let label_cell = buffer
+            .cell((label_col as u16, label_row as u16))
+            .expect("inactive label cell");
+        assert_eq!(label_cell.fg, theme.muted);
+
+        let options_row = lines
+            .iter()
+            .position(|line| line.contains("Options"))
+            .expect("options heading");
+        let (candidate_row, candidate_col) = lines
+            .iter()
+            .enumerate()
+            .skip(options_row + 1)
+            .find_map(|(row, line)| {
+                line.find("> open")
+                    .map(|column| (row, display_width(&line[..column]) + 2))
+            })
+            .expect("selected status candidate");
+        let candidate_cell = buffer
+            .cell((candidate_col as u16, candidate_row as u16))
+            .expect("selected candidate cell");
+        assert_eq!(candidate_cell.fg, theme.highlight_fg);
+        assert_eq!(candidate_cell.bg, theme.highlight_bg);
     }
 
     #[test]
@@ -26628,6 +28088,10 @@ diff --git a/src/main.rs b/src/main.rs
         app.move_comment_in_view(1, None);
         assert_eq!(app.selected_comment_index, 0);
         assert_eq!(app.status, "comment search: 1/2 for 'compiler'");
+
+        app.move_comment_in_view(-1, None);
+        assert_eq!(app.selected_comment_index, 2);
+        assert_eq!(app.status, "comment search: 2/2 for 'compiler'");
     }
 
     #[test]
@@ -26662,6 +28126,33 @@ diff --git a/src/main.rs b/src/main.rs
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("Comment Search: /borrow_  Enter keep  Esc clear"));
         assert!(rendered.contains("Comment search: 1/1 matches for /borrow"));
+    }
+
+    #[test]
+    fn details_title_keeps_comment_search_prompt_after_enter() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let item_id = app.current_item().expect("item").id.clone();
+        app.details.insert(
+            item_id,
+            DetailState::Loaded(vec![
+                comment("alice", "borrow checker", None),
+                comment("bob", "compiler diagnostic", None),
+            ]),
+        );
+        app.focus_details();
+        app.comment_search_active = false;
+        app.comment_search_query = "borrow".to_string();
+        let area = Rect::new(0, 0, 220, 40);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Comment Search: /borrow  n/p results  Esc clear"));
     }
 
     #[test]
@@ -27087,20 +28578,20 @@ diff --git a/src/main.rs b/src/main.rs
         app.start_global_search_input();
         let mut submitted = None;
 
-        app.handle_global_search_key_with_submit(key(KeyCode::Char('f')), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Char('f')), |query, _| {
             submitted = Some(query);
         });
-        app.handle_global_search_key_with_submit(key(KeyCode::Char('i')), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Char('i')), |query, _| {
             submitted = Some(query);
         });
-        app.handle_global_search_key_with_submit(key(KeyCode::Char('b')), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Char('b')), |query, _| {
             submitted = Some(query);
         });
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
             submitted = Some(query);
         });
 
-        assert_eq!(submitted, Some("fib".to_string()));
+        assert_eq!(submitted, Some("fib type:pr".to_string()));
         assert!(!app.global_search_active);
         assert!(app.global_search_running);
         assert!(app.global_search_started_at.is_some());
@@ -27167,14 +28658,14 @@ diff --git a/src/main.rs b/src/main.rs
             dialog.field = GlobalSearchField::Status;
         }
         let mut submitted = None;
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.status.text()),
             Some("")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
             submitted = Some(query);
         });
         assert_eq!(submitted, None);
@@ -27184,14 +28675,14 @@ diff --git a/src/main.rs b/src/main.rs
                 .map(|dialog| dialog.status.text()),
             Some("open")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.status.text()),
             Some("open")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
             submitted = Some(query);
         });
         assert_eq!(submitted, None);
@@ -27209,21 +28700,21 @@ diff --git a/src/main.rs b/src/main.rs
             dialog.label.set_text("good");
             reset_global_search_dialog_suggestions(dialog);
         }
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.label.text()),
             Some("good")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.label.text()),
             Some("good")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
@@ -27238,21 +28729,21 @@ diff --git a/src/main.rs b/src/main.rs
             dialog.author.set_text("bo");
             reset_global_search_dialog_suggestions(dialog);
         }
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.author.text()),
             Some("bo")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Down), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
                 .map(|dialog| dialog.author.text()),
             Some("bo")
         );
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_, _| {});
         assert_eq!(
             app.global_search_dialog
                 .as_ref()
@@ -27268,7 +28759,7 @@ diff --git a/src/main.rs b/src/main.rs
             dialog.assignee.set_text("chen");
             reset_global_search_dialog_suggestions(dialog);
         }
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
             submitted = Some(query);
         });
         assert_eq!(
@@ -27279,16 +28770,227 @@ diff --git a/src/main.rs b/src/main.rs
         );
         assert_eq!(submitted, None);
 
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query| {
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
             submitted = Some(query);
         });
         assert_eq!(
             submitted,
             Some(
-                "is:closed label:\"good second issue\" author:bobby assignee:chenyukang"
+                "is:closed label:\"good second issue\" author:bobby assignee:chenyukang type:pr"
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn global_search_reopens_with_last_repo_conditions() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.start_global_search_input();
+        {
+            let dialog = app.global_search_dialog.as_mut().expect("search dialog");
+            dialog.title.set_text("borrowck");
+            dialog.status.set_text("open");
+            dialog.label.set_text("T-compiler");
+            dialog.author.set_text("alice");
+            dialog.assignee.set_text("bob");
+            dialog.sort.set_text("updated_at");
+            dialog.field = GlobalSearchField::Assignee;
+        }
+
+        let mut submitted = None;
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |query, _| {
+            submitted = Some(query);
+        });
+
+        assert_eq!(
+            submitted,
+            Some(
+                "borrowck is:open label:T-compiler author:alice assignee:bob sort:updated-desc type:pr"
+                    .to_string()
+            )
+        );
+        assert!(!app.global_search_active);
+
+        app.start_global_search_input();
+        let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+        assert_eq!(dialog.title.text(), "borrowck");
+        assert_eq!(dialog.status.text(), "open");
+        assert_eq!(dialog.label.text(), "T-compiler");
+        assert_eq!(dialog.author.text(), "alice");
+        assert_eq!(dialog.assignee.text(), "bob");
+        assert_eq!(dialog.sort.text(), "updated_at");
+        assert_eq!(dialog.field, GlobalSearchField::Assignee);
+    }
+
+    #[test]
+    fn global_search_ctrl_u_clears_current_repo_conditions() {
+        let mut saved_searches = HashMap::new();
+        saved_searches.insert(
+            "rust-lang/rust".to_string(),
+            GlobalSearchState {
+                title: "borrowck".to_string(),
+                status: "open".to_string(),
+                label: "T-compiler".to_string(),
+                author: "alice".to_string(),
+                assignee: "bob".to_string(),
+                sort: "updated_at".to_string(),
+                field: "author".to_string(),
+            },
+        );
+        let mut app = AppState::with_ui_state(
+            SectionKind::PullRequests,
+            vec![test_section()],
+            UiState {
+                global_search_by_repo: saved_searches,
+                ..UiState::default()
+            },
+        );
+
+        app.start_global_search_input();
+        assert_eq!(
+            app.global_search_dialog
+                .as_ref()
+                .map(|dialog| dialog.author.text()),
+            Some("alice")
+        );
+
+        let mut submitted = None;
+        app.handle_global_search_key_with_submit(ctrl_key(KeyCode::Char('u')), |query, _| {
+            submitted = Some(query);
+        });
+
+        let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+        assert_eq!(dialog.title.text(), "");
+        assert_eq!(dialog.status.text(), "");
+        assert_eq!(dialog.label.text(), "");
+        assert_eq!(dialog.author.text(), "");
+        assert_eq!(dialog.assignee.text(), "");
+        assert_eq!(dialog.sort.text(), "created_at");
+        assert_eq!(dialog.field, GlobalSearchField::Title);
+        assert_eq!(submitted, None);
+        assert!(!app.global_search_by_repo.contains_key("rust-lang/rust"));
+
+        app.handle_global_search_key_with_submit(key(KeyCode::Esc), |_, _| {});
+        app.start_global_search_input();
+        let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+        assert_eq!(dialog.title.text(), "");
+        assert_eq!(dialog.sort.text(), "created_at");
+    }
+
+    #[test]
+    fn global_search_ctrl_s_prompts_for_named_saved_search_filter() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let mut config = Config::default();
+        let paths = unique_test_paths("saved-search-config");
+        app.start_global_search_input();
+        {
+            let dialog = app.global_search_dialog.as_mut().expect("search dialog");
+            dialog.status.set_text("open");
+            dialog.author.set_text("chenyukang");
+        }
+
+        app.handle_global_search_key_with_submit(ctrl_key(KeyCode::Char('s')), |_, _| {});
+
+        assert!(app.save_search_dialog.is_some());
+        assert_eq!(app.status, "name saved search filter");
+        {
+            let dialog = app.save_search_dialog.as_mut().expect("save dialog");
+            assert_eq!(dialog.repo, "rust-lang/rust");
+            assert_eq!(dialog.kind, SectionKind::PullRequests);
+            assert_eq!(dialog.search.status, "open");
+            assert_eq!(dialog.search.author, "chenyukang");
+            dialog.name.set_text("my rust prs");
+        }
+
+        app.handle_save_search_key(key(KeyCode::Enter), &mut config, &paths);
+
+        assert_eq!(
+            app.global_search_saved_by_repo
+                .get("rust-lang/rust")
+                .and_then(|items| items.first())
+                .map(|item| (item.name.as_str(), item.repo.as_str(), item.kind.as_str())),
+            Some(("my rust prs", "rust-lang/rust", "pull_requests"))
+        );
+        assert_eq!(
+            config.saved_search_filters.first().map(|item| (
+                item.name.as_str(),
+                item.repo.as_str(),
+                item.kind.as_str()
+            )),
+            Some(("my rust prs", "rust-lang/rust", "pull_requests"))
+        );
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(
+            saved.saved_search_filters.first().map(|item| (
+                item.name.as_str(),
+                item.repo.as_str(),
+                item.kind.as_str()
+            )),
+            Some(("my rust prs", "rust-lang/rust", "pull_requests"))
+        );
+        assert_eq!(
+            app.status,
+            format!(
+                "saved search filter 'my rust prs' saved to {}",
+                paths.config_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn saved_search_candidates_are_run_from_named_filter_dialog() {
+        let mut section = test_section();
+        section.key = "repo:Rust:pull_requests:Pull Requests".to_string();
+        section.title = "Pull Requests".to_string();
+        section.filters =
+            "repo:rust-lang/rust is:open archived:false sort:created-desc".to_string();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        let mut config = Config::default();
+        config.saved_search_filters.push(SavedSearchFilterConfig {
+            name: "my rust prs".to_string(),
+            repo: "rust-lang/rust".to_string(),
+            kind: "pull_requests".to_string(),
+            status: "open".to_string(),
+            author: "chenyukang".to_string(),
+            ..SavedSearchFilterConfig::default()
+        });
+
+        app.show_saved_search_dialog(&config);
+        assert!(app.saved_search_dialog.is_some());
+        assert_eq!(
+            app.saved_search_candidates_for_query("rust")
+                .first()
+                .map(|candidate| candidate.name.as_str()),
+            Some("my rust prs")
+        );
+
+        let candidate = app
+            .saved_search_candidates_for_query("my rust")
+            .into_iter()
+            .next()
+            .expect("candidate");
+        let target = app
+            .saved_search_section_target(&candidate, &Config::default())
+            .expect("target");
+        assert_eq!(
+            target.filters,
+            "repo:rust-lang/rust archived:false is:open author:chenyukang sort:created-desc"
+        );
+        let label = saved_search_active_filter_label(&candidate);
+        assert_eq!(
+            label,
+            "saved: my rust prs (status:open | author:chenyukang)"
+        );
+        app.section_filter_overrides.insert(
+            target.section_key.clone(),
+            SectionFilterOverride {
+                display: label.clone(),
+                filters: target.filters.clone(),
+            },
+        );
+        let section = app.current_section().expect("section");
+        assert_eq!(app.effective_filters_for_section(section), target.filters);
+        assert_eq!(app.current_filter_label().as_deref(), Some(label.as_str()));
     }
 
     #[test]
@@ -27342,6 +29044,76 @@ diff --git a/src/main.rs b/src/main.rs
             app.current_repo_scope().as_deref(),
             Some("nervosnetwork/fiber")
         );
+    }
+
+    #[test]
+    fn global_search_started_from_issues_prefers_issue_results() {
+        let mut issue_section = SectionSnapshot::empty_for_view(
+            builtin_view_key(SectionKind::Issues),
+            SectionKind::Issues,
+            "Issues",
+            "repo:nervosnetwork/fiber is:open archived:false sort:created-desc",
+        );
+        let mut source_issue = work_item(
+            "source-issue",
+            "nervosnetwork/fiber",
+            911,
+            "Atomic MPP design",
+            None,
+        );
+        source_issue.kind = ItemKind::Issue;
+        source_issue.url = "https://github.com/nervosnetwork/fiber/issues/911".to_string();
+        issue_section.items = vec![source_issue];
+
+        let mut app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        app.start_global_search_input();
+        assert_eq!(app.global_search_preferred_kind, Some(SectionKind::Issues));
+
+        let mut pr_section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "atomic",
+        );
+        pr_section.items = vec![work_item(
+            "pr-827",
+            "nervosnetwork/fiber",
+            827,
+            "Atomic mpp",
+            None,
+        )];
+        let mut result_issue_section = SectionSnapshot::empty_for_view(
+            global_search_view_key(),
+            SectionKind::Issues,
+            "Issues",
+            "atomic",
+        );
+        let mut result_issue = work_item(
+            "issue-911",
+            "nervosnetwork/fiber",
+            911,
+            "Atomic MPP design",
+            None,
+        );
+        result_issue.kind = ItemKind::Issue;
+        result_issue.url = "https://github.com/nervosnetwork/fiber/issues/911".to_string();
+        result_issue_section.items = vec![result_issue];
+
+        app.handle_msg(AppMsg::GlobalSearchFinished {
+            query: "atomic".to_string(),
+            sections: vec![pr_section, result_issue_section],
+        });
+
+        assert_eq!(app.active_view, global_search_view_key());
+        assert_eq!(
+            app.current_section().map(|section| section.kind),
+            Some(SectionKind::Issues)
+        );
+        assert_eq!(
+            app.current_item().map(|item| item.url.as_str()),
+            Some("https://github.com/nervosnetwork/fiber/issues/911")
+        );
+        assert_eq!(app.global_search_preferred_kind, None);
     }
 
     #[test]
@@ -27444,7 +29216,7 @@ diff --git a/src/main.rs b/src/main.rs
             .expect("search dialog")
             .title
             .set_text("fiber");
-        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_| {});
+        app.handle_global_search_key_with_submit(key(KeyCode::Enter), |_, _| {});
 
         let mut pr_section = SectionSnapshot::empty_for_view(
             global_search_view_key(),
@@ -35751,16 +37523,16 @@ diff --git a/d.rs b/d.rs
 
     #[test]
     fn details_panel_title_is_static() {
-        assert_eq!(details_title(), "Details:");
+        assert_eq!(details_title(), "Details");
     }
 
     #[test]
     fn focus_panel_title_marks_active_panel() {
         assert_eq!(
-            focus_panel_title("Details", "Details:", true),
-            "[Focus] Details:"
+            focus_panel_title("Details", "Details", true),
+            "[Focus] Details"
         );
-        assert_eq!(focus_panel_title("Details", "Details:", false), "Details:");
+        assert_eq!(focus_panel_title("Details", "Details", false), "Details");
     }
 
     #[test]
@@ -36213,6 +37985,35 @@ diff --git a/d.rs b/d.rs
         ));
         assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
         assert_eq!(app.current_section_position(), 0);
+        assert_eq!(app.focus, FocusTarget::Sections);
+
+        app.switch_view(builtin_view_key(SectionKind::PullRequests));
+        app.show_diff();
+        app.focus_ghr();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+
+        app.switch_view(builtin_view_key(SectionKind::PullRequests));
+        app.show_diff();
+        app.focus_sections();
+        assert_eq!(app.current_section_position(), 0);
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Tab),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.current_section_position(), 1);
         assert_eq!(app.focus, FocusTarget::Sections);
     }
 

@@ -12,6 +12,7 @@ pub const MIN_LIST_WIDTH_PERCENT: u16 = 30;
 pub const MAX_LIST_WIDTH_PERCENT: u16 = 85;
 pub const MAX_RECENT_ITEMS: usize = 200;
 pub const MAX_RECENT_COMMANDS: usize = 100;
+pub const MAX_GLOBAL_SAVED_SEARCHES_PER_REPO: usize = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +37,8 @@ pub struct UiState {
     pub ignored_items: Vec<String>,
     pub recent_items: Vec<RecentItemState>,
     pub recent_commands: Vec<RecentCommandState>,
+    pub global_search_by_repo: HashMap<String, GlobalSearchState>,
+    pub global_search_saved_by_repo: HashMap<String, Vec<GlobalSearchSavedState>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +65,70 @@ impl ViewSnapshot {
         self.section_key = self.section_key.filter(|value| !value.trim().is_empty());
         self.item_id = self.item_id.filter(|value| !value.trim().is_empty());
         self
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GlobalSearchState {
+    pub title: String,
+    pub status: String,
+    pub label: String,
+    pub author: String,
+    pub assignee: String,
+    pub sort: String,
+    pub field: String,
+}
+
+impl GlobalSearchState {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.title = self.title.trim().to_string();
+        self.status = self.status.trim().to_string();
+        self.label = self.label.trim().to_string();
+        self.author = self.author.trim().trim_start_matches('@').to_string();
+        self.assignee = self.assignee.trim().trim_start_matches('@').to_string();
+        self.sort = self.sort.trim().to_string();
+        if self.sort.is_empty() {
+            self.sort = "created_at".to_string();
+        }
+        if !matches!(
+            self.field.as_str(),
+            "title" | "status" | "label" | "author" | "assignee" | "sort"
+        ) {
+            self.field = "title".to_string();
+        }
+        if self.title.is_empty()
+            && self.status.is_empty()
+            && self.label.is_empty()
+            && self.author.is_empty()
+            && self.assignee.is_empty()
+            && self.sort == "created_at"
+        {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GlobalSearchSavedState {
+    pub name: String,
+    pub repo: String,
+    pub kind: String,
+    pub search: GlobalSearchState,
+}
+
+impl GlobalSearchSavedState {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.name = self.name.trim().to_string();
+        self.repo = self.repo.trim().to_ascii_lowercase();
+        self.kind = normalized_saved_search_kind(&self.kind)?;
+        self.search = self.search.normalized()?;
+        if self.name.is_empty() {
+            return None;
+        }
+        Some(self)
     }
 }
 
@@ -172,6 +239,9 @@ impl UiState {
         self.ignored_items.sort();
         self.recent_items = normalized_recent_items(self.recent_items);
         self.recent_commands = normalized_recent_commands(self.recent_commands);
+        self.global_search_by_repo = normalized_global_search_by_repo(self.global_search_by_repo);
+        self.global_search_saved_by_repo =
+            normalized_global_search_saved_by_repo(self.global_search_saved_by_repo);
         self
     }
 }
@@ -199,6 +269,8 @@ impl Default for UiState {
             ignored_items: Vec::new(),
             recent_items: Vec::new(),
             recent_commands: Vec::new(),
+            global_search_by_repo: HashMap::new(),
+            global_search_saved_by_repo: HashMap::new(),
         }
     }
 }
@@ -240,6 +312,71 @@ fn normalized_recent_commands(items: Vec<RecentCommandState>) -> Vec<RecentComma
     normalized.retain(|item| seen.insert(item.id.to_ascii_lowercase()));
     normalized.truncate(MAX_RECENT_COMMANDS);
     normalized
+}
+
+fn normalized_global_search_by_repo(
+    items: HashMap<String, GlobalSearchState>,
+) -> HashMap<String, GlobalSearchState> {
+    items
+        .into_iter()
+        .filter_map(|(repo, state)| {
+            let repo = normalized_global_search_repo_key(&repo)?;
+            state.normalized().map(|state| (repo, state))
+        })
+        .collect()
+}
+
+fn normalized_global_search_saved_by_repo(
+    items: HashMap<String, Vec<GlobalSearchSavedState>>,
+) -> HashMap<String, Vec<GlobalSearchSavedState>> {
+    items
+        .into_iter()
+        .filter_map(|(repo, searches)| {
+            let repo = normalized_global_search_repo_key(&repo)?;
+            let searches = normalized_global_search_saved_searches(&repo, searches);
+            (!searches.is_empty()).then_some((repo, searches))
+        })
+        .collect()
+}
+
+fn normalized_global_search_saved_searches(
+    repo: &str,
+    items: Vec<GlobalSearchSavedState>,
+) -> Vec<GlobalSearchSavedState> {
+    let mut normalized = items
+        .into_iter()
+        .filter_map(|mut item| {
+            if item.repo.trim().is_empty() {
+                item.repo = repo.to_string();
+            }
+            item.normalized()
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+
+    let mut seen = HashSet::new();
+    normalized.retain(|item| seen.insert(item.name.to_ascii_lowercase()));
+    normalized.truncate(MAX_GLOBAL_SAVED_SEARCHES_PER_REPO);
+    normalized
+}
+
+fn normalized_saved_search_kind(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pr" | "prs" | "pull_request" | "pull_requests" | "pull request" | "pull requests" => {
+            Some("pull_requests".to_string())
+        }
+        "issue" | "issues" => Some("issues".to_string()),
+        _ => None,
+    }
+}
+
+fn normalized_global_search_repo_key(repo: &str) -> Option<String> {
+    let repo = repo.trim().to_ascii_lowercase();
+    if repo.is_empty() { None } else { Some(repo) }
 }
 
 #[cfg(test)]
@@ -326,6 +463,51 @@ mod tests {
                     selected_at: Some(DateTime::from_timestamp(1_700_000_020, 0).unwrap()),
                 },
             ],
+            global_search_by_repo: HashMap::from([(
+                "Rust-Lang/Rust".to_string(),
+                GlobalSearchState {
+                    title: "borrowck".to_string(),
+                    status: "open".to_string(),
+                    label: "T-compiler".to_string(),
+                    author: "@alice".to_string(),
+                    assignee: "bob".to_string(),
+                    sort: String::new(),
+                    field: "author".to_string(),
+                },
+            )]),
+            global_search_saved_by_repo: HashMap::from([(
+                "Rust-Lang/Rust".to_string(),
+                vec![
+                    GlobalSearchSavedState {
+                        name: "open atomic issues".to_string(),
+                        repo: String::new(),
+                        kind: "issues".to_string(),
+                        search: GlobalSearchState {
+                            title: "atomic".to_string(),
+                            status: "open".to_string(),
+                            label: String::new(),
+                            author: "chenyukang".to_string(),
+                            assignee: String::new(),
+                            sort: String::new(),
+                            field: "author".to_string(),
+                        },
+                    },
+                    GlobalSearchSavedState {
+                        name: String::new(),
+                        repo: "rust-lang/rust".to_string(),
+                        kind: "issue".to_string(),
+                        search: GlobalSearchState {
+                            title: "atomic".to_string(),
+                            status: "open".to_string(),
+                            label: String::new(),
+                            author: "@chenyukang".to_string(),
+                            assignee: String::new(),
+                            sort: String::new(),
+                            field: "wat".to_string(),
+                        },
+                    },
+                ],
+            )]),
         }
         .save(&path)
         .expect("save state");
@@ -392,6 +574,38 @@ mod tests {
                 id: "Refresh".to_string(),
                 selected_at: Some(DateTime::from_timestamp(1_700_000_010, 0).unwrap()),
             }]
+        );
+        assert_eq!(
+            state.global_search_by_repo.get("rust-lang/rust"),
+            Some(&GlobalSearchState {
+                title: "borrowck".to_string(),
+                status: "open".to_string(),
+                label: "T-compiler".to_string(),
+                author: "alice".to_string(),
+                assignee: "bob".to_string(),
+                sort: "created_at".to_string(),
+                field: "author".to_string(),
+            })
+        );
+        assert_eq!(
+            state
+                .global_search_saved_by_repo
+                .get("rust-lang/rust")
+                .and_then(|items| items.first()),
+            Some(&GlobalSearchSavedState {
+                name: "open atomic issues".to_string(),
+                repo: "rust-lang/rust".to_string(),
+                kind: "issues".to_string(),
+                search: GlobalSearchState {
+                    title: "atomic".to_string(),
+                    status: "open".to_string(),
+                    label: String::new(),
+                    author: "chenyukang".to_string(),
+                    assignee: String::new(),
+                    sort: "created_at".to_string(),
+                    field: "author".to_string(),
+                },
+            })
         );
 
         let _ = fs::remove_file(path);

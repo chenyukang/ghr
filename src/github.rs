@@ -587,6 +587,28 @@ struct PullRequestActionRepositoryRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct SubscribableGraphQlRaw {
+    data: SubscribableDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribableDataRaw {
+    repository: Option<SubscribableRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribableRepositoryRaw {
+    issue: Option<SubscribableNodeRaw>,
+    pull_request: Option<SubscribableNodeRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribableNodeRaw {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestActionRaw {
     auto_merge_request: Option<serde_json::Value>,
@@ -2955,6 +2977,114 @@ pub async fn mark_pull_request_ready_for_review(repository: &str, number: u64) -
     Ok(())
 }
 
+pub async fn update_item_subscription(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+    subscribed: bool,
+) -> Result<()> {
+    let subscribable_id = fetch_subscribable_id(repository, number, kind).await?;
+    let state = if subscribed {
+        "SUBSCRIBED"
+    } else {
+        "UNSUBSCRIBED"
+    };
+    let query = r#"
+mutation($id: ID!, $state: SubscriptionState!) {
+  updateSubscription(input: {subscribableId: $id, state: $state}) {
+    subscribable {
+      id
+    }
+  }
+}
+"#;
+    run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-F".to_string(),
+        format!("id={subscribable_id}"),
+        "-F".to_string(),
+        format!("state={state}"),
+    ])
+    .await
+    .with_context(|| {
+        let action = if subscribed {
+            "subscribe to"
+        } else {
+            "unsubscribe from"
+        };
+        format!("failed to {action} {repository}#{number}")
+    })?;
+    Ok(())
+}
+
+async fn fetch_subscribable_id(repository: &str, number: u64, kind: ItemKind) -> Result<String> {
+    let (owner, name) = split_repository(repository)?;
+    let query = match kind {
+        ItemKind::Issue => {
+            r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id
+    }
+  }
+}
+"#
+        }
+        ItemKind::PullRequest => {
+            r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+    }
+  }
+}
+"#
+        }
+        ItemKind::Notification => bail!("selected item is not an issue or pull request"),
+    };
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-F".to_string(),
+        format!("owner={owner}"),
+        "-F".to_string(),
+        format!("name={name}"),
+        "-F".to_string(),
+        format!("number={number}"),
+    ])
+    .await?;
+    parse_subscribable_id(&output, repository, number, kind)
+}
+
+fn parse_subscribable_id(
+    output: &str,
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<String> {
+    let raw = serde_json::from_str::<SubscribableGraphQlRaw>(output).with_context(|| {
+        format!("failed to parse subscription target for {repository}#{number}")
+    })?;
+    let repository_raw = raw
+        .data
+        .repository
+        .ok_or_else(|| anyhow!("repository {repository} was not found"))?;
+    let node = match kind {
+        ItemKind::Issue => repository_raw.issue,
+        ItemKind::PullRequest => repository_raw.pull_request,
+        ItemKind::Notification => None,
+    }
+    .ok_or_else(|| anyhow!("subscription target {repository}#{number} was not found"))?;
+    Ok(node.id)
+}
+
 fn pull_request_ready_args(repository: &str, number: u64, undo: bool) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
@@ -4849,6 +4979,42 @@ mod tests {
         assert_eq!(search_command_limit(50), 50);
         assert_eq!(search_command_limit(101), 101);
         assert_eq!(search_command_limit(5_000), 1_000);
+    }
+
+    #[test]
+    fn parse_subscribable_id_for_pull_request() {
+        let output = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "id": "PR_kwDOSSH5Ns7XqHcs"
+                    }
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            parse_subscribable_id(output, "chenyukang/ghr", 34, ItemKind::PullRequest).unwrap(),
+            "PR_kwDOSSH5Ns7XqHcs"
+        );
+    }
+
+    #[test]
+    fn parse_subscribable_id_for_issue() {
+        let output = r#"{
+            "data": {
+                "repository": {
+                    "issue": {
+                        "id": "I_kwDOSSH5Ns7TAAAB"
+                    }
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            parse_subscribable_id(output, "chenyukang/ghr", 1, ItemKind::Issue).unwrap(),
+            "I_kwDOSSH5Ns7TAAAB"
+        );
     }
 
     #[test]

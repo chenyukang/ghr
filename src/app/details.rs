@@ -291,6 +291,8 @@ pub(super) enum DetailAction {
     ToggleCommentExpanded(usize),
     ReactItem,
     ReactComment(usize),
+    SubscribeItem,
+    UnsubscribeItem,
     AddLabel,
     RemoveLabel(String),
     AssignAssignee,
@@ -484,6 +486,15 @@ impl DetailsBuilder {
         self.document.lines.push(Line::from(""));
     }
 
+    fn push_gap_line(&mut self, prefix: &[DetailSegment]) {
+        let mut segments = prefix.to_vec();
+        let width = segments_width(&segments);
+        if width < self.width {
+            segments.push(DetailSegment::chrome(" ".repeat(self.width - width)));
+        }
+        self.push_line(segments);
+    }
+
     fn mark_diff_file(&mut self) {
         self.document.diff_files.push(self.document.lines.len());
     }
@@ -665,12 +676,16 @@ impl DetailsBuilder {
         self.width = reserved_width(self.width, options.right_padding);
         let mut emitted = 0;
         for block in blocks {
-            let mut line_prefix = options.prefix.clone();
-            line_prefix.extend(quote_prefix(block.quote_depth));
+            let mut block_prefix = options.prefix.clone();
+            block_prefix.extend(quote_prefix(block.quote_depth));
             if block.gap_before
-                && !self.push_markdown_gap(line_prefix.as_slice(), &mut emitted, max_lines)
+                && !self.push_markdown_gap(block_prefix.as_slice(), &mut emitted, max_lines)
             {
                 break;
+            }
+            let mut line_prefix = block_prefix;
+            if matches!(block.kind, MarkdownBlockKind::Code { .. }) {
+                line_prefix.extend(code_block_prefix());
             }
             match block.kind {
                 MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
@@ -977,13 +992,13 @@ pub(super) fn push_wrap_token_char(
         && last.kind == kind
     {
         push_char_segment(&mut last.segments, template, ch);
-        last.width = last.width.saturating_add(display_width_char(ch));
+        last.width = segments_width(&last.segments);
         return;
     }
 
     let mut segments = Vec::new();
     push_char_segment(&mut segments, template, ch);
-    let width = display_width_char(ch);
+    let width = segments_width(&segments);
     tokens.push(WrapToken {
         kind,
         segments,
@@ -1303,6 +1318,9 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_blank();
         builder.push_meta_line(vec![("assignees", assignee_detail_segments(item))]);
         push_label_controls(&mut builder, &item.labels);
+        if item.number.is_some() {
+            builder.push_meta_line(vec![("subscription", subscription_detail_segments())]);
+        }
     }
 
     if let Some(extra) = &item.extra {
@@ -1599,6 +1617,14 @@ pub(super) fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
         ));
     }
     segments
+}
+
+pub(super) fn subscription_detail_segments() -> Vec<DetailSegment> {
+    vec![
+        DetailSegment::action("subscribe", DetailAction::SubscribeItem),
+        DetailSegment::raw("  "),
+        DetailSegment::action("unsubscribe", DetailAction::UnsubscribeItem),
+    ]
 }
 
 pub(super) fn push_diff(
@@ -2013,7 +2039,7 @@ pub(super) fn push_diff_inline_comment(
         comment_right_padding(selected),
         2,
     );
-    push_comment_body_gap(builder, &prefix);
+    push_comment_body_gap(builder, &prefix, selected);
     let collapsed_body;
     let body = if collapse.collapsed {
         collapsed_body = collapsed_comment_body(&comment.body);
@@ -2801,7 +2827,7 @@ pub(super) fn push_comment(
             2,
         );
     }
-    push_comment_body_gap(builder, &prefix);
+    push_comment_body_gap(builder, &prefix, options.selected);
     if options.selected
         && let Some(review) = &comment.review
     {
@@ -2845,8 +2871,16 @@ pub(super) fn push_comment(
     });
 }
 
-pub(super) fn push_comment_body_gap(builder: &mut DetailsBuilder, prefix: &[DetailSegment]) {
-    builder.push_line(prefix.to_vec());
+pub(super) fn push_comment_body_gap(
+    builder: &mut DetailsBuilder,
+    prefix: &[DetailSegment],
+    selected: bool,
+) {
+    if selected {
+        builder.push_line(prefix.to_vec());
+    } else {
+        builder.push_gap_line(prefix);
+    }
 }
 
 pub(super) fn add_selected_comment_text_weight(
@@ -4768,8 +4802,10 @@ pub(super) fn push_markdown_block(
     segments: Vec<DetailSegment>,
 ) {
     let gap_before = markdown_gap_before(blocks.last(), quote_depth, kind);
-    let segments = if quote_depth > 0 {
-        muted_quote_segments(segments)
+    let segments = if matches!(kind, MarkdownBlockKind::Code { .. }) {
+        code_block_segments(segments)
+    } else if quote_depth > 0 {
+        quoted_segments(segments)
     } else {
         segments
     };
@@ -4803,9 +4839,19 @@ pub(super) fn markdown_gap_before(
     )
 }
 
-pub(super) fn muted_quote_segments(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
+pub(super) fn quoted_segments(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
     for segment in &mut segments {
-        segment.style = segment.style.fg(active_theme().muted);
+        segment.style = segment.style.bg(active_theme().quote_bg);
+        if segment.link.is_none() && segment.action.is_none() {
+            segment.style = segment.style.fg(active_theme().quote);
+        }
+    }
+    segments
+}
+
+pub(super) fn code_block_segments(mut segments: Vec<DetailSegment>) -> Vec<DetailSegment> {
+    for segment in &mut segments {
+        segment.style = segment.style.bg(active_theme().code_bg);
     }
     segments
 }
@@ -4815,10 +4861,14 @@ pub(super) fn quote_prefix(depth: u8) -> Vec<DetailSegment> {
         return Vec::new();
     }
 
-    vec![DetailSegment::styled(
-        "│ ".repeat(depth.min(3) as usize),
-        quote_style(),
+    vec![DetailSegment::styled_chrome(
+        "┃ ".repeat(depth.min(3) as usize),
+        quote_rail_style(),
     )]
+}
+
+pub(super) fn code_block_prefix() -> Vec<DetailSegment> {
+    vec![DetailSegment::styled_chrome("▏ ", code_block_rail_style())]
 }
 
 pub(super) fn append_text_segments(
@@ -5043,8 +5093,20 @@ pub(super) fn new_since_last_read_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub(super) fn quote_style() -> Style {
-    active_theme().panel().fg(active_theme().quote)
+pub(super) fn quote_rail_style() -> Style {
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
+        .bg(active_theme().quote_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(super) fn code_block_rail_style() -> Style {
+    active_theme()
+        .panel()
+        .fg(active_theme().focus)
+        .bg(active_theme().code_bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub(super) fn code_plain_style() -> Style {

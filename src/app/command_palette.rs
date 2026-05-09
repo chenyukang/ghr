@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 
 use super::layout::{centered_rect_width, centered_rect_with_size};
 use super::text::{display_width, truncate_inline};
-use super::{InboxThreadAction, ReactionContent};
+use super::{InboxThreadAction, ItemSubscriptionAction, ReactionContent};
 use crate::theme::active_theme;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub(super) enum PaletteAction {
     InboxMarkDone,
     InboxMarkAllRead,
     InboxThreadAction(InboxThreadAction),
+    ItemSubscriptionAction(ItemSubscriptionAction),
 }
 
 pub(super) fn command_palette_area(area: Rect) -> Rect {
@@ -222,6 +223,20 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "Inbox",
             "Unsubscribe from the selected inbox thread",
             PaletteAction::InboxThreadAction(InboxThreadAction::Unsubscribe),
+        ),
+        palette_command(
+            "Subscribe Item",
+            "",
+            "Details",
+            "Subscribe to the selected issue or pull request conversation",
+            PaletteAction::ItemSubscriptionAction(ItemSubscriptionAction::Subscribe),
+        ),
+        palette_command(
+            "Unsubscribe Item",
+            "",
+            "Details",
+            "Unsubscribe from the selected issue or pull request conversation",
+            PaletteAction::ItemSubscriptionAction(ItemSubscriptionAction::Unsubscribe),
         ),
         palette_command(
             "Search Current Repo",

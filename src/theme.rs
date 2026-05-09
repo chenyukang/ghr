@@ -122,6 +122,8 @@ pub struct Theme {
     pub highlight_bg: Color,
     pub selected_fg: Color,
     pub selected_bg: Color,
+    pub code_bg: Color,
+    pub quote_bg: Color,
     pub link: Color,
     pub action: Color,
     pub success: Color,
@@ -145,14 +147,16 @@ impl Theme {
                 surface: Color::Rgb(36, 39, 51),
                 text: Color::White,
                 muted: Color::Gray,
-                subtle: Color::DarkGray,
-                border: Color::DarkGray,
+                subtle: Color::Rgb(124, 132, 158),
+                border: Color::Rgb(92, 104, 132),
                 focus: Color::Cyan,
                 focus_alt: Color::Yellow,
                 highlight_fg: Color::Black,
                 highlight_bg: Color::LightCyan,
                 selected_fg: Color::White,
                 selected_bg: Color::DarkGray,
+                code_bg: Color::Rgb(27, 31, 42),
+                quote_bg: Color::Rgb(43, 47, 61),
                 link: Color::LightBlue,
                 action: Color::LightMagenta,
                 success: Color::LightGreen,
@@ -162,7 +166,7 @@ impl Theme {
                 added: Color::LightGreen,
                 removed: Color::LightRed,
                 code: Color::Gray,
-                quote: Color::DarkGray,
+                quote: Color::Rgb(156, 163, 185),
                 reaction: Color::LightYellow,
                 label: Color::LightBlue,
                 search: Color::Yellow,
@@ -180,6 +184,8 @@ impl Theme {
                 highlight_bg: Color::Rgb(3, 105, 161),
                 selected_fg: Color::Rgb(15, 23, 42),
                 selected_bg: Color::Rgb(226, 232, 240),
+                code_bg: Color::Rgb(226, 232, 240),
+                quote_bg: Color::Rgb(226, 232, 240),
                 link: Color::Rgb(79, 70, 229),
                 action: Color::Rgb(190, 24, 93),
                 success: Color::Rgb(22, 101, 52),
@@ -302,5 +308,17 @@ mod tests {
 
         assert_ne!(theme.background, Color::Reset);
         assert_ne!(theme.surface, Color::Reset);
+    }
+
+    #[test]
+    fn dark_theme_uses_visible_chrome_colors() {
+        let theme = Theme::from_name(ThemeName::Dark);
+
+        assert_ne!(theme.border, Color::DarkGray);
+        assert_ne!(theme.subtle, Color::DarkGray);
+        assert_ne!(theme.border, theme.background);
+        assert_ne!(theme.subtle, theme.background);
+        assert_ne!(theme.code_bg, theme.background);
+        assert_ne!(theme.quote_bg, theme.background);
     }
 }

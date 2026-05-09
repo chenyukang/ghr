@@ -104,6 +104,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Mark All Read` | Mark every GitHub inbox notification as read |
 | `Mute Thread` | Ignore future notifications for the selected inbox thread |
 | `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
+| `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
 | `Info` | Show version, config/db/log paths, ghr process memory usage, ignored/recent item counts, and current UI state |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |

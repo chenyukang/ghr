@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::io::IsTerminal;
 #[cfg(not(test))]
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,12 +21,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState,
-    Tabs, Wrap,
+    Tabs, Widget, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
@@ -57,7 +59,7 @@ use crate::github::{
     reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
     search_global, submit_pending_pull_request_review, submit_pull_request_review,
     subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
-    update_pull_request_branch, with_background_github_priority,
+    update_item_subscription, update_pull_request_branch, with_background_github_priority,
 };
 #[cfg(test)]
 use crate::model::CommentPreviewKind;
@@ -262,6 +264,12 @@ enum AppMsg {
     },
     InboxThreadActionFinished {
         action: InboxThreadAction,
+        result: std::result::Result<(), String>,
+    },
+    ItemSubscriptionUpdated {
+        item_id: String,
+        item_kind: ItemKind,
+        action: ItemSubscriptionAction,
         result: std::result::Result<(), String>,
     },
     SectionPageLoaded {
@@ -1437,15 +1445,15 @@ fn global_search_dialog_suggestion_matches(dialog: &GlobalSearchDialog) -> Vec<S
             &global_search_static_status_choices(),
             global_search_dialog_status_suggestion_prefix(dialog),
         ),
-        GlobalSearchField::Label => prefix_filter_candidates(
+        GlobalSearchField::Label => substring_filter_candidates(
             &dialog.labels,
             global_search_dialog_label_suggestion_prefix(dialog),
         ),
-        GlobalSearchField::Author => prefix_filter_candidates(
+        GlobalSearchField::Author => substring_filter_candidates(
             &dialog.author_candidates,
             global_search_dialog_author_suggestion_prefix(dialog),
         ),
-        GlobalSearchField::Assignee => prefix_filter_candidates(
+        GlobalSearchField::Assignee => substring_filter_candidates(
             &dialog.assignee_candidates,
             global_search_dialog_assignee_suggestion_prefix(dialog),
         ),
@@ -1604,6 +1612,15 @@ fn prefix_filter_candidates(candidates: &[String], prefix: String) -> Vec<String
         .filter(|candidate| {
             prefix.is_empty() || candidate.to_ascii_lowercase().starts_with(&prefix)
         })
+        .cloned()
+        .collect()
+}
+
+fn substring_filter_candidates(candidates: &[String], query: String) -> Vec<String> {
+    let query = query.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|candidate| query.is_empty() || candidate.to_ascii_lowercase().contains(&query))
         .cloned()
         .collect()
 }
@@ -2154,6 +2171,12 @@ enum InboxThreadAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemSubscriptionAction {
+    Subscribe,
+    Unsubscribe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewerAction {
     Request,
     Remove,
@@ -2191,6 +2214,39 @@ fn inbox_thread_action_success_status(action: InboxThreadAction) -> &'static str
         InboxThreadAction::Mute => "inbox thread muted",
         InboxThreadAction::Subscribe => "subscribed to inbox thread",
         InboxThreadAction::Unsubscribe => "unsubscribed from inbox thread",
+    }
+}
+
+fn item_subscription_action_label(action: ItemSubscriptionAction) -> &'static str {
+    match action {
+        ItemSubscriptionAction::Subscribe => "subscribe item",
+        ItemSubscriptionAction::Unsubscribe => "unsubscribe item",
+    }
+}
+
+fn item_subscription_action_running_status(
+    action: ItemSubscriptionAction,
+    item_kind: ItemKind,
+) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        ItemSubscriptionAction::Subscribe => format!("subscribing to {label} conversation"),
+        ItemSubscriptionAction::Unsubscribe => {
+            format!("unsubscribing from {label} conversation")
+        }
+    }
+}
+
+fn item_subscription_action_success_status(
+    action: ItemSubscriptionAction,
+    item_kind: ItemKind,
+) -> String {
+    let label = item_kind_label(item_kind);
+    match action {
+        ItemSubscriptionAction::Subscribe => format!("subscribed to {label} conversation"),
+        ItemSubscriptionAction::Unsubscribe => {
+            format!("unsubscribed from {label} conversation")
+        }
     }
 }
 
@@ -2367,6 +2423,8 @@ const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
 const AUTO_THEME_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const TERMINAL_DISCONNECT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
@@ -2441,8 +2499,7 @@ struct AppState {
     diff_inline_comments_visible: bool,
     revealed_diff_inline_comments: HashMap<String, HashSet<usize>>,
     conversation_details_state: HashMap<String, ConversationDetailsState>,
-    viewed_details_snapshot: HashMap<String, String>,
-    viewed_comments_snapshot: HashMap<String, String>,
+    viewed_item_at: HashMap<String, DateTime<Utc>>,
     action_hints: HashMap<String, ActionHintState>,
     action_hints_stale: HashSet<String>,
     action_hints_refreshing: HashSet<String>,
@@ -2731,6 +2788,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    start_terminal_disconnect_watchdog();
 
     let result = run_loop(
         &mut terminal,
@@ -2805,6 +2863,11 @@ async fn run_loop(
     let mut last_area = Rect::new(0, 0, initial_size.width, initial_size.height);
     let mut needs_draw = true;
     loop {
+        if !terminal_streams_connected() {
+            warn!("terminal disconnected; exiting ghr");
+            break;
+        }
+
         needs_draw |= drain_app_messages(app, rx);
         needs_draw |= app.ensure_current_details_loading(tx);
         needs_draw |= app.ensure_current_comments_auto_refresh(tx);
@@ -2849,8 +2912,14 @@ async fn run_loop(
         }
 
         let mut should_quit = false;
-        if event::poll(EVENT_POLL_TIMEOUT)? {
-            let events = read_event_batch(event::read()?)?;
+        let Some(event_ready) = poll_terminal_event()? else {
+            break;
+        };
+        if event_ready {
+            let Some(first_event) = read_terminal_event()? else {
+                break;
+            };
+            let events = read_event_batch(first_event)?;
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             should_quit = handle_event_batch_mut(app, events, area, config, paths, store, tx);
@@ -2875,10 +2944,76 @@ fn drain_app_messages(app: &mut AppState, rx: &mut UnboundedReceiver<AppMsg>) ->
     handled
 }
 
+fn terminal_streams_connected() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+#[cfg(not(test))]
+fn start_terminal_disconnect_watchdog() {
+    let _ = std::thread::Builder::new()
+        .name("terminal-disconnect-watchdog".to_string())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(TERMINAL_DISCONNECT_CHECK_INTERVAL);
+                if !terminal_streams_connected() {
+                    warn!("terminal disconnected; exiting ghr");
+                    std::process::exit(0);
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+fn start_terminal_disconnect_watchdog() {}
+
+fn terminal_disconnect_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    ) || matches!(error.raw_os_error(), Some(5 | 6 | 9 | 19 | 25))
+}
+
+fn poll_terminal_event() -> Result<Option<bool>> {
+    poll_terminal_event_with_timeout(EVENT_POLL_TIMEOUT)
+}
+
+fn poll_terminal_event_now() -> Result<Option<bool>> {
+    poll_terminal_event_with_timeout(Duration::from_millis(0))
+}
+
+fn poll_terminal_event_with_timeout(timeout: Duration) -> Result<Option<bool>> {
+    match event::poll(timeout) {
+        Ok(ready) => Ok(Some(ready)),
+        Err(error) if terminal_disconnect_error(&error) || !terminal_streams_connected() => {
+            warn!(error = %error, "terminal event poll failed after terminal disconnected");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_terminal_event() -> Result<Option<Event>> {
+    match event::read() {
+        Ok(event) => Ok(Some(event)),
+        Err(error) if terminal_disconnect_error(&error) || !terminal_streams_connected() => {
+            warn!(error = %error, "terminal event read failed after terminal disconnected");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn read_event_batch(first: Event) -> Result<Vec<Event>> {
     let mut events = vec![first];
-    while events.len() < EVENT_BATCH_LIMIT && event::poll(Duration::from_millis(0))? {
-        events.push(event::read()?);
+    while events.len() < EVENT_BATCH_LIMIT && poll_terminal_event_now()?.unwrap_or(false) {
+        let Some(event) = read_terminal_event()? else {
+            break;
+        };
+        events.push(event);
     }
     Ok(events)
 }
@@ -3380,6 +3515,35 @@ fn start_inbox_thread_action_sync(
         }
         .map_err(|error| error.to_string());
         let _ = tx.send(AppMsg::InboxThreadActionFinished { action, result });
+    });
+}
+
+fn start_item_subscription_sync(
+    item: WorkItem,
+    action: ItemSubscriptionAction,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let item_kind = item.kind;
+        let result = match (item.number, item.kind) {
+            (Some(number), ItemKind::Issue | ItemKind::PullRequest) => update_item_subscription(
+                &item.repo,
+                number,
+                item.kind,
+                matches!(action, ItemSubscriptionAction::Subscribe),
+            )
+            .await
+            .map_err(error_chain_message),
+            (None, _) => Err("selected item has no issue or pull request number".to_string()),
+            (_, _) => Err("selected item is not an issue or pull request".to_string()),
+        };
+        let _ = tx.send(AppMsg::ItemSubscriptionUpdated {
+            item_id,
+            item_kind,
+            action,
+            result,
+        });
     });
 }
 
@@ -6824,24 +6988,151 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
     frame.render_widget(Clear, area);
     if text_selection_mode {
-        let details = Paragraph::new(Text::from(document.lines))
-            .style(active_theme().panel())
-            .scroll((app.details_scroll, 0));
-        frame.render_widget(details, area);
+        frame.render_widget(
+            DetailsLines::new(&document.lines, app.details_scroll, active_theme().panel()),
+            area,
+        );
         return;
     }
 
-    let details = Paragraph::new(Text::from(document.lines))
+    let block = Block::default()
         .style(active_theme().panel())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border_type)
-                .border_style(border_style)
-                .title(Span::styled(title, title_style)),
-        )
-        .scroll((app.details_scroll, 0));
-    frame.render_widget(details, area);
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .border_style(border_style)
+        .title(Span::styled(title, title_style));
+    let inner = block_inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        DetailsLines::new(&document.lines, app.details_scroll, active_theme().panel()),
+        inner,
+    );
+}
+
+struct DetailsLines<'a> {
+    lines: &'a [Line<'static>],
+    scroll: u16,
+    base_style: Style,
+}
+
+impl<'a> DetailsLines<'a> {
+    const fn new(lines: &'a [Line<'static>], scroll: u16, base_style: Style) -> Self {
+        Self {
+            lines,
+            scroll,
+            base_style,
+        }
+    }
+}
+
+impl Widget for DetailsLines<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let area = area.intersection(buf.area);
+        if area.is_empty() {
+            return;
+        }
+
+        fill_details_area(buf, area, self.base_style);
+        for (row, line) in self
+            .lines
+            .iter()
+            .skip(usize::from(self.scroll))
+            .take(usize::from(area.height))
+            .enumerate()
+        {
+            let y = area.y.saturating_add(row as u16);
+            render_details_line(buf, area, y, line, self.base_style);
+        }
+    }
+}
+
+fn fill_details_area(buf: &mut Buffer, area: Rect, style: Style) {
+    for y in area.top()..area.bottom() {
+        fill_details_row(buf, area, y, style);
+    }
+}
+
+fn fill_details_row(buf: &mut Buffer, area: Rect, y: u16, style: Style) {
+    for x in area.left()..area.right() {
+        let cell = &mut buf[(x, y)];
+        cell.reset();
+        cell.set_symbol(" ").set_style(style).set_skip(false);
+    }
+}
+
+fn render_details_line(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'static>,
+    base_style: Style,
+) {
+    let line_style = base_style.patch(line.style);
+    fill_details_row(buf, area, y, line_style);
+    let line_width = details_line_width(line);
+    if line_width == 0 {
+        return;
+    }
+
+    let available_width = usize::from(area.width);
+    let offset = if line_width <= available_width {
+        match line.alignment {
+            Some(Alignment::Center) => (available_width - line_width) / 2,
+            Some(Alignment::Right) => available_width - line_width,
+            Some(Alignment::Left) | None => 0,
+        }
+    } else {
+        0
+    };
+    let mut x = area
+        .x
+        .saturating_add(offset.min(usize::from(u16::MAX)) as u16);
+
+    'spans: for span in &line.spans {
+        let style = line_style.patch(span.style);
+        for symbol in details_text_symbols(span.content.as_ref()) {
+            let width = display_width(&symbol);
+            if width == 0 {
+                continue;
+            }
+            let width_u16 = width.min(usize::from(u16::MAX)) as u16;
+            let next_x = x.saturating_add(width_u16);
+            if next_x > area.right() {
+                break 'spans;
+            }
+
+            let cell = &mut buf[(x, y)];
+            cell.reset();
+            cell.set_symbol(&symbol).set_style(style).set_skip(false);
+
+            for hidden_x in x.saturating_add(1)..next_x {
+                let cell = &mut buf[(hidden_x, y)];
+                cell.reset();
+                cell.set_symbol(" ").set_style(style).set_skip(true);
+            }
+            x = next_x;
+        }
+    }
+}
+
+fn details_line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn details_text_symbols(text: &str) -> Vec<String> {
+    let mut symbols = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let mut symbol = ch.to_string();
+        if chars.peek().is_some_and(|next| *next == '\u{fe0f}') {
+            symbol.push(chars.next().expect("peeked variation selector"));
+        }
+        symbols.push(symbol);
+    }
+    symbols
 }
 
 fn apply_details_text_selection(app: &AppState, document: &mut DetailsDocument) {
@@ -11547,6 +11838,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
         help_key_line("T", "edit selected issue or PR title/body"),
+        help_key_line("Palette", "subscribe or unsubscribe this issue or PR"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open close or reopen confirmation"),
@@ -12076,30 +12368,6 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
     !recent.id.is_empty() && item.id == recent.id
 }
 
-fn details_snapshot_hash(item: &WorkItem) -> String {
-    let value = serde_json::json!({
-        "kind": item.kind,
-        "repo": &item.repo,
-        "number": item.number,
-        "title": &item.title,
-        "body": &item.body,
-        "author": &item.author,
-        "state": &item.state,
-        "url": &item.url,
-        "updated_at": &item.updated_at,
-        "labels": &item.labels,
-        "reactions": &item.reactions,
-        "comments_count": item.comments,
-    });
-    let bytes = serde_json::to_vec(&value).unwrap_or_default();
-    format!("{:x}", md5::compute(bytes))
-}
-
-fn comments_snapshot_hash(comments: &[CommentPreview]) -> String {
-    let bytes = serde_json::to_vec(comments).unwrap_or_default();
-    format!("{:x}", md5::compute(bytes))
-}
-
 fn editor_draft_item_key(item: &WorkItem) -> String {
     let kind = match item.kind {
         ItemKind::Notification => "notification",
@@ -12308,8 +12576,7 @@ impl AppState {
             diff_inline_comments_visible: true,
             revealed_diff_inline_comments: HashMap::new(),
             conversation_details_state,
-            viewed_details_snapshot: ui_state.viewed_details_snapshot.clone(),
-            viewed_comments_snapshot: ui_state.viewed_comments_snapshot.clone(),
+            viewed_item_at: ui_state.viewed_item_at.clone(),
             action_hints: HashMap::new(),
             action_hints_stale: HashSet::new(),
             action_hints_refreshing: HashSet::new(),
@@ -12846,8 +13113,7 @@ impl AppState {
                 .iter()
                 .map(|(item_id, state)| (item_id.clone(), state.selected_comment_index))
                 .collect(),
-            viewed_details_snapshot: self.viewed_details_snapshot.clone(),
-            viewed_comments_snapshot: self.viewed_comments_snapshot.clone(),
+            viewed_item_at: self.viewed_item_at.clone(),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
@@ -14242,6 +14508,28 @@ impl AppState {
                     );
                 }
             },
+            AppMsg::ItemSubscriptionUpdated {
+                item_id,
+                item_kind,
+                action,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.details_stale.insert(item_id);
+                    self.status = item_subscription_action_success_status(action, item_kind);
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    self.status = format!(
+                        "{} failed: {}",
+                        item_subscription_action_label(action),
+                        operation_error_body(&error)
+                    );
+                }
+            },
             AppMsg::SectionPageLoaded {
                 section_key,
                 section,
@@ -14641,6 +14929,10 @@ impl AppState {
             }
             PaletteAction::InboxThreadAction(action) => {
                 self.start_inbox_thread_action(action, tx);
+                false
+            }
+            PaletteAction::ItemSubscriptionAction(action) => {
+                self.start_item_subscription_action(action, tx);
                 false
             }
         }
@@ -15887,6 +16179,31 @@ impl AppState {
 
         self.status = inbox_thread_action_running_status(action).to_string();
         start_inbox_thread_action_sync(thread_id, action, tx.clone());
+    }
+
+    fn start_item_subscription_action(
+        &mut self,
+        action: ItemSubscriptionAction,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(item) = self.current_item().cloned() else {
+            self.status = format!(
+                "select an issue or pull request to {}",
+                item_subscription_action_label(action)
+            );
+            return;
+        };
+        if !matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
+            self.status = "selected item is not an issue or pull request".to_string();
+            return;
+        }
+        if item.number.is_none() {
+            self.status = "selected item has no issue or pull request number".to_string();
+            return;
+        }
+
+        self.status = item_subscription_action_running_status(action, item.kind);
+        start_item_subscription_sync(item, action, tx.clone());
     }
 
     fn current_inbox_thread_id(&self) -> Option<String> {
@@ -17940,6 +18257,20 @@ impl AppState {
             DetailAction::ReactComment(index) => {
                 self.select_comment(index);
                 self.start_comment_reaction_dialog(index);
+            }
+            DetailAction::SubscribeItem => {
+                if let Some(tx) = tx {
+                    self.start_item_subscription_action(ItemSubscriptionAction::Subscribe, tx);
+                } else {
+                    self.status = "subscription action unavailable".to_string();
+                }
+            }
+            DetailAction::UnsubscribeItem => {
+                if let Some(tx) = tx {
+                    self.start_item_subscription_action(ItemSubscriptionAction::Unsubscribe, tx);
+                } else {
+                    self.status = "subscription action unavailable".to_string();
+                }
             }
             DetailAction::AddLabel => self.start_add_label_dialog_with_store(store, tx),
             DetailAction::RemoveLabel(label) => self.start_remove_label_dialog(label),
@@ -21099,27 +21430,16 @@ impl AppState {
         }
     }
 
-    fn details_snapshot_hash_for_item(&self, item: &WorkItem) -> String {
-        details_snapshot_hash(item)
-    }
-
     fn item_has_unseen_details(&self, item: &WorkItem) -> bool {
-        if !item_supports_details_memory(item) {
+        let Some(key) = work_item_details_memory_key(item) else {
             return false;
-        }
-        if self
-            .viewed_details_snapshot
-            .get(&item.id)
-            .is_some_and(|viewed| viewed != &self.details_snapshot_hash_for_item(item))
-        {
-            return true;
-        }
-        self.loaded_comments_for_item(&item.id)
-            .is_some_and(|comments| {
-                self.viewed_comments_snapshot
-                    .get(&item.id)
-                    .is_some_and(|viewed| viewed != &comments_snapshot_hash(comments))
-            })
+        };
+        let Some(updated_at) = item.updated_at else {
+            return false;
+        };
+        self.viewed_item_at
+            .get(&key)
+            .is_some_and(|viewed_at| updated_at > *viewed_at)
     }
 
     fn mark_current_details_viewed(&mut self) {
@@ -21132,13 +21452,8 @@ impl AppState {
         {
             return;
         }
-        self.viewed_details_snapshot
-            .insert(item.id.clone(), self.details_snapshot_hash_for_item(&item));
-        let comments_hash = self
-            .loaded_comments_for_item(&item.id)
-            .map(comments_snapshot_hash);
-        if let Some(hash) = comments_hash {
-            self.viewed_comments_snapshot.insert(item.id.clone(), hash);
+        if let Some(key) = work_item_details_memory_key(&item) {
+            self.viewed_item_at.insert(key, Utc::now());
         }
     }
 
@@ -24283,6 +24598,33 @@ diff --git a/src/github.rs b/src/github.rs
     }
 
     #[test]
+    fn terminal_disconnect_error_classifies_closed_terminal_io() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(terminal_disconnect_error(&io::Error::new(
+                kind,
+                "terminal closed"
+            )));
+        }
+
+        for raw_error in [5, 6, 9, 19, 25] {
+            assert!(terminal_disconnect_error(&io::Error::from_raw_os_error(
+                raw_error
+            )));
+        }
+
+        assert!(!terminal_disconnect_error(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "permission denied"
+        )));
+    }
+
+    #[test]
     fn startup_setup_dialog_sets_status_without_initializing_dialog() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.show_startup_initializing();
@@ -24816,8 +25158,7 @@ diff --git a/src/github.rs b/src/github.rs
             expanded_comments: Vec::new(),
             details_scroll_by_item: HashMap::new(),
             selected_comment_index_by_item: HashMap::new(),
-            viewed_details_snapshot: HashMap::new(),
-            viewed_comments_snapshot: HashMap::new(),
+            viewed_item_at: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
@@ -25067,25 +25408,33 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn viewed_details_snapshot_marks_unseen_comment_updates() {
+    fn viewed_item_at_marks_items_updated_after_last_view_unseen() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.details.insert(
-            "1".to_string(),
-            DetailState::Loaded(vec![comment("alice", "old", None)]),
-        );
-        app.focus_details();
+        let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
+        let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        app.sections[0].items[0].updated_at = Some(updated_before_view);
+        let key = work_item_details_memory_key(app.current_item().expect("item"))
+            .expect("details memory key");
+
         assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-        app.focus_list();
-        app.handle_msg(AppMsg::CommentsLoaded {
-            item_id: "1".to_string(),
-            comments: Ok(CommentFetchResult {
-                item_metadata: None,
-                item_reactions: ReactionSummary::default(),
-                item_milestone: None,
-                comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
-            }),
-        });
+        app.viewed_item_at.insert(key, viewed_at);
+        assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+
+        app.sections[0].items[0].updated_at = Some(updated_after_view);
+        assert!(app.item_has_unseen_details(app.current_item().expect("item")));
+    }
+
+    #[test]
+    fn focusing_details_marks_current_item_viewed_by_time() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        app.sections[0].items[0].updated_at = Some(updated_at);
+        let key = work_item_details_memory_key(app.current_item().expect("item"))
+            .expect("details memory key");
+        app.viewed_item_at.insert(key, viewed_at);
         assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 
         app.focus_details();
@@ -25093,12 +25442,37 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn viewed_details_snapshot_marks_unseen_list_metadata_updates() {
+    fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.focus_details();
+        let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
+        let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        app.sections[0].items[0].updated_at = Some(updated_before_view);
+        let key = work_item_details_memory_key(app.current_item().expect("item"))
+            .expect("details memory key");
+        app.viewed_item_at.insert(key, viewed_at);
         assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-        app.sections[0].items[0].comments = Some(3);
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_metadata: Some(ItemDetailsMetadata {
+                    title: None,
+                    body: None,
+                    author: None,
+                    state: None,
+                    url: None,
+                    created_at: None,
+                    updated_at: Some(updated_after_view),
+                    labels: None,
+                    assignees: None,
+                    comments: Some(3),
+                }),
+                item_reactions: ReactionSummary::default(),
+                item_milestone: None,
+                comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
+            }),
+        });
 
         assert!(app.item_has_unseen_details(app.current_item().expect("item")));
     }
@@ -27443,6 +27817,11 @@ diff --git a/src/main.rs b/src/main.rs
             buffer.cell((0, 0)).expect("top-left cell").bg,
             theme.surface
         );
+        assert_eq!(
+            buffer.cell((0, 0)).expect("top-left border").fg,
+            theme.border
+        );
+        assert_ne!(theme.border, Color::DarkGray);
     }
 
     #[test]
@@ -27676,7 +28055,10 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(unread_style.add_modifier.contains(Modifier::BOLD));
 
         let read_style = list_item_row_style(&app, &read);
-        assert_eq!(read_style.fg, Some(Color::DarkGray));
+        assert_eq!(
+            read_style.fg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).subtle)
+        );
         assert!(!read_style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -29069,6 +29451,49 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn global_search_dynamic_candidates_support_substring_matching() {
+        let mut dialog = GlobalSearchDialog {
+            labels: vec![
+                "T-compiler".to_string(),
+                "good first issue".to_string(),
+                "S-waiting-on-review".to_string(),
+            ],
+            author_candidates: vec![
+                "chenyukang".to_string(),
+                "bjorn3".to_string(),
+                "rustbot".to_string(),
+            ],
+            assignee_candidates: vec![
+                "compiler-errors".to_string(),
+                "estebank".to_string(),
+                "BoxyUwU".to_string(),
+            ],
+            ..GlobalSearchDialog::default()
+        };
+
+        dialog.field = GlobalSearchField::Label;
+        dialog.label.set_text("compiler");
+        assert_eq!(
+            global_search_dialog_suggestion_matches(&dialog),
+            vec!["T-compiler".to_string()]
+        );
+
+        dialog.field = GlobalSearchField::Author;
+        dialog.author.set_text("yuk");
+        assert_eq!(
+            global_search_dialog_suggestion_matches(&dialog),
+            vec!["chenyukang".to_string()]
+        );
+
+        dialog.field = GlobalSearchField::Assignee;
+        dialog.assignee.set_text("uwu");
+        assert_eq!(
+            global_search_dialog_suggestion_matches(&dialog),
+            vec!["BoxyUwU".to_string()]
+        );
+    }
+
+    #[test]
     fn global_search_reopens_with_last_repo_conditions() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.start_global_search_input();
@@ -30176,9 +30601,22 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(rendered.contains("labels:  +"));
         assert!(!rendered.contains("labels: none"));
+        assert!(rendered.contains("subscription: subscribe  unsubscribe"));
         assert!(rendered.contains("  reactions:  + react"));
         assert!(!rendered.contains("reactions: none"));
         assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
+        assert_document_action_for_text_on_line(
+            &document,
+            "subscription:",
+            "subscribe",
+            DetailAction::SubscribeItem,
+        );
+        assert_document_action_for_text_on_line(
+            &document,
+            "subscription:",
+            "unsubscribe",
+            DetailAction::UnsubscribeItem,
+        );
         assert_document_action_for_text_on_line(
             &document,
             "reactions:",
@@ -30226,6 +30664,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(!rendered.contains("+ react"));
         assert!(!rendered.contains("reactions:"));
+        assert!(!rendered.contains("subscription:"));
         assert!(
             !document
                 .actions
@@ -31172,7 +31611,7 @@ The reviewer was selected based on:\n\
             "quote should wrap in the narrow details pane"
         );
         assert!(
-            quote_lines.iter().all(|line| line.starts_with("│ ")),
+            quote_lines.iter().all(|line| line.starts_with("┃ ")),
             "each wrapped quote line should keep the quote marker: {quote_lines:?}"
         );
         let quoted_text = document.lines[0]
@@ -31180,7 +31619,14 @@ The reviewer was selected based on:\n\
             .iter()
             .find(|span| span.content.contains("quoted"))
             .expect("quoted text span");
-        assert_eq!(quoted_text.style.fg, Some(Color::Gray));
+        assert_eq!(
+            quoted_text.style.fg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).quote)
+        );
+        assert_eq!(
+            quoted_text.style.bg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).quote_bg)
+        );
         let normal_index = rendered
             .iter()
             .position(|line| line == "normal reply")
@@ -31196,7 +31642,8 @@ The reviewer was selected based on:\n\
             document.lines[normal_index]
                 .spans
                 .iter()
-                .all(|span| span.style.fg != Some(Color::Gray)),
+                .all(|span| span.style.fg
+                    != Some(crate::theme::Theme::from_name(ThemeName::Dark).quote)),
             "normal paragraph should keep the regular text color"
         );
     }
@@ -31254,8 +31701,8 @@ The reviewer was selected based on:\n\
         assert!(rendered[3].trim().is_empty());
         assert_eq!(rendered[4], "  Public API");
         assert!(rendered[5].trim().is_empty());
-        assert_eq!(rendered[6], "  let a = [1,2,3];");
-        assert_eq!(rendered[7], "  let mut iter = a.split(|i| i == 2);");
+        assert_eq!(rendered[6], "  ▏ let a = [1,2,3];");
+        assert_eq!(rendered[7], "  ▏ let mut iter = a.split(|i| i == 2);");
         assert!(rendered[8].trim().is_empty());
         assert_eq!(rendered[9], "  - [x] Implementation: #92287");
         assert_eq!(rendered[10], "  - [ ] Final comment period (FCP)");
@@ -31279,9 +31726,9 @@ The reviewer was selected based on:\n\
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered[0], "  fn places_alias<'tcx>(");
-        assert_eq!(rendered[1], "      tcx: TyCtxt<'tcx>,");
-        assert_eq!(rendered[3], "      return false; // conservative");
+        assert_eq!(rendered[0], "  ▏ fn places_alias<'tcx>(");
+        assert_eq!(rendered[1], "  ▏     tcx: TyCtxt<'tcx>,");
+        assert_eq!(rendered[3], "  ▏     return false; // conservative");
 
         let keyword = document.lines[0]
             .spans
@@ -31289,6 +31736,10 @@ The reviewer was selected based on:\n\
             .find(|span| span.content.as_ref() == "fn")
             .expect("highlighted fn keyword");
         assert_eq!(keyword.style.fg, Some(Color::LightMagenta));
+        assert_eq!(
+            keyword.style.bg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).code_bg)
+        );
         assert!(keyword.style.add_modifier.contains(Modifier::BOLD));
 
         let comment = document.lines[3]
@@ -31296,7 +31747,14 @@ The reviewer was selected based on:\n\
             .iter()
             .find(|span| span.content.as_ref() == "// conservative")
             .expect("highlighted comment");
-        assert_eq!(comment.style.fg, Some(Color::DarkGray));
+        assert_eq!(
+            comment.style.fg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).quote)
+        );
+        assert_eq!(
+            comment.style.bg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).code_bg)
+        );
     }
 
     #[test]
@@ -31317,19 +31775,26 @@ The reviewer was selected based on:\n\
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered[0], "  ---");
+        assert_eq!(rendered[0], "  ▏ ---");
         assert_eq!(
             rendered[1],
-            "      Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.62s"
+            "  ▏     Finished `dev` profile [unoptimized + debuginfo] target(s) in 31.62s"
         );
-        assert_eq!(rendered[2], "  error[E0308]: mismatched types");
+        assert_eq!(rendered[2], "  ▏ error[E0308]: mismatched types");
 
         let separator = document.lines[0]
             .spans
             .iter()
             .find(|span| span.content.as_ref() == "---")
             .expect("highlighted separator");
-        assert_eq!(separator.style.fg, Some(Color::DarkGray));
+        assert_eq!(
+            separator.style.fg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).subtle)
+        );
+        assert_eq!(
+            separator.style.bg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).code_bg)
+        );
 
         let error = document.lines[2]
             .spans
@@ -31337,7 +31802,72 @@ The reviewer was selected based on:\n\
             .find(|span| span.content.as_ref() == "error[E0308]: mismatched types")
             .expect("highlighted error");
         assert_eq!(error.style.fg, Some(Color::LightRed));
+        assert_eq!(
+            error.style.bg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).code_bg)
+        );
         assert!(error.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_code_and_quote_blocks_have_distinct_chrome() {
+        let mut builder = DetailsBuilder::new(88);
+        builder.push_markdown_block_indented(
+            "Intro\n\n```console\nerror[E0214]: parenthesized type parameters\n  1 | fn foo(_: Option()) {}\n```\n\n> quoted rationale\n> with another line",
+            "empty",
+            usize::MAX,
+            usize::MAX,
+            COMMENT_LEFT_PADDING,
+            COMMENT_RIGHT_PADDING,
+        );
+        let document = builder.finish();
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let theme = crate::theme::Theme::from_name(ThemeName::Dark);
+
+        assert_eq!(
+            rendered[2],
+            "  ▏ error[E0214]: parenthesized type parameters"
+        );
+        assert_eq!(rendered[4], "  ┃ quoted rationale");
+
+        let code_rail = document.lines[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "▏ ")
+            .expect("code rail");
+        assert_eq!(code_rail.style.bg, Some(theme.code_bg));
+        assert!(document.copy_exclusions.iter().any(|region| {
+            region.line == 2 && region.start == COMMENT_LEFT_PADDING as u16 && region.end == 4
+        }));
+
+        let quote_rail = document.lines[4]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "┃ ")
+            .expect("quote rail");
+        assert_eq!(quote_rail.style.bg, Some(theme.quote_bg));
+        assert!(document.copy_exclusions.iter().any(|region| {
+            region.line == 4 && region.start == COMMENT_LEFT_PADDING as u16 && region.end == 4
+        }));
+
+        let code = document.lines[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "error[E0214]: parenthesized type parameters")
+            .expect("code content");
+        assert_eq!(code.style.bg, Some(theme.code_bg));
+
+        let quote = document.lines[4]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "quoted rationale")
+            .expect("quote content");
+        assert_eq!(quote.style.fg, Some(theme.quote));
+        assert_eq!(quote.style.bg, Some(theme.quote_bg));
     }
 
     #[test]
@@ -31418,7 +31948,7 @@ The reviewer was selected based on:\n\
             comment_line_indices
                 .iter()
                 .filter_map(|index| rendered_lines.get(*index))
-                .filter(|line| !line.is_empty())
+                .filter(|line| !line.trim().is_empty())
                 .all(|line| display_width(line) <= 96),
             "comment lines should reserve right padding: {rendered_lines:?}"
         );
@@ -31690,8 +32220,32 @@ The reviewer was selected based on:\n\
     #[test]
     fn display_width_counts_reaction_emoji_columns() {
         assert_eq!(display_width("😄"), 2);
+        assert_eq!(display_width("❤️"), 2);
         assert_eq!(display_width("👀"), 2);
-        assert_eq!(display_width("😄 1  👀 1  react"), 17);
+        assert_eq!(display_width("❤️ 1  👀 1  react"), 17);
+    }
+
+    #[test]
+    fn details_renderer_marks_terminal_wide_symbols_as_skip_cells() {
+        let line = Line::from(vec![
+            Span::raw("Zhangcy0x3 - 16d open "),
+            Span::raw("❤️"),
+            Span::raw(" 1  "),
+            Span::styled("+ react", active_theme().action),
+        ]);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 3));
+
+        DetailsLines::new(std::slice::from_ref(&line), 0, active_theme().panel())
+            .render(buffer.area, &mut buffer);
+
+        let heart_column = display_width("Zhangcy0x3 - 16d open ") as u16;
+        assert_eq!(buffer[(heart_column, 0)].symbol(), "❤️");
+        assert!(
+            buffer[(heart_column + 1, 0)].skip,
+            "the second cell occupied by the heart emoji should be skipped by terminal diffing"
+        );
+        assert_eq!(buffer[(heart_column + 2, 0)].symbol(), " ");
+        assert_eq!(buffer[(heart_column + 3, 0)].symbol(), "1");
     }
 
     #[test]
@@ -32170,6 +32724,85 @@ The reviewer was selected based on:\n\
             Some(DetailAction::ReplyComment(1))
         );
         assert_eq!(document.comment_at(bob_line_index), Some(1));
+    }
+
+    #[test]
+    fn comment_gap_lines_are_padded_to_clear_stale_header_cells() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.clear_selected_comment();
+        let mut reacted = comment("Zhangcy0x3", "pushed 1 commit", None);
+        reacted.reactions.heart = 1;
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![reacted]));
+
+        let document = build_details_document(&app, 100);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let header_index = rendered
+            .iter()
+            .position(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+            .expect("comment header");
+        let gap = rendered
+            .get(header_index + 1)
+            .expect("comment body gap line");
+
+        assert!(
+            gap.trim().is_empty(),
+            "gap should stay visually blank: {gap:?}"
+        );
+        assert_eq!(
+            display_width(gap),
+            100,
+            "gap should overwrite the full details row: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn selected_comment_right_border_stays_aligned_with_reactions() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.focus_details();
+        app.selected_comment_index = 0;
+        let mut reacted = comment("Zhangcy0x3", "pushed 1 commit", None);
+        reacted.reactions.heart = 1;
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(vec![reacted]));
+
+        let width = 100;
+        let document = build_details_document(&app, width);
+        let border_width = comment_right_border_column(usize::from(width)) + 1;
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let top = rendered
+            .iter()
+            .find(|line| line.starts_with('┏'))
+            .expect("selected comment top border");
+        let header = rendered
+            .iter()
+            .find(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+            .expect("selected comment header");
+        let body = rendered
+            .iter()
+            .find(|line| line.contains("pushed 1 commit"))
+            .expect("selected comment body");
+
+        for line in [top, header, body] {
+            assert_eq!(
+                display_width(line),
+                border_width,
+                "selected comment line should end at the shared right border: {line:?}"
+            );
+            assert!(
+                line.ends_with('┓') || line.ends_with('┃'),
+                "selected comment line should have a visible right edge: {line:?}"
+            );
+        }
     }
 
     #[test]

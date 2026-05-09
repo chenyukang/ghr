@@ -87,6 +87,8 @@ const shortcuts = [
   ["Inbox", "Palette", "Mute Thread: ignore future notifications for the selected inbox thread"],
   ["Inbox", "Palette", "Subscribe Thread: subscribe to the selected inbox thread"],
   ["Inbox", "Palette", "Unsubscribe Thread: unsubscribe from the selected inbox thread"],
+  ["Details", "Palette", "Subscribe Item: subscribe to the selected issue or pull request conversation"],
+  ["Details", "Palette", "Unsubscribe Item: unsubscribe from the selected issue or pull request conversation"],
   ["Clipboard", "Palette", "Copy GitHub Link: copy selected comment link or issue/PR URL"],
   ["Clipboard", "Palette", "Copy Content: copy selected comment body or issue/PR description"],
   ["Info", "Palette", "Info: show version, paths, ghr process memory, UI state, and ignored/recent counts"],

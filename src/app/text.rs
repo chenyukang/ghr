@@ -1,7 +1,24 @@
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 pub(super) fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    let mut width = 0;
+    let mut last_char_width = None;
+    for ch in text.chars() {
+        if ch == '\u{fe0f}' {
+            if let Some(previous_width) = last_char_width
+                && previous_width < 2
+            {
+                width += 2 - previous_width;
+                last_char_width = Some(2);
+            }
+            continue;
+        }
+
+        let char_width = display_width_char(ch);
+        width += char_width;
+        last_char_width = Some(char_width);
+    }
+    width
 }
 
 pub(super) fn display_width_char(ch: char) -> usize {

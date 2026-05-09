@@ -77,7 +77,7 @@ ghr
 The installers detect your OS and CPU architecture, download the matching GitHub release asset with visible progress, verify its `.sha256`, and install `ghr` into `~/.local/bin` by default. Use `GHR_INSTALL_DIR` to choose another install directory, or `GHR_VERSION` to pin a release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.7.3 GHR_INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GHR_VERSION=v0.7.4 GHR_INSTALL_DIR=/usr/local/bin sh
 ```
 
 ## Usage

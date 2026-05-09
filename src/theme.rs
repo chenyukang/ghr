@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::process::Command;
 
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,15 @@ pub enum ThemeName {
     #[default]
     Dark = 0,
     Light = 1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    Auto,
+    Dark,
+    Light,
 }
 
 impl ThemeName {
@@ -36,6 +46,65 @@ impl ThemeName {
             Self::Light => "light",
         }
     }
+}
+
+impl ThemePreference {
+    pub fn effective(self) -> ThemeName {
+        self.effective_with(detect_system_theme)
+    }
+
+    fn effective_with(self, detect: impl FnOnce() -> Option<ThemeName>) -> ThemeName {
+        match self {
+            Self::Auto => detect().unwrap_or(ThemeName::Dark),
+            Self::Dark => ThemeName::Dark,
+            Self::Light => ThemeName::Light,
+        }
+    }
+
+    pub fn from_theme_name(theme: ThemeName) -> Self {
+        match theme {
+            ThemeName::Dark => Self::Dark,
+            ThemeName::Light => Self::Light,
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+pub fn detect_system_theme() -> Option<ThemeName> {
+    detect_macos_system_theme()
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_system_theme() -> Option<ThemeName> {
+    let output = Command::new("defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(ThemeName::Light);
+    }
+    let style = String::from_utf8_lossy(&output.stdout);
+    if style.trim().eq_ignore_ascii_case("dark") {
+        Some(ThemeName::Dark)
+    } else {
+        Some(ThemeName::Light)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_macos_system_theme() -> Option<ThemeName> {
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,8 +140,8 @@ impl Theme {
     pub fn from_name(name: ThemeName) -> Self {
         match name {
             ThemeName::Dark => Self {
-                background: Color::Reset,
-                surface: Color::Reset,
+                background: Color::Rgb(36, 39, 51),
+                surface: Color::Rgb(36, 39, 51),
                 text: Color::White,
                 muted: Color::Gray,
                 subtle: Color::DarkGray,
@@ -98,8 +167,8 @@ impl Theme {
                 search: Color::Yellow,
             },
             ThemeName::Light => Self {
-                background: Color::Rgb(248, 250, 252),
-                surface: Color::Rgb(248, 250, 252),
+                background: Color::Rgb(241, 245, 249),
+                surface: Color::Rgb(241, 245, 249),
                 text: Color::Rgb(30, 41, 59),
                 muted: Color::Rgb(100, 116, 139),
                 subtle: Color::Rgb(148, 163, 184),
@@ -200,4 +269,37 @@ pub fn active_theme_name() -> ThemeName {
 
 pub fn active_theme() -> Theme {
     Theme::from_name(active_theme_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_theme_uses_detected_system_theme() {
+        assert_eq!(
+            ThemePreference::Auto.effective_with(|| Some(ThemeName::Light)),
+            ThemeName::Light
+        );
+        assert_eq!(
+            ThemePreference::Auto.effective_with(|| Some(ThemeName::Dark)),
+            ThemeName::Dark
+        );
+    }
+
+    #[test]
+    fn auto_theme_falls_back_to_dark_when_detection_fails() {
+        assert_eq!(
+            ThemePreference::Auto.effective_with(|| None),
+            ThemeName::Dark
+        );
+    }
+
+    #[test]
+    fn dark_theme_uses_explicit_background() {
+        let theme = Theme::from_name(ThemeName::Dark);
+
+        assert_ne!(theme.background, Color::Reset);
+        assert_ne!(theme.surface, Color::Reset);
+    }
 }

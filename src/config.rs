@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::SectionKind;
 use crate::state::{GlobalSearchSavedState, GlobalSearchState};
-use crate::theme::ThemeName;
+use crate::theme::ThemePreference;
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
@@ -30,7 +30,7 @@ pub struct Config {
 pub struct Defaults {
     pub view: SectionKind,
     pub command_palette_key: String,
-    pub theme: ThemeName,
+    pub theme: ThemePreference,
     pub log_level: String,
     pub pr_per_page: usize,
     pub issue_per_page: usize,
@@ -464,7 +464,7 @@ impl Default for Defaults {
         Self {
             view: SectionKind::PullRequests,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
-            theme: ThemeName::Dark,
+            theme: ThemePreference::Auto,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             pr_per_page: 50,
             issue_per_page: 50,
@@ -879,7 +879,7 @@ mod tests {
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
         assert_eq!(config.defaults.command_palette_key, ":");
-        assert_eq!(config.defaults.theme, ThemeName::Dark);
+        assert_eq!(config.defaults.theme, ThemePreference::Dark);
         assert_eq!(config.defaults.log_level, "debug");
         assert_eq!(config.defaults.pr_per_page, 50);
         assert_eq!(config.defaults.issue_per_page, 50);
@@ -941,7 +941,20 @@ mod tests {
         )
         .expect("light theme should parse");
 
-        assert_eq!(config.defaults.theme, ThemeName::Light);
+        assert_eq!(config.defaults.theme, ThemePreference::Light);
+    }
+
+    #[test]
+    fn parses_auto_theme() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            theme = "auto"
+            "#,
+        )
+        .expect("auto theme should parse");
+
+        assert_eq!(config.defaults.theme, ThemePreference::Auto);
     }
 
     #[test]

@@ -178,7 +178,7 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "Toggle Theme",
             "",
             "General",
-            "Switch between dark and light themes and save config.toml",
+            "Cycle auto, dark, and light themes and save config.toml",
             PaletteAction::ToggleTheme,
         ),
         palette_command(

@@ -75,7 +75,7 @@ use crate::state::{
     MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
     ViewSnapshot as SavedViewSnapshot,
 };
-use crate::theme::{ThemeName, active_theme, set_active_theme};
+use crate::theme::{ThemeName, ThemePreference, active_theme, set_active_theme};
 
 mod command_palette;
 mod details;
@@ -2365,6 +2365,7 @@ const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
 const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
+const AUTO_THEME_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
@@ -2375,6 +2376,7 @@ const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 
 struct AppState {
     theme_name: ThemeName,
+    last_auto_theme_check: Instant,
     active_view: String,
     sections: Vec<SectionSnapshot>,
     section_index: HashMap<String, usize>,
@@ -2714,7 +2716,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
             RefreshScope::View(app.active_view.clone()),
         );
     }
-    app.set_theme(config.defaults.theme);
+    app.apply_theme_preference(config.defaults.theme);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2810,6 +2812,7 @@ async fn run_loop(
         app.sync_recent_details_visit(Instant::now());
         needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
+        needs_draw |= app.refresh_auto_theme(config, Instant::now());
 
         if !app.refreshing
             && config.defaults.refetch_interval_seconds > 0
@@ -5703,6 +5706,7 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
     let max_scroll = max_details_scroll(app, area);
     if max_scroll == 0 {
         app.details_scroll = 0;
+        app.remember_current_conversation_details_position();
         return;
     }
 
@@ -5712,6 +5716,7 @@ fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) {
         app.details_scroll = app.details_scroll.saturating_add(delta as u16);
     }
     app.details_scroll = app.details_scroll.min(max_scroll);
+    app.remember_current_conversation_details_position();
 }
 
 fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
@@ -12238,6 +12243,7 @@ impl AppState {
             .collect::<HashMap<_, _>>();
         let mut state = Self {
             theme_name: ThemeName::Dark,
+            last_auto_theme_check: Instant::now(),
             active_view,
             sections,
             section_index: ui_state.section_index.clone(),
@@ -12394,13 +12400,42 @@ impl AppState {
         set_active_theme(theme_name);
     }
 
+    fn apply_theme_preference(&mut self, preference: ThemePreference) {
+        self.set_theme(preference.effective());
+        self.last_auto_theme_check = Instant::now();
+    }
+
+    fn refresh_auto_theme(&mut self, config: &Config, now: Instant) -> bool {
+        if !config.defaults.theme.is_auto() {
+            return false;
+        }
+        if now.duration_since(self.last_auto_theme_check) < AUTO_THEME_CHECK_INTERVAL {
+            return false;
+        }
+        self.last_auto_theme_check = now;
+        let next = config.defaults.theme.effective();
+        if next == self.theme_name {
+            return false;
+        }
+        self.set_theme(next);
+        self.status = format!("theme auto: {}", next.as_str());
+        true
+    }
+
     fn toggle_theme(&mut self, config: &mut Config, paths: &Paths) {
         let previous_app_theme = self.theme_name;
         let previous_config_theme = config.defaults.theme;
-        let next = self.theme_name.toggled();
+        let next_theme = self.theme_name.toggled();
+        let next_preference = match config.defaults.theme {
+            ThemePreference::Auto => ThemePreference::from_theme_name(next_theme),
+            ThemePreference::Dark => ThemePreference::Light,
+            ThemePreference::Light => ThemePreference::Auto,
+        };
+        let next_effective = next_preference.effective();
 
-        self.set_theme(next);
-        config.defaults.theme = next;
+        self.set_theme(next_effective);
+        self.last_auto_theme_check = Instant::now();
+        config.defaults.theme = next_preference;
 
         if let Err(error) = config.save(&paths.config_path) {
             self.set_theme(previous_app_theme);
@@ -12409,7 +12444,11 @@ impl AppState {
             return;
         }
 
-        self.status = format!("theme: {}", next.as_str());
+        self.status = if next_preference.is_auto() {
+            format!("theme: auto ({})", next_effective.as_str())
+        } else {
+            format!("theme: {}", next_preference.as_str())
+        };
     }
 
     fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
@@ -12839,11 +12878,11 @@ impl AppState {
     }
 
     fn remember_current_view_snapshot(&mut self) {
+        self.save_current_conversation_details_state();
+        self.save_current_diff_mode_state();
         if !view_supports_snapshot(&self.active_view) {
             return;
         }
-        self.save_current_conversation_details_state();
-        self.save_current_diff_mode_state();
         self.view_snapshots
             .insert(self.active_view.clone(), self.current_view_snapshot());
     }
@@ -17505,6 +17544,7 @@ impl AppState {
         } else {
             self.details_scroll = self.details_scroll.saturating_add(delta as u16);
         }
+        self.remember_current_conversation_details_position();
     }
 
     fn select_comment(&mut self, index: usize) {
@@ -17521,6 +17561,7 @@ impl AppState {
             to_index = self.selected_comment_index,
             "ui comment selected"
         );
+        self.remember_current_conversation_details_position();
     }
 
     fn clear_selected_comment(&mut self) {
@@ -17539,6 +17580,7 @@ impl AppState {
     fn select_details_body_without_scroll(&mut self) {
         self.clear_selected_comment();
         self.status = self.details_body_focus_status();
+        self.remember_current_conversation_details_position();
     }
 
     fn details_body_focus_status(&self) -> String {
@@ -17559,6 +17601,7 @@ impl AppState {
 
         self.selected_comment_index = index;
         self.status = format!("details bottom; comment {len}/{len} focused");
+        self.remember_current_conversation_details_position();
     }
 
     fn move_comment(&mut self, delta: isize) {
@@ -17807,19 +17850,23 @@ impl AppState {
                 .details_scroll
                 .min(max_details_scroll(self, details_area));
         }
+        self.remember_current_conversation_details_position();
     }
 
     fn scroll_selected_comment_into_view(&mut self, area: Option<Rect>) {
         let Some(area) = area else {
+            self.remember_current_conversation_details_position();
             return;
         };
         let details_area = details_area_for(self, area);
         let inner = block_inner(details_area);
         if inner.height == 0 {
+            self.remember_current_conversation_details_position();
             return;
         }
         let document = build_details_document(self, inner.width);
         let Some(region) = document.comment_region(self.selected_comment_index) else {
+            self.remember_current_conversation_details_position();
             return;
         };
         let viewport_start = usize::from(self.details_scroll);
@@ -17837,6 +17884,7 @@ impl AppState {
         self.details_scroll = self
             .details_scroll
             .min(max_details_scroll(self, details_area));
+        self.remember_current_conversation_details_position();
     }
 
     fn start_keyboard_reaction_dialog(&mut self, area: Option<Rect>) {
@@ -21291,6 +21339,10 @@ impl AppState {
             self.save_current_diff_mode_state();
             return;
         }
+        self.remember_current_conversation_details_position();
+    }
+
+    fn remember_current_conversation_details_position(&mut self) {
         if self.details_mode != DetailsMode::Conversation {
             return;
         }
@@ -26117,11 +26169,29 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(app.command_palette.is_none());
         assert_eq!(app.theme_name, ThemeName::Light);
-        assert_eq!(config.defaults.theme, ThemeName::Light);
+        assert_eq!(config.defaults.theme, ThemePreference::Light);
         assert_eq!(app.status, "theme: light");
 
         let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
-        assert_eq!(saved.defaults.theme, ThemeName::Light);
+        assert_eq!(saved.defaults.theme, ThemePreference::Light);
+    }
+
+    #[test]
+    fn theme_toggle_from_light_returns_to_auto_preference() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Light);
+        let mut config = Config::default();
+        config.defaults.theme = ThemePreference::Light;
+        let paths = unique_test_paths("toggle-theme-auto");
+        config.save(&paths.config_path).expect("save config");
+
+        app.toggle_theme(&mut config, &paths);
+
+        assert_eq!(config.defaults.theme, ThemePreference::Auto);
+        assert!(app.status.starts_with("theme: auto ("));
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.defaults.theme, ThemePreference::Auto);
     }
 
     #[test]
@@ -26332,6 +26402,197 @@ diff --git a/src/main.rs b/src/main.rs
             Some("regular-pr-1")
         );
         assert_eq!(app.details_scroll, 9);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn recent_item_jump_preserves_current_position_from_builtin_pr_view() {
+        let first = work_item(
+            "regular-pr-1",
+            "rust-lang/rust",
+            156194,
+            "Avoid deriving bounds from FnPtr",
+            None,
+        );
+        let second = work_item(
+            "regular-pr-2",
+            "nervosnetwork/fiber",
+            1197,
+            "feat: add backup and restore",
+            None,
+        );
+        let pull_request_section = SectionSnapshot {
+            key: "pull_requests:needs-attention".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Needs Attention".to_string(),
+            filters: String::new(),
+            items: vec![first.clone(), second.clone()],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![pull_request_section]);
+        app.details.insert(
+            "regular-pr-1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.details.insert(
+            "regular-pr-2".to_string(),
+            DetailState::Loaded(vec![comment("carol", "other", None)]),
+        );
+        app.focus_details();
+        app.details_scroll = 14;
+        app.selected_comment_index = 1;
+        app.recent_items = vec![
+            recent_item_from_work_item(&first, Utc::now()).unwrap(),
+            recent_item_from_work_item(&second, Utc::now()).unwrap(),
+        ];
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("regular-pr-2")
+        );
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("regular-pr-1")
+        );
+        assert_eq!(app.details_scroll, 14);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn issue_details_position_updates_memory_while_focused() {
+        let mut issue = work_item(
+            "issue-1",
+            "nervosnetwork/fiber",
+            941,
+            "Atomic MPP design",
+            None,
+        );
+        issue.kind = ItemKind::Issue;
+        issue.url = "https://github.com/nervosnetwork/fiber/issues/941".to_string();
+        let issue_section = SectionSnapshot {
+            key: "issues:involved".to_string(),
+            kind: SectionKind::Issues,
+            title: "Involved".to_string(),
+            filters: String::new(),
+            items: vec![issue.clone()],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        app.details.insert(
+            "issue-1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+
+        app.focus_details();
+        app.scroll_details(8);
+        app.select_comment(1);
+
+        let key = work_item_details_memory_key(&issue).expect("issue memory key");
+        assert_eq!(
+            app.conversation_details_state.get(&key),
+            Some(&ConversationDetailsState {
+                details_scroll: 8,
+                selected_comment_index: 1,
+            })
+        );
+
+        app.details_scroll = 0;
+        app.selected_comment_index = 0;
+        app.restore_current_conversation_details_state();
+
+        assert_eq!(app.details_scroll, 8);
+        assert_eq!(app.selected_comment_index, 1);
+    }
+
+    #[test]
+    fn recent_item_jump_preserves_current_position_from_builtin_issues_view() {
+        let mut first = work_item(
+            "issue-1",
+            "nervosnetwork/fiber",
+            941,
+            "Atomic MPP design",
+            None,
+        );
+        first.kind = ItemKind::Issue;
+        first.url = "https://github.com/nervosnetwork/fiber/issues/941".to_string();
+        let mut second = work_item(
+            "issue-2",
+            "rust-lang/rust",
+            155758,
+            "Rustc version fails",
+            None,
+        );
+        second.kind = ItemKind::Issue;
+        second.url = "https://github.com/rust-lang/rust/issues/155758".to_string();
+        let issue_section = SectionSnapshot {
+            key: "issues:involved".to_string(),
+            kind: SectionKind::Issues,
+            title: "Involved".to_string(),
+            filters: String::new(),
+            items: vec![first.clone(), second.clone()],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![issue_section]);
+        app.details.insert(
+            "issue-1".to_string(),
+            DetailState::Loaded(vec![
+                comment("alice", "first", None),
+                comment("bob", "second", None),
+            ]),
+        );
+        app.details.insert(
+            "issue-2".to_string(),
+            DetailState::Loaded(vec![comment("carol", "other", None)]),
+        );
+        app.focus_details();
+        app.details_scroll = 11;
+        app.select_comment(1);
+        app.recent_items = vec![
+            recent_item_from_work_item(&first, Utc::now()).unwrap(),
+            recent_item_from_work_item(&second, Utc::now()).unwrap(),
+        ];
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("issue-2")
+        );
+
+        app.show_recent_items_dialog();
+        app.handle_recent_items_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.current_item().map(|item| item.id.as_str()),
+            Some("issue-1")
+        );
+        assert_eq!(app.details_scroll, 11);
         assert_eq!(app.selected_comment_index, 1);
     }
 
@@ -27164,6 +27425,27 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn dark_theme_renders_explicit_background() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Dark);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let theme = crate::theme::Theme::from_name(ThemeName::Dark);
+        let buffer = terminal.backend().buffer();
+        assert_ne!(theme.surface, Color::Reset);
+        assert_eq!(
+            buffer.cell((0, 0)).expect("top-left cell").bg,
+            theme.surface
+        );
+    }
+
+    #[test]
     fn light_theme_global_search_modal_uses_contrast_styles() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.set_theme(ThemeName::Light);
@@ -27747,6 +28029,7 @@ diff --git a/src/main.rs b/src/main.rs
     fn top_status_label_uses_active_color() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
+        app.set_theme(ThemeName::Dark);
         app.focus_details();
         let line = top_status_line(&app, 40);
 
@@ -27763,7 +28046,10 @@ diff --git a/src/main.rs b/src/main.rs
             .iter()
             .find(|span| span.content.as_ref() == "details focused")
             .expect("status value");
-        assert_eq!(value.style.fg, Some(Color::Green));
+        assert_eq!(
+            value.style.fg,
+            Some(crate::theme::Theme::from_name(ThemeName::Dark).success)
+        );
     }
 
     #[test]
@@ -31873,12 +32159,12 @@ The reviewer was selected based on:\n\
                 .any(|span| span.content.contains("Second")
                     && span.style.add_modifier.contains(Modifier::BOLD))
         );
-        assert!(
-            document
-                .lines
+        let theme = crate::theme::active_theme();
+        assert!(document.lines.iter().all(|line| {
+            line.spans
                 .iter()
-                .all(|line| line.spans.iter().all(|span| span.style.bg.is_none()))
-        );
+                .all(|span| span.style.bg.is_none() || span.style.bg == Some(theme.surface))
+        }));
         assert_eq!(
             document.action_at(bob_line_index, reply_column),
             Some(DetailAction::ReplyComment(1))

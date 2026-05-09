@@ -7511,13 +7511,18 @@ fn footer_groups(app: &AppState) -> Vec<Vec<Span<'static>>> {
 
 fn footer_status(app: &AppState) -> String {
     if let Some(loading) = &app.section_page_loading {
-        section_page_loading_status(loading)
-    } else if app.refreshing {
-        "refreshing".to_string()
-    } else if !app.status.is_empty() {
+        return section_page_loading_status(loading);
+    }
+    if app.refreshing {
+        return "refreshing".to_string();
+    }
+    let age = snapshot_age_status(app);
+    if app.status.is_empty() {
+        age
+    } else if age.is_empty() {
         app.status.clone()
     } else {
-        snapshot_age_status(app)
+        format!("{} · {}", app.status, age)
     }
 }
 

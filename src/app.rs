@@ -7514,8 +7514,34 @@ fn footer_status(app: &AppState) -> String {
         section_page_loading_status(loading)
     } else if app.refreshing {
         "refreshing".to_string()
-    } else {
+    } else if !app.status.is_empty() {
         app.status.clone()
+    } else {
+        snapshot_age_status(app)
+    }
+}
+
+fn snapshot_age_status(app: &AppState) -> String {
+    let Some(refreshed_at) = app.current_section().and_then(|s| s.refreshed_at) else {
+        return String::new();
+    };
+    let delta = Utc::now().signed_duration_since(refreshed_at);
+    if delta.num_seconds() < 10 {
+        "just now".to_string()
+    } else if delta.num_minutes() < 1 {
+        format!("{}s ago", delta.num_seconds())
+    } else if delta.num_hours() < 1 {
+        let mins = delta.num_minutes();
+        let secs = delta.num_seconds() % 60;
+        format!("{mins}m{secs}s ago")
+    } else if delta.num_days() < 1 {
+        let hours = delta.num_hours();
+        let mins = delta.num_minutes() % 60;
+        format!("{hours}h{mins}m ago")
+    } else {
+        let days = delta.num_days();
+        let hours = delta.num_hours() % 24;
+        format!("{days}d{hours}h ago")
     }
 }
 

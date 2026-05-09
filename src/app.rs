@@ -110,7 +110,7 @@ use layout::{body_area, body_areas};
 use pr_checkout::{
     PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
     current_git_branch_for_directory, ensure_directory_tracks_repo, resolve_pr_checkout_directory,
-    run_pr_checkout,
+    resolve_pull_request_head_ref, run_pr_checkout,
 };
 #[cfg(test)]
 use pr_checkout::{command_output_text, pr_checkout_command_args, pr_checkout_command_display};
@@ -847,6 +847,7 @@ struct PrCreateDialog {
     repo: String,
     local_dir: PathBuf,
     branch: String,
+    head_ref: String,
     title: EditorText,
     body: EditorText,
     field: PrCreateField,
@@ -857,7 +858,7 @@ struct PrCreateDialog {
 struct PendingPrCreate {
     repo: String,
     local_dir: PathBuf,
-    branch: String,
+    head_ref: String,
     title: String,
     body: String,
     dialog: PrCreateDialog,
@@ -4040,7 +4041,7 @@ fn start_pr_create(
         let result = create_pull_request(
             &pending.repo,
             &pending.local_dir,
-            &pending.branch,
+            &pending.head_ref,
             &pending.title,
             &pending.body,
         )
@@ -12888,6 +12889,7 @@ impl AppState {
         local_dir: PathBuf,
         branch: String,
     ) -> bool {
+        let head_ref = resolve_pull_request_head_ref(&local_dir, &repo, &branch);
         let draft_key = new_pr_draft_key(&repo);
         let loaded_payload = self
             .editor_drafts
@@ -12902,6 +12904,7 @@ impl AppState {
             repo,
             local_dir,
             branch,
+            head_ref,
             title: EditorText::from_text(payload.title),
             body: EditorText::from_text(payload.body),
             field: PrCreateField::Title,
@@ -20347,7 +20350,7 @@ impl AppState {
         }
 
         self.pr_creating = true;
-        self.status = format!("creating pull request from {}", dialog.branch);
+        self.status = format!("creating pull request from {}", dialog.head_ref);
         self.message_dialog = Some(message_dialog(
             "Creating Pull Request",
             "Waiting for GitHub...",
@@ -20355,7 +20358,7 @@ impl AppState {
         let pending = PendingPrCreate {
             repo: dialog.repo.clone(),
             local_dir: dialog.local_dir.clone(),
-            branch: dialog.branch.clone(),
+            head_ref: dialog.head_ref.clone(),
             title,
             body,
             dialog,
@@ -33714,7 +33717,54 @@ The reviewer was selected based on:\n\
         assert_eq!(dialog.repo, "chenyukang/ghr");
         assert_eq!(dialog.local_dir, local_dir);
         assert_eq!(dialog.branch, "feature/new-pr");
+        assert_eq!(dialog.head_ref, "feature/new-pr");
         assert_eq!(dialog.field, PrCreateField::Title);
+        assert_eq!(app.status, "new pull request");
+    }
+
+    #[test]
+    fn capital_n_in_pr_repo_with_fork_local_dir_uses_owner_qualified_head() {
+        let branch = "fix/mpp-force-close-preimage-retention";
+        let local_dir = checkout_test_fork_repo_dir_on_branch(
+            branch,
+            "chenyukang/fiber",
+            "nervosnetwork/fiber",
+        );
+        let section = SectionSnapshot {
+            key: "repo:fiber:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:nervosnetwork/fiber is:open archived:false".to_string(),
+            items: Vec::new(),
+            total_count: Some(0),
+            page: 1,
+            page_size: 50,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = "repo:fiber".to_string();
+        let mut config = Config::default();
+        config.repos.push(crate::config::RepoConfig {
+            name: "Fiber".to_string(),
+            repo: "nervosnetwork/fiber".to_string(),
+            local_dir: Some(local_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        app.start_new_issue_or_pull_request_dialog(&config);
+        let dialog = app.pr_create_dialog.as_ref().expect("pr create dialog");
+
+        assert_eq!(dialog.repo, "nervosnetwork/fiber");
+        assert_eq!(dialog.branch, branch);
+        assert_eq!(
+            dialog.head_ref,
+            "chenyukang:fix/mpp-force-close-preimage-retention"
+        );
         assert_eq!(app.status, "new pull request");
     }
 
@@ -33899,6 +33949,7 @@ The reviewer was selected based on:\n\
         assert_eq!(dialog.repo, "chenyukang/ghr");
         assert_eq!(dialog.local_dir, local_dir);
         assert_eq!(dialog.branch, "feature/details-pr");
+        assert_eq!(dialog.head_ref, "feature/details-pr");
         assert_eq!(app.status, "new pull request");
     }
 
@@ -33949,6 +34000,7 @@ The reviewer was selected based on:\n\
             repo: "chenyukang/ghr".to_string(),
             local_dir: local_dir.clone(),
             branch: "feature/pr-body".to_string(),
+            head_ref: "feature/pr-body".to_string(),
             title: EditorText::from_text("Add PR creation"),
             body: EditorText::from_text("Created from the TUI"),
             field: PrCreateField::Body,
@@ -33961,7 +34013,7 @@ The reviewer was selected based on:\n\
         assert!(app.pr_create_dialog.is_none());
         assert_eq!(pending.repo, "chenyukang/ghr");
         assert_eq!(pending.local_dir, local_dir);
-        assert_eq!(pending.branch, "feature/pr-body");
+        assert_eq!(pending.head_ref, "feature/pr-body");
         assert_eq!(pending.title, "Add PR creation");
         assert_eq!(pending.body, "Created from the TUI");
     }
@@ -34013,6 +34065,7 @@ The reviewer was selected based on:\n\
             repo: "chenyukang/ghr".to_string(),
             local_dir: local_dir.clone(),
             branch: "feature/pr-body".to_string(),
+            head_ref: "feature/pr-body".to_string(),
             title: EditorText::from_text("Add PR creation"),
             body: EditorText::from_text("Created from the TUI"),
             field: PrCreateField::Body,
@@ -34022,7 +34075,7 @@ The reviewer was selected based on:\n\
         app.pending_pr_create = Some(PendingPrCreate {
             repo: "chenyukang/ghr".to_string(),
             local_dir,
-            branch: "feature/pr-body".to_string(),
+            head_ref: "feature/pr-body".to_string(),
             title: "Add PR creation".to_string(),
             body: "Created from the TUI".to_string(),
             dialog,
@@ -36403,6 +36456,7 @@ The reviewer was selected based on:\n\
             repo: "chenyukang/ghr".to_string(),
             local_dir: PathBuf::from("/tmp/ghr"),
             branch: "dev-next".to_string(),
+            head_ref: "dev-next".to_string(),
             title: EditorText::from_text("Retry title"),
             body: EditorText::from_text("Retry body"),
             field: PrCreateField::Body,
@@ -40043,6 +40097,60 @@ diff --git a/d.rs b/d.rs
             command_output_text(&checkout.stdout, &checkout.stderr)
         );
         dir
+    }
+
+    fn checkout_test_fork_repo_dir_on_branch(
+        branch: &str,
+        fork_repo: &str,
+        base_repo: &str,
+    ) -> PathBuf {
+        let dir = checkout_test_repo_dir_on_branch(branch);
+        run_checkout_test_git(
+            &dir,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("https://github.com/{fork_repo}.git"),
+            ],
+        );
+        run_checkout_test_git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                &format!("https://github.com/{base_repo}.git"),
+            ],
+        );
+        run_checkout_test_git(
+            &dir,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        run_checkout_test_git(
+            &dir,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        dir
+    }
+
+    fn run_checkout_test_git(dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            command_output_text(&output.stdout, &output.stderr)
+        );
     }
 
     fn many_items_section(count: u64) -> SectionSnapshot {

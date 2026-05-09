@@ -244,6 +244,83 @@ pub(super) fn current_git_branch_for_directory(
     ))
 }
 
+pub(super) fn resolve_pull_request_head_ref(
+    directory: &Path,
+    repository: &str,
+    branch: &str,
+) -> String {
+    let Some(remote) = current_branch_push_remote(directory)
+        .or_else(|| configured_branch_remote(directory, branch, "pushRemote"))
+        .or_else(|| git_config_value(directory, "remote.pushDefault"))
+        .or_else(|| configured_branch_remote(directory, branch, "remote"))
+    else {
+        return branch.to_string();
+    };
+
+    if remote == "." {
+        return branch.to_string();
+    }
+
+    let Some(head_repo) = git_remote_repo(directory, &remote) else {
+        return branch.to_string();
+    };
+    pull_request_head_ref(repository, &head_repo, branch)
+}
+
+fn pull_request_head_ref(base_repo: &str, head_repo: &str, branch: &str) -> String {
+    if head_repo.eq_ignore_ascii_case(base_repo) {
+        return branch.to_string();
+    }
+
+    head_repo
+        .split_once('/')
+        .map(|(owner, _)| format!("{owner}:{branch}"))
+        .unwrap_or_else(|| branch.to_string())
+}
+
+fn current_branch_push_remote(directory: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{push}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let push_ref = String::from_utf8(output.stdout).ok()?;
+    push_ref
+        .trim()
+        .split_once('/')
+        .map(|(remote, _)| remote.trim().to_string())
+        .filter(|remote| !remote.is_empty())
+}
+
+fn configured_branch_remote(directory: &Path, branch: &str, key: &str) -> Option<String> {
+    git_config_value(directory, &format!("branch.{branch}.{key}"))
+}
+
+fn git_config_value(directory: &Path, key: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn git_remotes_for_directory(
     directory: &Path,
 ) -> std::result::Result<Vec<(String, String)>, String> {

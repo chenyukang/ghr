@@ -1334,7 +1334,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
-        builder.push_heading("Recent Comments");
+        builder.push_heading("Comments");
         builder.push_blank();
         match app.details.get(&item.id) {
             Some(DetailState::Loading) => {

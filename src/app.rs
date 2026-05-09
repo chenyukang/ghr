@@ -31114,7 +31114,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         let comments_index = rendered
             .iter()
-            .position(|line| line == "Recent Comments")
+            .position(|line| line == "Comments")
             .expect("comments heading");
         assert_eq!(rendered.get(comments_index + 1), Some(&String::new()));
         assert!(

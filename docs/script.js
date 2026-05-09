@@ -1,5 +1,5 @@
 const shortcuts = [
-  ["General", ":", "Open the command palette and fuzzy-search every command; recently run commands appear first"],
+  ["General", ":", "Open the command palette and fuzzy-search commands; recently run commands appear first"],
   ["General", "?", "Open the live help reference"],
   ["General", "r", "Refresh dashboard data from GitHub"],
   ["General", "q / Ctrl+C", "Save UI state and quit"],
@@ -75,23 +75,6 @@ const shortcuts = [
   ["Diff Details", "c", "Add an inline review comment"],
   ["Diff Details", "single click", "Select one line, or end a pending range"],
   ["Diff Details", "double click", "Begin a review range"],
-  ["Project", "Palette", "Project Switch: filter configured repositories and switch tabs"],
-  ["Project", "Palette", "Project Add: add a repo project to config.toml"],
-  ["Project", "Palette", "Project Remove: remove a repo project from config.toml"],
-  ["Navigation", "Palette", "Recent Items: fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back"],
-  ["Search", "Palette", "Saved Search Filter: pick a named saved PR/issue search from config.toml"],
-  ["Theme", "Palette", "Toggle Theme: cycle auto, dark, and light themes and save config.toml"],
-  ["Cache", "Palette", "Clear Cache: choose which local cache layer to clear"],
-  ["Inbox", "Palette", "Mark Done: move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless muted"],
-  ["Inbox", "Palette", "Mark All Read: mark every GitHub inbox notification as read"],
-  ["Inbox", "Palette", "Mute Thread: ignore future notifications for the selected inbox thread"],
-  ["Inbox", "Palette", "Subscribe Thread: subscribe to the selected inbox thread"],
-  ["Inbox", "Palette", "Unsubscribe Thread: unsubscribe from the selected inbox thread"],
-  ["Details", "Palette", "Subscribe Item: subscribe to the selected issue or pull request conversation"],
-  ["Details", "Palette", "Unsubscribe Item: unsubscribe from the selected issue or pull request conversation"],
-  ["Clipboard", "Palette", "Copy GitHub Link: copy selected comment link or issue/PR URL"],
-  ["Clipboard", "Palette", "Copy Content: copy selected comment body or issue/PR description"],
-  ["Info", "Palette", "Info: show version, paths, ghr process memory, UI state, and ignored/recent counts"],
   ["Mouse", "click tabs / sections", "Switch view or section"],
   ["Mouse", "click list row", "Select item or diff file"],
   ["Mouse", "click descriptions/comments", "Focus the description or selected comment"],
@@ -102,27 +85,42 @@ const shortcuts = [
   ["Mouse", "drag split border", "Resize list/details ratio"],
 ];
 
+const commands = [
+  ["Project", "Project Switch", "Filter configured repositories and switch tabs"],
+  ["Project", "Project Add", "Add a repo project to config.toml"],
+  ["Project", "Project Remove", "Remove a repo project from config.toml"],
+  ["Navigation", "Recent Items", "Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back"],
+  ["Search", "Saved Search Filter", "Pick a named saved PR/issue search from config.toml"],
+  ["Theme", "Toggle Theme", "Cycle auto, dark, and light themes and save config.toml"],
+  ["Cache", "Clear Cache", "Choose which local cache layer to clear"],
+  ["Inbox", "Mark Done", "Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless muted"],
+  ["Inbox", "Mark All Read", "Mark every GitHub inbox notification as read"],
+  ["Inbox", "Mute Thread", "Ignore future notifications for the selected inbox thread"],
+  ["Inbox", "Subscribe Thread", "Subscribe to the selected inbox thread"],
+  ["Inbox", "Unsubscribe Thread", "Unsubscribe from the selected inbox thread"],
+  ["Details", "Subscribe Item", "Subscribe to the selected issue or pull request conversation"],
+  ["Details", "Unsubscribe Item", "Unsubscribe from the selected issue or pull request conversation"],
+  ["Clipboard", "Copy GitHub Link", "Copy selected comment link or issue/PR URL"],
+  ["Clipboard", "Copy Content", "Copy selected comment body or issue/PR description"],
+  ["Info", "Info", "Show version, paths, ghr process memory, UI state, and ignored/recent counts"],
+];
+
 const table = document.querySelector("#shortcut-table");
+const commandTable = document.querySelector("#command-table");
 const input = document.querySelector("#shortcut-filter");
 
-function renderShortcuts(query = "") {
-  const normalized = query.trim().toLowerCase();
-  const matches = shortcuts.filter(([scope, key, action]) => {
-    const text = `${scope} ${key} ${action}`.toLowerCase();
-    return !normalized || text.includes(normalized);
-  });
+function renderRows(tableNode, rows, emptyText) {
+  tableNode.replaceChildren();
 
-  table.replaceChildren();
-
-  if (matches.length === 0) {
+  if (rows.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "No shortcuts match that filter.";
-    table.append(empty);
+    empty.textContent = emptyText;
+    tableNode.append(empty);
     return;
   }
 
-  for (const [scope, key, action] of matches) {
+  for (const [scope, key, action] of rows) {
     const row = document.createElement("div");
     row.className = "shortcut-row";
     row.innerHTML = `
@@ -133,8 +131,21 @@ function renderShortcuts(query = "") {
     row.children[0].textContent = scope;
     row.children[1].textContent = key;
     row.children[2].textContent = action;
-    table.append(row);
+    tableNode.append(row);
   }
+}
+
+function filterRows(rows, query) {
+  const normalized = query.trim().toLowerCase();
+  return rows.filter(([scope, key, action]) => {
+    const text = `${scope} ${key} ${action}`.toLowerCase();
+    return !normalized || text.includes(normalized);
+  });
+}
+
+function renderShortcuts(query = "") {
+  renderRows(table, filterRows(shortcuts, query), "No keybindings match that filter.");
+  renderRows(commandTable, filterRows(commands, query), "No commands match that filter.");
 }
 
 input.addEventListener("input", (event) => renderShortcuts(event.target.value));

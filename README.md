@@ -90,22 +90,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 | Key | Action |
 | --- | --- |
-| `:` | Open the command palette and fuzzy search every shortcut; recently run commands appear first |
-| `Project Switch` | Filter configured repos by prefix and activate a project tab |
-| `Project Add` | Add a repo project to the menu and save it to `config.toml` |
-| `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
-| `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
-| `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
-| `Toggle Theme` | Cycle `auto`, `dark`, and `light` themes and save it to `config.toml` |
-| `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
-| `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
-| `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
-| `Mark Done` | Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless the thread is muted |
-| `Mark All Read` | Mark every GitHub inbox notification as read |
-| `Mute Thread` | Ignore future notifications for the selected inbox thread |
-| `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
-| `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
-| `Info` | Show version, config/db/log paths, ghr process memory usage, ignored/recent item counts, and current UI state |
+| `:` | Open the command palette and fuzzy search commands; recently run commands appear first |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
 | `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
@@ -167,6 +152,28 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Ctrl+R` / `Cmd+Shift+Z` in editor dialogs | Redo text edits |
 | `r` | Refresh from GitHub |
 | `q` / `Ctrl+C` | Save UI state and quit |
+
+## Commands
+
+Open the command palette with `:` to fuzzy search and run commands. Recently run commands appear first.
+
+| Command | Action |
+| --- | --- |
+| `Project Switch` | Filter configured repos by prefix and activate a project tab |
+| `Project Add` | Add a repo project to the menu and save it to `config.toml` |
+| `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
+| `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
+| `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
+| `Toggle Theme` | Cycle `auto`, `dark`, and `light` themes and save it to `config.toml` |
+| `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
+| `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
+| `Mark Done` | Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless the thread is muted |
+| `Mark All Read` | Mark every GitHub inbox notification as read |
+| `Mute Thread` | Ignore future notifications for the selected inbox thread |
+| `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
+| `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
+| `Info` | Show version, config/db/log paths, ghr process memory usage, ignored/recent item counts, and current UI state |
 
 Diff review ranges:
 

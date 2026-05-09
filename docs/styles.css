@@ -326,6 +326,13 @@ code {
   box-shadow: 0 0 0 2px rgba(156, 255, 74, 0.14);
 }
 
+.shortcut-heading {
+  margin: 26px 0 12px;
+  color: var(--amber);
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
 .shortcut-table {
   display: grid;
   border: 1px solid var(--line);

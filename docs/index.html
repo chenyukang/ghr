@@ -134,7 +134,7 @@
       <section class="docs-band" id="shortcuts">
         <div class="section-heading">
           <p class="eyebrow">Keyboard surface</p>
-          <h2>Every shortcut, searchable</h2>
+          <h2>Every shortcut and command, searchable</h2>
           <p>
             Press <kbd>?</kbd> inside ghr for the live reference, or use
             <kbd>:</kbd> to fuzzy-search and run commands from the TUI. Recently
@@ -142,7 +142,7 @@
           </p>
         </div>
         <label class="shortcut-search">
-          <span>Filter shortcuts</span>
+          <span>Filter shortcuts and commands</span>
           <input
             id="shortcut-filter"
             type="search"
@@ -150,7 +150,10 @@
             autocomplete="off"
           />
         </label>
+        <h3 class="shortcut-heading">Keybindings</h3>
         <div class="shortcut-table" id="shortcut-table"></div>
+        <h3 class="shortcut-heading">Commands</h3>
+        <div class="shortcut-table" id="command-table"></div>
       </section>
     </main>
 

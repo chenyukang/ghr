@@ -26,7 +26,9 @@ pub enum ThemeName {
     SolarizedLight = 10,
     OneDark = 11,
     Monokai = 12,
+    #[serde(rename = "github_dark", alias = "git_hub_dark")]
     GitHubDark = 13,
+    #[serde(rename = "github_light", alias = "git_hub_light")]
     GitHubLight = 14,
 }
 
@@ -778,6 +780,7 @@ pub fn active_theme() -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toml;
 
     #[test]
     fn auto_theme_uses_detected_system_theme() {
@@ -904,6 +907,28 @@ mod tests {
     fn from_u8_round_trips_all_variants() {
         for &name in ThemeName::ALL {
             assert_eq!(ThemeName::from_u8(name as u8), name);
+        }
+    }
+
+    #[test]
+    fn github_theme_variants_serialize_as_github_not_git_hub() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrapper {
+            theme: ThemeName,
+        }
+        for (name, expected) in [
+            (ThemeName::GitHubDark, "github_dark"),
+            (ThemeName::GitHubLight, "github_light"),
+        ] {
+            let wrapper = Wrapper { theme: name };
+            let encoded = toml::to_string_pretty(&wrapper).unwrap();
+            assert!(
+                encoded.contains(&format!("theme = \"{expected}\"")),
+                "expected theme = \"{expected}\" in:\n{encoded}"
+            );
+            let decoded: Wrapper =
+                toml::from_str(&format!("theme = \"{expected}\"")).unwrap();
+            assert_eq!(decoded.theme, name);
         }
     }
 

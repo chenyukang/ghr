@@ -2774,7 +2774,7 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
             RefreshScope::View(app.active_view.clone()),
         );
     }
-    app.apply_theme_preference(config.defaults.theme);
+    app.apply_theme_preference(&config);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -12663,18 +12663,25 @@ impl AppState {
         self.global_search_saved_by_repo = saved_search_map_from_config(config);
     }
 
+    fn effective_theme(config: &Config) -> ThemeName {
+        config
+            .defaults
+            .theme_name
+            .unwrap_or_else(|| config.defaults.theme.effective())
+    }
+
     fn set_theme(&mut self, theme_name: ThemeName) {
         self.theme_name = theme_name;
         set_active_theme(theme_name);
     }
 
-    fn apply_theme_preference(&mut self, preference: ThemePreference) {
-        self.set_theme(preference.effective());
+    fn apply_theme_preference(&mut self, config: &Config) {
+        self.set_theme(Self::effective_theme(config));
         self.last_auto_theme_check = Instant::now();
     }
 
     fn refresh_auto_theme(&mut self, config: &Config, now: Instant) -> bool {
-        if !config.defaults.theme.is_auto() {
+        if !config.defaults.theme.is_auto() || config.defaults.theme_name.is_some() {
             return false;
         }
         if now.duration_since(self.last_auto_theme_check) < AUTO_THEME_CHECK_INTERVAL {
@@ -12692,31 +12699,54 @@ impl AppState {
 
     fn toggle_theme(&mut self, config: &mut Config, paths: &Paths) {
         let previous_app_theme = self.theme_name;
+        let previous_theme_name = config.defaults.theme_name;
         let previous_config_theme = config.defaults.theme;
-        let next_theme = self.theme_name.toggled();
-        let next_preference = match config.defaults.theme {
-            ThemePreference::Auto => ThemePreference::from_theme_name(next_theme),
-            ThemePreference::Dark => ThemePreference::Light,
-            ThemePreference::Light => ThemePreference::Auto,
-        };
-        let next_effective = next_preference.effective();
 
-        self.set_theme(next_effective);
-        self.last_auto_theme_check = Instant::now();
-        config.defaults.theme = next_preference;
+        if let Some(current_name) = config.defaults.theme_name {
+            let pos = ThemeName::ALL
+                .iter()
+                .position(|t| *t == current_name)
+                .unwrap_or(0);
+            let next_name = ThemeName::ALL[(pos + 1) % ThemeName::ALL.len()];
 
-        if let Err(error) = config.save(&paths.config_path) {
-            self.set_theme(previous_app_theme);
-            config.defaults.theme = previous_config_theme;
-            self.status = format!("theme toggle failed: {error}");
-            return;
-        }
+            self.set_theme(next_name);
+            self.last_auto_theme_check = Instant::now();
+            config.defaults.theme_name = Some(next_name);
 
-        self.status = if next_preference.is_auto() {
-            format!("theme: auto ({})", next_effective.as_str())
+            if let Err(error) = config.save(&paths.config_path) {
+                self.set_theme(previous_app_theme);
+                config.defaults.theme_name = previous_theme_name;
+                self.status = format!("theme toggle failed: {error}");
+                return;
+            }
+
+            self.status = format!("theme: {}", next_name.as_str());
         } else {
-            format!("theme: {}", next_preference.as_str())
-        };
+            let next_theme = self.theme_name.toggled();
+            let next_preference = match config.defaults.theme {
+                ThemePreference::Auto => ThemePreference::from_theme_name(next_theme),
+                ThemePreference::Dark => ThemePreference::Light,
+                ThemePreference::Light => ThemePreference::Auto,
+            };
+            let next_effective = next_preference.effective();
+
+            self.set_theme(next_effective);
+            self.last_auto_theme_check = Instant::now();
+            config.defaults.theme = next_preference;
+
+            if let Err(error) = config.save(&paths.config_path) {
+                self.set_theme(previous_app_theme);
+                config.defaults.theme = previous_config_theme;
+                self.status = format!("theme toggle failed: {error}");
+                return;
+            }
+
+            self.status = if next_preference.is_auto() {
+                format!("theme: auto ({})", next_effective.as_str())
+            } else {
+                format!("theme: {}", next_preference.as_str())
+            };
+        }
     }
 
     fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
@@ -26569,6 +26599,25 @@ diff --git a/src/main.rs b/src/main.rs
 
         let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
         assert_eq!(saved.defaults.theme, ThemePreference::Auto);
+    }
+
+    #[test]
+    fn theme_toggle_with_theme_name_cycles_through_all_themes() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::CatppuccinMocha);
+        let mut config = Config::default();
+        config.defaults.theme_name = Some(ThemeName::CatppuccinMocha);
+        let paths = unique_test_paths("toggle-theme-cycle");
+        config.save(&paths.config_path).expect("save config");
+
+        app.toggle_theme(&mut config, &paths);
+
+        assert_eq!(config.defaults.theme_name, Some(ThemeName::CatppuccinLatte));
+        assert_eq!(app.theme_name, ThemeName::CatppuccinLatte);
+        assert!(app.status.contains("catppuccin_latte"));
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.defaults.theme_name, Some(ThemeName::CatppuccinLatte));
     }
 
     #[test]

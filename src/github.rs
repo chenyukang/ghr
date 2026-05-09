@@ -1457,12 +1457,12 @@ enum SearchKindFilter {
 
 impl SearchKindFilter {
     fn matches(self, kind: SectionKind) -> bool {
-        match (self, kind) {
-            (Self::All, SectionKind::PullRequests | SectionKind::Issues) => true,
-            (Self::PullRequests, SectionKind::PullRequests) => true,
-            (Self::Issues, SectionKind::Issues) => true,
-            _ => false,
-        }
+        matches!(
+            (self, kind),
+            (Self::All, SectionKind::PullRequests | SectionKind::Issues)
+                | (Self::PullRequests, SectionKind::PullRequests)
+                | (Self::Issues, SectionKind::Issues)
+        )
     }
 }
 
@@ -1484,7 +1484,7 @@ fn search_kind_filter(filters: &str) -> SearchKindFilter {
     search_filter_tokens(filters)
         .into_iter()
         .filter_map(|token| search_kind_filter_token(&token))
-        .last()
+        .next_back()
         .unwrap_or(SearchKindFilter::All)
 }
 

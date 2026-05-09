@@ -20410,11 +20410,11 @@ impl AppState {
             KeyCode::Down => self.move_global_search_suggestion(1),
             KeyCode::Up => self.move_global_search_suggestion(-1),
             _ => {
-                if let Some(dialog) = &mut self.global_search_dialog {
-                    if dialog.active_editor_mut().input_key(key, false) {
-                        reset_global_search_dialog_suggestions(dialog);
-                        self.remember_current_global_search_dialog();
-                    }
+                if let Some(dialog) = &mut self.global_search_dialog
+                    && dialog.active_editor_mut().input_key(key, false)
+                {
+                    reset_global_search_dialog_suggestions(dialog);
+                    self.remember_current_global_search_dialog();
                 }
             }
         }
@@ -20672,8 +20672,8 @@ impl AppState {
     fn saved_search_candidates(&self) -> Vec<SavedSearchCandidate> {
         let mut candidates = self
             .global_search_saved_by_repo
-            .iter()
-            .flat_map(|(_repo_key, searches)| {
+            .values()
+            .flat_map(|searches| {
                 searches.iter().filter_map(move |saved| {
                     let saved = saved.clone().normalized()?;
                     let kind = section_kind_from_saved_search_kind(&saved.kind)?;

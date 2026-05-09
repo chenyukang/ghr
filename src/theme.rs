@@ -1,4 +1,5 @@
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use ratatui::style::{Color, Modifier, Style};

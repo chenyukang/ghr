@@ -1684,34 +1684,16 @@ pub(super) fn push_diff(
                 }),
                 inline_summary,
             );
-            if let Some(comments) = context.comments {
+            if context.comments.is_some() {
                 if context.diff_inline_comments_visible {
-                    push_diff_inline_comments(
-                        builder,
-                        context.item_id,
-                        comments,
-                        inline_entries,
-                        context.expanded_comments,
-                        context.details_focused,
-                        context.selected_comment_index,
-                        context.show_thread_markers,
-                    );
+                    push_diff_inline_comments(builder, inline_entries, &context);
                 } else if let Some(revealed) = context.revealed_diff_inline_comments {
                     let revealed_entries = inline_entries
                         .iter()
                         .filter(|entry| revealed.contains(&entry.index))
                         .cloned()
                         .collect::<Vec<_>>();
-                    push_diff_inline_comments(
-                        builder,
-                        context.item_id,
-                        comments,
-                        &revealed_entries,
-                        context.expanded_comments,
-                        context.details_focused,
-                        context.selected_comment_index,
-                        context.show_thread_markers,
-                    );
+                    push_diff_inline_comments(builder, &revealed_entries, &context);
                 }
             }
         }
@@ -1727,16 +1709,7 @@ pub(super) fn push_diff(
                 "Resolved/outdated comments not attached to a current diff line",
                 diff_metadata_style(),
             )]);
-            push_diff_inline_comments(
-                builder,
-                context.item_id,
-                comments,
-                &unplaced_entries,
-                context.expanded_comments,
-                context.details_focused,
-                context.selected_comment_index,
-                context.show_thread_markers,
-            );
+            push_diff_inline_comments(builder, &unplaced_entries, &context);
         }
     }
 }
@@ -1943,21 +1916,28 @@ pub(super) fn push_diff_line(
 
 pub(super) fn push_diff_inline_comments(
     builder: &mut DetailsBuilder,
-    item_id: &str,
-    comments: &[CommentPreview],
     entries: &[CommentDisplayEntry],
-    expanded_comments: &HashSet<String>,
-    details_focused: bool,
-    selected_comment_index: usize,
-    show_thread_markers: bool,
+    context: &DiffRenderContext<'_>,
 ) {
+    let Some(comments) = context.comments else {
+        return;
+    };
     for entry in entries {
         let Some(comment) = comments.get(entry.index) else {
             continue;
         };
-        let selected = details_focused && entry.index == selected_comment_index;
-        let collapse = comment_collapse_state_for(item_id, entry.index, comment, expanded_comments);
-        let depth = if show_thread_markers { entry.depth } else { 0 };
+        let selected = context.details_focused && entry.index == context.selected_comment_index;
+        let collapse = comment_collapse_state_for(
+            context.item_id,
+            entry.index,
+            comment,
+            context.expanded_comments,
+        );
+        let depth = if context.show_thread_markers {
+            entry.depth
+        } else {
+            0
+        };
         push_diff_inline_comment(builder, entry.index, comment, selected, depth, collapse);
     }
 }

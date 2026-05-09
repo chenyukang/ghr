@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::SectionKind;
 use crate::state::{GlobalSearchSavedState, GlobalSearchState};
-use crate::theme::ThemePreference;
+use crate::theme::{ThemeName, ThemePreference};
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
@@ -31,6 +31,8 @@ pub struct Defaults {
     pub view: SectionKind,
     pub command_palette_key: String,
     pub theme: ThemePreference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_name: Option<ThemeName>,
     pub log_level: String,
     pub pr_per_page: usize,
     pub issue_per_page: usize,
@@ -465,6 +467,7 @@ impl Default for Defaults {
             view: SectionKind::PullRequests,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             theme: ThemePreference::Auto,
+            theme_name: None,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             pr_per_page: 50,
             issue_per_page: 50,
@@ -955,6 +958,25 @@ mod tests {
         .expect("auto theme should parse");
 
         assert_eq!(config.defaults.theme, ThemePreference::Auto);
+    }
+
+    #[test]
+    fn parses_theme_name() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            theme_name = "catppuccin_mocha"
+            "#,
+        )
+        .expect("theme_name should parse");
+
+        assert_eq!(config.defaults.theme_name, Some(ThemeName::CatppuccinMocha));
+    }
+
+    #[test]
+    fn theme_name_is_none_by_default() {
+        let config = Config::default();
+        assert_eq!(config.defaults.theme_name, None);
     }
 
     #[test]

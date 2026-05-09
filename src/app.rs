@@ -7526,9 +7526,7 @@ fn snapshot_age_status(app: &AppState) -> String {
         return String::new();
     };
     let delta = Utc::now().signed_duration_since(refreshed_at);
-    if delta.num_seconds() < 10 {
-        "just now".to_string()
-    } else if delta.num_minutes() < 1 {
+    if delta.num_minutes() < 1 {
         format!("{}s ago", delta.num_seconds())
     } else if delta.num_hours() < 1 {
         let mins = delta.num_minutes();

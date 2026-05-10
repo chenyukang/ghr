@@ -22874,6 +22874,32 @@ mod tests {
 
     static CHECKOUT_TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    fn rendered_line_without_block_copy(document: &DetailsDocument, line_index: usize) -> String {
+        let rendered = document.lines[line_index].to_string();
+        let Some(copy_exclusion) = document.copy_exclusions.iter().find(|exclusion| {
+            exclusion.line == line_index
+                && document.actions.iter().any(|action| {
+                    action.line == line_index
+                        && matches!(&action.action, DetailAction::CopyBlock(_))
+                        && exclusion.start <= action.start
+                        && exclusion.end >= action.end
+                })
+        }) else {
+            return rendered;
+        };
+
+        take_display_width(&rendered, usize::from(copy_exclusion.start))
+    }
+
+    fn rendered_lines_without_block_copy(document: &DetailsDocument) -> Vec<String> {
+        document
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, _)| rendered_line_without_block_copy(document, line_index))
+            .collect()
+    }
+
     #[test]
     fn fuzzy_score_matches_ordered_subsequence() {
         assert!(fuzzy_score("frc", "fix rust closure").is_some());
@@ -32601,11 +32627,7 @@ The reviewer was selected based on:\n\
             0,
         );
         let document = builder.finish();
-        let rendered = document
-            .lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines_without_block_copy(&document);
 
         let quote_lines = rendered
             .iter()
@@ -32621,10 +32643,12 @@ The reviewer was selected based on:\n\
             quote_lines.iter().all(|line| line.starts_with("┃ ")),
             "each wrapped quote line should keep the quote marker: {quote_lines:?}"
         );
-        let quoted_text = document.lines[0]
-            .spans
+        let quoted_text = document
+            .lines
             .iter()
-            .find(|span| span.content.contains("quoted"))
+            .take(quote_lines.len())
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("quote"))
             .expect("quoted text span");
         assert_eq!(
             quoted_text.style.fg,
@@ -32695,12 +32719,8 @@ The reviewer was selected based on:\n\
             COMMENT_LEFT_PADDING,
             COMMENT_RIGHT_PADDING,
         );
-        let rendered = builder
-            .finish()
-            .lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let document = builder.finish();
+        let rendered = rendered_lines_without_block_copy(&document);
 
         assert_eq!(rendered[0], "  Feature gate: #![feature(split_as_slice)]");
         assert!(rendered[1].trim().is_empty());
@@ -32727,11 +32747,7 @@ The reviewer was selected based on:\n\
             COMMENT_RIGHT_PADDING,
         );
         let document = builder.finish();
-        let rendered = document
-            .lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines_without_block_copy(&document);
 
         assert_eq!(rendered[0], "  ▏ fn places_alias<'tcx>(");
         assert_eq!(rendered[1], "  ▏     tcx: TyCtxt<'tcx>,");
@@ -32776,11 +32792,7 @@ The reviewer was selected based on:\n\
             COMMENT_RIGHT_PADDING,
         );
         let document = builder.finish();
-        let rendered = document
-            .lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines_without_block_copy(&document);
 
         assert_eq!(rendered[0], "  ▏ ---");
         assert_eq!(

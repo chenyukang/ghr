@@ -762,6 +762,7 @@ mod tests {
             unread: Some(unread),
             reason: Some("mention".to_string()),
             extra: Some("PullRequest".to_string()),
+            viewer_subscription: None,
         }
     }
 }

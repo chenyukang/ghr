@@ -5,7 +5,7 @@ const shortcuts = [
   ["General", "q / Ctrl+C", "Save UI state and quit"],
   ["General", "1 / 2 / 3 / 4", "Focus ghr, Sections, List, or Details"],
   ["General", "Tab / Shift+Tab", "Switch list/details focus, or move within focused ghr/Sections tabs"],
-  ["General", "h / l", "Move within focused ghr or Sections tabs"],
+  ["General", "h / l / [ / ]", "Move within focused ghr or Sections tabs"],
   ["General", "j / k / n / p / Up / Down", "Move focus between ghr, Sections, and List"],
   ["General", "S", "Search pull requests and issues with remembered structured fields; Ctrl+S saves reusable conditions and Ctrl+U clears them"],
   ["General", "f", "Filter the current PR or issue section"],

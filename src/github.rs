@@ -85,6 +85,7 @@ pub struct ItemDetailsMetadata {
     pub labels: Option<Vec<String>>,
     pub assignees: Option<Vec<String>>,
     pub comments: Option<u64>,
+    pub viewer_subscription: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,8 +605,10 @@ struct SubscribableRepositoryRaw {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SubscribableNodeRaw {
-    id: String,
+    id: Option<String>,
+    viewer_subscription: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1663,9 +1666,18 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
     let issue_output = fetch_issue_details_output(repository, number);
     let comments_output = fetch_issue_comments_output(repository, number);
     let viewer_login = comment_viewer_login("comment ownership");
-    let (issue_output, comments_output, viewer_login) =
-        tokio::join!(issue_output, comments_output, viewer_login);
-    let issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
+    let viewer_subscription =
+        fetch_item_subscription_state_optional(repository, number, ItemKind::Issue);
+    let (issue_output, comments_output, viewer_login, viewer_subscription) = tokio::join!(
+        issue_output,
+        comments_output,
+        viewer_login,
+        viewer_subscription
+    );
+    let mut issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
+    if let Some(metadata) = issue_details.item_metadata.as_mut() {
+        metadata.viewer_subscription = viewer_subscription;
+    }
     Ok(CommentFetchResult {
         item_metadata: issue_details.item_metadata,
         item_reactions: issue_details.reactions,
@@ -1713,6 +1725,8 @@ pub async fn fetch_pull_request_comments(
     let review_thread_states = fetch_pull_request_review_thread_states(repository, number);
     let timeline = fetch_pull_request_timeline_output(repository, number);
     let viewer_login = comment_viewer_login("pull request comment ownership");
+    let viewer_subscription =
+        fetch_item_subscription_state_optional(repository, number, ItemKind::PullRequest);
     let (
         issue_details,
         issue_output,
@@ -1720,13 +1734,15 @@ pub async fn fetch_pull_request_comments(
         review_thread_states,
         timeline_output,
         viewer_login,
+        viewer_subscription,
     ) = tokio::join!(
         issue_details,
         issue_comments,
         review_comments,
         review_thread_states,
         timeline,
-        viewer_login
+        viewer_login,
+        viewer_subscription
     );
     let viewer_login = viewer_login.as_deref();
     let mut comments =
@@ -1774,7 +1790,10 @@ pub async fn fetch_pull_request_comments(
         }
     }
     comments.sort_by_key(|comment| comment.created_at);
-    let issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
+    let mut issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
+    if let Some(metadata) = issue_details.item_metadata.as_mut() {
+        metadata.viewer_subscription = viewer_subscription;
+    }
     Ok(CommentFetchResult {
         item_metadata: issue_details.item_metadata,
         item_reactions: issue_details.reactions,
@@ -3020,6 +3039,73 @@ mutation($id: ID!, $state: SubscriptionState!) {
     Ok(())
 }
 
+async fn fetch_item_subscription_state_optional(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Option<String> {
+    match fetch_item_subscription_state(repository, number, kind).await {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                ?kind,
+                "failed to load item subscription state"
+            );
+            None
+        }
+    }
+}
+
+async fn fetch_item_subscription_state(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<Option<String>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = match kind {
+        ItemKind::Issue => {
+            r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      viewerSubscription
+    }
+  }
+}
+"#
+        }
+        ItemKind::PullRequest => {
+            r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      viewerSubscription
+    }
+  }
+}
+"#
+        }
+        ItemKind::Notification => bail!("selected item is not an issue or pull request"),
+    };
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-F".to_string(),
+        format!("owner={owner}"),
+        "-F".to_string(),
+        format!("name={name}"),
+        "-F".to_string(),
+        format!("number={number}"),
+    ])
+    .await?;
+    parse_subscribable_viewer_subscription(&output, repository, number, kind)
+}
+
 async fn fetch_subscribable_id(repository: &str, number: u64, kind: ItemKind) -> Result<String> {
     let (owner, name) = split_repository(repository)?;
     let query = match kind {
@@ -3082,7 +3168,29 @@ fn parse_subscribable_id(
         ItemKind::Notification => None,
     }
     .ok_or_else(|| anyhow!("subscription target {repository}#{number} was not found"))?;
-    Ok(node.id)
+    node.id
+        .ok_or_else(|| anyhow!("subscription target {repository}#{number} did not include an id"))
+}
+
+fn parse_subscribable_viewer_subscription(
+    output: &str,
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<Option<String>> {
+    let raw = serde_json::from_str::<SubscribableGraphQlRaw>(output)
+        .with_context(|| format!("failed to parse subscription state for {repository}#{number}"))?;
+    let repository_raw = raw
+        .data
+        .repository
+        .ok_or_else(|| anyhow!("repository {repository} was not found"))?;
+    let node = match kind {
+        ItemKind::Issue => repository_raw.issue,
+        ItemKind::PullRequest => repository_raw.pull_request,
+        ItemKind::Notification => None,
+    }
+    .ok_or_else(|| anyhow!("subscription target {repository}#{number} was not found"))?;
+    Ok(node.viewer_subscription)
 }
 
 fn pull_request_ready_args(repository: &str, number: u64, undo: bool) -> Vec<String> {
@@ -3265,6 +3373,7 @@ impl IssueDetailsRaw {
                     .collect::<Vec<_>>()
             }),
             comments: self.comments,
+            viewer_subscription: None,
         })
     }
 }
@@ -4501,6 +4610,7 @@ fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem 
             .is_draft
             .filter(|is_draft| *is_draft)
             .map(|_| "draft".to_string()),
+        viewer_subscription: None,
     }
 }
 
@@ -4550,6 +4660,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
             .draft
             .filter(|is_draft| *is_draft)
             .map(|_| "draft".to_string()),
+        viewer_subscription: None,
     }
 }
 
@@ -4664,6 +4775,7 @@ fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
         unread: None,
         reason: None,
         extra: None,
+        viewer_subscription: None,
     }
 }
 
@@ -4753,6 +4865,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
         extra: Some(notification.subject.subject_type.clone()),
+        viewer_subscription: None,
     }
 }
 
@@ -5014,6 +5127,31 @@ mod tests {
         assert_eq!(
             parse_subscribable_id(output, "chenyukang/ghr", 1, ItemKind::Issue).unwrap(),
             "I_kwDOSSH5Ns7TAAAB"
+        );
+    }
+
+    #[test]
+    fn parse_subscribable_viewer_subscription_for_pull_request() {
+        let output = r#"{
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "viewerSubscription": "SUBSCRIBED"
+                    }
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            parse_subscribable_viewer_subscription(
+                output,
+                "chenyukang/ghr",
+                1,
+                ItemKind::PullRequest
+            )
+            .unwrap()
+            .as_deref(),
+            Some("SUBSCRIBED")
         );
     }
 

@@ -54,11 +54,22 @@ pub struct WorkItem {
     pub unread: Option<bool>,
     pub reason: Option<String>,
     pub extra: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_subscription: Option<String>,
 }
 
 impl WorkItem {
     pub fn supports_reactions(&self) -> bool {
         matches!(self.kind, ItemKind::Issue | ItemKind::PullRequest) && self.number.is_some()
+    }
+
+    pub fn viewer_is_subscribed(&self) -> bool {
+        if let Some(subscription) = self.viewer_subscription.as_deref() {
+            return subscription.eq_ignore_ascii_case("SUBSCRIBED");
+        }
+        self.reason
+            .as_deref()
+            .is_some_and(|reason| reason.eq_ignore_ascii_case("subscribed"))
     }
 }
 
@@ -879,6 +890,7 @@ mod tests {
             unread: None,
             reason: None,
             extra: None,
+            viewer_subscription: None,
         }
     }
 }

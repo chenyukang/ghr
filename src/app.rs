@@ -2489,6 +2489,7 @@ struct AppState {
     idle_sweep_cursor: usize,
     last_idle_sweep_request: Instant,
     details: HashMap<String, DetailState>,
+    details_synced_at: HashMap<String, DateTime<Utc>>,
     diffs: HashMap<String, DiffState>,
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
@@ -6449,7 +6450,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .filter_map(|index| section.items.get(*index))
         .map(|item| {
             let row_style = list_item_row_style(app, item);
-            Row::new(list_table_cells(section.kind, item)).style(row_style)
+            Row::new(list_table_cells(section, item)).style(row_style)
         })
         .collect::<Vec<_>>();
     let empty_state = rows
@@ -6463,7 +6464,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         active_theme().subtle().add_modifier(Modifier::BOLD)
     };
-    let header = Row::new(list_table_header(section.kind))
+    let header = Row::new(list_table_header(section))
         .style(header_style)
         .bottom_margin(1);
 
@@ -6559,7 +6560,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     }
     let title = focus_panel_title("List", &title, list_focused);
 
-    let table = Table::new(rows, list_table_constraints(section.kind))
+    let table = Table::new(rows, list_table_constraints(section))
         .header(header)
         .style(active_theme().panel())
         .block(
@@ -6587,36 +6588,48 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     }
 }
 
-fn list_table_cells(kind: SectionKind, item: &WorkItem) -> Vec<String> {
-    let mut cells = vec![
-        item.repo.clone(),
+fn list_table_cells(section: &SectionSnapshot, item: &WorkItem) -> Vec<String> {
+    let mut cells = Vec::new();
+    if !list_table_hides_repo(section) {
+        cells.push(item.repo.clone());
+    }
+    cells.extend([
         item.number
             .map(|number| format!("#{number}"))
             .unwrap_or_default(),
         item.title.clone(),
         relative_time(item.updated_at),
-    ];
-    if !matches!(kind, SectionKind::Notifications) {
+    ]);
+    if !matches!(section.kind, SectionKind::Notifications) {
         cells.push(item_meta(item));
     }
     cells
 }
 
-fn list_table_header(kind: SectionKind) -> Vec<&'static str> {
-    if matches!(kind, SectionKind::Notifications) {
+fn list_table_header(section: &SectionSnapshot) -> Vec<&'static str> {
+    if matches!(section.kind, SectionKind::Notifications) {
         vec!["Repo", "#", "Title", "Updated"]
+    } else if list_table_hides_repo(section) {
+        vec!["#", "Title", "Updated", "Meta"]
     } else {
         vec!["Repo", "#", "Title", "Updated", "Meta"]
     }
 }
 
-fn list_table_constraints(kind: SectionKind) -> Vec<Constraint> {
-    if matches!(kind, SectionKind::Notifications) {
+fn list_table_constraints(section: &SectionSnapshot) -> Vec<Constraint> {
+    if matches!(section.kind, SectionKind::Notifications) {
         vec![
             Constraint::Length(20),
             Constraint::Length(8),
             Constraint::Min(20),
             Constraint::Length(8),
+        ]
+    } else if list_table_hides_repo(section) {
+        vec![
+            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(14),
         ]
     } else {
         vec![
@@ -6627,6 +6640,11 @@ fn list_table_constraints(kind: SectionKind) -> Vec<Constraint> {
             Constraint::Length(14),
         ]
     }
+}
+
+fn list_table_hides_repo(section: &SectionSnapshot) -> bool {
+    !matches!(section.kind, SectionKind::Notifications)
+        && section_view_key(section).starts_with("repo:")
 }
 
 fn list_item_row_style(app: &AppState, item: &WorkItem) -> Style {
@@ -7585,12 +7603,12 @@ fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
 
     match app.focus {
         FocusTarget::Ghr => {
-            push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
+            push_footer_pair(&mut spans, "tab/h/l/[ ]", "switch", Color::Cyan);
             push_footer_pair(&mut spans, "j/n/enter", "Sections", Color::Cyan);
             push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }
         FocusTarget::Sections => {
-            push_footer_pair(&mut spans, "tab/h/l", "switch", Color::Cyan);
+            push_footer_pair(&mut spans, "tab/h/l/[ ]", "switch", Color::Cyan);
             push_footer_pair(&mut spans, "k/p", "ghr", Color::Cyan);
             push_footer_pair(&mut spans, "j/n/enter", "List", Color::Cyan);
             push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
@@ -7856,6 +7874,9 @@ fn push_footer_state(
 fn themed_hint_color(color: Color) -> Color {
     let theme = active_theme();
     match color {
+        Color::White => theme.text,
+        Color::Gray => theme.muted,
+        Color::DarkGray => theme.subtle,
         Color::Cyan | Color::LightCyan => theme.focus,
         Color::LightBlue => theme.link,
         Color::LightMagenta => theme.action,
@@ -11767,7 +11788,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         Line::from(""),
         help_heading("ghr and Sections"),
         help_key_line(
-            "Tab / Shift+Tab / h/l or Left/Right",
+            "Tab / Shift+Tab / h/l/[ ] or Left/Right",
             "switch the focused tab group",
         ),
         help_key_line(
@@ -12595,6 +12616,7 @@ impl AppState {
             idle_sweep_cursor: 0,
             last_idle_sweep_request: Instant::now() - INITIAL_IDLE_SWEEP_DELAY,
             details: HashMap::new(),
+            details_synced_at: HashMap::new(),
             diffs: HashMap::new(),
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
@@ -13559,6 +13581,7 @@ impl AppState {
                 Ok(result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
@@ -13690,6 +13713,7 @@ impl AppState {
                         comment_index.min(result.comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
@@ -13774,6 +13798,7 @@ impl AppState {
                     }
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
@@ -14577,6 +14602,8 @@ impl AppState {
                 result,
             } => match result {
                 Ok(()) => {
+                    let subscribed = matches!(action, ItemSubscriptionAction::Subscribe);
+                    self.update_item_subscription_local(&item_id, subscribed);
                     self.details_stale.insert(item_id);
                     self.status = item_subscription_action_success_status(action, item_kind);
                 }
@@ -16021,6 +16048,9 @@ impl AppState {
                 if metadata.comments.is_some() {
                     item.comments = metadata.comments;
                 }
+                if let Some(subscription) = &metadata.viewer_subscription {
+                    item.viewer_subscription = Some(subscription.clone());
+                }
             }
         }
     }
@@ -16320,12 +16350,51 @@ impl AppState {
         }
     }
 
+    fn update_item_subscription_local(&mut self, item_id: &str, subscribed: bool) {
+        let state = if subscribed {
+            "SUBSCRIBED"
+        } else {
+            "UNSUBSCRIBED"
+        };
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id == item_id {
+                    item.viewer_subscription = Some(state.to_string());
+                }
+            }
+        }
+    }
+
     fn apply_comment_fetch_result_metadata(&mut self, item_id: &str, result: &CommentFetchResult) {
         if let Some(metadata) = &result.item_metadata {
             self.apply_item_details_metadata(item_id, metadata);
         }
         self.update_item_reactions(item_id, result.item_reactions.clone());
         self.mark_item_milestone(item_id, result.item_milestone.as_ref());
+    }
+
+    fn remember_details_synced_at(&mut self, item_id: &str, result: &CommentFetchResult) {
+        let metadata_updated_at = result
+            .item_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.updated_at);
+        let synced_at = self
+            .item_updated_at_by_id(item_id)
+            .into_iter()
+            .chain(metadata_updated_at)
+            .max();
+        if let Some(synced_at) = synced_at {
+            self.details_synced_at
+                .insert(item_id.to_string(), synced_at);
+        }
+    }
+
+    fn item_updated_at_by_id(&self, item_id: &str) -> Option<DateTime<Utc>> {
+        self.sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .find(|item| item.id == item_id)
+            .and_then(|item| item.updated_at)
     }
 
     fn append_local_comment(&mut self, item_id: &str, comment: CommentPreview) -> usize {
@@ -16619,7 +16688,22 @@ impl AppState {
     }
 
     fn comments_load_needed(&self, item: &WorkItem) -> bool {
-        !self.details.contains_key(&item.id) || self.details_stale.contains(&item.id)
+        !self.details.contains_key(&item.id)
+            || self.details_stale.contains(&item.id)
+            || self.details_cache_outdated(item)
+    }
+
+    fn details_cache_outdated(&self, item: &WorkItem) -> bool {
+        if !self.details.contains_key(&item.id) {
+            return false;
+        }
+        let Some(updated_at) = item.updated_at else {
+            return false;
+        };
+        self.details_synced_at
+            .get(&item.id)
+            .map(|synced_at| updated_at > *synced_at)
+            .unwrap_or_else(|| self.item_has_unseen_details(item))
     }
 
     fn action_hints_load_needed(&self, item: &WorkItem) -> bool {
@@ -16821,7 +16905,8 @@ impl AppState {
     }
 
     fn start_comments_load_if_needed_at(&mut self, item: &WorkItem, now: Instant) -> bool {
-        let should_refresh = self.details_stale.remove(&item.id);
+        let should_refresh =
+            self.details_stale.remove(&item.id) || self.details_cache_outdated(item);
         if self.details.contains_key(&item.id) && !should_refresh {
             return false;
         }
@@ -17681,6 +17766,7 @@ impl AppState {
                 self.clamp_selected_comment();
             }
             if self.details_mode == DetailsMode::Conversation {
+                self.mark_current_details_stale_if_unseen();
                 self.mark_current_details_viewed();
             }
             self.sync_recent_details_visit(Instant::now());
@@ -21502,6 +21588,15 @@ impl AppState {
         self.viewed_item_at
             .get(&key)
             .is_some_and(|viewed_at| updated_at > *viewed_at)
+    }
+
+    fn mark_current_details_stale_if_unseen(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if self.details_cache_outdated(&item) {
+            self.details_stale.insert(item.id);
+        }
     }
 
     fn mark_current_details_viewed(&mut self) {
@@ -25504,6 +25599,118 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn focusing_details_refreshes_cached_comments_when_item_updated_after_view() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        app.sections[0].items[0].updated_at = Some(updated_after_view);
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", "cached before update", None)]),
+        );
+        let key = work_item_details_memory_key(app.current_item().expect("item"))
+            .expect("details memory key");
+        app.viewed_item_at.insert(key, viewed_at);
+
+        app.focus_details();
+
+        assert!(app.details_stale.contains("1"));
+        assert!(app.item_has_unseen_details(app.current_item().expect("item")));
+        assert!(app.comments_load_needed(app.current_item().expect("item")));
+    }
+
+    #[test]
+    fn comments_loaded_records_item_updated_at_for_cache_freshness() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+        app.sections[0].items[0].updated_at = Some(updated_after_view);
+        let key = work_item_details_memory_key(app.current_item().expect("item"))
+            .expect("details memory key");
+        app.viewed_item_at.insert(key, viewed_at);
+
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_metadata: Some(ItemDetailsMetadata {
+                    title: None,
+                    body: None,
+                    author: None,
+                    state: None,
+                    url: None,
+                    created_at: None,
+                    updated_at: Some(updated_after_view),
+                    labels: None,
+                    assignees: None,
+                    comments: Some(1),
+                    viewer_subscription: None,
+                }),
+                item_reactions: ReactionSummary::default(),
+                item_milestone: None,
+                comments: vec![comment("alice", "fresh comment", None)],
+            }),
+        });
+
+        assert!(app.item_has_unseen_details(app.current_item().expect("item")));
+        assert!(!app.details_cache_outdated(app.current_item().expect("item")));
+        assert!(!app.comments_load_needed(app.current_item().expect("item")));
+    }
+
+    #[test]
+    fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_item() {
+        let mut item = notification_item("thread-1", true);
+        item.number = Some(156354);
+        item.repo = "rust-lang/rust".to_string();
+        item.updated_at = DateTime::from_timestamp(1_700_000_023, 0);
+        let section = SectionSnapshot {
+            key: "notifications:all".to_string(),
+            kind: SectionKind::Notifications,
+            title: "All".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Notifications, vec![section]);
+        app.details.insert(
+            "thread-1".to_string(),
+            DetailState::Loaded(vec![comment("rustbot", "cached", None)]),
+        );
+
+        app.handle_msg(AppMsg::CommentsLoaded {
+            item_id: "thread-1".to_string(),
+            comments: Ok(CommentFetchResult {
+                item_metadata: Some(ItemDetailsMetadata {
+                    title: None,
+                    body: None,
+                    author: None,
+                    state: None,
+                    url: None,
+                    created_at: None,
+                    updated_at: DateTime::from_timestamp(1_700_000_005, 0),
+                    labels: None,
+                    assignees: None,
+                    comments: Some(3),
+                    viewer_subscription: None,
+                }),
+                item_reactions: ReactionSummary::default(),
+                item_milestone: None,
+                comments: vec![comment("rust-bors[bot]", "fresh", None)],
+            }),
+        });
+
+        assert_eq!(
+            app.details_synced_at.get("thread-1").copied(),
+            DateTime::from_timestamp(1_700_000_023, 0)
+        );
+        assert!(!app.details_cache_outdated(app.current_item().expect("item")));
+        assert!(!app.comments_load_needed(app.current_item().expect("item")));
+    }
+
+    #[test]
     fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
@@ -25529,6 +25736,7 @@ diff --git a/src/main.rs b/src/main.rs
                     labels: None,
                     assignees: None,
                     comments: Some(3),
+                    viewer_subscription: None,
                 }),
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
@@ -28067,6 +28275,76 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
+    fn repo_list_table_hides_redundant_repo_column() {
+        let view = repo_view_key("Rust");
+        let mut section = SectionSnapshot::empty_for_view(
+            &view,
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:rust-lang/rust",
+        );
+        section.items = vec![work_item(
+            "rust-lang/rust#1",
+            "rust-lang/rust",
+            1,
+            "Compiler diagnostics",
+            None,
+        )];
+        section.items[0].updated_at = Some(Utc::now() - chrono::Duration::hours(3));
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.active_view = view;
+        app.list_width_percent = crate::state::MAX_LIST_WIDTH_PERCENT;
+        let area = Rect::new(0, 0, 180, 30);
+        let list_area = layout::body_areas_with_ratio(body_area(area), app.list_width_percent)[0];
+        let list_width = usize::from(list_area.x.saturating_add(list_area.width));
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let paths = test_paths();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &paths))
+            .expect("draw");
+
+        let lines = buffer_lines(terminal.backend().buffer());
+        let header = lines
+            .iter()
+            .find(|line| {
+                line.contains("#")
+                    && line.contains("Title")
+                    && line.contains("Updated")
+                    && line.contains("Meta")
+            })
+            .expect("repo list header");
+        let header = &header[..header.len().min(list_width)];
+        assert!(!header.contains("Repo"));
+        let number_pos = header.find("#").expect("number column");
+        let title_pos = header.find("Title").expect("title column");
+        let updated_pos = header.find("Updated").expect("updated column");
+        assert!(number_pos < title_pos);
+        assert!(title_pos < updated_pos);
+        assert!(
+            updated_pos.saturating_sub(title_pos) >= 94,
+            "header positions: {header:?}"
+        );
+
+        let row = lines
+            .iter()
+            .find(|line| line.contains("#1") && line.contains("Compiler diagnostics"))
+            .expect("repo list row");
+        let row = &row[..row.len().min(list_width)];
+        assert!(!row.contains("rust-lang/rust"));
+        let number_pos = row.find("#1").expect("number cell");
+        let title_pos = row.find("Compiler diagnostics").expect("title cell");
+        let updated_pos = row.find("3h").expect("updated cell");
+        assert!(number_pos < title_pos);
+        assert!(title_pos < updated_pos);
+        assert!(
+            updated_pos.saturating_sub(title_pos) >= 94,
+            "row positions: {row:?}"
+        );
+    }
+
+    #[test]
     fn notification_list_table_hides_meta_and_moves_updated_right() {
         let mut item = notification_item("thread-1", true);
         item.title = "Notification title".to_string();
@@ -28305,13 +28583,13 @@ diff --git a/src/main.rs b/src/main.rs
 
         app.focus_ghr();
         let ghr = footer_line(&app, &paths).to_string();
-        assert!(ghr.contains("tab/h/l switch  j/n/enter Sections  esc List"));
+        assert!(ghr.contains("tab/h/l/[ ] switch  j/n/enter Sections  esc List"));
         assert!(!ghr.contains("M/C/D/U/E/O/F/X actions"));
         assert!(!ghr.contains("t milestone"));
 
         app.focus_sections();
         let sections = footer_line(&app, &paths).to_string();
-        assert!(sections.contains("tab/h/l switch  k/p ghr  j/n/enter List"));
+        assert!(sections.contains("tab/h/l/[ ] switch  k/p ghr  j/n/enter List"));
         assert!(!sections.contains("a comment"));
 
         app.focus_details();
@@ -29139,6 +29417,33 @@ diff --git a/src/main.rs b/src/main.rs
             .expect("inbox tab");
 
         assert_eq!(inbox.label, "Inbox");
+    }
+
+    #[test]
+    fn legacy_ansi_text_colors_use_readable_light_theme_palette() {
+        let previous = crate::theme::active_theme_name();
+        set_active_theme(ThemeName::Light);
+        let theme = active_theme();
+
+        assert_eq!(themed_fg_style(Color::White).fg, Some(theme.text));
+        assert_eq!(themed_fg_style(Color::Gray).fg, Some(theme.muted));
+        assert_eq!(themed_fg_style(Color::DarkGray).fg, Some(theme.subtle));
+
+        set_active_theme(previous);
+    }
+
+    #[test]
+    fn key_value_labels_are_readable_in_light_theme() {
+        let previous = crate::theme::active_theme_name();
+        set_active_theme(ThemeName::Light);
+        let theme = active_theme();
+
+        let line = key_value_line("repo", "chenyukang/ghr".to_string());
+
+        assert_eq!(line.spans[0].style.fg, Some(theme.muted));
+        assert_eq!(line.spans[0].style.bg, Some(theme.surface));
+
+        set_active_theme(previous);
     }
 
     #[test]
@@ -30460,6 +30765,7 @@ diff --git a/src/main.rs b/src/main.rs
                     labels: Some(vec!["T-compiler".to_string()]),
                     assignees: Some(vec!["alice".to_string()]),
                     comments: Some(3),
+                    viewer_subscription: None,
                 }),
                 item_reactions: ReactionSummary::default(),
                 item_milestone: None,
@@ -30682,7 +30988,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         assert!(rendered.contains("labels:  +"));
         assert!(!rendered.contains("labels: none"));
-        assert!(rendered.contains("subscription: subscribe  unsubscribe"));
+        assert!(rendered.contains("subscription: subscribe"));
         assert!(rendered.contains("  reactions:  + react"));
         assert!(!rendered.contains("reactions: none"));
         assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
@@ -30692,17 +30998,98 @@ diff --git a/src/main.rs b/src/main.rs
             "subscribe",
             DetailAction::SubscribeItem,
         );
-        assert_document_action_for_text_on_line(
-            &document,
-            "subscription:",
-            "unsubscribe",
-            DetailAction::UnsubscribeItem,
+        assert!(
+            !document
+                .actions
+                .iter()
+                .any(|action| action.action == DetailAction::UnsubscribeItem)
         );
         assert_document_action_for_text_on_line(
             &document,
             "reactions:",
             "+ react",
             DetailAction::ReactItem,
+        );
+    }
+
+    #[test]
+    fn issue_details_show_unsubscribe_for_subscribed_item() {
+        let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+        item.kind = ItemKind::Issue;
+        item.viewer_subscription = Some("SUBSCRIBED".to_string());
+        item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let app = AppState::new(SectionKind::Issues, vec![section]);
+        let document = build_details_document(&app, 120);
+        let rendered = document
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("subscription: unsubscribe"));
+        assert_document_action_for_text_on_line(
+            &document,
+            "subscription:",
+            "unsubscribe",
+            DetailAction::UnsubscribeItem,
+        );
+        assert!(
+            !document
+                .actions
+                .iter()
+                .any(|action| action.action == DetailAction::SubscribeItem)
+        );
+    }
+
+    #[test]
+    fn item_subscription_success_updates_visible_action() {
+        let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+        item.kind = ItemKind::Issue;
+        let section = SectionSnapshot {
+            key: "issues:test".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: String::new(),
+            items: vec![item],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        };
+        let mut app = AppState::new(SectionKind::Issues, vec![section]);
+
+        app.handle_msg(AppMsg::ItemSubscriptionUpdated {
+            item_id: "issue-1".to_string(),
+            item_kind: ItemKind::Issue,
+            action: ItemSubscriptionAction::Subscribe,
+            result: Ok(()),
+        });
+
+        assert_eq!(
+            app.current_item()
+                .and_then(|item| item.viewer_subscription.as_deref()),
+            Some("SUBSCRIBED")
+        );
+        let document = build_details_document(&app, 120);
+        assert_document_action_for_text_on_line(
+            &document,
+            "subscription:",
+            "unsubscribe",
+            DetailAction::UnsubscribeItem,
         );
     }
 
@@ -35893,6 +36280,7 @@ The reviewer was selected based on:\n\
                 unread: Some(true),
                 reason: Some("mention".to_string()),
                 extra: Some("Commit".to_string()),
+                viewer_subscription: None,
             }],
             total_count: None,
             page: 1,
@@ -38882,7 +39270,7 @@ diff --git a/d.rs b/d.rs
     }
 
     #[test]
-    fn h_and_l_switch_only_the_focused_tab_group() {
+    fn h_l_and_brackets_switch_only_the_focused_tab_group() {
         let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
         issue.kind = ItemKind::Issue;
         issue.url = "https://github.com/nervosnetwork/fiber/issues/1".to_string();
@@ -38942,6 +39330,61 @@ diff --git a/d.rs b/d.rs
         assert_eq!(app.focus, FocusTarget::Sections);
 
         app.switch_view(builtin_view_key(SectionKind::PullRequests));
+        app.focus_sections();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('l')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.current_section_position(), 1);
+        assert_eq!(app.focus, FocusTarget::Sections);
+
+        app.focus_ghr();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(']')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('[')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
+        assert_eq!(app.focus, FocusTarget::Ghr);
+
+        app.section_index
+            .insert(builtin_view_key(SectionKind::PullRequests), 0);
+        app.focus_sections();
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char(']')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.current_section_position(), 1);
+        assert_eq!(app.focus, FocusTarget::Sections);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('[')),
+            &config,
+            &store,
+            &tx
+        ));
+        assert_eq!(app.current_section_position(), 0);
+        assert_eq!(app.focus, FocusTarget::Sections);
+
         app.focus_sections();
         assert!(!handle_key(
             &mut app,
@@ -40381,6 +40824,7 @@ diff --git a/d.rs b/d.rs
             unread: None,
             reason: None,
             extra: None,
+            viewer_subscription: None,
         }
     }
 
@@ -40429,6 +40873,7 @@ diff --git a/d.rs b/d.rs
             unread: Some(unread),
             reason: Some("mention".to_string()),
             extra: Some("PullRequest".to_string()),
+            viewer_subscription: None,
         }
     }
 }

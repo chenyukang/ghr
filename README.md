@@ -93,7 +93,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `:` | Open the command palette and fuzzy search commands; recently run commands appear first |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
-| `h` / `l` | Move within the focused ghr or Sections tab group, wrapping at the ends |
+| `h` / `l` or `[` / `]` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff mode |
 | `j` / `k` | Move list selection, choose diff files, select diff lines, or scroll details |

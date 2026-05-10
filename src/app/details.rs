@@ -1319,7 +1319,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_meta_line(vec![("assignees", assignee_detail_segments(item))]);
         push_label_controls(&mut builder, &item.labels);
         if item.number.is_some() {
-            builder.push_meta_line(vec![("subscription", subscription_detail_segments())]);
+            builder.push_meta_line(vec![("subscription", subscription_detail_segments(item))]);
         }
     }
 
@@ -1619,12 +1619,18 @@ pub(super) fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
     segments
 }
 
-pub(super) fn subscription_detail_segments() -> Vec<DetailSegment> {
-    vec![
-        DetailSegment::action("subscribe", DetailAction::SubscribeItem),
-        DetailSegment::raw("  "),
-        DetailSegment::action("unsubscribe", DetailAction::UnsubscribeItem),
-    ]
+pub(super) fn subscription_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
+    if item.viewer_is_subscribed() {
+        vec![DetailSegment::action(
+            "unsubscribe",
+            DetailAction::UnsubscribeItem,
+        )]
+    } else {
+        vec![DetailSegment::action(
+            "subscribe",
+            DetailAction::SubscribeItem,
+        )]
+    }
 }
 
 pub(super) fn push_diff(

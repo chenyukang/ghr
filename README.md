@@ -204,7 +204,7 @@ Mouse behavior:
 
 - Click ghr or Sections tabs to switch views or sections.
 - Click list rows to select them and focus Details. Mouse hover and mouse wheel do not change PR/issue selection.
-- Click descriptions, comments, links, and visible actions in Details to focus or open them.
+- Click descriptions, comments, links, and visible actions in Details to focus, open, or copy code/quote blocks.
 - Click inside comment, review, issue, or PR editor dialogs to place the edit cursor.
 - Drag text inside Details to copy that rendered selection to the clipboard without leaving mouse mode.
 - Scroll Details with the mouse wheel.

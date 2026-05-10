@@ -6,6 +6,7 @@ use crate::theme::active_theme;
 const DETAILS_METADATA_PADDING: usize = 2;
 const DETAILS_METADATA_KEY_WIDTH: usize = 11;
 const DESCRIPTION_BODY_PADDING: usize = 2;
+const BLOCK_COPY_BUTTON_LABEL: &str = "copy";
 const INLINE_COMMENT_MARKER: &str = "💬 ";
 const INLINE_COMMENT_MULTIPLE_MARKER: &str = "💬* ";
 
@@ -291,6 +292,7 @@ pub(super) enum DetailAction {
     ToggleCommentExpanded(usize),
     ReactItem,
     ReactComment(usize),
+    CopyBlock(String),
     SubscribeItem,
     UnsubscribeItem,
     AddLabel,
@@ -385,6 +387,7 @@ pub(super) struct MarkdownBlock {
     pub(super) quote_depth: u8,
     pub(super) kind: MarkdownBlockKind,
     pub(super) gap_before: bool,
+    pub(super) copy_text: Option<String>,
     pub(super) segments: Vec<DetailSegment>,
 }
 
@@ -687,6 +690,14 @@ impl DetailsBuilder {
             if matches!(block.kind, MarkdownBlockKind::Code { .. }) {
                 line_prefix.extend(code_block_prefix());
             }
+            let block_width = self.width;
+            let copy_reserve = block.copy_text.as_ref().map_or(0, |_| {
+                display_width(BLOCK_COPY_BUTTON_LABEL).saturating_add(1)
+            });
+            let line_start = self.document.lines.len();
+            if copy_reserve > 0 {
+                self.width = reserved_width(self.width, copy_reserve);
+            }
             match block.kind {
                 MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
                     if !self.push_wrapped_prefixed(
@@ -695,6 +706,7 @@ impl DetailsBuilder {
                         &mut emitted,
                         max_lines,
                     ) {
+                        self.width = block_width;
                         break;
                     }
                 }
@@ -705,12 +717,71 @@ impl DetailsBuilder {
                         &mut emitted,
                         max_lines,
                     ) {
+                        self.width = block_width;
                         break;
                     }
                 }
             }
+            self.width = block_width;
+            if let Some(copy_text) = block.copy_text {
+                self.add_block_copy_button(
+                    line_start,
+                    block_width,
+                    block.kind,
+                    block.quote_depth,
+                    copy_text,
+                );
+            }
         }
         self.width = original_width;
+    }
+
+    fn add_block_copy_button(
+        &mut self,
+        line_index: usize,
+        target_width: usize,
+        kind: MarkdownBlockKind,
+        quote_depth: u8,
+        copy_text: String,
+    ) {
+        let Some(line) = self.document.lines.get_mut(line_index) else {
+            return;
+        };
+        let button_width = display_width(BLOCK_COPY_BUTTON_LABEL);
+        if button_width == 0 || target_width <= button_width {
+            return;
+        }
+        let button_start = target_width.saturating_sub(button_width);
+        let line_width = display_width(&line.to_string());
+        if line_width > button_start {
+            return;
+        }
+
+        let surface_style = block_copy_surface_style(kind, quote_depth);
+        if button_start > line_width {
+            line.spans.push(Span::styled(
+                " ".repeat(button_start - line_width),
+                surface_style,
+            ));
+        }
+        line.spans.push(Span::styled(
+            BLOCK_COPY_BUTTON_LABEL,
+            block_copy_action_style(kind, quote_depth),
+        ));
+
+        let start = button_start.min(usize::from(u16::MAX)) as u16;
+        let end = target_width.min(usize::from(u16::MAX)) as u16;
+        self.document.actions.push(ActionRegion {
+            line: line_index,
+            start,
+            end,
+            action: DetailAction::CopyBlock(copy_text),
+        });
+        self.document.copy_exclusions.push(CopyExclusionRegion {
+            line: line_index,
+            start: line_width.min(usize::from(u16::MAX)) as u16,
+            end,
+        });
     }
 
     fn push_markdown_gap(
@@ -4095,6 +4166,7 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 code_block.clear();
             }
             MarkdownEvent::End(TagEnd::CodeBlock) => {
+                let block_copy_text = code_block_copy_text(&code_block);
                 let mut lines = code_block.split('\n').collect::<Vec<_>>();
                 if lines.last() == Some(&"") {
                     lines.pop();
@@ -4102,14 +4174,15 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
                 if lines.is_empty() {
                     lines.push("");
                 }
-                for line in lines {
-                    push_markdown_block(
+                for (index, line) in lines.into_iter().enumerate() {
+                    push_markdown_block_with_copy(
                         &mut blocks,
                         quote_depth,
                         MarkdownBlockKind::Code {
                             language: code_language,
                         },
                         highlight_code_line(line, code_language),
+                        (index == 0).then(|| block_copy_text.clone()),
                     );
                 }
                 in_code_block = false;
@@ -4199,7 +4272,63 @@ pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
         quote_depth,
         MarkdownBlockKind::Text,
     );
+    attach_quote_copy_buttons(&mut blocks);
     blocks
+}
+
+pub(super) fn code_block_copy_text(text: &str) -> String {
+    text.strip_suffix('\n').unwrap_or(text).to_string()
+}
+
+pub(super) fn attach_quote_copy_buttons(blocks: &mut [MarkdownBlock]) {
+    let mut index = 0;
+    while index < blocks.len() {
+        if blocks[index].quote_depth == 0 {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < blocks.len() && blocks[index].quote_depth > 0 {
+            index += 1;
+        }
+
+        if blocks[start].copy_text.is_none() {
+            let copy_text = markdown_blocks_copy_text(&blocks[start..index]);
+            if !copy_text.is_empty() {
+                blocks[start].copy_text = Some(copy_text);
+            }
+        }
+    }
+}
+
+pub(super) fn markdown_blocks_copy_text(blocks: &[MarkdownBlock]) -> String {
+    let mut text = String::new();
+    for block in blocks {
+        let line = segments_copy_text(&block.segments);
+        if line.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            if block.gap_before {
+                text.push('\n');
+            }
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
+    text
+}
+
+pub(super) fn segments_copy_text(segments: &[DetailSegment]) -> String {
+    let mut text = String::new();
+    for segment in segments {
+        if segment.copyable {
+            text.push_str(&segment.text);
+        }
+    }
+    text
 }
 
 pub(super) fn push_image_alt(image: &mut MarkdownImage, text: &str) {
@@ -4807,6 +4936,16 @@ pub(super) fn push_markdown_block(
     kind: MarkdownBlockKind,
     segments: Vec<DetailSegment>,
 ) {
+    push_markdown_block_with_copy(blocks, quote_depth, kind, segments, None);
+}
+
+pub(super) fn push_markdown_block_with_copy(
+    blocks: &mut Vec<MarkdownBlock>,
+    quote_depth: u8,
+    kind: MarkdownBlockKind,
+    segments: Vec<DetailSegment>,
+    copy_text: Option<String>,
+) {
     let gap_before = markdown_gap_before(blocks.last(), quote_depth, kind);
     let segments = if matches!(kind, MarkdownBlockKind::Code { .. }) {
         code_block_segments(segments)
@@ -4819,6 +4958,7 @@ pub(super) fn push_markdown_block(
         quote_depth,
         kind,
         gap_before,
+        copy_text,
         segments,
     });
 }
@@ -4875,6 +5015,22 @@ pub(super) fn quote_prefix(depth: u8) -> Vec<DetailSegment> {
 
 pub(super) fn code_block_prefix() -> Vec<DetailSegment> {
     vec![DetailSegment::styled_chrome("▏ ", code_block_rail_style())]
+}
+
+pub(super) fn block_copy_surface_style(kind: MarkdownBlockKind, quote_depth: u8) -> Style {
+    match kind {
+        MarkdownBlockKind::Code { .. } => active_theme().panel().bg(active_theme().code_bg),
+        _ if quote_depth > 0 => active_theme().panel().bg(active_theme().quote_bg),
+        _ => active_theme().panel(),
+    }
+}
+
+pub(super) fn block_copy_action_style(kind: MarkdownBlockKind, quote_depth: u8) -> Style {
+    action_style().bg(match kind {
+        MarkdownBlockKind::Code { .. } => active_theme().code_bg,
+        _ if quote_depth > 0 => active_theme().quote_bg,
+        _ => active_theme().surface,
+    })
 }
 
 pub(super) fn append_text_segments(

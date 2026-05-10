@@ -12123,7 +12123,7 @@ fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
         help_key_line("click tabs / sections", "switch view or section"),
         help_key_line("click list row", "select item or diff file"),
         help_key_line(
-            "click links / open / reply / edit / react",
+            "click links / open / reply / edit / react / copy block",
             "run that action",
         ),
         help_key_line("drag Details text", "copy rendered selection"),
@@ -18720,6 +18720,7 @@ impl AppState {
                 self.select_comment(index);
                 self.start_comment_reaction_dialog(index);
             }
+            DetailAction::CopyBlock(text) => self.copy_block_to_clipboard(&text),
             DetailAction::SubscribeItem => {
                 if let Some(tx) = tx {
                     self.start_item_subscription_action(ItemSubscriptionAction::Subscribe, tx);
@@ -21755,6 +21756,17 @@ impl AppState {
         match copy_text_to_clipboard(&content) {
             Ok(()) => {
                 self.status = format!("copied {label}");
+            }
+            Err(error) => {
+                self.status = format!("copy failed: {error}");
+            }
+        }
+    }
+
+    fn copy_block_to_clipboard(&mut self, text: &str) {
+        match copy_text_to_clipboard(text) {
+            Ok(()) => {
+                self.status = "block copied".to_string();
             }
             Err(error) => {
                 self.status = format!("copy failed: {error}");
@@ -32689,11 +32701,10 @@ The reviewer was selected based on:\n\
             .collect::<Vec<_>>();
         let theme = crate::theme::Theme::from_name(ThemeName::Dark);
 
-        assert_eq!(
-            rendered[2],
-            "  ▏ error[E0214]: parenthesized type parameters"
-        );
-        assert_eq!(rendered[4], "  ┃ quoted rationale");
+        assert!(rendered[2].starts_with("  ▏ error[E0214]: parenthesized type parameters"));
+        assert!(rendered[2].trim_end().ends_with("copy"));
+        assert!(rendered[4].starts_with("  ┃ quoted rationale"));
+        assert!(rendered[4].trim_end().ends_with("copy"));
 
         let code_rail = document.lines[2]
             .spans
@@ -32722,6 +32733,26 @@ The reviewer was selected based on:\n\
             .expect("code content");
         assert_eq!(code.style.bg, Some(theme.code_bg));
 
+        let code_copy =
+            "error[E0214]: parenthesized type parameters\n  1 | fn foo(_: Option()) {}".to_string();
+        let code_copy_action = document
+            .actions
+            .iter()
+            .find(|region| {
+                region.line == 2
+                    && matches!(&region.action, DetailAction::CopyBlock(text) if text == &code_copy)
+            })
+            .expect("code copy action");
+        assert_eq!(
+            document.action_at(code_copy_action.line, code_copy_action.start),
+            Some(DetailAction::CopyBlock(code_copy))
+        );
+        assert!(document.copy_exclusions.iter().any(|region| {
+            region.line == 2
+                && region.start <= code_copy_action.start
+                && region.end >= code_copy_action.end
+        }));
+
         let quote = document.lines[4]
             .spans
             .iter()
@@ -32729,6 +32760,25 @@ The reviewer was selected based on:\n\
             .expect("quote content");
         assert_eq!(quote.style.fg, Some(theme.quote));
         assert_eq!(quote.style.bg, Some(theme.quote_bg));
+
+        let quote_copy = "quoted rationale\nwith another line".to_string();
+        let quote_copy_action = document
+            .actions
+            .iter()
+            .find(|region| {
+                region.line == 4
+                    && matches!(&region.action, DetailAction::CopyBlock(text) if text == &quote_copy)
+            })
+            .expect("quote copy action");
+        assert_eq!(
+            document.action_at(quote_copy_action.line, quote_copy_action.start),
+            Some(DetailAction::CopyBlock(quote_copy))
+        );
+        assert!(document.copy_exclusions.iter().any(|region| {
+            region.line == 4
+                && region.start <= quote_copy_action.start
+                && region.end >= quote_copy_action.end
+        }));
     }
 
     #[test]

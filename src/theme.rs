@@ -107,26 +107,6 @@ impl ThemeName {
         }
     }
 
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
-            Self::CatppuccinMocha => Self::CatppuccinLatte,
-            Self::CatppuccinLatte => Self::CatppuccinMocha,
-            Self::Nord => Self::Light,
-            Self::GruvboxDark => Self::GruvboxLight,
-            Self::GruvboxLight => Self::GruvboxDark,
-            Self::TokyoNight => Self::Light,
-            Self::Dracula => Self::Light,
-            Self::SolarizedDark => Self::SolarizedLight,
-            Self::SolarizedLight => Self::SolarizedDark,
-            Self::OneDark => Self::Light,
-            Self::Monokai => Self::Light,
-            Self::GitHubDark => Self::GitHubLight,
-            Self::GitHubLight => Self::GitHubDark,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dark => "dark",
@@ -170,14 +150,6 @@ impl ThemePreference {
 
     pub fn is_auto(self) -> bool {
         matches!(self, Self::Auto)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Dark => "dark",
-            Self::Light => "light",
-        }
     }
 }
 
@@ -780,7 +752,6 @@ pub fn active_theme() -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toml;
 
     #[test]
     fn auto_theme_uses_detected_system_theme() {
@@ -859,9 +830,16 @@ mod tests {
                 Color::Reset,
                 "{name:?} should define background"
             );
-            assert_ne!(theme.surface, Color::Reset, "{name:?} should define surface");
+            assert_ne!(
+                theme.surface,
+                Color::Reset,
+                "{name:?} should define surface"
+            );
             assert_ne!(theme.text, Color::Reset, "{name:?} should define text");
-            assert_ne!(theme.border, theme.background, "{name:?} border must differ from background");
+            assert_ne!(
+                theme.border, theme.background,
+                "{name:?} border must differ from background"
+            );
         }
     }
 
@@ -926,22 +904,8 @@ mod tests {
                 encoded.contains(&format!("theme = \"{expected}\"")),
                 "expected theme = \"{expected}\" in:\n{encoded}"
             );
-            let decoded: Wrapper =
-                toml::from_str(&format!("theme = \"{expected}\"")).unwrap();
+            let decoded: Wrapper = toml::from_str(&format!("theme = \"{expected}\"")).unwrap();
             assert_eq!(decoded.theme, name);
-        }
-    }
-
-    #[test]
-    fn toggle_flips_family() {
-        for &name in ThemeName::ALL {
-            let toggled = name.toggled();
-            assert_ne!(name, toggled, "{name:?} toggle must change theme");
-            assert_ne!(
-                name.family(),
-                toggled.family(),
-                "{name:?} toggle must flip family"
-            );
         }
     }
 }

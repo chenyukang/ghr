@@ -29,7 +29,7 @@
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
 - Mouse support for tabs, lists, links, descriptions, comments, editor cursor placement, details drag-copy, scrolling, text selection mode, and split resizing.
-- Built-in `auto`, `dark`, and `light` themes configured through `defaults.theme`; `auto` follows the macOS appearance when available.
+- Built-in `auto` plus named light and dark color themes configured through `defaults.theme` / `defaults.theme_name`; `auto` follows the macOS appearance when available.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
 - Uses the GitHub CLI for authentication, API access, and browser opening behavior.
@@ -164,7 +164,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Project Remove` | Select a configured repo project, confirm, and remove it from `config.toml` |
 | `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
 | `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
-| `Toggle Theme` | Cycle `auto`, `dark`, and `light` themes and save it to `config.toml` |
+| `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
@@ -302,7 +302,7 @@ When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repos
 
 Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
 
-Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the TUI palette. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected.
+Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 
 Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
 

@@ -91,7 +91,7 @@ const commands = [
   ["Project", "Project Remove", "Remove a repo project from config.toml"],
   ["Navigation", "Recent Items", "Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back"],
   ["Search", "Saved Search Filter", "Pick a named saved PR/issue search from config.toml"],
-  ["Theme", "Toggle Theme", "Cycle auto, dark, and light themes and save config.toml"],
+  ["Theme", "Set Color Theme", "Choose auto or a fixed color theme and save config.toml"],
   ["Cache", "Clear Cache", "Choose which local cache layer to clear"],
   ["Inbox", "Mark Done", "Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless muted"],
   ["Inbox", "Mark All Read", "Mark every GitHub inbox notification as read"],

@@ -77,7 +77,7 @@ use crate::state::{
     MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
     ViewSnapshot as SavedViewSnapshot,
 };
-use crate::theme::{ThemeName, ThemePreference, active_theme, set_active_theme};
+use crate::theme::{ThemeFamily, ThemeName, ThemePreference, active_theme, set_active_theme};
 
 mod command_palette;
 mod details;
@@ -1097,6 +1097,27 @@ struct ProjectSwitcher {
 struct TopMenuSwitcher {
     query: String,
     selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ThemeChoice {
+    #[default]
+    Auto,
+    Name(ThemeName),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ThemeSwitcher {
+    query: String,
+    selected: usize,
+    current: ThemeChoice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThemeCandidate {
+    choice: ThemeChoice,
+    label: String,
+    detail: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2472,6 +2493,7 @@ struct AppState {
     command_palette: Option<CommandPalette>,
     project_switcher: Option<ProjectSwitcher>,
     top_menu_switcher: Option<TopMenuSwitcher>,
+    theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
     recent_commands: Vec<RecentCommand>,
@@ -2490,6 +2512,7 @@ struct AppState {
     last_idle_sweep_request: Instant,
     details: HashMap<String, DetailState>,
     details_synced_at: HashMap<String, DateTime<Utc>>,
+    details_refreshed_at: HashMap<String, DateTime<Utc>>,
     diffs: HashMap<String, DiffState>,
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
@@ -3169,6 +3192,7 @@ fn mouse_wheel_target(app: &AppState, mouse: MouseEvent, area: Rect) -> Option<M
         || app.command_palette.is_some()
         || app.project_switcher.is_some()
         || app.top_menu_switcher.is_some()
+        || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
@@ -4463,6 +4487,11 @@ fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.theme_switcher.is_some() {
+        app.handle_theme_switcher_key(key, config, paths);
+        return false;
+    }
+
     if app.recent_items_dialog.is_some() {
         app.handle_recent_items_key(key);
         return false;
@@ -5092,6 +5121,7 @@ fn handle_mouse_with_sync(
     if app.command_palette.is_some()
         || app.project_switcher.is_some()
         || app.top_menu_switcher.is_some()
+        || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
@@ -6210,6 +6240,9 @@ fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
     if let Some(switcher) = &app.top_menu_switcher {
         draw_top_menu_switcher(frame, app, switcher, area);
+    }
+    if let Some(switcher) = &app.theme_switcher {
+        draw_theme_switcher(frame, app, switcher, area);
     }
     if let Some(dialog) = &app.recent_items_dialog {
         draw_recent_items_dialog(frame, app, dialog, area);
@@ -7534,7 +7567,7 @@ fn footer_status(app: &AppState) -> String {
     if app.refreshing {
         return "refreshing".to_string();
     }
-    let age = snapshot_age_status(app);
+    let age = refresh_age_status(app);
     if app.status.is_empty() {
         age
     } else if age.is_empty() {
@@ -7544,11 +7577,23 @@ fn footer_status(app: &AppState) -> String {
     }
 }
 
-fn snapshot_age_status(app: &AppState) -> String {
+fn refresh_age_status(app: &AppState) -> String {
+    if app.focus == FocusTarget::Details
+        && app.details_mode == DetailsMode::Conversation
+        && let Some(item) = app.current_item()
+        && let Some(refreshed_at) = app.details_refreshed_at.get(&item.id)
+    {
+        return format!("details refreshed {}", time_ago(*refreshed_at));
+    }
+
     let Some(refreshed_at) = app.current_section().and_then(|s| s.refreshed_at) else {
         return String::new();
     };
-    let delta = Utc::now().signed_duration_since(refreshed_at);
+    format!("list refreshed {}", time_ago(refreshed_at))
+}
+
+fn time_ago(value: DateTime<Utc>) -> String {
+    let delta = Utc::now().signed_duration_since(value);
     if delta.num_minutes() < 1 {
         format!("{}s ago", delta.num_seconds())
     } else if delta.num_hours() < 1 {
@@ -8399,10 +8444,92 @@ fn draw_top_menu_switcher(
     ));
 }
 
+fn draw_theme_switcher(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    switcher: &ThemeSwitcher,
+    area: Rect,
+) {
+    let candidates = app.theme_switcher_candidates_for_query(&switcher.query);
+    let dialog_area = theme_switcher_area(area);
+    let inner = block_inner(dialog_area);
+    let result_height = usize::from(inner.height.saturating_sub(2));
+    let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, candidates.len(), result_height);
+    let width = usize::from(inner.width.max(1));
+
+    let mut lines = Vec::new();
+    lines.push(theme_switcher_input_line(&switcher.query, width));
+    lines.push(Line::from(""));
+
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No color themes found",
+            active_theme().subtle(),
+        )));
+    } else {
+        for (position, candidate) in candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+        {
+            lines.push(theme_switcher_candidate_line(
+                candidate,
+                candidate.choice == switcher.current,
+                position == selected,
+                width,
+            ));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Set Color Theme",
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("Enter: set    Esc: close    Up/Down: select"),
+    );
+
+    let cursor_column =
+        display_width(&switcher.query).min(usize::from(inner.width.saturating_sub(3)));
+    frame.set_cursor_position(Position::new(
+        inner
+            .x
+            .saturating_add(2)
+            .saturating_add(cursor_column as u16),
+        inner.y,
+    ));
+}
+
 fn project_switcher_area(area: Rect) -> Rect {
     let width = centered_rect_width(52, area).max(32).min(area.width);
     let max_height = area.height.saturating_sub(2).max(3);
     let height = 14.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+fn theme_switcher_area(area: Rect) -> Rect {
+    let width = centered_rect_width(62, area).max(36).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 20.min(max_height).max(3);
     centered_rect_with_size(width, height, area)
 }
 
@@ -8440,6 +8567,23 @@ fn top_menu_switcher_input_line(query: &str, width: usize) -> Line<'static> {
     ])
 }
 
+fn theme_switcher_input_line(query: &str, width: usize) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(vec![
+            Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+            Span::styled("Type a color theme", active_theme().subtle()),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("> ", active_theme().panel().fg(active_theme().focus)),
+        Span::styled(
+            truncate_inline(query, width.saturating_sub(2)),
+            active_theme().panel(),
+        ),
+    ])
+}
+
 fn project_switcher_candidate_line(
     candidate: &ViewTab,
     current: bool,
@@ -8450,6 +8594,34 @@ fn project_switcher_candidate_line(
     let current_label = if current { "  current" } else { "" };
     let text = truncate_inline(
         &format!("{marker}{}{current_label}", candidate.label),
+        width,
+    );
+    let style = if selected {
+        active_theme().active()
+    } else if current {
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().panel()
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn theme_switcher_candidate_line(
+    candidate: &ThemeCandidate,
+    current: bool,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let current_label = if current { "  current" } else { "" };
+    let text = truncate_inline(
+        &format!(
+            "{marker}{:<22} {}{current_label}",
+            candidate.label, candidate.detail
+        ),
         width,
     );
     let style = if selected {
@@ -11111,6 +11283,24 @@ fn project_switcher_candidate_matches(candidate: &ViewTab, query: &str) -> bool 
     label.starts_with(&query) || key.starts_with(&query)
 }
 
+fn theme_candidate_matches(candidate: &ThemeCandidate, query: &str) -> bool {
+    let query = command_palette_normalized_text(query);
+    if query.is_empty() {
+        return true;
+    }
+
+    let label = command_palette_normalized_text(&candidate.label);
+    let detail = command_palette_normalized_text(&candidate.detail);
+    label.contains(&query) || detail.contains(&query)
+}
+
+fn theme_family_label(family: ThemeFamily) -> &'static str {
+    match family {
+        ThemeFamily::Dark => "dark",
+        ThemeFamily::Light => "light",
+    }
+}
+
 fn recent_item_matches_query(item: &RecentItem, query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() {
@@ -12240,6 +12430,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.project_remove_dialog.is_some()
         || app.recent_items_dialog.is_some()
         || app.top_menu_switcher.is_some()
+        || app.theme_switcher.is_some()
         || app.cache_clear_dialog.is_some()
 }
 
@@ -12599,6 +12790,7 @@ impl AppState {
             command_palette: None,
             project_switcher: None,
             top_menu_switcher: None,
+            theme_switcher: None,
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
@@ -12617,6 +12809,7 @@ impl AppState {
             last_idle_sweep_request: Instant::now() - INITIAL_IDLE_SWEEP_DELAY,
             details: HashMap::new(),
             details_synced_at: HashMap::new(),
+            details_refreshed_at: HashMap::new(),
             diffs: HashMap::new(),
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
@@ -12721,6 +12914,17 @@ impl AppState {
             .unwrap_or_else(|| config.defaults.theme.effective())
     }
 
+    fn configured_theme_choice(config: &Config) -> ThemeChoice {
+        if let Some(theme_name) = config.defaults.theme_name {
+            return ThemeChoice::Name(theme_name);
+        }
+        match config.defaults.theme {
+            ThemePreference::Auto => ThemeChoice::Auto,
+            ThemePreference::Dark => ThemeChoice::Name(ThemeName::Dark),
+            ThemePreference::Light => ThemeChoice::Name(ThemeName::Light),
+        }
+    }
+
     fn set_theme(&mut self, theme_name: ThemeName) {
         self.theme_name = theme_name;
         set_active_theme(theme_name);
@@ -12748,56 +12952,49 @@ impl AppState {
         true
     }
 
-    fn toggle_theme(&mut self, config: &mut Config, paths: &Paths) {
+    fn set_color_theme(&mut self, choice: ThemeChoice, config: &mut Config, paths: &Paths) {
         let previous_app_theme = self.theme_name;
         let previous_theme_name = config.defaults.theme_name;
         let previous_config_theme = config.defaults.theme;
 
-        if let Some(current_name) = config.defaults.theme_name {
-            let pos = ThemeName::ALL
-                .iter()
-                .position(|t| *t == current_name)
-                .unwrap_or(0);
-            let next_name = ThemeName::ALL[(pos + 1) % ThemeName::ALL.len()];
-
-            self.set_theme(next_name);
-            self.last_auto_theme_check = Instant::now();
-            config.defaults.theme_name = Some(next_name);
-
-            if let Err(error) = config.save(&paths.config_path) {
-                self.set_theme(previous_app_theme);
-                config.defaults.theme_name = previous_theme_name;
-                self.status = format!("theme toggle failed: {error}");
-                return;
+        let next_effective = match choice {
+            ThemeChoice::Auto => {
+                config.defaults.theme = ThemePreference::Auto;
+                config.defaults.theme_name = None;
+                config.defaults.theme.effective()
             }
-
-            self.status = format!("theme: {}", next_name.as_str());
-        } else {
-            let next_theme = self.theme_name.toggled();
-            let next_preference = match config.defaults.theme {
-                ThemePreference::Auto => ThemePreference::from_theme_name(next_theme),
-                ThemePreference::Dark => ThemePreference::Light,
-                ThemePreference::Light => ThemePreference::Auto,
-            };
-            let next_effective = next_preference.effective();
-
-            self.set_theme(next_effective);
-            self.last_auto_theme_check = Instant::now();
-            config.defaults.theme = next_preference;
-
-            if let Err(error) = config.save(&paths.config_path) {
-                self.set_theme(previous_app_theme);
-                config.defaults.theme = previous_config_theme;
-                self.status = format!("theme toggle failed: {error}");
-                return;
+            ThemeChoice::Name(ThemeName::Dark) => {
+                config.defaults.theme = ThemePreference::Dark;
+                config.defaults.theme_name = None;
+                ThemeName::Dark
             }
+            ThemeChoice::Name(ThemeName::Light) => {
+                config.defaults.theme = ThemePreference::Light;
+                config.defaults.theme_name = None;
+                ThemeName::Light
+            }
+            ThemeChoice::Name(theme_name) => {
+                config.defaults.theme = ThemePreference::from_theme_name(theme_name);
+                config.defaults.theme_name = Some(theme_name);
+                theme_name
+            }
+        };
 
-            self.status = if next_preference.is_auto() {
-                format!("theme: auto ({})", next_effective.as_str())
-            } else {
-                format!("theme: {}", next_preference.as_str())
-            };
+        self.set_theme(next_effective);
+        self.last_auto_theme_check = Instant::now();
+
+        if let Err(error) = config.save(&paths.config_path) {
+            self.set_theme(previous_app_theme);
+            config.defaults.theme_name = previous_theme_name;
+            config.defaults.theme = previous_config_theme;
+            self.status = format!("theme set failed: {error}");
+            return;
         }
+
+        self.status = match choice {
+            ThemeChoice::Auto => format!("theme: auto ({})", next_effective.as_str()),
+            ThemeChoice::Name(theme_name) => format!("theme: {}", theme_name.as_str()),
+        };
     }
 
     fn load_repo_candidate_cache(&mut self, cache: RepoCandidateCache) {
@@ -14809,6 +15006,7 @@ impl AppState {
         self.command_palette = None;
         self.recent_items_dialog = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.cache_clear_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
@@ -14826,6 +15024,7 @@ impl AppState {
         self.command_palette = Some(CommandPalette::default());
         self.project_switcher = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -14952,8 +15151,8 @@ impl AppState {
                 self.show_recent_items_dialog();
                 false
             }
-            PaletteAction::ToggleTheme => {
-                self.toggle_theme(config, paths);
+            PaletteAction::SetColorTheme => {
+                self.show_theme_switcher(config);
                 false
             }
             PaletteAction::TopMenuSwitch => {
@@ -15095,6 +15294,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.project_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -15181,6 +15381,112 @@ impl AppState {
             .collect()
     }
 
+    fn show_theme_switcher(&mut self, config: &Config) {
+        let candidates = self.theme_switcher_candidates();
+        let current = Self::configured_theme_choice(config);
+        let selected = candidates
+            .iter()
+            .position(|candidate| candidate.choice == current)
+            .unwrap_or(0);
+        self.finish_details_visit(Instant::now());
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.top_menu_switcher = None;
+        self.recent_items_dialog = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
+        self.theme_switcher = Some(ThemeSwitcher {
+            query: String::new(),
+            selected,
+            current,
+        });
+        self.status = "set color theme".to_string();
+    }
+
+    fn dismiss_theme_switcher(&mut self) {
+        self.theme_switcher = None;
+        self.status = "set color theme cancelled".to_string();
+    }
+
+    fn handle_theme_switcher_key(&mut self, key: KeyEvent, config: &mut Config, paths: &Paths) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_theme_switcher(),
+            KeyCode::Enter => self.submit_theme_switcher_selection(config, paths),
+            KeyCode::Down | KeyCode::Tab => self.move_theme_switcher_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_theme_switcher_selection(-1),
+            KeyCode::PageDown => self.move_theme_switcher_selection(8),
+            KeyCode::PageUp => self.move_theme_switcher_selection(-8),
+            KeyCode::Backspace => {
+                if let Some(switcher) = &mut self.theme_switcher {
+                    switcher.query.pop();
+                    switcher.selected = 0;
+                }
+            }
+            KeyCode::Char(value)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(switcher) = &mut self.theme_switcher {
+                    switcher.query.push(value);
+                    switcher.selected = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_theme_switcher_selection(&mut self, delta: isize) {
+        let Some(query) = self
+            .theme_switcher
+            .as_ref()
+            .map(|switcher| switcher.query.clone())
+        else {
+            return;
+        };
+        let len = self.theme_switcher_candidates_for_query(&query).len();
+        if let Some(switcher) = &mut self.theme_switcher {
+            switcher.selected = move_wrapping(switcher.selected, len, delta);
+        }
+    }
+
+    fn submit_theme_switcher_selection(&mut self, config: &mut Config, paths: &Paths) {
+        let Some(switcher) = &self.theme_switcher else {
+            return;
+        };
+        let candidates = self.theme_switcher_candidates_for_query(&switcher.query);
+        let selected = switcher.selected.min(candidates.len().saturating_sub(1));
+        let Some(candidate) = candidates.get(selected) else {
+            self.status = "no matching color theme".to_string();
+            return;
+        };
+
+        let choice = candidate.choice;
+        self.theme_switcher = None;
+        self.set_color_theme(choice, config, paths);
+    }
+
+    fn theme_switcher_candidates(&self) -> Vec<ThemeCandidate> {
+        let mut candidates = vec![ThemeCandidate {
+            choice: ThemeChoice::Auto,
+            label: "auto".to_string(),
+            detail: "follow system appearance".to_string(),
+        }];
+        candidates.extend(ThemeName::ALL.iter().map(|theme_name| ThemeCandidate {
+            choice: ThemeChoice::Name(*theme_name),
+            label: theme_name.as_str().to_string(),
+            detail: format!("fixed {} theme", theme_family_label(theme_name.family())),
+        }));
+        candidates
+    }
+
+    fn theme_switcher_candidates_for_query(&self, query: &str) -> Vec<ThemeCandidate> {
+        self.theme_switcher_candidates()
+            .into_iter()
+            .filter(|candidate| theme_candidate_matches(candidate, query))
+            .collect()
+    }
+
     fn show_project_switcher(&mut self) {
         let candidates = self.project_switcher_candidates();
         if candidates.is_empty() {
@@ -15196,6 +15502,7 @@ impl AppState {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -15292,6 +15599,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -15384,6 +15692,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
@@ -15589,6 +15898,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.cache_clear_dialog = None;
@@ -15728,6 +16038,7 @@ impl AppState {
         self.command_palette = None;
         self.project_switcher = None;
         self.top_menu_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
@@ -15934,6 +16245,7 @@ impl AppState {
         self.save_current_conversation_details_state();
         let count = self.details.len() + self.diffs.len() + self.action_hints.len();
         self.details.clear();
+        self.details_refreshed_at.clear();
         self.diffs.clear();
         self.action_hints.clear();
         self.action_hints_stale.clear();
@@ -16387,6 +16699,8 @@ impl AppState {
             self.details_synced_at
                 .insert(item_id.to_string(), synced_at);
         }
+        self.details_refreshed_at
+            .insert(item_id.to_string(), Utc::now());
     }
 
     fn item_updated_at_by_id(&self, item_id: &str) -> Option<DateTime<Utc>> {
@@ -21667,6 +21981,7 @@ impl AppState {
             || self.command_palette.is_some()
             || self.project_switcher.is_some()
             || self.top_menu_switcher.is_some()
+            || self.theme_switcher.is_some()
             || self.recent_items_dialog.is_some()
             || self.project_add_dialog.is_some()
             || self.project_remove_dialog.is_some()
@@ -21750,6 +22065,7 @@ impl AppState {
         self.filter_input_active = false;
         self.comment_dialog = None;
         self.project_switcher = None;
+        self.theme_switcher = None;
         self.recent_items_dialog = None;
         self.details_mode = DetailsMode::Conversation;
         self.diff_return_state = None;
@@ -25654,6 +25970,7 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(app.item_has_unseen_details(app.current_item().expect("item")));
         assert!(!app.details_cache_outdated(app.current_item().expect("item")));
         assert!(!app.comments_load_needed(app.current_item().expect("item")));
+        assert!(app.details_refreshed_at.contains_key("1"));
     }
 
     #[test]
@@ -25706,6 +26023,7 @@ diff --git a/src/main.rs b/src/main.rs
             app.details_synced_at.get("thread-1").copied(),
             DateTime::from_timestamp(1_700_000_023, 0)
         );
+        assert!(app.details_refreshed_at.contains_key("thread-1"));
         assert!(!app.details_cache_outdated(app.current_item().expect("item")));
         assert!(!app.comments_load_needed(app.current_item().expect("item")));
     }
@@ -26788,16 +27106,14 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn command_palette_toggle_theme_switches_and_saves_config() {
+    fn command_palette_set_color_theme_opens_theme_switcher() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.set_theme(ThemeName::Dark);
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut config = Config::default();
-        let paths = unique_test_paths("toggle-theme");
-        config.save(&paths.config_path).expect("save config");
+        let paths = unique_test_paths("set-color-theme-open");
         let store = SnapshotStore::new(paths.db_path.clone());
         app.command_palette = Some(CommandPalette {
-            query: "toggle theme".to_string(),
+            query: "set color theme".to_string(),
             selected: 0,
         });
 
@@ -26812,49 +27128,93 @@ diff --git a/src/main.rs b/src/main.rs
         ));
 
         assert!(app.command_palette.is_none());
-        assert_eq!(app.theme_name, ThemeName::Light);
-        assert_eq!(config.defaults.theme, ThemePreference::Light);
-        assert_eq!(app.status, "theme: light");
-
-        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
-        assert_eq!(saved.defaults.theme, ThemePreference::Light);
+        assert_eq!(
+            app.theme_switcher,
+            Some(ThemeSwitcher {
+                query: String::new(),
+                selected: 0,
+                current: ThemeChoice::Auto,
+            })
+        );
+        assert_eq!(app.status, "set color theme");
     }
 
     #[test]
-    fn theme_toggle_from_light_returns_to_auto_preference() {
+    fn theme_switcher_selects_fixed_theme_and_saves_config() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-        app.set_theme(ThemeName::Light);
         let mut config = Config::default();
-        config.defaults.theme = ThemePreference::Light;
-        let paths = unique_test_paths("toggle-theme-auto");
+        let paths = unique_test_paths("set-color-theme-fixed");
         config.save(&paths.config_path).expect("save config");
 
-        app.toggle_theme(&mut config, &paths);
+        app.show_theme_switcher(&config);
+        app.handle_theme_switcher_key(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+        app.handle_theme_switcher_key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+        app.handle_theme_switcher_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
 
+        assert!(app.theme_switcher.is_none());
+        assert_eq!(app.theme_name, ThemeName::CatppuccinMocha);
+        assert_eq!(config.defaults.theme, ThemePreference::Dark);
+        assert_eq!(config.defaults.theme_name, Some(ThemeName::CatppuccinMocha));
+        assert_eq!(app.status, "theme: catppuccin_mocha");
+
+        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+        assert_eq!(saved.defaults.theme, ThemePreference::Dark);
+        assert_eq!(saved.defaults.theme_name, Some(ThemeName::CatppuccinMocha));
+    }
+
+    #[test]
+    fn theme_switcher_auto_clears_fixed_theme_and_saves_config() {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.set_theme(ThemeName::Monokai);
+        let mut config = Config::default();
+        config.defaults.theme = ThemePreference::Dark;
+        config.defaults.theme_name = Some(ThemeName::Monokai);
+        let paths = unique_test_paths("set-color-theme-auto");
+        config.save(&paths.config_path).expect("save config");
+
+        app.show_theme_switcher(&config);
+        app.theme_switcher.as_mut().expect("theme switcher").query = "auto".to_string();
+        app.handle_theme_switcher_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut config,
+            &paths,
+        );
+
+        assert!(app.theme_switcher.is_none());
         assert_eq!(config.defaults.theme, ThemePreference::Auto);
+        assert_eq!(config.defaults.theme_name, None);
         assert!(app.status.starts_with("theme: auto ("));
 
         let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
         assert_eq!(saved.defaults.theme, ThemePreference::Auto);
+        assert_eq!(saved.defaults.theme_name, None);
     }
 
     #[test]
-    fn theme_toggle_with_theme_name_cycles_through_all_themes() {
+    fn explicit_color_theme_disables_auto_theme_refresh() {
         let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
         app.set_theme(ThemeName::CatppuccinMocha);
+        app.last_auto_theme_check = Instant::now() - AUTO_THEME_CHECK_INTERVAL;
         let mut config = Config::default();
+        config.defaults.theme = ThemePreference::Dark;
         config.defaults.theme_name = Some(ThemeName::CatppuccinMocha);
-        let paths = unique_test_paths("toggle-theme-cycle");
-        config.save(&paths.config_path).expect("save config");
 
-        app.toggle_theme(&mut config, &paths);
+        let changed = app.refresh_auto_theme(&config, Instant::now());
 
-        assert_eq!(config.defaults.theme_name, Some(ThemeName::CatppuccinLatte));
-        assert_eq!(app.theme_name, ThemeName::CatppuccinLatte);
-        assert!(app.status.contains("catppuccin_latte"));
-
-        let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
-        assert_eq!(saved.defaults.theme_name, Some(ThemeName::CatppuccinLatte));
+        assert!(!changed);
+        assert_eq!(app.theme_name, ThemeName::CatppuccinMocha);
     }
 
     #[test]
@@ -28531,6 +28891,39 @@ diff --git a/src/main.rs b/src/main.rs
                 .to_string()
                 .contains("loading Pull Requests")
         );
+    }
+
+    #[test]
+    fn status_age_labels_list_refresh_source() {
+        let mut section = test_section();
+        section.refreshed_at = Some(Utc::now() - chrono::Duration::seconds(34));
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.status = "comment 4 focused".to_string();
+
+        let status = footer_status(&app);
+
+        assert!(status.contains("comment 4 focused"));
+        assert!(status.contains("list refreshed"));
+        assert!(!status.contains("details refreshed"));
+    }
+
+    #[test]
+    fn status_age_prefers_details_refresh_source_while_details_focused() {
+        let mut section = test_section();
+        section.refreshed_at = Some(Utc::now() - chrono::Duration::seconds(120));
+        let item_id = section.items[0].id.clone();
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.focus = FocusTarget::Details;
+        app.details_mode = DetailsMode::Conversation;
+        app.status = "comment 4 focused".to_string();
+        app.details_refreshed_at
+            .insert(item_id, Utc::now() - chrono::Duration::seconds(34));
+
+        let status = footer_status(&app);
+
+        assert!(status.contains("comment 4 focused"));
+        assert!(status.contains("details refreshed"));
+        assert!(!status.contains("list refreshed"));
     }
 
     #[test]

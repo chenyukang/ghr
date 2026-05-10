@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) const HELP_DIALOG_WIDTH_PERCENT: u16 = 98;
+pub(super) const HELP_DIALOG_MAX_WIDTH: u16 = 160;
+pub(super) const HELP_TWO_COLUMN_MIN_WIDTH: usize = 104;
+pub(super) const HELP_COLUMN_GAP: usize = 4;
+
 pub(super) fn modal_surface_style() -> Style {
     active_theme().panel()
 }
@@ -3180,5 +3185,933 @@ pub(super) fn key_value_line(key: &'static str, value: String) -> Line<'static> 
     Line::from(vec![
         Span::styled(format!("{key}: "), themed_fg_style(Color::Gray)),
         Span::raw(value),
+    ])
+}
+
+pub(super) fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
+    let title = match &dialog.mode {
+        CommentDialogMode::New => "New Comment".to_string(),
+        CommentDialogMode::Reply { author, .. } => {
+            return draw_reply_dialog(frame, dialog, author, area);
+        }
+        CommentDialogMode::Edit { .. } => "Edit Comment".to_string(),
+        CommentDialogMode::Review { target } => {
+            format!("Review {}", target.location_label())
+        }
+        CommentDialogMode::ItemMetadata { field } => format!("Edit {}", field.title()),
+    };
+    draw_comment_editor(frame, &title, dialog, area);
+}
+
+pub(super) fn draw_review_submit_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &ReviewSubmitDialog,
+    area: Rect,
+) {
+    let title = match dialog.mode {
+        ReviewSubmitMode::New => "Submit Review",
+        ReviewSubmitMode::Pending { .. } => "Submit Pending Review",
+    };
+    let dialog_area = review_submit_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    let header_height = 3.min(inner.height);
+    let editor_height = inner.height.saturating_sub(header_height).max(1);
+    let editor_width = inner.width.max(1);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
+    let scroll = dialog.scroll.min(max_scroll);
+    let mut lines = vec![
+        key_value_line("event", review_event_selector_label(dialog.event)),
+        key_value_line("pull request", review_dialog_pr_label(dialog)),
+        Line::from(""),
+    ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(header_height.saturating_add(editor_height)) {
+        lines.push(Line::from(""));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(themed_fg_style(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(title, themed_bold_style(Color::LightMagenta)));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style());
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line(
+            "Tab/1/2/3: event    Ctrl+Enter: submit    arrows/Home/End/Ctrl+W/U/K/X edit    click cursor",
+        ),
+    );
+    if let Some(position) = review_submit_cursor_position(
+        body,
+        dialog.body.cursor_byte(),
+        scroll,
+        dialog_area,
+        editor_width,
+        editor_height,
+    ) {
+        frame.set_cursor_position(position);
+    }
+}
+
+pub(super) fn review_event_selector_label(selected: PullRequestReviewEvent) -> String {
+    [
+        PullRequestReviewEvent::Comment,
+        PullRequestReviewEvent::RequestChanges,
+        PullRequestReviewEvent::Approve,
+    ]
+    .into_iter()
+    .map(|event| {
+        if event == selected {
+            format!("[{}]", event.label())
+        } else {
+            event.label().to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("  ")
+}
+
+pub(super) fn review_dialog_pr_label(dialog: &ReviewSubmitDialog) -> String {
+    dialog
+        .item
+        .number
+        .map(|number| format!("{}#{number}", dialog.item.repo))
+        .unwrap_or_else(|| dialog.item.repo.clone())
+}
+
+pub(super) fn draw_reply_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &CommentDialog,
+    author: &str,
+    area: Rect,
+) {
+    draw_comment_editor(frame, &format!("Reply to @{author}"), dialog, area);
+}
+
+pub(super) fn draw_comment_editor(
+    frame: &mut Frame<'_>,
+    title: &str,
+    dialog: &CommentDialog,
+    area: Rect,
+) {
+    let dialog_area = comment_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    let editor_height = inner.height.max(1);
+    let editor_width = inner.width.max(1);
+    let body = dialog.body.text();
+    let body_lines = comment_dialog_body_lines(body, editor_width);
+    let max_scroll = max_comment_dialog_scroll(body, editor_width, editor_height);
+    let scroll = dialog.scroll.min(max_scroll);
+    let mut lines = body_lines
+        .into_iter()
+        .skip(usize::from(scroll))
+        .take(usize::from(editor_height))
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    while lines.len() < usize::from(editor_height) {
+        lines.push(Line::from(""));
+    }
+    let footer = if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
+        "Ctrl+Enter: update    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
+    } else {
+        "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(themed_fg_style(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            title.to_string(),
+            themed_bold_style(Color::LightMagenta),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style());
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+    if let Some(position) = comment_dialog_cursor_position(
+        body,
+        dialog.body.cursor_byte(),
+        scroll,
+        dialog_area,
+        editor_width,
+        editor_height,
+    ) {
+        frame.set_cursor_position(position);
+    }
+}
+
+pub(super) fn comment_dialog_cursor_position(
+    body: &str,
+    cursor: usize,
+    scroll: u16,
+    area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(area);
+    let width = editor_width.max(1);
+    let height = editor_height.max(1);
+    let (line, column) = comment_dialog_cursor_offset_at(body, cursor, width);
+    let visible_end = scroll.saturating_add(height);
+    if line < scroll || line >= visible_end {
+        return None;
+    }
+
+    let visible_line = line.saturating_sub(scroll);
+    Some(Position::new(
+        inner.x.saturating_add(column.min(width.saturating_sub(1))),
+        inner.y.saturating_add(visible_line),
+    ))
+}
+
+pub(super) fn comment_dialog_area(dialog: &CommentDialog, area: Rect) -> Rect {
+    let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
+    let editor_width = width.saturating_sub(2).max(1);
+    let editor_height = comment_dialog_desired_editor_height(dialog.body.text(), editor_width);
+    let desired_height = editor_height.saturating_add(2);
+    let min_height = comment_dialog_min_height(area);
+    let max_height = comment_dialog_max_height(area);
+    let height = desired_height.max(min_height).min(max_height);
+    centered_rect_with_size(width, height, area)
+}
+
+pub(super) fn review_submit_dialog_area(dialog: &ReviewSubmitDialog, area: Rect) -> Rect {
+    let width = centered_rect_width(COMMENT_DIALOG_WIDTH_PERCENT, area);
+    let editor_width = width.saturating_sub(2).max(1);
+    let editor_height = comment_dialog_desired_editor_height(dialog.body.text(), editor_width);
+    let desired_height = editor_height.saturating_add(5);
+    let min_height = comment_dialog_min_height(area).saturating_add(1);
+    let max_height = comment_dialog_max_height(area);
+    let height = desired_height.max(min_height).min(max_height);
+    centered_rect_with_size(width, height, area)
+}
+
+pub(super) fn review_submit_cursor_position(
+    body: &str,
+    cursor: usize,
+    scroll: u16,
+    area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(area);
+    let header_height = 3_u16.min(inner.height);
+    let (line, column) = comment_dialog_cursor_offset_at(body, cursor, editor_width.max(1));
+    let visible_end = scroll.saturating_add(editor_height.max(1));
+    if line < scroll || line >= visible_end {
+        return None;
+    }
+
+    let visible_line = line.saturating_sub(scroll);
+    Some(Position::new(
+        inner
+            .x
+            .saturating_add(column.min(editor_width.max(1).saturating_sub(1))),
+        inner
+            .y
+            .saturating_add(header_height)
+            .saturating_add(visible_line),
+    ))
+}
+
+pub(super) fn comment_dialog_min_height(area: Rect) -> u16 {
+    if area.height == 0 {
+        0
+    } else {
+        COMMENT_DIALOG_MIN_HEIGHT.min(area.height)
+    }
+}
+
+pub(super) fn comment_dialog_max_height(area: Rect) -> u16 {
+    if area.height == 0 {
+        return 0;
+    }
+
+    let min_height = comment_dialog_min_height(area);
+    area.height
+        .saturating_sub(COMMENT_DIALOG_VERTICAL_MARGIN)
+        .max(min_height)
+        .min(area.height)
+}
+
+pub(super) fn comment_dialog_desired_editor_height(text: &str, width: u16) -> u16 {
+    let line_count = comment_dialog_body_lines(text, width)
+        .len()
+        .min(usize::from(u16::MAX)) as u16;
+    line_count
+        .saturating_add(COMMENT_DIALOG_EDITOR_PADDING_LINES)
+        .max(COMMENT_DIALOG_MIN_EDITOR_HEIGHT)
+}
+
+pub(super) fn comment_dialog_editor_size(dialog: &CommentDialog, area: Option<Rect>) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = comment_dialog_area(dialog, area);
+        let inner = block_inner(dialog_area);
+        return (inner.width.max(1), inner.height.max(1));
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+pub(super) fn review_submit_editor_size(
+    dialog: &ReviewSubmitDialog,
+    area: Option<Rect>,
+) -> (u16, u16) {
+    if let Some(area) = area {
+        let dialog_area = review_submit_dialog_area(dialog, area);
+        let inner = block_inner(dialog_area);
+        let header_height = 3_u16.min(inner.height);
+        return (
+            inner.width.max(1),
+            inner.height.saturating_sub(header_height).max(1),
+        );
+    }
+
+    (
+        COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH,
+        COMMENT_DIALOG_FALLBACK_EDITOR_HEIGHT,
+    )
+}
+
+pub(super) fn comment_dialog_body_lines(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut column = 0_usize;
+        for ch in raw_line.chars() {
+            let char_width = display_width_char(ch);
+            if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+                lines.push(std::mem::take(&mut current));
+                column = 0;
+            }
+            current.push(ch);
+            column = column.saturating_add(char_width);
+        }
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+pub(super) fn max_comment_dialog_scroll(text: &str, width: u16, editor_height: u16) -> u16 {
+    let line_count = comment_dialog_scrollable_line_count(text, width);
+    line_count
+        .saturating_sub(usize::from(editor_height.max(1)))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+pub(super) fn comment_dialog_scrollable_line_count(text: &str, width: u16) -> usize {
+    let body_line_count = comment_dialog_body_lines(text, width).len();
+    let (cursor_line, _) = comment_dialog_cursor_offset(text, width);
+    body_line_count.max(usize::from(cursor_line).saturating_add(1))
+}
+
+pub(super) fn scroll_for_comment_dialog_cursor(
+    text: &str,
+    cursor: usize,
+    width: u16,
+    height: u16,
+    current_scroll: u16,
+) -> u16 {
+    let width = width.max(1);
+    let height = height.max(1);
+    let (line, _) = comment_dialog_cursor_offset_at(text, cursor, width);
+    let max_scroll = max_comment_dialog_scroll(text, width, height);
+    if line < current_scroll {
+        line
+    } else if line >= current_scroll.saturating_add(height) {
+        line.saturating_sub(height.saturating_sub(1))
+            .min(max_scroll)
+    } else {
+        current_scroll.min(max_scroll)
+    }
+}
+
+pub(super) fn comment_dialog_cursor_offset(text: &str, width: u16) -> (u16, u16) {
+    comment_dialog_cursor_offset_at(text, text.len(), width)
+}
+
+pub(super) fn comment_dialog_cursor_offset_at(text: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let width = usize::from(width.max(1));
+    let cursor = clamp_text_cursor(text, cursor);
+    let mut line = 0_usize;
+    let mut raw_line_start = 0_usize;
+
+    for (index, ch) in text.char_indices() {
+        if index >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            line = line.saturating_add(comment_dialog_raw_line_height(
+                &text[raw_line_start..index],
+                width,
+            ));
+            raw_line_start = index.saturating_add(ch.len_utf8());
+        }
+    }
+
+    let (cursor_line, column) =
+        comment_dialog_raw_line_cursor_offset(&text[raw_line_start..cursor], width);
+    line = line.saturating_add(cursor_line);
+    (
+        line.min(usize::from(u16::MAX)) as u16,
+        column.min(usize::from(u16::MAX)) as u16,
+    )
+}
+
+pub(super) fn comment_dialog_raw_line_height(text: &str, width: usize) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    let mut lines = 1_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            lines = lines.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+    }
+    lines
+}
+
+pub(super) fn comment_dialog_raw_line_cursor_offset(text: &str, width: usize) -> (usize, usize) {
+    let mut line = 0_usize;
+    let mut column = 0_usize;
+    for ch in text.chars() {
+        let char_width = display_width_char(ch);
+        if column > 0 && (column >= width || column.saturating_add(char_width) > width) {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(char_width);
+        if column == width {
+            line = line.saturating_add(1);
+            column = 0;
+        }
+    }
+    (line, column)
+}
+
+pub(super) fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
+    if area.height == 0 {
+        return 0;
+    }
+
+    let desired = (line_count + 2).min(usize::from(u16::MAX)) as u16;
+    desired
+        .max(12.min(area.height))
+        .min(area.height.saturating_sub(2).max(1))
+}
+
+pub(super) fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
+    match dialog {
+        SetupDialog::MissingGh => (
+            "GitHub CLI Required",
+            vec![
+                Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
+                Line::from(""),
+                Line::from("Install GitHub CLI: https://cli.github.com/"),
+                command_line("macOS: brew install gh"),
+                command_line("Debian/Ubuntu: sudo apt install gh"),
+                Line::from("Linux package details:"),
+                Line::from("https://github.com/cli/cli/blob/trunk/docs/install_linux.md"),
+                Line::from(""),
+                Line::from("Then authenticate:"),
+                command_line("gh auth login"),
+                Line::from(""),
+                Line::from("After setup, press Esc and then r to refresh."),
+                Line::from("Esc: close and use cached data    q: quit"),
+            ],
+        ),
+        SetupDialog::AuthRequired => (
+            "GitHub Login Required",
+            vec![
+                Line::from("GitHub CLI is installed, but it is not authenticated."),
+                Line::from(""),
+                Line::from("Run this in your terminal:"),
+                command_line("gh auth login"),
+                Line::from(""),
+                Line::from("You can also launch ghr with GH_TOKEN set."),
+                Line::from("After setup, press Esc and then r to refresh."),
+                Line::from("Esc: close and use cached data    q: quit"),
+            ],
+        ),
+    }
+}
+
+pub(super) fn command_line(command: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(command, themed_bold_style(Color::Cyan)),
+    ])
+}
+
+pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static>> {
+    vec![
+        help_heading("General"),
+        help_key_line("? / Esc / Enter / q", "close this help"),
+        help_key_line_owned(command_palette_key.to_string(), "open the command palette"),
+        help_key_line("q", "quit ghr outside help"),
+        help_key_line("q / Esc in diff", "return to the state before opening diff"),
+        help_key_line("r", "refresh from GitHub"),
+        help_key_line("Tab / Shift+Tab", "switch list/details focus"),
+        help_key_line("1 / 2 / 3 / 4", "focus GHR / Sections / List / Details"),
+        help_key_line("/", "search the current list or Details comments"),
+        help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("Ctrl+U in Search", "clear remembered search conditions"),
+        help_key_line("Ctrl+S in Search", "save current search conditions"),
+        help_key_line("f", "filter current PR/issue section"),
+        help_key_line(
+            "Esc in Search results",
+            "return to the previous default list",
+        ),
+        help_key_line("m", "toggle mouse text selection mode"),
+        help_key_line("Esc", "leave details or clear search"),
+        Line::from(""),
+        help_heading("GHR and Sections"),
+        help_key_line(
+            "Tab / Shift+Tab / h/l/[ ] or Left/Right",
+            "switch the focused tab group",
+        ),
+        help_key_line(
+            "j/k/n/p or Up/Down",
+            "move focus between GHR, Sections, and List",
+        ),
+        Line::from(""),
+        help_heading("List"),
+        help_key_line(
+            "j/k/n/p or Up/Down",
+            "move selection; k/p at first item focuses Sections",
+        ),
+        help_key_line("Tab / Shift+Tab", "focus Details"),
+        help_key_line("[ / ]", "load previous / next GitHub result page"),
+        help_key_line("PgDown/PgUp or d/u", "move by visible page"),
+        help_key_line("g / G", "first / last item"),
+        help_key_line("Enter or 4", "focus Details"),
+        help_key_line("o", "open selected item in browser"),
+        help_key_line("i", "ignore selected pull request or issue"),
+        help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("f", "filter with state:closed label:bug author:alice"),
+        help_key_line("v", "show pull request diff"),
+        help_key_line("T", "edit selected issue or PR title/body"),
+        help_key_line("M", "open PR merge confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("t", "change issue or PR milestone"),
+        help_key_line("a", "add a new issue or PR comment"),
+        help_key_line("L", "add a label to the selected issue or PR"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
+        Line::from(""),
+        help_heading("Diff Files"),
+        help_key_line("3", "focus the changed-file list"),
+        help_key_line("Tab / Shift+Tab", "focus the file diff"),
+        help_key_line("j/k or Up/Down", "choose a changed file"),
+        help_key_line("PgDown/PgUp", "move by visible file page"),
+        help_key_line("h / l", "page diff down/up across files"),
+        help_key_line("[ / ]", "previous / next changed file"),
+        help_key_line("Enter or 4", "focus the file diff"),
+        help_key_line("c", "add review comment on selected diff line"),
+        help_key_line("i", "toggle inline review comments in diff"),
+        help_key_line("a", "add a normal PR comment"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("@ / -", "assign or unassign PR assignees"),
+        Line::from(""),
+        help_heading("Details"),
+        help_key_line("Tab / Shift+Tab", "focus List"),
+        help_key_line("Tab / Shift+Tab in diff", "focus changed-file list"),
+        help_key_line("j/k or Up/Down", "scroll details or select diff line"),
+        help_key_line("/", "search loaded comments by keyword"),
+        help_key_line(
+            "n / p",
+            "focus comments; p from first returns to PR/issue details",
+        ),
+        help_key_line(
+            "h / l in diff",
+            "page down/up across files, stop at diff ends",
+        ),
+        help_key_line(
+            "Enter in conversation",
+            "expand or collapse a long focused comment",
+        ),
+        help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
+        help_key_line(
+            "g / G",
+            "top clears comment focus / bottom focuses last comment",
+        ),
+        help_key_line("v", "show PR diff"),
+        help_key_line("[ / ]", "jump previous / next diff file"),
+        help_key_line("m in diff", "begin a review range"),
+        help_key_line("e in diff", "end the review range"),
+        help_key_line(
+            "single click in diff",
+            "select line, or end a pending range",
+        ),
+        help_key_line("double click in diff", "begin a review range"),
+        help_key_line("c in diff", "add review comment on selected diff line"),
+        help_key_line("a in diff", "add a normal PR comment"),
+        help_key_line("c / a", "add a new comment"),
+        help_key_line("@ / -", "assign or unassign issue and PR assignees"),
+        help_key_line("R", "reply to focused comment"),
+        help_key_line("+", "add a reaction to the visible focused comment or item"),
+        help_key_line("e", "edit focused comment when it is yours"),
+        help_key_line("L", "add a label to the selected issue or PR"),
+        help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
+        help_key_line("T", "edit selected issue or PR title/body"),
+        help_key_line("Palette", "subscribe or unsubscribe this issue or PR"),
+        help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("M", "open PR merge confirmation"),
+        help_key_line("C", "open close or reopen confirmation"),
+        help_key_line("X", "open local PR checkout confirmation"),
+        help_key_line("F", "rerun failed PR checks"),
+        help_key_line("U", "open PR update-branch confirmation"),
+        help_key_line("s", "submit a PR review summary"),
+        help_key_line("A", "approve via the PR review summary"),
+        help_key_line("Ctrl+D", "discard a pending PR review"),
+        help_key_line("E", "open PR enable auto-merge confirmation"),
+        help_key_line("O", "open PR disable auto-merge confirmation"),
+        help_key_line("D", "toggle PR draft / ready for review"),
+        help_key_line("t", "change issue or PR milestone"),
+        help_key_line("P", "request or re-request PR reviewers"),
+        help_key_line("Y", "remove pending PR review requests"),
+        help_key_line("o", "open selected item in browser"),
+        Line::from(""),
+        help_heading("Editor"),
+        help_key_line("Left / Right", "move cursor by character"),
+        help_key_line(
+            "Up / Down",
+            "move cursor by rendered line in multiline editors",
+        ),
+        help_key_line("Home / End", "jump to line start / end"),
+        help_key_line("Alt+B / Alt+F", "jump previous / next word"),
+        help_key_line("Backspace / Delete", "delete previous / next character"),
+        help_key_line("Ctrl+W / Alt+Backspace", "delete previous word"),
+        help_key_line("Alt+D", "delete next word"),
+        help_key_line("Ctrl+U / Ctrl+K", "delete to line start / end"),
+        help_key_line("Ctrl+X", "delete current line"),
+        help_key_line("Ctrl+S / Cmd+S", "save the active editor draft"),
+        help_key_line("Ctrl+Z / Cmd+Z", "undo text edits"),
+        help_key_line("Ctrl+R / Cmd+Shift+Z", "redo text edits"),
+        help_key_line("click editor text", "move cursor to that position"),
+        Line::from(""),
+        help_heading("Mouse"),
+        help_key_line(
+            "m",
+            "toggle between TUI mouse controls and terminal text selection",
+        ),
+        help_key_line("click tabs / sections", "switch view or section"),
+        help_key_line("click list row", "select item or diff file"),
+        help_key_line(
+            "click links / open / reply / edit / react / copy block",
+            "run that action",
+        ),
+        help_key_line("drag Details text", "copy rendered selection"),
+        help_key_line("wheel over list/details/dialog", "scroll that area"),
+        help_key_line("drag split border", "resize list/details ratio"),
+    ]
+}
+
+pub(super) fn help_dialog_content_for_width(
+    content_width: u16,
+    command_palette_key: &str,
+) -> Vec<Line<'static>> {
+    let lines = help_dialog_content(command_palette_key);
+    let content_width = usize::from(content_width);
+    if content_width < HELP_TWO_COLUMN_MIN_WIDTH {
+        return lines;
+    }
+    help_dialog_two_column_content(lines, content_width)
+}
+
+pub(super) fn help_dialog_two_column_content(
+    lines: Vec<Line<'static>>,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    if lines.len() < 8 {
+        return lines;
+    }
+    let column_width = content_width
+        .saturating_sub(HELP_COLUMN_GAP)
+        .saturating_div(2);
+    if column_width < 42 {
+        return lines;
+    }
+
+    let split = help_dialog_split_index(&lines);
+    let (left, right) = lines.split_at(split);
+    let row_count = left.len().max(right.len());
+    let mut rows = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let left_lines = left
+            .get(row)
+            .map(|line| wrapped_help_column_lines(line, column_width))
+            .unwrap_or_default();
+        let right_lines = right
+            .get(row)
+            .map(|line| wrapped_help_column_lines(line, column_width))
+            .unwrap_or_default();
+        let wrapped_rows = left_lines.len().max(right_lines.len()).max(1);
+        for wrapped_row in 0..wrapped_rows {
+            let mut spans = left_lines
+                .get(wrapped_row)
+                .map(|line| line.spans.clone())
+                .unwrap_or_default();
+            let left_width = spans_display_width(&spans);
+            spans.push(Span::raw(
+                " ".repeat(column_width.saturating_sub(left_width) + HELP_COLUMN_GAP),
+            ));
+            if let Some(line) = right_lines.get(wrapped_row) {
+                spans.extend(line.spans.clone());
+            }
+            rows.push(Line::from(spans));
+        }
+    }
+    rows
+}
+
+pub(super) fn help_dialog_split_index(lines: &[Line<'static>]) -> usize {
+    if lines.len() <= 1 {
+        return lines.len();
+    }
+
+    let target = lines.len().div_ceil(2);
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if index == 0 || index + 1 >= lines.len() || !line.to_string().trim().is_empty() {
+                return None;
+            }
+            let split = index + 1;
+            Some((split.abs_diff(target), split))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, split)| split)
+        .unwrap_or(target)
+        .clamp(1, lines.len() - 1)
+}
+
+pub(super) fn wrapped_help_column_lines(
+    line: &Line<'static>,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    if max_width == 0 {
+        return vec![Line::default()];
+    }
+    if line.spans.is_empty() || line.to_string().is_empty() {
+        return vec![Line::default()];
+    }
+    if let Some(lines) = wrapped_help_key_line(line, max_width) {
+        return lines;
+    }
+    wrap_spans_to_width(&line.spans, max_width)
+}
+
+pub(super) fn wrapped_help_key_line(
+    line: &Line<'static>,
+    max_width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if line.spans.len() != 3 || line.spans.first()?.content.as_ref() != "  " {
+        return None;
+    }
+
+    let prefix = vec![line.spans[0].clone(), line.spans[1].clone()];
+    let prefix_width = spans_display_width(&prefix);
+    if prefix_width >= max_width {
+        return None;
+    }
+
+    let description = line.spans[2].content.as_ref();
+    let description_width = max_width - prefix_width;
+    let description_lines = wrap_text_to_width(description, description_width);
+    let description_style = line.spans[2].style;
+    let mut lines = Vec::with_capacity(description_lines.len().max(1));
+    for (index, description_line) in description_lines.into_iter().enumerate() {
+        let mut spans = if index == 0 {
+            prefix.clone()
+        } else {
+            vec![Span::raw(" ".repeat(prefix_width))]
+        };
+        if !description_line.is_empty() {
+            spans.push(Span::styled(description_line, description_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    Some(lines)
+}
+
+pub(super) fn wrap_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut current_width = 0_usize;
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.as_ref().chars() {
+            let ch_width = display_width_char(ch);
+            if current_width > 0 && current_width.saturating_add(ch_width) > max_width {
+                lines.push(Vec::new());
+                current_width = 0;
+            }
+            push_span_text(
+                lines.last_mut().expect("current line"),
+                ch.to_string(),
+                style,
+            );
+            current_width = current_width.saturating_add(ch_width);
+        }
+    }
+
+    lines.into_iter().map(Line::from).collect()
+}
+
+pub(super) fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0_usize;
+    for word in text.split_whitespace() {
+        let word_width = display_width(word);
+        let separator_width = usize::from(!current.is_empty());
+        if current_width
+            .saturating_add(separator_width)
+            .saturating_add(word_width)
+            <= max_width
+        {
+            if !current.is_empty() {
+                current.push(' ');
+                current_width = current_width.saturating_add(1);
+            }
+            current.push_str(word);
+            current_width = current_width.saturating_add(word_width);
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+
+        if word_width <= max_width {
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            let mut rest = word;
+            while !rest.is_empty() {
+                let taken = take_display_width(rest, max_width);
+                if taken.is_empty() {
+                    break;
+                }
+                let taken_len = taken.len();
+                lines.push(taken);
+                rest = &rest[taken_len..];
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+pub(super) fn take_display_width(text: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let ch_width = display_width_char(ch);
+        if width + ch_width > max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output
+}
+
+pub(super) fn push_span_text(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(&text);
+        return;
+    }
+    spans.push(Span::styled(text, style));
+}
+
+pub(super) fn spans_display_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+pub(super) fn help_heading(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, themed_bold_style(Color::Yellow)))
+}
+
+pub(super) fn help_key_line(keys: &'static str, description: &'static str) -> Line<'static> {
+    help_key_line_owned(keys.to_string(), description)
+}
+
+pub(super) fn help_key_line_owned(keys: String, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{keys:<24}"), themed_bold_style(Color::Cyan)),
+        Span::raw(description),
     ])
 }

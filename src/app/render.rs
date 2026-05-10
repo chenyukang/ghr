@@ -116,7 +116,7 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         BorderType::Plain
     };
-    let title = if ghr_focused { "[Focus] ghr" } else { "ghr" };
+    let title = if ghr_focused { "[Focus] GHR" } else { "GHR" };
     let title_style = view_tabs_title_style(app, border_style);
 
     let tabs = Tabs::new(titles)
@@ -135,13 +135,22 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 pub(super) fn view_tabs_title_style(app: &AppState, base_style: Style) -> Style {
+    let style = navigation_tab_title_style(app.focus == FocusTarget::Ghr, base_style);
     if app.focus == FocusTarget::Ghr
         || app.has_unread_notifications()
         || app.has_unseen_repo_items()
     {
-        base_style.add_modifier(Modifier::BOLD)
+        style.add_modifier(Modifier::BOLD)
     } else {
-        base_style
+        style
+    }
+}
+
+fn navigation_tab_title_style(focused: bool, focus_style: Style) -> Style {
+    if focused {
+        focus_style
+    } else {
+        active_theme().muted()
     }
 }
 
@@ -184,7 +193,10 @@ fn draw_section_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .border_type(border_type)
                 .border_style(border_style)
                 .style(active_theme().panel())
-                .title(Span::styled(title, border_style)),
+                .title(Span::styled(
+                    title,
+                    navigation_tab_title_style(sections_focused, border_style),
+                )),
         )
         .style(active_theme().muted())
         .highlight_style(active_section_tab_style());
@@ -1351,7 +1363,7 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
         }
         FocusTarget::Sections => {
             push_footer_pair(&mut spans, "tab/h/l/[ ]", "switch", Color::Cyan);
-            push_footer_pair(&mut spans, "k/p", "ghr", Color::Cyan);
+            push_footer_pair(&mut spans, "k/p", "GHR", Color::Cyan);
             push_footer_pair(&mut spans, "j/n/enter", "List", Color::Cyan);
             push_footer_pair(&mut spans, "esc", "List", Color::Cyan);
         }

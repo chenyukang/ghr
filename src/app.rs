@@ -2497,6 +2497,7 @@ struct AppState {
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
     recent_commands: Vec<RecentCommand>,
+    repo_unseen_items: HashMap<String, RepoUnseenItems>,
     details_visit: Option<DetailsVisitState>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
@@ -2590,6 +2591,34 @@ struct AppState {
 struct ViewTab {
     key: String,
     label: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RepoUnseenItems {
+    issues: HashSet<String>,
+    pull_requests: HashSet<String>,
+}
+
+impl RepoUnseenItems {
+    fn is_empty(&self) -> bool {
+        self.issues.is_empty() && self.pull_requests.is_empty()
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (self.issues.len(), self.pull_requests.len())
+    }
+
+    fn insert(&mut self, kind: SectionKind, item_id: String) {
+        match kind {
+            SectionKind::Issues => {
+                self.issues.insert(item_id);
+            }
+            SectionKind::PullRequests => {
+                self.pull_requests.insert(item_id);
+            }
+            SectionKind::Notifications => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6304,7 +6333,10 @@ fn draw_view_tabs(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn view_tabs_title_style(app: &AppState, base_style: Style) -> Style {
-    if app.focus == FocusTarget::Ghr || app.has_unread_notifications() {
+    if app.focus == FocusTarget::Ghr
+        || app.has_unread_notifications()
+        || app.has_unseen_repo_items()
+    {
         base_style.add_modifier(Modifier::BOLD)
     } else {
         base_style
@@ -12794,6 +12826,7 @@ impl AppState {
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
+            repo_unseen_items: HashMap::new(),
             details_visit: None,
             project_add_dialog: None,
             project_remove_dialog: None,
@@ -13602,6 +13635,89 @@ impl AppState {
                 >= config.defaults.refetch_interval_seconds
     }
 
+    fn record_unseen_repo_items_for_sections(&mut self, sections: &[SectionSnapshot]) {
+        for section in sections {
+            if section.error.is_some()
+                || !matches!(
+                    section.kind,
+                    SectionKind::Issues | SectionKind::PullRequests
+                )
+            {
+                continue;
+            }
+
+            let view_key = section_view_key(section);
+            if !view_key.starts_with("repo:") {
+                continue;
+            }
+
+            if same_view_key(&view_key, &self.active_view) {
+                self.clear_repo_unseen_for_view(&view_key);
+                continue;
+            }
+
+            let Some(current) = self
+                .sections
+                .iter()
+                .find(|current| current.key == section.key)
+            else {
+                continue;
+            };
+            if current.refreshed_at.is_none() && current.items.is_empty() {
+                continue;
+            }
+
+            let current_ids = current
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<HashSet<_>>();
+            let new_item_ids = section
+                .items
+                .iter()
+                .filter(|item| !self.ignored_items.contains(&item.id))
+                .filter(|item| !current_ids.contains(item.id.as_str()))
+                .filter(|item| matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest))
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>();
+
+            if new_item_ids.is_empty() {
+                continue;
+            }
+
+            let target_key = self
+                .repo_unseen_items
+                .keys()
+                .find(|key| same_view_key(key, &view_key))
+                .cloned()
+                .unwrap_or_else(|| view_key.clone());
+            let unseen = self.repo_unseen_items.entry(target_key).or_default();
+            for item_id in new_item_ids {
+                unseen.insert(section.kind, item_id);
+            }
+        }
+        self.repo_unseen_items
+            .retain(|_, unseen| !unseen.is_empty());
+    }
+
+    fn clear_repo_unseen_for_view(&mut self, view: &str) {
+        self.repo_unseen_items
+            .retain(|key, _| !same_view_key(key, view));
+    }
+
+    fn repo_unseen_items_for_view(&self, view: &str) -> Option<&RepoUnseenItems> {
+        self.repo_unseen_items
+            .iter()
+            .find(|(key, _)| same_view_key(key, view))
+            .map(|(_, unseen)| unseen)
+    }
+
+    fn has_unseen_repo_items(&self) -> bool {
+        self.repo_unseen_items
+            .values()
+            .any(|unseen| !unseen.is_empty())
+    }
+
     fn apply_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
         let active_view = self.active_view.clone();
         let sections = sections
@@ -13618,6 +13734,7 @@ impl AppState {
             self.remember_base_filters(section);
         }
 
+        self.record_unseen_repo_items_for_sections(&sections);
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, sections);
     }
@@ -13656,6 +13773,7 @@ impl AppState {
             return;
         }
 
+        self.record_unseen_repo_items_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
 
@@ -13740,6 +13858,7 @@ impl AppState {
                     .filter(|section| !self.has_active_section_filter(&section.key))
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
+                self.record_unseen_repo_items_for_sections(&sections);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
                 let restored_item = self.restore_refresh_anchor(&anchor);
@@ -17323,6 +17442,8 @@ impl AppState {
                     .map(|(_, snapshot)| snapshot.clone())
             });
         self.active_view = requested_view;
+        let active_view = self.active_view.clone();
+        self.clear_repo_unseen_for_view(&active_view);
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;
@@ -22498,10 +22619,23 @@ impl AppState {
                 .strip_prefix("repo:")
                 .unwrap_or(key.as_str())
                 .to_string();
+            let label = self.repo_view_tab_label(&key, label);
             tabs.push(ViewTab { key, label });
         }
 
         tabs
+    }
+
+    fn repo_view_tab_label(&self, key: &str, label: String) -> String {
+        let Some(unseen) = self.repo_unseen_items_for_view(key) else {
+            return label;
+        };
+        let (issues, pull_requests) = unseen.counts();
+        if issues == 0 && pull_requests == 0 {
+            label
+        } else {
+            format!("{label}({issues}|{pull_requests})")
+        }
     }
 
     fn unread_notification_count(&self) -> usize {
@@ -38974,6 +39108,79 @@ The reviewer was selected based on:\n\
             .collect::<Vec<_>>();
 
         assert_eq!(repo_tabs, vec!["runnel", "Fiber"]);
+    }
+
+    #[test]
+    fn repo_top_tab_shows_unseen_issue_and_pr_counts_until_opened() {
+        let now = Utc::now();
+        let mut issue_one = work_item("issue-1", "chenyukang/ghr", 1, "Issue one", None);
+        issue_one.kind = ItemKind::Issue;
+        issue_one.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+        let mut issue_two = work_item("issue-2", "chenyukang/ghr", 2, "Issue two", None);
+        issue_two.kind = ItemKind::Issue;
+        issue_two.url = "https://github.com/chenyukang/ghr/issues/2".to_string();
+        let pr_one = work_item("pr-1", "chenyukang/ghr", 11, "PR one", None);
+        let pr_two = work_item("pr-2", "chenyukang/ghr", 12, "PR two", None);
+        let pr_three = work_item("pr-3", "chenyukang/ghr", 13, "PR three", None);
+        let issue_section = SectionSnapshot {
+            key: "repo:ghr:issues:Issues".to_string(),
+            kind: SectionKind::Issues,
+            title: "Issues".to_string(),
+            filters: "repo:chenyukang/ghr is:open".to_string(),
+            items: vec![issue_one.clone()],
+            total_count: Some(1),
+            page: 1,
+            page_size: 50,
+            refreshed_at: Some(now),
+            error: None,
+        };
+        let pr_section = SectionSnapshot {
+            key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: "repo:chenyukang/ghr is:open".to_string(),
+            items: vec![pr_one.clone()],
+            total_count: Some(1),
+            page: 1,
+            page_size: 50,
+            refreshed_at: Some(now),
+            error: None,
+        };
+        let mut app = AppState::new(
+            SectionKind::PullRequests,
+            vec![test_section(), issue_section.clone(), pr_section.clone()],
+        );
+
+        app.apply_idle_refreshed_sections(vec![
+            SectionSnapshot {
+                items: vec![issue_two, issue_one],
+                total_count: Some(2),
+                refreshed_at: Some(now + chrono::Duration::minutes(1)),
+                ..issue_section
+            },
+            SectionSnapshot {
+                items: vec![pr_three, pr_two, pr_one],
+                total_count: Some(3),
+                refreshed_at: Some(now + chrono::Duration::minutes(1)),
+                ..pr_section
+            },
+        ]);
+
+        let repo_tab = app
+            .view_tabs()
+            .into_iter()
+            .find(|view| view.key == "repo:ghr")
+            .expect("repo tab");
+        assert_eq!(repo_tab.label, "ghr(1|2)");
+
+        app.switch_view("repo:ghr");
+
+        let repo_tab = app
+            .view_tabs()
+            .into_iter()
+            .find(|view| view.key == "repo:ghr")
+            .expect("repo tab");
+        assert_eq!(repo_tab.label, "ghr");
     }
 
     #[test]

@@ -11788,6 +11788,65 @@ fn copy_content_reports_missing_description() {
 }
 
 #[test]
+fn linux_clipboard_commands_require_matching_display_env() {
+    let wayland = UNIX_CLIPBOARD_COMMANDS
+        .iter()
+        .find(|command| command.command == "wl-copy")
+        .copied()
+        .expect("wl-copy command");
+    let xclip = UNIX_CLIPBOARD_COMMANDS
+        .iter()
+        .find(|command| command.command == "xclip")
+        .copied()
+        .expect("xclip command");
+
+    assert!(clipboard_command_enabled(wayland, |name| name == "WAYLAND_DISPLAY"));
+    assert!(!clipboard_command_enabled(wayland, |name| name == "DISPLAY"));
+    assert!(clipboard_command_enabled(xclip, |name| name == "DISPLAY"));
+    assert!(!clipboard_command_enabled(xclip, |name| name == "WAYLAND_DISPLAY"));
+}
+
+#[test]
+fn osc52_base64_encoding_handles_padding() {
+    assert_eq!(base64_encode(b""), "");
+    assert_eq!(base64_encode(b"f"), "Zg==");
+    assert_eq!(base64_encode(b"fo"), "Zm8=");
+    assert_eq!(base64_encode(b"foo"), "Zm9v");
+    assert_eq!(
+        base64_encode(&[0xe5, 0xa4, 0x8d, 0xe5, 0x88, 0xb6]),
+        "5aSN5Yi2"
+    );
+}
+
+#[test]
+fn clipboard_command_failure_message_includes_stderr() {
+    assert_eq!(
+        command_failure_message("xclip", "exit status: 1", b"Error: Can't open display\n"),
+        "xclip failed (exit status: 1): Error: Can't open display"
+    );
+    assert_eq!(
+        command_failure_message("xsel", "exit status: 1", b""),
+        "xsel failed (exit status: 1)"
+    );
+}
+
+#[test]
+fn clipboard_copy_error_reports_attempted_targets_concisely() {
+    let errors = vec![
+        "wl-copy skipped; WAYLAND_DISPLAY is not set".to_string(),
+        "xclip failed (exit status: 1): Error: Can't open display".to_string(),
+        "xsel not found".to_string(),
+        "tmux failed (exit status: 1): clipboard unavailable".to_string(),
+        "OSC 52 requires terminal stdout".to_string(),
+    ];
+
+    assert_eq!(
+        clipboard_copy_error(&errors).to_string(),
+        "no usable clipboard target: wl-copy skipped; WAYLAND_DISPLAY is not set; xclip failed (exit status: 1): Error: Can't open display; xsel not found; tmux failed (exit status: 1): clipboard unavailable; OSC 52 requires terminal stdout"
+    );
+}
+
+#[test]
 fn command_palette_copy_github_link_copies_current_item_link() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();

@@ -1,6 +1,6 @@
 [package]
 name = "ghr-cli"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2024"
 description = "A fast terminal dashboard for GitHub pull requests, issues, and notifications."
 license = "MIT"

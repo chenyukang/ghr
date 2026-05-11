@@ -9,7 +9,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Local, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -32,7 +32,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::{
     Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, SavedSearchFilterConfig,
@@ -40,7 +40,7 @@ use crate::config::{
 };
 use crate::dirs::Paths;
 use crate::github::{
-    AssigneeAction, CommentFetchResult, ItemDetailsMetadata, ItemMetadataUpdate, MergeMethod,
+    AssigneeAction, CommentFetchResult, ItemDetailsMetadata, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
     add_issue_comment_reaction, add_issue_label, add_issue_reaction,
     add_pull_request_review_comment_reaction, approve_pull_request, change_issue_milestone,
@@ -248,10 +248,9 @@ enum AppMsg {
         milestone: Option<Milestone>,
         result: std::result::Result<(), String>,
     },
-    ItemMetadataUpdated {
+    ItemEdited {
         item_id: String,
-        field: ItemEditField,
-        result: std::result::Result<ItemMetadataUpdate, String>,
+        result: std::result::Result<ItemEditUpdate, String>,
     },
     AssigneesUpdated {
         item_id: String,
@@ -398,9 +397,6 @@ enum CommentDialogMode {
     },
     Review {
         target: DiffReviewTarget,
-    },
-    ItemMetadata {
-        field: ItemEditField,
     },
 }
 
@@ -682,21 +678,30 @@ struct NewPrDraft {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemEditField {
     Title,
+    Assignees,
+    Labels,
     Body,
 }
 
 impl ItemEditField {
+    fn next(self, delta: isize) -> Self {
+        const FIELDS: [ItemEditField; 4] = [
+            ItemEditField::Title,
+            ItemEditField::Assignees,
+            ItemEditField::Labels,
+            ItemEditField::Body,
+        ];
+        let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
+        let next = move_wrapping(index, FIELDS.len(), delta);
+        FIELDS[next]
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Title => "title",
+            Self::Assignees => "assign",
+            Self::Labels => "labels",
             Self::Body => "body",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Title => "Title",
-            Self::Body => "Body",
         }
     }
 }
@@ -704,6 +709,40 @@ impl ItemEditField {
 #[derive(Debug, Clone)]
 struct ItemEditDialog {
     item: WorkItem,
+    title: EditorText,
+    body: EditorText,
+    assignees: Vec<String>,
+    labels: Vec<String>,
+    field: ItemEditField,
+    body_scroll: u16,
+    assignee_input: String,
+    assignee_suggestions: Vec<String>,
+    assignee_suggestions_loading: bool,
+    assignee_suggestions_error: Option<String>,
+    selected_assignee_suggestion: usize,
+    label_input: String,
+    label_suggestions: Vec<String>,
+    label_suggestions_loading: bool,
+    label_suggestions_error: Option<String>,
+    selected_label_suggestion: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ItemEditUpdate {
+    title: String,
+    body: Option<String>,
+    labels: Vec<String>,
+    assignees: Vec<String>,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingItemEdit {
+    item: WorkItem,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    assignees: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,9 +1317,6 @@ enum PendingCommentMode {
     Review {
         target: DiffReviewTarget,
     },
-    ItemMetadata {
-        field: ItemEditField,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1329,7 +1365,7 @@ const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
 const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
-const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
+const RECENT_ITEM_DWELL: Duration = Duration::from_secs(5);
 const AUTO_THEME_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -1383,6 +1419,7 @@ struct AppState {
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
+    recent_items_dirty: bool,
     recent_commands: Vec<RecentCommand>,
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
     details_visit: Option<DetailsVisitState>,
@@ -1456,6 +1493,7 @@ struct AppState {
     review_submit_running: bool,
     pending_reviews: HashMap<String, PendingReviewState>,
     item_edit_dialog: Option<ItemEditDialog>,
+    item_edit_running: bool,
     pr_action_dialog: Option<PrActionDialog>,
     pr_action_running: bool,
     milestone_dialog: Option<MilestoneDialog>,
@@ -1765,21 +1803,46 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
         .arg("--version")
         .output();
     match &result {
-        Ok(output) => debug!(
-            command = "gh --version",
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        ),
-        Err(error) => debug!(
-            command = "gh --version",
-            error = %error,
-            "gh request failed to start"
-        ),
+        Ok(output) => {
+            debug!(
+                command = "gh --version",
+                status = %output.status,
+                success = output.status.success(),
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "gh request finished"
+            );
+            if !output.status.success() {
+                error!(
+                    command = "gh --version",
+                    status = %output.status,
+                    message = %gh_version_output_message(output),
+                    stdout_bytes = output.stdout.len(),
+                    stderr_bytes = output.stderr.len(),
+                    "gh request returned failure"
+                );
+            }
+        }
+        Err(error) => {
+            debug!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
+            error!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
+        }
     }
     startup_setup_dialog_from_gh_probe(result.map(|_| ()))
+}
+
+fn gh_version_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stderr.is_empty() { stdout } else { stderr }
 }
 
 fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {
@@ -1814,6 +1877,9 @@ async fn run_loop(
         needs_draw |= app.ensure_current_comments_auto_refresh(tx);
         needs_draw |= app.ensure_current_diff_loading(tx);
         app.sync_recent_details_visit(Instant::now());
+        if app.take_recent_items_dirty() {
+            save_ui_state(app, paths);
+        }
         needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
@@ -2463,6 +2529,7 @@ impl AppState {
             theme_switcher: None,
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
+            recent_items_dirty: false,
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
             repo_unseen_items: HashMap::new(),
             details_visit: None,
@@ -2535,6 +2602,8 @@ impl AppState {
             review_submit_dialog: None,
             review_submit_running: false,
             pending_reviews: HashMap::new(),
+            item_edit_dialog: None,
+            item_edit_running: false,
             pr_action_dialog: None,
             pr_action_running: false,
             milestone_dialog: None,
@@ -2551,7 +2620,6 @@ impl AppState {
             details_text_selection: None,
             help_dialog: false,
             diff_return_state: None,
-            item_edit_dialog: None,
         };
         state.clamp_positions();
         if view_supports_snapshot(&state.active_view)
@@ -3502,6 +3570,17 @@ impl AppState {
                         clamp_label_dialog_selection(dialog);
                         self.status = "label suggestions loaded".to_string();
                     }
+                    if let Some(dialog) = &mut self.item_edit_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.label_suggestions_loading = false;
+                        if dialog.label_suggestions != labels {
+                            dialog.label_suggestions = labels.clone();
+                        }
+                        dialog.label_suggestions_error = None;
+                        clamp_item_edit_label_selection(dialog);
+                        self.status = "label candidates loaded".to_string();
+                    }
                     if let Some(dialog) = &mut self.global_search_dialog
                         && dialog.repo.as_deref() == Some(repo.as_str())
                     {
@@ -3527,6 +3606,21 @@ impl AppState {
                             dialog.suggestions_error = Some(error.clone());
                             dialog.selected_suggestion = 0;
                             self.status = "label suggestions unavailable".to_string();
+                        }
+                    }
+                    if let Some(dialog) = &mut self.item_edit_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.label_suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.label_suggestions_error = None;
+                            self.status =
+                                "label candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.label_suggestions.clear();
+                            dialog.label_suggestions_error = Some(error.clone());
+                            dialog.selected_label_suggestion = 0;
+                            self.status = "label candidates unavailable".to_string();
                         }
                     }
                     if let Some(dialog) = &mut self.global_search_dialog
@@ -3559,6 +3653,17 @@ impl AppState {
                         clamp_assignee_dialog_selection(dialog);
                         self.status = "assignee candidates loaded".to_string();
                     }
+                    if let Some(dialog) = &mut self.item_edit_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.assignee_suggestions_loading = false;
+                        if dialog.assignee_suggestions != assignees {
+                            dialog.assignee_suggestions = assignees.clone();
+                        }
+                        dialog.assignee_suggestions_error = None;
+                        clamp_item_edit_assignee_selection(dialog);
+                        self.status = "assignee candidates loaded".to_string();
+                    }
                     if let Some(dialog) = &mut self.global_search_dialog
                         && dialog.repo.as_deref() == Some(repo.as_str())
                     {
@@ -3586,6 +3691,21 @@ impl AppState {
                             dialog.suggestions.clear();
                             dialog.suggestions_error = Some(error.clone());
                             dialog.selected_suggestion = 0;
+                            self.status = "assignee candidates unavailable".to_string();
+                        }
+                    }
+                    if let Some(dialog) = &mut self.item_edit_dialog
+                        && dialog.item.repo == repo
+                    {
+                        dialog.assignee_suggestions_loading = false;
+                        if has_cached_suggestions {
+                            dialog.assignee_suggestions_error = None;
+                            self.status =
+                                "assignee candidates refresh failed; using cache".to_string();
+                        } else {
+                            dialog.assignee_suggestions.clear();
+                            dialog.assignee_suggestions_error = Some(error.clone());
+                            dialog.selected_assignee_suggestion = 0;
                             self.status = "assignee candidates unavailable".to_string();
                         }
                     }
@@ -4000,22 +4120,17 @@ impl AppState {
                     }
                 }
             }
-            AppMsg::ItemMetadataUpdated {
-                item_id,
-                field,
-                result,
-            } => {
-                self.posting_comment = false;
+            AppMsg::ItemEdited { item_id, result } => {
+                self.item_edit_running = false;
                 match result {
                     Ok(update) => {
-                        self.apply_item_metadata_update(&item_id, update);
+                        self.apply_item_edit_update(&item_id, update);
                         self.details_stale.insert(item_id);
-                        self.clear_pending_comment_draft_local();
-                        self.pending_comment_submit = None;
-                        self.status = format!("{} updated", field.label());
+                        self.item_edit_dialog = None;
+                        self.status = "item updated".to_string();
                         self.message_dialog = Some(success_message_dialog(
-                            format!("{} Updated", field.title()),
-                            "GitHub accepted the update and the current item was refreshed.",
+                            "Item Updated",
+                            "GitHub accepted the item update.",
                         ));
                     }
                     Err(error) => {
@@ -4024,16 +4139,14 @@ impl AppState {
                             self.setup_dialog = setup_dialog;
                         }
                         if setup_dialog.is_none() {
-                            self.restore_pending_comment_submit_dialog();
-                            self.message_dialog = Some(retryable_message_dialog(
-                                format!("{} Update Failed", field.title()),
-                                retryable_operation_error_body(&error),
+                            self.message_dialog = Some(message_dialog(
+                                "Item Update Failed",
+                                operation_error_body(&error),
                             ));
                         } else {
                             self.message_dialog = None;
-                            self.restore_pending_comment_submit_dialog();
                         }
-                        self.status = format!("{} update failed", field.label());
+                        self.status = "item update failed".to_string();
                     }
                 }
             }
@@ -4753,22 +4866,6 @@ impl AppState {
                 }
             }
         }
-    }
-
-    fn apply_item_metadata_update(&mut self, item_id: &str, update: ItemMetadataUpdate) -> bool {
-        let mut changed = false;
-        for section in &mut self.sections {
-            for item in &mut section.items {
-                if item.id != item_id {
-                    continue;
-                }
-                item.title = update.title.clone();
-                item.body = update.body.clone();
-                item.updated_at = update.updated_at;
-                changed = true;
-            }
-        }
-        changed
     }
 
     fn apply_item_details_metadata(&mut self, item_id: &str, metadata: &ItemDetailsMetadata) {
@@ -7527,7 +7624,16 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     fn start_item_edit_dialog(&mut self) {
+        self.start_item_edit_dialog_with_store(None, None);
+    }
+
+    fn start_item_edit_dialog_with_store(
+        &mut self,
+        store: Option<&SnapshotStore>,
+        tx: Option<&UnboundedSender<AppMsg>>,
+    ) {
         let Some(item) = self.current_item().cloned() else {
             self.status = "nothing selected".to_string();
             return;
@@ -7548,47 +7654,404 @@ impl AppState {
         self.review_submit_dialog = None;
         self.pr_action_dialog = None;
         self.milestone_dialog = None;
-        self.item_edit_dialog = Some(ItemEditDialog { item });
-        self.status = "choose title or body to edit".to_string();
+        self.assignee_dialog = None;
+        self.reviewer_dialog = None;
+        let repo = item.repo.clone();
+        let cached_labels = self.label_suggestions_cache.get(&repo).cloned();
+        let cached_assignees = self.assignee_suggestions_cache.get(&repo).cloned();
+        let has_cached_labels = cached_labels.is_some();
+        let has_cached_assignees = cached_assignees.is_some();
+        self.item_edit_dialog = Some(ItemEditDialog {
+            title: EditorText::from_text(&item.title),
+            body: EditorText::from_text(item.body.clone().unwrap_or_default()),
+            assignees: item.assignees.clone(),
+            labels: item.labels.clone(),
+            field: ItemEditField::Title,
+            body_scroll: 0,
+            assignee_input: String::new(),
+            assignee_suggestions: cached_assignees.unwrap_or_default(),
+            assignee_suggestions_loading: false,
+            assignee_suggestions_error: None,
+            selected_assignee_suggestion: 0,
+            label_input: String::new(),
+            label_suggestions: cached_labels.unwrap_or_default(),
+            label_suggestions_loading: false,
+            label_suggestions_error: None,
+            selected_label_suggestion: 0,
+            item,
+        });
+        self.item_edit_running = false;
+        let labels_refreshing = tx
+            .map(|tx| start_label_suggestions_load(repo.clone(), store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        let assignees_refreshing = tx
+            .map(|tx| start_assignee_suggestions_load(repo, store.cloned(), tx.clone()))
+            .unwrap_or(false);
+        if let Some(dialog) = &mut self.item_edit_dialog {
+            dialog.label_suggestions_loading = labels_refreshing && !has_cached_labels;
+            dialog.assignee_suggestions_loading = assignees_refreshing && !has_cached_assignees;
+        }
+        self.status = if labels_refreshing || assignees_refreshing {
+            "editing item; loading candidates".to_string()
+        } else {
+            "editing item".to_string()
+        };
     }
 
-    fn handle_item_edit_dialog_key(&mut self, key: KeyEvent) {
+    fn handle_item_edit_dialog_key(
+        &mut self,
+        key: KeyEvent,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) {
+        let tx = tx.clone();
+        self.handle_item_edit_dialog_key_with_submit(key, area, move |pending| {
+            start_item_edit(pending, tx.clone());
+        });
+    }
+
+    fn handle_item_edit_dialog_key_with_submit<F>(
+        &mut self,
+        key: KeyEvent,
+        area: Option<Rect>,
+        mut submit: F,
+    ) where
+        F: FnMut(PendingItemEdit),
+    {
+        if self.item_edit_running {
+            self.status = "item edit already running".to_string();
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.item_edit_dialog = None;
+                self.item_edit_running = false;
                 self.status = "edit cancelled".to_string();
             }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                self.start_item_metadata_editor(ItemEditField::Title);
+            KeyCode::Tab => self.move_item_edit_field(1),
+            KeyCode::BackTab => self.move_item_edit_field(-1),
+            KeyCode::PageDown => self.scroll_item_edit_body(6, area),
+            KeyCode::PageUp => self.scroll_item_edit_body(-6, area),
+            _ if is_comment_submit_key(key) => {
+                if let Some(pending) = self.prepare_item_edit_submit() {
+                    submit(pending);
+                }
             }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                self.start_item_metadata_editor(ItemEditField::Body);
+            _ => self.handle_item_edit_field_key(key, area),
+        }
+    }
+
+    fn move_item_edit_field(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
+            return;
+        };
+        dialog.field = dialog.field.next(delta);
+        self.status = format!("editing {}", dialog.field.label());
+    }
+
+    fn handle_item_edit_field_key(&mut self, key: KeyEvent, area: Option<Rect>) {
+        let Some(field) = self.item_edit_dialog.as_ref().map(|dialog| dialog.field) else {
+            return;
+        };
+        match field {
+            ItemEditField::Title => {
+                if let Some(dialog) = &mut self.item_edit_dialog {
+                    dialog.title.input_key(key, false);
+                }
+            }
+            ItemEditField::Body => {
+                if let Some(dialog) = &mut self.item_edit_dialog
+                    && dialog.body.input_key(key, true)
+                {
+                    self.scroll_item_edit_body_to_cursor_in_area(area);
+                }
+            }
+            ItemEditField::Assignees => self.handle_item_edit_assignee_key(key),
+            ItemEditField::Labels => self.handle_item_edit_label_key(key),
+        }
+    }
+
+    fn handle_item_edit_assignee_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.toggle_item_edit_assignee_from_input(),
+            KeyCode::Up => self.move_item_edit_assignee_suggestion(-1),
+            KeyCode::Down => self.move_item_edit_assignee_suggestion(1),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.item_edit_dialog {
+                    if dialog.assignee_input.is_empty() {
+                        if let Some(login) = dialog.assignees.pop() {
+                            self.status = format!("removed assignee {login}");
+                        }
+                    } else {
+                        dialog.assignee_input.pop();
+                        dialog.selected_assignee_suggestion = 0;
+                        clamp_item_edit_assignee_selection(dialog);
+                    }
+                }
+            }
+            KeyCode::Delete
+                if self
+                    .item_edit_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.assignee_input.is_empty()) =>
+            {
+                if let Some(dialog) = &mut self.item_edit_dialog
+                    && let Some(login) = dialog.assignees.pop()
+                {
+                    self.status = format!("removed assignee {login}");
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                if let Some(dialog) = &mut self.item_edit_dialog {
+                    dialog.assignee_input.push(value);
+                    dialog.selected_assignee_suggestion = 0;
+                    clamp_item_edit_assignee_selection(dialog);
+                }
             }
             _ => {}
         }
     }
 
-    fn start_item_metadata_editor(&mut self, field: ItemEditField) {
-        let Some(dialog) = self.item_edit_dialog.take() else {
+    fn handle_item_edit_label_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.toggle_item_edit_label_from_input(),
+            KeyCode::Up => self.move_item_edit_label_suggestion(-1),
+            KeyCode::Down => self.move_item_edit_label_suggestion(1),
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.item_edit_dialog {
+                    if dialog.label_input.is_empty() {
+                        if let Some(label) = dialog.labels.pop() {
+                            self.status = format!("removed label {label}");
+                        }
+                    } else {
+                        dialog.label_input.pop();
+                        dialog.selected_label_suggestion = 0;
+                        clamp_item_edit_label_selection(dialog);
+                    }
+                }
+            }
+            KeyCode::Delete
+                if self
+                    .item_edit_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.label_input.is_empty()) =>
+            {
+                if let Some(dialog) = &mut self.item_edit_dialog
+                    && let Some(label) = dialog.labels.pop()
+                {
+                    self.status = format!("removed label {label}");
+                }
+            }
+            KeyCode::Char(value) if !value.is_control() => {
+                if let Some(dialog) = &mut self.item_edit_dialog {
+                    dialog.label_input.push(value);
+                    dialog.selected_label_suggestion = 0;
+                    clamp_item_edit_label_selection(dialog);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_item_edit_assignee_from_input(&mut self) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
             return;
         };
-        let item = dialog.item;
-        let value = match field {
-            ItemEditField::Title => item.title.clone(),
-            ItemEditField::Body => item.body.clone().unwrap_or_default(),
+        let mut assignees = parse_assignee_input(&dialog.assignee_input);
+        if !assignees.is_empty()
+            && !assignee_input_prefix(&dialog.assignee_input).is_empty()
+            && let Some(selected) = selected_item_edit_assignee_suggestion(dialog)
+            && let Some(last) = assignees.last_mut()
+        {
+            *last = selected;
+        } else if assignees.is_empty()
+            && let Some(selected) = selected_item_edit_assignee_suggestion(dialog)
+        {
+            assignees = vec![selected];
+        }
+        if assignees.is_empty() {
+            self.status = "assignee login is empty".to_string();
+            return;
+        }
+        let mut changed = false;
+        for login in assignees {
+            if let Some(index) = dialog
+                .assignees
+                .iter()
+                .position(|existing| existing.eq_ignore_ascii_case(&login))
+            {
+                let removed = dialog.assignees.remove(index);
+                self.status = format!("removed assignee {removed}");
+                changed = true;
+            } else {
+                dialog.assignees.push(login.clone());
+                self.status = format!("added assignee {login}");
+                changed = true;
+            }
+        }
+        if changed {
+            dialog.assignees = dedupe_assignee_logins(dialog.assignees.clone());
+            dialog.assignee_input.clear();
+            dialog.selected_assignee_suggestion = 0;
+            clamp_item_edit_assignee_selection(dialog);
+        }
+    }
+
+    fn toggle_item_edit_label_from_input(&mut self) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
+            return;
         };
-        self.focus = FocusTarget::Details;
-        let loaded = self.open_comment_dialog_with_draft(
-            CommentDialogMode::ItemMetadata { field },
-            value,
-            item_metadata_draft_key(&item, field),
-        );
-        self.scroll_comment_dialog_to_cursor();
-        self.status = if loaded {
-            format!("loaded {} draft", field.label())
+        let label_prefix = label_completion_prefix(&dialog.label_input);
+        let mut labels = if !label_prefix.is_empty()
+            && let Some(selected) = selected_item_edit_label_suggestion(dialog)
+        {
+            parse_issue_labels(&replace_last_comma_component(
+                &dialog.label_input,
+                &selected,
+            ))
         } else {
-            format!("editing {}", field.label())
+            parse_issue_labels(&dialog.label_input)
         };
+        if labels.is_empty()
+            && let Some(selected) = selected_item_edit_label_suggestion(dialog)
+        {
+            labels = vec![selected];
+        }
+        if labels.is_empty() {
+            self.status = "label is empty".to_string();
+            return;
+        }
+        let mut changed = false;
+        for label in labels {
+            if let Some(index) = dialog
+                .labels
+                .iter()
+                .position(|existing| existing.eq_ignore_ascii_case(&label))
+            {
+                let removed = dialog.labels.remove(index);
+                self.status = format!("removed label {removed}");
+                changed = true;
+            } else {
+                dialog.labels.push(label.clone());
+                self.status = format!("added label {label}");
+                changed = true;
+            }
+        }
+        if changed {
+            dialog.labels = dedupe_label_names(dialog.labels.clone());
+            dialog.label_input.clear();
+            dialog.selected_label_suggestion = 0;
+            clamp_item_edit_label_selection(dialog);
+        }
+    }
+
+    fn move_item_edit_assignee_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
+            return;
+        };
+        let count = item_edit_assignee_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no assignee candidates match".to_string();
+            return;
+        }
+        dialog.selected_assignee_suggestion =
+            move_wrapping(dialog.selected_assignee_suggestion, count, delta);
+        let login = selected_item_edit_assignee_suggestion(dialog).unwrap_or_default();
+        self.status = format!("selected assignee candidate: {login}");
+    }
+
+    fn move_item_edit_label_suggestion(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
+            return;
+        };
+        let count = item_edit_label_suggestion_matches(dialog).len();
+        if count == 0 {
+            self.status = "no label candidates match".to_string();
+            return;
+        }
+        dialog.selected_label_suggestion =
+            move_wrapping(dialog.selected_label_suggestion, count, delta);
+        let label = selected_item_edit_label_suggestion(dialog).unwrap_or_default();
+        self.status = format!("selected label candidate: {label}");
+    }
+
+    fn scroll_item_edit_body(&mut self, delta: i16, area: Option<Rect>) {
+        let Some(dialog) = &mut self.item_edit_dialog else {
+            return;
+        };
+        let (width, height) = item_edit_body_editor_size(area, dialog.field);
+        let max_scroll = max_comment_dialog_scroll(dialog.body.text(), width, height);
+        if delta < 0 {
+            dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            dialog.body_scroll = dialog.body_scroll.saturating_add(delta as u16);
+        }
+        dialog.body_scroll = dialog.body_scroll.min(max_scroll);
+    }
+
+    fn scroll_item_edit_body_to_cursor_in_area(&mut self, area: Option<Rect>) {
+        if let Some(dialog) = &mut self.item_edit_dialog {
+            let (width, height) = item_edit_body_editor_size(area, dialog.field);
+            dialog.body_scroll = scroll_for_comment_dialog_cursor(
+                dialog.body.text(),
+                dialog.body.cursor_byte(),
+                width,
+                height,
+                dialog.body_scroll,
+            );
+        }
+    }
+
+    fn prepare_item_edit_submit(&mut self) -> Option<PendingItemEdit> {
+        let Some(dialog) = &self.item_edit_dialog else {
+            return None;
+        };
+        let title = dialog.title.text().trim().to_string();
+        if title.is_empty() {
+            self.status = "title is empty".to_string();
+            return None;
+        }
+        let body = dialog.body.text().trim().to_string();
+        let labels = dedupe_label_names(dialog.labels.clone());
+        let assignees = dedupe_assignee_logins(dialog.assignees.clone());
+        let original_body = dialog.item.body.clone().unwrap_or_default();
+        if title == dialog.item.title
+            && body == original_body
+            && same_names_ignore_case(&labels, &dialog.item.labels)
+            && same_names_ignore_case(&assignees, &dialog.item.assignees)
+        {
+            self.status = "no item changes to save".to_string();
+            return None;
+        }
+        self.item_edit_running = true;
+        self.status = "updating item".to_string();
+        Some(PendingItemEdit {
+            item: dialog.item.clone(),
+            title,
+            body,
+            labels,
+            assignees,
+        })
+    }
+
+    fn apply_item_edit_update(&mut self, item_id: &str, update: ItemEditUpdate) -> bool {
+        let mut changed = false;
+        for section in &mut self.sections {
+            for item in &mut section.items {
+                if item.id != item_id {
+                    continue;
+                }
+                item.title = update.title.clone();
+                item.body = update.body.clone();
+                item.labels = update.labels.clone();
+                item.assignees = update.assignees.clone();
+                if update.updated_at.is_some() {
+                    item.updated_at = update.updated_at;
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn handle_pr_action_dialog_key(
@@ -8475,14 +8938,14 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
-        if !comment.is_mine {
-            self.status = "only your comments can be edited".to_string();
-            return;
-        }
         let Some(comment_id) = comment.id else {
             self.status = "comment id unavailable; cannot edit".to_string();
             return;
         };
+        if !comment.can_edit() {
+            self.status = "selected comment cannot be edited".to_string();
+            return;
+        }
 
         self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;
@@ -8614,15 +9077,6 @@ impl AppState {
                 start_review_comment_submit(
                     submit.item,
                     target,
-                    submit.body,
-                    draft_clear_task(submit.draft_key, store.clone()),
-                    tx.clone(),
-                );
-            }
-            PendingCommentMode::ItemMetadata { field } => {
-                start_item_metadata_edit(
-                    submit.item,
-                    field,
                     submit.body,
                     draft_clear_task(submit.draft_key, store.clone()),
                     tx.clone(),
@@ -9302,20 +9756,9 @@ impl AppState {
     fn prepare_comment_submit(&mut self) -> Option<PendingCommentSubmit> {
         let dialog = self.comment_dialog.take()?;
         let body = dialog.body.text().trim().to_string();
-        let empty_status = match dialog.mode {
-            CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Title,
-            } => Some("title is empty"),
-            CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Body,
-            } => None,
-            _ => Some("comment is empty"),
-        };
-        if body.is_empty()
-            && let Some(status) = empty_status
-        {
+        if body.is_empty() {
             self.comment_dialog = Some(dialog);
-            self.status = status.to_string();
+            self.status = "comment is empty".to_string();
             return None;
         }
         let Some(item) = self.current_item().cloned() else {
@@ -9340,7 +9783,6 @@ impl AppState {
                 is_review,
             },
             CommentDialogMode::Review { target } => PendingCommentMode::Review { target },
-            CommentDialogMode::ItemMetadata { field } => PendingCommentMode::ItemMetadata { field },
         };
         self.posting_comment = true;
         self.message_dialog = Some(comment_pending_dialog(&mode));
@@ -9349,7 +9791,6 @@ impl AppState {
             PendingCommentMode::ReviewReply { .. } => "posting review reply".to_string(),
             PendingCommentMode::Edit { .. } => "updating comment".to_string(),
             PendingCommentMode::Review { .. } => "posting review comment".to_string(),
-            PendingCommentMode::ItemMetadata { field } => format!("updating {}", field.label()),
         };
         let pending = PendingCommentSubmit {
             item,
@@ -10454,6 +10895,13 @@ impl AppState {
         self.recent_items
             .sort_by_key(|item| std::cmp::Reverse(item.visited_at));
         self.recent_items.truncate(MAX_RECENT_ITEMS);
+        self.recent_items_dirty = true;
+    }
+
+    fn take_recent_items_dirty(&mut self) -> bool {
+        let dirty = self.recent_items_dirty;
+        self.recent_items_dirty = false;
+        dirty
     }
 
     fn jump_to_recent_item(&mut self, item: &RecentItem) -> bool {
@@ -11103,6 +11551,34 @@ fn item_meta(item: &WorkItem) -> String {
         parts.push(extra.clone());
     }
     parts.join(" ")
+}
+
+fn dedupe_label_names(labels: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for label in labels
+        .into_iter()
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+    {
+        if !deduped
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&label))
+        {
+            deduped.push(label);
+        }
+    }
+    deduped
+}
+
+fn same_names_ignore_case(left: &[String], right: &[String]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().all(|name| {
+        right
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(name))
+    })
 }
 
 fn item_is_open_pull_request(item: &WorkItem) -> bool {

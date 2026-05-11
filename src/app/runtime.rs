@@ -166,6 +166,14 @@ fn github_cli_version_summary() -> String {
                     .unwrap_or("installed")
                     .to_string()
             } else {
+                error!(
+                    command = "gh --version",
+                    status = %output.status,
+                    message = %gh_version_output_message(&output),
+                    stdout_bytes = output.stdout.len(),
+                    stderr_bytes = output.stderr.len(),
+                    "gh request returned failure"
+                );
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 stderr
                     .lines()
@@ -182,7 +190,19 @@ fn github_cli_version_summary() -> String {
                 error = %error,
                 "gh request failed to start"
             );
+            error!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
             format!("unavailable ({error})")
         }
     }
+}
+
+#[cfg(not(test))]
+fn gh_version_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stderr.is_empty() { stdout } else { stderr }
 }

@@ -475,34 +475,94 @@ pub(super) fn start_comment_edit(
     });
 }
 
-pub(super) fn start_item_metadata_edit(
-    item: WorkItem,
-    field: ItemEditField,
-    value: String,
-    draft_clear: Option<DraftClearTask>,
-    tx: UnboundedSender<AppMsg>,
-) {
+pub(super) fn start_item_edit(pending: PendingItemEdit, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
-        let item_id = item.id.clone();
-        let result = match item.number {
-            Some(number) => {
-                let title = (field == ItemEditField::Title).then_some(value.as_str());
-                let body = (field == ItemEditField::Body).then_some(value.as_str());
-                edit_item_metadata(&item.repo, number, title, body)
-                    .await
-                    .map_err(error_chain_message)
-            }
-            None => Err("selected item has no issue or pull request number".to_string()),
-        };
-        if result.is_ok() {
-            clear_editor_draft_after_success(draft_clear);
-        }
-        let _ = tx.send(AppMsg::ItemMetadataUpdated {
-            item_id,
-            field,
-            result,
-        });
+        let item_id = pending.item.id.clone();
+        let result = run_item_edit(pending).await.map_err(error_chain_message);
+        let _ = tx.send(AppMsg::ItemEdited { item_id, result });
     });
+}
+
+async fn run_item_edit(pending: PendingItemEdit) -> Result<ItemEditUpdate> {
+    let item = pending.item;
+    let Some(number) = item.number else {
+        bail!("selected item has no issue or pull request number");
+    };
+
+    let original_body = item.body.clone().unwrap_or_default();
+    let title_changed = pending.title != item.title;
+    let body_changed = pending.body != original_body;
+    let mut updated_at = None;
+    if title_changed || body_changed {
+        let title = title_changed.then_some(pending.title.as_str());
+        let body = body_changed.then_some(pending.body.as_str());
+        let update = edit_item_metadata(&item.repo, number, title, body).await?;
+        updated_at = update.updated_at;
+    }
+
+    let labels_to_add = names_added(&item.labels, &pending.labels);
+    let labels_to_remove = names_removed(&item.labels, &pending.labels);
+    for label in labels_to_add {
+        add_issue_label(&item.repo, number, &label).await?;
+    }
+    for label in labels_to_remove {
+        remove_issue_label(&item.repo, number, &label).await?;
+    }
+
+    let assignees_to_add = names_added(&item.assignees, &pending.assignees);
+    if !assignees_to_add.is_empty() {
+        update_issue_assignees(
+            &item.repo,
+            number,
+            item.kind,
+            AssigneeAction::Assign,
+            &assignees_to_add,
+        )
+        .await?;
+    }
+    let assignees_to_remove = names_removed(&item.assignees, &pending.assignees);
+    if !assignees_to_remove.is_empty() {
+        update_issue_assignees(
+            &item.repo,
+            number,
+            item.kind,
+            AssigneeAction::Unassign,
+            &assignees_to_remove,
+        )
+        .await?;
+    }
+
+    Ok(ItemEditUpdate {
+        title: pending.title,
+        body: (!pending.body.trim().is_empty()).then_some(pending.body),
+        labels: pending.labels,
+        assignees: pending.assignees,
+        updated_at,
+    })
+}
+
+fn names_added(current: &[String], target: &[String]) -> Vec<String> {
+    target
+        .iter()
+        .filter(|name| {
+            !current
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect()
+}
+
+fn names_removed(current: &[String], target: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|name| {
+            !target
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect()
 }
 
 pub(super) fn start_review_comment_submit(

@@ -134,10 +134,18 @@ pub struct CommentPreview {
     pub parent_id: Option<u64>,
     #[serde(default)]
     pub is_mine: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_can_update: Option<bool>,
     #[serde(default)]
     pub reactions: ReactionSummary,
     #[serde(default)]
     pub review: Option<ReviewCommentPreview>,
+}
+
+impl CommentPreview {
+    pub fn can_edit(&self) -> bool {
+        self.id.is_some() && self.viewer_can_update.unwrap_or(self.is_mine)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

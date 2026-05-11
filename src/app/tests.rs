@@ -4106,7 +4106,7 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("Tab / Shift+Tab"));
     assert!(text.contains(":"));
     assert!(text.contains("R"));
-    assert!(text.contains("edit focused comment"));
+    assert!(text.contains("edit selected issue or PR fields"));
     assert!(text.contains("drag split border"));
     assert!(text.contains("open PR merge confirmation"));
     assert!(text.contains("open close or reopen confirmation"));
@@ -4580,7 +4580,7 @@ fn explicit_color_theme_disables_auto_theme_refresh() {
 }
 
 #[test]
-fn recent_items_only_records_details_visits_after_ten_seconds() {
+fn recent_items_only_records_details_visits_after_dwell_time() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
     app.focus_details();
@@ -4717,6 +4717,33 @@ fn recent_items_candidates_omit_current_item() {
         matches,
         vec!["[pr] #2 Fix funding state.  nervosnetwork/fiber"]
     );
+
+    let matches = app
+        .recent_item_candidates_for_query("compiler")
+        .into_iter()
+        .map(|item| recent_item_label(&item))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matches,
+        vec!["[pr] #1 Compiler diagnostics.  rust-lang/rust"]
+    );
+}
+
+#[test]
+fn recent_items_recording_marks_ui_state_dirty_once() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.details_visit
+        .as_mut()
+        .expect("details visit")
+        .started_at = Instant::now() - RECENT_ITEM_DWELL - Duration::from_millis(100);
+
+    app.sync_recent_details_visit(Instant::now());
+
+    assert_eq!(app.recent_items.len(), 1);
+    assert!(app.take_recent_items_dirty());
+    assert!(!app.take_recent_items_dirty());
 }
 
 #[test]
@@ -6226,7 +6253,7 @@ fn footer_uses_list_shortcuts_and_status() {
     let text = footer_line(&app, &paths).to_string();
 
     assert!(text.contains(
-        "j/k/n/p move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  a comment"
+        "j/k/n/p move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  e edit  a comment"
     ));
     assert!(!text.contains("List items"));
     assert!(!text.contains("Details content"));
@@ -6377,7 +6404,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
     assert!(!details.contains("Details content"));
     assert!(details.contains("tab List  v diff  / search  c/a comment"));
     assert!(!details.contains("R reply"));
-    assert!(!details.contains("e edit"));
+    assert!(details.contains("e edit"));
     assert!(!details.contains("enter expand"));
     assert!(details.contains("esc List"));
     assert!(!details.contains("g/G ends"));
@@ -6389,7 +6416,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
     let details_with_comment = footer_line(&app, &paths).to_string();
     assert!(details_with_comment.contains("n/p comment  enter expand"));
     assert!(details_with_comment.contains("R reply"));
-    assert!(!details_with_comment.contains("e edit"));
+    assert!(details_with_comment.contains("e edit"));
 
     app.details.insert(
         "1".to_string(),
@@ -8466,6 +8493,7 @@ fn inbox_details_mark_new_since_last_read_updates() {
             url: None,
             parent_id: None,
             is_mine: false,
+            viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
         }]),
@@ -10150,6 +10178,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 url: None,
                 parent_id: None,
                 is_mine: false,
+                viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
             },
@@ -10163,6 +10192,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 url: Some("https://github.com/rust-lang/rust/pull/1#issuecomment-2".to_string()),
                 parent_id: None,
                 is_mine: false,
+                viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
             },
@@ -11100,6 +11130,31 @@ fn own_comment_has_edit_action() {
 }
 
 #[test]
+fn comment_with_github_update_permission_has_edit_action() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    let mut editable = comment("alice", "Editable by viewer permissions", None);
+    editable.id = Some(42);
+    editable.viewer_can_update = Some(true);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![editable]));
+
+    let document = build_details_document(&app, 100);
+    let header_index = document
+        .lines
+        .iter()
+        .position(|line| line.to_string().contains("alice"))
+        .expect("comment header");
+    let header = document.lines[header_index].to_string();
+    let edit_column = display_width(&header[..header.find("edit").expect("edit button")]) as u16;
+
+    assert_eq!(
+        document.action_at(header_index, edit_column),
+        Some(DetailAction::EditComment(0))
+    );
+}
+
+#[test]
 fn edit_action_opens_dialog_prefilled_with_comment_body() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details.insert(
@@ -11512,7 +11567,7 @@ fn capital_r_replies_in_details_while_lowercase_r_keeps_refreshing() {
 }
 
 #[test]
-fn e_key_edits_selected_own_comment() {
+fn e_key_opens_item_edit_dialog_from_details() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
     let config = Config::default();
@@ -11531,6 +11586,23 @@ fn e_key_edits_selected_own_comment() {
         &tx
     ));
 
+    assert!(app.item_edit_dialog.is_some());
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(app.status, "editing item");
+}
+
+#[test]
+fn start_edit_selected_comment_dialog_uses_github_update_permission() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    let mut comment = comment("alice", "Editable by repository permission", None);
+    comment.id = Some(42);
+    comment.viewer_can_update = Some(true);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+    app.start_edit_selected_comment_dialog();
+
     assert_eq!(
         app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
         Some(&CommentDialogMode::Edit {
@@ -11539,36 +11611,36 @@ fn e_key_edits_selected_own_comment() {
             is_review: false,
         })
     );
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| dialog.body.as_str()),
-        Some("Original body")
-    );
 }
 
 #[test]
-fn e_key_rejects_comments_not_owned_by_viewer() {
+fn start_edit_selected_comment_dialog_rejects_without_update_permission() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config::default();
-    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.focus_details();
-    app.details.insert(
-        "1".to_string(),
-        DetailState::Loaded(vec![comment("alice", "Not mine", None)]),
-    );
+    let mut comment = comment("alice", "Not editable", None);
+    comment.id = Some(42);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
-    assert!(!handle_key(
-        &mut app,
-        key(KeyCode::Char('e')),
-        &config,
-        &store,
-        &tx
-    ));
+    app.start_edit_selected_comment_dialog();
 
     assert!(app.comment_dialog.is_none());
-    assert_eq!(app.status, "only your comments can be edited");
+    assert_eq!(app.status, "selected comment cannot be edited");
+}
+
+#[test]
+fn github_update_permission_overrides_comment_ownership() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    let mut comment = own_comment(42, "chenyukang", "Owned but locked", None);
+    comment.viewer_can_update = Some(false);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+    app.start_edit_selected_comment_dialog();
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(app.status, "selected comment cannot be edited");
 }
 
 #[test]
@@ -13824,7 +13896,7 @@ fn auto_merge_action_rejects_non_pull_request() {
 }
 
 #[test]
-fn item_edit_key_opens_choice_from_list_and_details() {
+fn item_edit_key_opens_form_from_list_and_details() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
     let config = Config::default();
@@ -13832,186 +13904,306 @@ fn item_edit_key_opens_choice_from_list_and_details() {
 
     assert!(!handle_key(
         &mut app,
-        key(KeyCode::Char('T')),
+        key(KeyCode::Char('e')),
         &config,
         &store,
         &tx
     ));
 
     assert!(app.item_edit_dialog.is_some());
-    assert_eq!(app.status, "choose title or body to edit");
+    assert_eq!(app.status, "editing item");
 
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.focus_details();
 
     assert!(!handle_key(
         &mut app,
-        key(KeyCode::Char('T')),
+        key(KeyCode::Char('e')),
         &config,
         &store,
         &tx
     ));
 
     assert!(app.item_edit_dialog.is_some());
-    assert_eq!(app.status, "choose title or body to edit");
+    assert_eq!(app.status, "editing item");
 }
 
 #[test]
-fn item_edit_choice_opens_title_or_body_editor() {
+fn item_edit_form_prefills_editable_fields_without_repo_or_number() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
     app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
 
-    assert!(app.item_edit_dialog.is_none());
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| (&dialog.mode, dialog.body.as_str())),
-        Some((
-            &CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Title,
-            },
-            "Compiler diagnostics"
-        ))
-    );
-    assert_eq!(app.status, "editing title");
+    let dialog = app.item_edit_dialog.as_ref().expect("item edit dialog");
+    assert_eq!(dialog.title.text(), "Compiler diagnostics");
+    assert_eq!(dialog.body.text(), "A body with useful context");
+    assert_eq!(dialog.labels, vec!["T-compiler".to_string()]);
+    assert_eq!(dialog.assignees, Vec::<String>::new());
 
-    app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
-
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| (&dialog.mode, dialog.body.as_str())),
-        Some((
-            &CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Body,
-            },
-            "A body with useful context"
-        ))
-    );
-    assert_eq!(app.status, "editing body");
+    let backend = ratatui::backend::TestBackend::new(100, 32);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    let title_index = rendered.find("Title:").expect("title field");
+    let assign_index = rendered.find("Assign:").expect("assign field");
+    let labels_index = rendered.find("Labels:").expect("labels field");
+    let body_index = rendered.find("Body:").expect("body field");
+    assert!(title_index < assign_index);
+    assert!(assign_index < labels_index);
+    assert!(labels_index < body_index);
+    assert!(!rendered.contains("Assignees:"));
+    assert!(!rendered.contains("Assignee:"));
+    assert!(!rendered.contains("Label:"));
+    assert!(!rendered.contains("repo:"));
+    assert!(!rendered.contains("pull request:"));
+    assert!(!rendered.contains("item: #"));
 }
 
 #[test]
-fn item_title_edit_submit_updates_title() {
+fn item_edit_cursor_positions_match_rendered_field_rows() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
-    app.comment_dialog
-        .as_mut()
-        .unwrap()
-        .body
-        .set_text("New title");
+    let area = Rect::new(0, 0, 120, 34);
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = item_edit_body_editor_height(dialog_area, ItemEditField::Labels);
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Labels;
+    app.item_edit_dialog.as_mut().expect("dialog").label_input = "bu".to_string();
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let lines = buffer_lines(terminal.backend().buffer());
+    let labels_y = lines
+        .iter()
+        .position(|line| line.contains("Labels:"))
+        .expect("labels line") as u16;
+    let labels_cursor = item_edit_dialog_cursor_position(
+        app.item_edit_dialog.as_ref().expect("dialog"),
+        0,
+        dialog_area,
+        editor_width,
+        editor_height,
+    )
+    .expect("labels cursor");
+    assert_eq!(labels_cursor.y, labels_y);
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.field = ItemEditField::Body;
+    dialog.body.set_text("first\nsecond");
+    dialog.body.set_cursor_byte("first\nse".len());
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let lines = buffer_lines(terminal.backend().buffer());
+    let body_first_y = lines
+        .iter()
+        .position(|line| line.contains("first"))
+        .expect("body first line") as u16;
+    let body_cursor = item_edit_dialog_cursor_position(
+        app.item_edit_dialog.as_ref().expect("dialog"),
+        0,
+        dialog_area,
+        editor_width,
+        item_edit_body_editor_height(dialog_area, ItemEditField::Body),
+    )
+    .expect("body cursor");
+    assert_eq!(body_cursor.y, body_first_y + 1);
+}
+
+#[test]
+fn item_edit_candidate_lists_only_show_for_focused_collection_field() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let area = Rect::new(0, 0, 120, 34);
+    let paths = test_paths();
+
+    let render = |app: &AppState| {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, app, &paths)).unwrap();
+        buffer_lines(terminal.backend().buffer()).join("\n")
+    };
+
+    {
+        let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+        dialog.assignee_suggestions = vec!["alice".to_string()];
+        dialog.label_suggestions = vec!["bug".to_string()];
+    }
+
+    let rendered = render(&app);
+    assert!(!rendered.contains("Assignee candidates"));
+    assert!(!rendered.contains("Label candidates"));
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Assignees;
+    let rendered = render(&app);
+    assert!(rendered.contains("Assignee candidates"));
+    assert!(!rendered.contains("Label candidates"));
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Labels;
+    let rendered = render(&app);
+    assert!(!rendered.contains("Assignee candidates"));
+    assert!(rendered.contains("Label candidates"));
+}
+
+#[test]
+fn item_edit_assignee_and_label_fields_use_candidates() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.field = ItemEditField::Assignees;
+    dialog.assignee_suggestions = vec!["alice".to_string(), "bob".to_string()];
+    dialog.assignee_input = "bo".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(dialog.assignees, vec!["bob".to_string()]);
+    assert!(dialog.assignee_input.is_empty());
+    dialog.assignee_input = "bob".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert!(dialog.assignees.is_empty());
+    dialog.assignee_input = "alice bo".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(
+        dialog.assignees,
+        vec!["alice".to_string(), "bob".to_string()]
+    );
+    dialog.field = ItemEditField::Labels;
+    dialog.label_suggestions = vec!["bug".to_string(), "T-compiler".to_string()];
+    dialog.label_input = "bu".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(
+        dialog.labels,
+        vec!["T-compiler".to_string(), "bug".to_string()]
+    );
+    assert!(dialog.label_input.is_empty());
+    dialog.label_input = "T-compiler".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    assert_eq!(
+        app.item_edit_dialog.as_ref().unwrap().labels,
+        vec!["bug".to_string()]
+    );
+    app.item_edit_dialog.as_mut().unwrap().label_input = "help wanted, T-".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    assert_eq!(
+        app.item_edit_dialog.as_ref().unwrap().labels,
+        vec![
+            "bug".to_string(),
+            "help wanted".to_string(),
+            "T-compiler".to_string()
+        ]
+    );
+}
+
+#[test]
+fn item_edit_submit_sends_all_editable_fields() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.title.set_text("New title");
+    dialog.body.clear();
+    dialog.assignees = vec!["alice".to_string(), "bob".to_string()];
+    dialog.labels = vec!["bug".to_string(), "T-compiler".to_string()];
     let mut submitted = None;
 
-    app.handle_comment_dialog_key_with_submit(
+    app.handle_item_edit_dialog_key_with_submit(
         KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
         None,
-        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        |pending| {
+            submitted = Some((
+                pending.item.id,
+                pending.title,
+                pending.body,
+                pending.assignees,
+                pending.labels,
+            ))
+        },
     );
 
-    assert!(app.comment_dialog.is_none());
-    assert!(app.posting_comment);
-    assert_eq!(app.status, "updating title");
-    assert_eq!(
-        app.message_dialog
-            .as_ref()
-            .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
-        Some((
-            "Updating Title",
-            "Waiting for GitHub to accept the title update..."
-        ))
-    );
+    assert!(app.item_edit_running);
+    assert_eq!(app.status, "updating item");
     assert_eq!(
         submitted,
         Some((
             "1".to_string(),
             "New title".to_string(),
-            PendingCommentMode::ItemMetadata {
-                field: ItemEditField::Title,
-            }
-        ))
-    );
-}
-
-#[test]
-fn item_body_edit_submit_allows_empty_body() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
-    app.comment_dialog.as_mut().unwrap().body.clear();
-    let mut submitted = None;
-
-    app.handle_comment_dialog_key_with_submit(
-        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
-        None,
-        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
-    );
-
-    assert!(app.comment_dialog.is_none());
-    assert!(app.posting_comment);
-    assert_eq!(app.status, "updating body");
-    assert_eq!(
-        submitted,
-        Some((
-            "1".to_string(),
             String::new(),
-            PendingCommentMode::ItemMetadata {
-                field: ItemEditField::Body,
-            }
+            vec!["alice".to_string(), "bob".to_string()],
+            vec!["bug".to_string(), "T-compiler".to_string()],
         ))
     );
 }
 
 #[test]
-fn item_metadata_update_success_refreshes_cached_item() {
+fn item_edit_update_success_refreshes_cached_item() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.posting_comment = true;
+    app.item_edit_running = true;
+    app.start_item_edit_dialog();
 
-    app.handle_msg(AppMsg::ItemMetadataUpdated {
+    app.handle_msg(AppMsg::ItemEdited {
         item_id: "1".to_string(),
-        field: ItemEditField::Title,
-        result: Ok(ItemMetadataUpdate {
+        result: Ok(ItemEditUpdate {
             title: "New title".to_string(),
             body: Some("New body".to_string()),
+            labels: vec!["bug".to_string()],
+            assignees: vec!["alice".to_string()],
             updated_at: None,
         }),
     });
 
-    assert!(!app.posting_comment);
+    assert!(!app.item_edit_running);
+    assert!(app.item_edit_dialog.is_none());
     assert_eq!(app.sections[0].items[0].title, "New title");
     assert_eq!(app.sections[0].items[0].body.as_deref(), Some("New body"));
+    assert_eq!(app.sections[0].items[0].labels, vec!["bug".to_string()]);
+    assert_eq!(
+        app.sections[0].items[0].assignees,
+        vec!["alice".to_string()]
+    );
     assert!(app.details_stale.contains("1"));
-    assert_eq!(app.status, "title updated");
+    assert_eq!(app.status, "item updated");
     assert_eq!(
         app.message_dialog
             .as_ref()
             .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
-        Some((
-            "Title Updated",
-            "GitHub accepted the update and the current item was refreshed."
-        ))
+        Some(("Item Updated", "GitHub accepted the item update."))
     );
 }
 
 #[test]
-fn item_metadata_update_failure_reports_status() {
+fn item_edit_update_failure_reports_status() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.posting_comment = true;
+    app.item_edit_running = true;
 
-    app.handle_msg(AppMsg::ItemMetadataUpdated {
+    app.handle_msg(AppMsg::ItemEdited {
         item_id: "1".to_string(),
-        field: ItemEditField::Body,
         result: Err("gh api repos/owner/repo/issues/1 failed: validation failed".to_string()),
     });
 
-    assert!(!app.posting_comment);
-    assert_eq!(app.status, "body update failed");
+    assert!(!app.item_edit_running);
+    assert_eq!(app.status, "item update failed");
     let dialog = app.message_dialog.as_ref().expect("failure dialog");
-    assert_eq!(dialog.title, "Body Update Failed");
-    assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+    assert_eq!(dialog.title, "Item Update Failed");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
     assert!(dialog.body.contains("validation failed"));
     assert!(dialog.auto_close_at.is_none());
 }
@@ -16109,6 +16301,7 @@ fn details_comment_bodies_are_not_truncated() {
             url: None,
             parent_id: None,
             is_mine: false,
+            viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
         }]),
@@ -18611,6 +18804,7 @@ fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         url: url.map(str::to_string),
         parent_id: None,
         is_mine: false,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     }
@@ -18627,6 +18821,7 @@ fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentP
         url: url.map(str::to_string),
         parent_id: None,
         is_mine: true,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tokio::process::Command as TokioCommand;
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::text::truncate_text;
 use crate::config::{Config, github_repo_from_remote_url};
@@ -49,6 +49,12 @@ pub(super) async fn run_pr_checkout(
                 error = %error,
                 "gh request failed to start"
             );
+            error!(
+                command = %command,
+                cwd = %directory.display(),
+                error = %error,
+                "gh request failed to start"
+            );
             if error.kind() == io::ErrorKind::NotFound {
                 format!(
                     "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
@@ -78,6 +84,15 @@ pub(super) async fn run_pr_checkout(
         } else {
             output_text
         };
+        error!(
+            command = %command,
+            cwd = %directory.display(),
+            status = %output.status,
+            message = %truncate_text(&detail, 900),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request returned failure"
+        );
         return Err(format!(
             "{} failed.\n\n{}\n\n{}",
             command,

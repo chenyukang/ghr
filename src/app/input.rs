@@ -358,7 +358,7 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if app.item_edit_dialog.is_some() {
-        app.handle_item_edit_dialog_key(key);
+        app.handle_item_edit_dialog_key(key, tx, area);
         return false;
     }
 
@@ -467,7 +467,7 @@ pub(super) fn handle_key_in_area_mut(
         KeyCode::BackTab => app.move_focused_tab_group(-1),
         KeyCode::Char('o') => app.open_selected(),
         _ if is_ignore_key(key) => app.ignore_current_item(),
-        KeyCode::Char('T') => app.start_item_edit_dialog(),
+        KeyCode::Char('T') => app.start_item_edit_dialog_with_store(Some(store), Some(tx)),
         _ => {}
     }
 
@@ -553,6 +553,7 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Char('U') => app.start_pr_action_dialog(PrAction::UpdateBranch),
             KeyCode::Char('X') => app.start_pr_checkout_dialog(config),
             KeyCode::Char('F') => app.start_pr_action_dialog(PrAction::RerunFailedChecks),
+            KeyCode::Char('e') => app.start_item_edit_dialog_with_store(Some(store), Some(tx)),
             KeyCode::Char('t') => app.start_milestone_dialog(tx),
             KeyCode::Char('P') => {
                 app.start_reviewer_dialog_with_store(ReviewerAction::Request, Some(store), Some(tx))
@@ -638,7 +639,7 @@ pub(super) fn handle_key_in_area_mut(
                 app.start_keyboard_reaction_dialog(area)
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
-                app.start_edit_selected_comment_dialog()
+                app.start_item_edit_dialog_with_store(Some(store), Some(tx))
             }
             KeyCode::Char('n') => app.move_comment_in_view(1, area),
             KeyCode::Char('p') => app.move_comment_in_view(-1, area),

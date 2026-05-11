@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SearchSection};
 use crate::model::{
@@ -192,7 +192,7 @@ fn debug_log_gh_request_finished(
     }
 }
 
-fn debug_log_gh_request_failed_to_start(
+fn log_gh_request_failed_to_start(
     args: &[String],
     directory: Option<&Path>,
     error: &std::io::Error,
@@ -207,6 +207,13 @@ fn debug_log_gh_request_failed_to_start(
             error = %error,
             "gh request failed to start"
         );
+        error!(
+            kind,
+            command = %command,
+            cwd = %directory.display(),
+            error = %error,
+            "gh request failed to start"
+        );
     } else {
         debug!(
             kind,
@@ -214,7 +221,65 @@ fn debug_log_gh_request_failed_to_start(
             error = %error,
             "gh request failed to start"
         );
+        error!(
+            kind,
+            command = %command,
+            error = %error,
+            "gh request failed to start"
+        );
     }
+}
+
+fn log_gh_request_failed_result(
+    args: &[String],
+    directory: Option<&Path>,
+    output: &std::process::Output,
+) {
+    let kind = gh_request_kind(args);
+    let command = gh_command_display(args);
+    if let Some(directory) = directory {
+        error!(
+            kind,
+            command = %command,
+            cwd = %directory.display(),
+            status = %output.status,
+            message = %gh_output_message(output),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request returned failure"
+        );
+    } else {
+        error!(
+            kind,
+            command = %command,
+            status = %output.status,
+            message = %gh_output_message(output),
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "gh request returned failure"
+        );
+    }
+}
+
+fn gh_output_message(output: &std::process::Output) -> String {
+    gh_output_message_from_parts(&output.stdout, &output.stderr)
+}
+
+fn gh_output_message_from_parts(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    truncate_gh_output_message(&message)
+}
+
+fn truncate_gh_output_message(message: &str) -> String {
+    const MAX_CHARS: usize = 1200;
+    if message.chars().count() <= MAX_CHARS {
+        return message.to_string();
+    }
+    let mut truncated = message.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,6 +481,7 @@ struct IssueCommentRaw {
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    viewer_can_update: Option<bool>,
     reactions: Option<ReactionSummaryRaw>,
     user: Option<SearchAuthorRaw>,
 }
@@ -429,6 +495,7 @@ struct PullRequestReviewCommentRaw {
     html_url: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    viewer_can_update: Option<bool>,
     reactions: Option<ReactionSummaryRaw>,
     user: Option<SearchAuthorRaw>,
     path: Option<String>,
@@ -481,6 +548,14 @@ struct PullRequestTimelineCommit {
 struct ReviewThreadState {
     is_resolved: bool,
     is_outdated: bool,
+    viewer_can_update: Option<bool>,
+}
+
+impl ReviewThreadState {
+    fn with_viewer_can_update(mut self, viewer_can_update: Option<bool>) -> Self {
+        self.viewer_can_update = viewer_can_update;
+        self
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +605,44 @@ struct PullRequestReviewThreadCommentConnectionRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestReviewThreadCommentRaw {
     database_id: Option<u64>,
+    viewer_can_update: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentPermissionsGraphQlRaw {
+    data: IssueCommentPermissionsDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueCommentPermissionsDataRaw {
+    repository: Option<IssueCommentPermissionsRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentPermissionsRepositoryRaw {
+    issue: Option<IssueCommentPermissionsCommentableRaw>,
+    pull_request: Option<IssueCommentPermissionsCommentableRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueCommentPermissionsCommentableRaw {
+    comments: IssueCommentPermissionConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentPermissionConnectionRaw {
+    nodes: Option<Vec<IssueCommentPermissionRaw>>,
+    page_info: GraphQlPageInfoRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentPermissionRaw {
+    database_id: Option<u64>,
+    viewer_can_update: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1665,15 +1778,29 @@ pub async fn fetch_comments(
 pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<CommentFetchResult> {
     let issue_output = fetch_issue_details_output(repository, number);
     let comments_output = fetch_issue_comments_output(repository, number);
+    let comment_permissions = fetch_issue_comment_permissions(repository, number, ItemKind::Issue);
     let viewer_login = comment_viewer_login("comment ownership");
     let viewer_subscription =
         fetch_item_subscription_state_optional(repository, number, ItemKind::Issue);
-    let (issue_output, comments_output, viewer_login, viewer_subscription) = tokio::join!(
+    let (issue_output, comments_output, comment_permissions, viewer_login, viewer_subscription) = tokio::join!(
         issue_output,
         comments_output,
+        comment_permissions,
         viewer_login,
         viewer_subscription
     );
+    let comment_permissions = match comment_permissions {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load issue comment edit permissions"
+            );
+            HashMap::new()
+        }
+    };
     let mut issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
     if let Some(metadata) = issue_details.item_metadata.as_mut() {
         metadata.viewer_subscription = viewer_subscription;
@@ -1687,6 +1814,7 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
             repository,
             number,
             viewer_login.as_deref(),
+            &comment_permissions,
         )?,
     })
 }
@@ -1715,12 +1843,82 @@ async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<St
     .await
 }
 
+async fn fetch_issue_comment_permissions(
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<HashMap<u64, bool>> {
+    let (owner, name) = split_repository(repository)?;
+    let commentable_field = match kind {
+        ItemKind::Issue => "issue",
+        ItemKind::PullRequest => "pullRequest",
+        ItemKind::Notification => return Ok(HashMap::new()),
+    };
+    let query = format!(
+        r#"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {{
+  repository(owner: $owner, name: $name) {{
+    {commentable_field}(number: $number) {{
+      comments(first: 100, after: $cursor) {{
+        pageInfo {{
+          hasNextPage
+          endCursor
+        }}
+        nodes {{
+          databaseId
+          viewerCanUpdate
+        }}
+      }}
+    }}
+  }}
+}}
+"#
+    );
+    let mut cursor = None;
+    let mut permissions = HashMap::new();
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+
+        let output = run_gh_json(&args).await?;
+        let (page_permissions, has_next_page, end_cursor) =
+            parse_issue_comment_permissions_page(&output, repository, number, kind)?;
+        permissions.extend(page_permissions);
+        if !has_next_page {
+            break;
+        }
+        let Some(next_cursor) = end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(permissions)
+}
+
 pub async fn fetch_pull_request_comments(
     repository: &str,
     number: u64,
 ) -> Result<CommentFetchResult> {
     let issue_details = fetch_issue_details_output(repository, number);
     let issue_comments = fetch_issue_comments_output(repository, number);
+    let issue_comment_permissions =
+        fetch_issue_comment_permissions(repository, number, ItemKind::PullRequest);
     let review_comments = fetch_pull_request_review_comments_output(repository, number);
     let review_thread_states = fetch_pull_request_review_thread_states(repository, number);
     let timeline = fetch_pull_request_timeline_output(repository, number);
@@ -1730,6 +1928,7 @@ pub async fn fetch_pull_request_comments(
     let (
         issue_details,
         issue_output,
+        issue_comment_permissions,
         review_output,
         review_thread_states,
         timeline_output,
@@ -1738,6 +1937,7 @@ pub async fn fetch_pull_request_comments(
     ) = tokio::join!(
         issue_details,
         issue_comments,
+        issue_comment_permissions,
         review_comments,
         review_thread_states,
         timeline,
@@ -1745,8 +1945,25 @@ pub async fn fetch_pull_request_comments(
         viewer_subscription
     );
     let viewer_login = viewer_login.as_deref();
-    let mut comments =
-        parse_issue_comments_output(&issue_output?, repository, number, viewer_login)?;
+    let issue_comment_permissions = match issue_comment_permissions {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load pull request conversation comment edit permissions"
+            );
+            HashMap::new()
+        }
+    };
+    let mut comments = parse_issue_comments_output(
+        &issue_output?,
+        repository,
+        number,
+        viewer_login,
+        &issue_comment_permissions,
+    )?;
     let review_thread_states = match review_thread_states {
         Ok(states) => states,
         Err(error) => {
@@ -1851,6 +2068,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           comments(first: 100) {
             nodes {
               databaseId
+              viewerCanUpdate
             }
           }
         }
@@ -2075,7 +2293,7 @@ async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
         .output()
         .await
         .map_err(|error| {
-            debug_log_gh_request_failed_to_start(args, None, &error);
+            log_gh_request_failed_to_start(args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
@@ -2083,6 +2301,10 @@ async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
             }
         })?;
     debug_log_gh_request_finished(args, None, &output);
+
+    if !output.status.success() {
+        log_gh_request_failed_result(args, None, &output);
+    }
 
     if !output.status.success() && output.stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2123,7 +2345,7 @@ pub async fn post_issue_comment(
     .await?;
     let comment = serde_json::from_str::<IssueCommentRaw>(&output)
         .with_context(|| format!("failed to parse posted comment for {repository}#{number}"))?;
-    Ok(issue_comment_preview(comment, None, true))
+    Ok(issue_comment_preview(comment, None, true, &HashMap::new()))
 }
 
 pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
@@ -3274,13 +3496,14 @@ fn parse_issue_comments_output(
     repository: &str,
     number: u64,
     viewer_login: Option<&str>,
+    permissions: &HashMap<u64, bool>,
 ) -> Result<Vec<CommentPreview>> {
     let pages = serde_json::from_str::<Vec<Vec<IssueCommentRaw>>>(output)
         .with_context(|| format!("failed to parse comments for {repository}#{number}"))?;
     let mut comments = pages
         .into_iter()
         .flatten()
-        .map(|comment| issue_comment_preview(comment, viewer_login, false))
+        .map(|comment| issue_comment_preview(comment, viewer_login, false, permissions))
         .collect::<Vec<_>>();
 
     comments.sort_by_key(|comment| comment.created_at);
@@ -3291,6 +3514,7 @@ fn issue_comment_preview(
     comment: IssueCommentRaw,
     viewer_login: Option<&str>,
     mine_if_viewer_unknown: bool,
+    permissions: &HashMap<u64, bool>,
 ) -> CommentPreview {
     let author = comment
         .user
@@ -3301,6 +3525,10 @@ fn issue_comment_preview(
     let is_mine = viewer_login
         .map(|viewer| author.eq_ignore_ascii_case(viewer))
         .unwrap_or(mine_if_viewer_unknown);
+    let viewer_can_update = comment
+        .id
+        .and_then(|id| permissions.get(&id).copied())
+        .or(comment.viewer_can_update);
     CommentPreview {
         id: comment.id,
         kind: CommentPreviewKind::Comment,
@@ -3311,6 +3539,7 @@ fn issue_comment_preview(
         url: comment.html_url,
         parent_id: None,
         is_mine,
+        viewer_can_update,
         reactions: comment
             .reactions
             .map(ReactionSummary::from)
@@ -3418,6 +3647,7 @@ fn pull_request_review_comment_preview(
     let is_mine = viewer_login
         .map(|viewer| author.eq_ignore_ascii_case(viewer))
         .unwrap_or(mine_if_viewer_unknown);
+    let viewer_can_update = thread_state.viewer_can_update.or(comment.viewer_can_update);
     CommentPreview {
         id: comment.id,
         kind: CommentPreviewKind::Comment,
@@ -3428,6 +3658,7 @@ fn pull_request_review_comment_preview(
         url: comment.html_url,
         parent_id: comment.in_reply_to_id,
         is_mine,
+        viewer_can_update,
         reactions: comment
             .reactions
             .map(ReactionSummary::from)
@@ -3559,6 +3790,7 @@ fn pull_request_timeline_review_summary_comment(
         url: event.html_url,
         parent_id: None,
         is_mine: false,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     })
@@ -3656,6 +3888,7 @@ fn pull_request_commit_activity_comment(
         )),
         parent_id: None,
         is_mine: false,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     }
@@ -3700,10 +3933,11 @@ fn parse_pull_request_review_thread_states_page(
         let state = ReviewThreadState {
             is_resolved: thread.is_resolved,
             is_outdated: thread.is_outdated,
+            viewer_can_update: None,
         };
         for comment in thread.comments.nodes.unwrap_or_default() {
             if let Some(id) = comment.database_id {
-                states.insert(id, state);
+                states.insert(id, state.with_viewer_can_update(comment.viewer_can_update));
             }
         }
     }
@@ -3712,6 +3946,42 @@ fn parse_pull_request_review_thread_states_page(
         states,
         threads.page_info.has_next_page,
         threads.page_info.end_cursor,
+    ))
+}
+
+fn parse_issue_comment_permissions_page(
+    output: &str,
+    repository: &str,
+    number: u64,
+    kind: ItemKind,
+) -> Result<(HashMap<u64, bool>, bool, Option<String>)> {
+    let raw =
+        serde_json::from_str::<IssueCommentPermissionsGraphQlRaw>(output).with_context(|| {
+            format!("failed to parse comment permissions for {repository}#{number}")
+        })?;
+    let repository_node = raw
+        .data
+        .repository
+        .ok_or_else(|| anyhow!("repository {repository} was not found"))?;
+    let comments = match kind {
+        ItemKind::Issue => repository_node.issue,
+        ItemKind::PullRequest => repository_node.pull_request,
+        ItemKind::Notification => None,
+    }
+    .ok_or_else(|| anyhow!("{kind:?} {repository}#{number} was not found"))?
+    .comments;
+
+    let permissions = comments
+        .nodes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|comment| Some((comment.database_id?, comment.viewer_can_update?)))
+        .collect::<HashMap<_, _>>();
+
+    Ok((
+        permissions,
+        comments.page_info.has_next_page,
+        comments.page_info.end_cursor,
     ))
 }
 
@@ -3926,7 +4196,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
         .output()
         .await
         .map_err(|error| {
-            debug_log_gh_request_failed_to_start(args, None, &error);
+            log_gh_request_failed_to_start(args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
@@ -3936,6 +4206,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
     debug_log_gh_request_finished(args, None, &output);
 
     if !output.status.success() {
+        log_gh_request_failed_result(args, None, &output);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let message = if stderr.is_empty() { stdout } else { stderr };
@@ -3955,7 +4226,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
         .output()
         .await
         .map_err(|error| {
-            debug_log_gh_request_failed_to_start(args, Some(directory), &error);
+            log_gh_request_failed_to_start(args, Some(directory), &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
@@ -3969,6 +4240,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
     debug_log_gh_request_finished(args, Some(directory), &output);
 
     if !output.status.success() {
+        log_gh_request_failed_result(args, Some(directory), &output);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let message = if stderr.is_empty() { stdout } else { stderr };
@@ -5037,6 +5309,22 @@ mod tests {
     }
 
     #[test]
+    fn gh_output_message_prefers_stderr() {
+        assert_eq!(
+            gh_output_message_from_parts(b"{\"state\":\"failure\"}", b"HTTP 403\n"),
+            "HTTP 403"
+        );
+    }
+
+    #[test]
+    fn gh_output_message_uses_stdout_when_stderr_is_empty() {
+        assert_eq!(
+            gh_output_message_from_parts(b"{\"state\":\"failure\"}\n", b""),
+            "{\"state\":\"failure\"}"
+        );
+    }
+
+    #[test]
     fn wildcard_excludes_repositories() {
         assert!(wildcard_match("nervosnetwork/*", "nervosnetwork/ckb"));
         assert!(wildcard_match("*/sandbox", "me/sandbox"));
@@ -5692,7 +5980,8 @@ mod tests {
             "user": { "login": "alice" }
           }]
         ]"##;
-        let comments = parse_issue_comments_output(output, "owner/repo", 1, None).unwrap();
+        let comments =
+            parse_issue_comments_output(output, "owner/repo", 1, None, &HashMap::new()).unwrap();
         assert_eq!(comments[0].reactions.plus_one, 2);
         assert_eq!(comments[0].reactions.rocket, 1);
     }
@@ -5855,6 +6144,7 @@ mod tests {
               "html_url": "https://github.com/owner/repo/issues/1#issuecomment-2",
               "created_at": "2026-01-03T00:00:00Z",
               "updated_at": "2026-01-03T00:00:00Z",
+              "viewer_can_update": false,
               "user": { "login": "bob" }
             }
           ],
@@ -5871,7 +6161,14 @@ mod tests {
         ]
         "##;
 
-        let comments = parse_issue_comments_output(output, "owner/repo", 1, Some("bob")).unwrap();
+        let comments = parse_issue_comments_output(
+            output,
+            "owner/repo",
+            1,
+            Some("bob"),
+            &HashMap::from([(1, true)]),
+        )
+        .unwrap();
 
         assert_eq!(comments.len(), 3);
         assert_eq!(
@@ -5894,6 +6191,13 @@ mod tests {
                 .map(|comment| comment.is_mine)
                 .collect::<Vec<_>>(),
             vec![false, false, true]
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.can_edit())
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
         );
         assert!(comments.iter().all(|comment| comment.review.is_none()));
     }
@@ -5934,6 +6238,7 @@ mod tests {
                 ReviewThreadState {
                     is_resolved: true,
                     is_outdated: false,
+                    viewer_can_update: Some(true),
                 },
             )]),
         )
@@ -5945,6 +6250,7 @@ mod tests {
         assert_eq!(comment.parent_id, Some(8));
         assert_eq!(comment.author, "alice");
         assert!(comment.is_mine);
+        assert!(comment.can_edit());
         let review = comment.review.as_ref().expect("review metadata");
         assert_eq!(review.path, "src/app.rs");
         assert_eq!(review.line, Some(57));
@@ -6100,8 +6406,8 @@ mod tests {
                       "isOutdated": false,
                       "comments": {
                         "nodes": [
-                          { "databaseId": 10 },
-                          { "databaseId": 11 }
+                          { "databaseId": 10, "viewerCanUpdate": true },
+                          { "databaseId": 11, "viewerCanUpdate": false }
                         ]
                       }
                     },
@@ -6132,6 +6438,7 @@ mod tests {
             Some(&ReviewThreadState {
                 is_resolved: true,
                 is_outdated: false,
+                viewer_can_update: Some(true),
             })
         );
         assert_eq!(
@@ -6139,8 +6446,41 @@ mod tests {
             Some(&ReviewThreadState {
                 is_resolved: false,
                 is_outdated: true,
+                viewer_can_update: None,
             })
         );
+    }
+
+    #[test]
+    fn issue_comment_permissions_parse_viewer_can_update() {
+        let output = r#"
+        {
+          "data": {
+            "repository": {
+              "issue": {
+                "comments": {
+                  "pageInfo": {
+                    "hasNextPage": false,
+                    "endCursor": null
+                  },
+                  "nodes": [
+                    { "databaseId": 1, "viewerCanUpdate": true },
+                    { "databaseId": 2, "viewerCanUpdate": false }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        "#;
+
+        let (permissions, has_next, cursor) =
+            parse_issue_comment_permissions_page(output, "owner/repo", 1, ItemKind::Issue).unwrap();
+
+        assert!(!has_next);
+        assert_eq!(cursor, None);
+        assert_eq!(permissions.get(&1), Some(&true));
+        assert_eq!(permissions.get(&2), Some(&false));
     }
 
     #[test]

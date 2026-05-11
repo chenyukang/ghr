@@ -401,9 +401,10 @@ impl AppState {
     }
 
     pub(super) fn recent_item_candidates_for_query(&self, query: &str) -> Vec<RecentItem> {
+        let query_is_empty = query.trim().is_empty();
         self.recent_items
             .iter()
-            .filter(|item| !self.recent_item_matches_current_item(item))
+            .filter(|item| !query_is_empty || !self.recent_item_matches_current_item(item))
             .filter(|item| recent_item_matches_query(item, query))
             .cloned()
             .collect()

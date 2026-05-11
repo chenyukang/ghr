@@ -678,18 +678,18 @@ struct NewPrDraft {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemEditField {
     Title,
-    Body,
     Assignees,
     Labels,
+    Body,
 }
 
 impl ItemEditField {
     fn next(self, delta: isize) -> Self {
         const FIELDS: [ItemEditField; 4] = [
             ItemEditField::Title,
-            ItemEditField::Body,
             ItemEditField::Assignees,
             ItemEditField::Labels,
+            ItemEditField::Body,
         ];
         let index = FIELDS.iter().position(|field| *field == self).unwrap_or(0);
         let next = move_wrapping(index, FIELDS.len(), delta);
@@ -699,9 +699,9 @@ impl ItemEditField {
     fn label(self) -> &'static str {
         match self {
             Self::Title => "title",
-            Self::Body => "body",
-            Self::Assignees => "assignees",
+            Self::Assignees => "assign",
             Self::Labels => "labels",
+            Self::Body => "body",
         }
     }
 }
@@ -7974,7 +7974,7 @@ impl AppState {
         let Some(dialog) = &mut self.item_edit_dialog else {
             return;
         };
-        let (width, height) = item_edit_body_editor_size(area);
+        let (width, height) = item_edit_body_editor_size(area, dialog.field);
         let max_scroll = max_comment_dialog_scroll(dialog.body.text(), width, height);
         if delta < 0 {
             dialog.body_scroll = dialog.body_scroll.saturating_sub(delta.unsigned_abs());
@@ -7986,7 +7986,7 @@ impl AppState {
 
     fn scroll_item_edit_body_to_cursor_in_area(&mut self, area: Option<Rect>) {
         if let Some(dialog) = &mut self.item_edit_dialog {
-            let (width, height) = item_edit_body_editor_size(area);
+            let (width, height) = item_edit_body_editor_size(area, dialog.field);
             dialog.body_scroll = scroll_for_comment_dialog_cursor(
                 dialog.body.text(),
                 dialog.body.cursor_byte(),

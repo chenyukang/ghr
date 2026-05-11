@@ -2755,21 +2755,48 @@ pub(super) fn draw_item_edit_dialog(
     let dialog_area = item_edit_dialog_area(area);
     let inner = block_inner(dialog_area);
     let editor_width = inner.width.max(1);
-    let editor_height = item_edit_body_editor_height(dialog_area);
+    let layout = item_edit_layout_rows(dialog.field);
+    let editor_height = item_edit_body_editor_height(dialog_area, dialog.field);
     let body_lines = comment_dialog_body_lines(dialog.body.text(), editor_width);
     let max_scroll = max_comment_dialog_scroll(dialog.body.text(), editor_width, editor_height);
     let scroll = dialog.body_scroll.min(max_scroll);
-    let mut lines = vec![
-        item_edit_field_input_line(
-            "Title",
-            dialog.title.text(),
-            ItemEditField::Title,
-            dialog.field,
-            editor_width,
-        ),
-        issue_dialog_separator_line(editor_width),
-        item_edit_field_label("Body", ItemEditField::Body, dialog.field),
-    ];
+    let mut lines = vec![item_edit_field_input_line(
+        "Title",
+        dialog.title.text(),
+        ItemEditField::Title,
+        dialog.field,
+        editor_width,
+    )];
+    lines.push(issue_dialog_separator_line(editor_width));
+    lines.push(item_edit_collection_input_line(
+        "Assign",
+        &dialog.assignees,
+        &dialog.assignee_input,
+        ItemEditField::Assignees,
+        dialog.field,
+        editor_width,
+    ));
+    if dialog.field == ItemEditField::Assignees {
+        item_edit_push_assignee_suggestions(lines.as_mut(), dialog);
+    }
+    lines.push(issue_dialog_separator_line(editor_width));
+    lines.push(item_edit_collection_input_line(
+        "Labels",
+        &dialog.labels,
+        &dialog.label_input,
+        ItemEditField::Labels,
+        dialog.field,
+        editor_width,
+    ));
+    if dialog.field == ItemEditField::Labels {
+        item_edit_push_label_suggestions(lines.as_mut(), dialog);
+    }
+    lines.push(issue_dialog_separator_line(editor_width));
+    lines.push(item_edit_field_label(
+        "Body",
+        ItemEditField::Body,
+        dialog.field,
+    ));
     lines.extend(
         body_lines
             .into_iter()
@@ -2777,41 +2804,9 @@ pub(super) fn draw_item_edit_dialog(
             .take(usize::from(editor_height))
             .map(Line::from),
     );
-    while lines.len() < usize::from(3 + editor_height) {
+    while lines.len() < usize::from(layout.reserved_rows.saturating_add(editor_height)) {
         lines.push(Line::from(""));
     }
-    lines.push(issue_dialog_separator_line(editor_width));
-    lines.push(item_edit_collection_line(
-        "Assignees",
-        &dialog.assignees,
-        ItemEditField::Assignees,
-        dialog.field,
-        editor_width,
-    ));
-    lines.push(item_edit_plain_input_line(
-        "Assignee",
-        &dialog.assignee_input,
-        ItemEditField::Assignees,
-        dialog.field,
-        editor_width,
-    ));
-    item_edit_push_assignee_suggestions(lines.as_mut(), dialog);
-    lines.push(issue_dialog_separator_line(editor_width));
-    lines.push(item_edit_collection_line(
-        "Labels",
-        &dialog.labels,
-        ItemEditField::Labels,
-        dialog.field,
-        editor_width,
-    ));
-    lines.push(item_edit_plain_input_line(
-        "Label",
-        &dialog.label_input,
-        ItemEditField::Labels,
-        dialog.field,
-        editor_width,
-    ));
-    item_edit_push_label_suggestions(lines.as_mut(), dialog);
     let footer = if running {
         "working..."
     } else {
@@ -2840,21 +2835,64 @@ pub(super) fn draw_item_edit_dialog(
     }
 }
 
+// Keep these fixed row offsets in sync with draw_item_edit_dialog's line order.
+const ITEM_EDIT_TITLE_ROW: u16 = 0;
+const ITEM_EDIT_ASSIGN_ROW: u16 = 2;
+const ITEM_EDIT_SUGGESTION_ROWS: u16 = 4;
+const ITEM_EDIT_BODY_TRAILING_ROWS: u16 = 2;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ItemEditLayoutRows {
+    labels: u16,
+    body_text: u16,
+    reserved_rows: u16,
+}
+
+pub(super) fn item_edit_layout_rows(field: ItemEditField) -> ItemEditLayoutRows {
+    let mut row = ITEM_EDIT_TITLE_ROW.saturating_add(1);
+    row = row.saturating_add(1); // separator after Title
+
+    row = row.saturating_add(1); // Assign field
+    if field == ItemEditField::Assignees {
+        row = row.saturating_add(ITEM_EDIT_SUGGESTION_ROWS);
+    }
+    row = row.saturating_add(1); // separator after Assign
+
+    let labels = row;
+    row = row.saturating_add(1); // Labels field
+    if field == ItemEditField::Labels {
+        row = row.saturating_add(ITEM_EDIT_SUGGESTION_ROWS);
+    }
+    row = row.saturating_add(1); // separator after Labels
+
+    row = row.saturating_add(1); // Body label
+    let body_text = row;
+
+    ItemEditLayoutRows {
+        labels,
+        body_text,
+        reserved_rows: body_text.saturating_add(ITEM_EDIT_BODY_TRAILING_ROWS),
+    }
+}
+
 pub(super) fn item_edit_dialog_area(area: Rect) -> Rect {
     centered_rect(84, 28, area)
 }
 
-pub(super) fn item_edit_body_editor_height(dialog_area: Rect) -> u16 {
-    block_inner(dialog_area).height.saturating_sub(17).max(4)
+pub(super) fn item_edit_body_editor_height(dialog_area: Rect, field: ItemEditField) -> u16 {
+    block_inner(dialog_area)
+        .height
+        .saturating_sub(item_edit_layout_rows(field).reserved_rows)
+        .max(4)
 }
 
-pub(super) fn item_edit_body_editor_size(area: Option<Rect>) -> (u16, u16) {
+pub(super) fn item_edit_body_editor_size(area: Option<Rect>, field: ItemEditField) -> (u16, u16) {
     match area {
         Some(area) => {
             let dialog_area = item_edit_dialog_area(area);
             (
                 block_inner(dialog_area).width.max(1),
-                item_edit_body_editor_height(dialog_area),
+                item_edit_body_editor_height(dialog_area, field),
             )
         }
         None => (COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH, 6),
@@ -2880,16 +2918,6 @@ fn item_edit_field_input_line(
     ])
 }
 
-fn item_edit_plain_input_line(
-    label: &'static str,
-    value: &str,
-    field: ItemEditField,
-    current: ItemEditField,
-    width: u16,
-) -> Line<'static> {
-    item_edit_field_input_line(label, value, field, current, width)
-}
-
 fn item_edit_field_label(
     label: &'static str,
     field: ItemEditField,
@@ -2901,19 +2929,16 @@ fn item_edit_field_label(
     ))
 }
 
-fn item_edit_collection_line(
+fn item_edit_collection_input_line(
     label: &'static str,
     values: &[String],
+    input: &str,
     field: ItemEditField,
     current: ItemEditField,
     width: u16,
 ) -> Line<'static> {
     let prefix = issue_dialog_field_prefix(label);
-    let value = if values.is_empty() {
-        "-".to_string()
-    } else {
-        values.join(", ")
-    };
+    let value = item_edit_collection_input_text(values, input);
     let value_width =
         width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
     Line::from(vec![
@@ -2923,6 +2948,16 @@ fn item_edit_collection_line(
             active_theme().panel(),
         ),
     ])
+}
+
+fn item_edit_collection_input_text(values: &[String], input: &str) -> String {
+    let value = match (values.is_empty(), input.is_empty()) {
+        (true, true) => "-".to_string(),
+        (false, true) => values.join(", "),
+        (true, false) => input.to_string(),
+        (false, false) => format!("{}, {}", values.join(", "), input),
+    };
+    issue_dialog_input_text(&value, u16::MAX)
 }
 
 fn item_edit_field_label_style(field: ItemEditField, current: ItemEditField) -> Style {
@@ -3030,19 +3065,7 @@ pub(super) fn item_edit_dialog_cursor_position(
 ) -> Option<Position> {
     let inner = block_inner(dialog_area);
     let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
-    let field_position = |label: &'static str, value: &str, y_offset: u16| {
-        let prefix_width =
-            display_width(&issue_dialog_field_prefix(label)).min(usize::from(u16::MAX)) as u16;
-        Position::new(
-            clamp_x(
-                inner
-                    .x
-                    .saturating_add(prefix_width)
-                    .saturating_add(display_width(value).min(usize::from(u16::MAX)) as u16),
-            ),
-            inner.y.saturating_add(y_offset),
-        )
-    };
+    let layout = item_edit_layout_rows(dialog.field);
     match dialog.field {
         ItemEditField::Title => Some(Position::new(
             clamp_x(
@@ -3057,7 +3080,7 @@ pub(super) fn item_edit_dialog_cursor_position(
                         dialog.title.cursor_byte(),
                     )),
             ),
-            inner.y,
+            inner.y.saturating_add(ITEM_EDIT_TITLE_ROW),
         )),
         ItemEditField::Body => {
             let (line, column) = comment_dialog_cursor_offset_at(
@@ -3071,20 +3094,51 @@ pub(super) fn item_edit_dialog_cursor_position(
             }
             Some(Position::new(
                 clamp_x(inner.x.saturating_add(column)),
-                inner.y.saturating_add(3).saturating_add(line - scroll),
+                inner
+                    .y
+                    .saturating_add(layout.body_text)
+                    .saturating_add(line - scroll),
             ))
         }
-        ItemEditField::Assignees => Some(field_position(
-            "Assignee",
-            &dialog.assignee_input,
-            editor_height.saturating_add(5),
-        )),
-        ItemEditField::Labels => Some(field_position(
-            "Label",
-            &dialog.label_input,
-            editor_height.saturating_add(12),
-        )),
+        ItemEditField::Assignees => {
+            let prefix_width = display_width(&issue_dialog_field_prefix("Assign"))
+                .min(usize::from(u16::MAX)) as u16;
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(prefix_width).saturating_add(
+                    item_edit_collection_cursor_width(
+                        &dialog.assignees,
+                        &dialog.assignee_input,
+                        dialog.assignee_input.len(),
+                    ),
+                )),
+                inner.y.saturating_add(ITEM_EDIT_ASSIGN_ROW),
+            ))
+        }
+        ItemEditField::Labels => {
+            let prefix_width = display_width(&issue_dialog_field_prefix("Labels"))
+                .min(usize::from(u16::MAX)) as u16;
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(prefix_width).saturating_add(
+                    item_edit_collection_cursor_width(
+                        &dialog.labels,
+                        &dialog.label_input,
+                        dialog.label_input.len(),
+                    ),
+                )),
+                inner.y.saturating_add(layout.labels),
+            ))
+        }
     }
+}
+
+fn item_edit_collection_cursor_width(values: &[String], input: &str, input_cursor: usize) -> u16 {
+    let selected_width = if values.is_empty() {
+        0
+    } else {
+        display_width(&values.join(", ")).min(usize::from(u16::MAX)) as u16
+            + if input.is_empty() { 0 } else { 2 }
+    };
+    selected_width.saturating_add(text_before_cursor_width(input, input_cursor))
 }
 
 pub(super) fn item_edit_label_suggestion_matches(dialog: &ItemEditDialog) -> Vec<String> {

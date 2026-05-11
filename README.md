@@ -118,8 +118,8 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
-| `e` | Edit the selected issue or PR title/body/assignees/labels; in diff mode, end a review range |
-| `T` | Edit the selected issue or PR title/body/assignees/labels |
+| `e` | Edit the selected issue or PR title, assignees, labels, and body; in diff mode, end a review range |
+| `T` | Edit the selected issue or PR title, assignees, labels, and body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close or reopen confirmation for the selected issue or PR |

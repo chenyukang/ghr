@@ -13918,13 +13918,110 @@ fn item_edit_form_prefills_editable_fields_without_repo_or_number() {
     let paths = test_paths();
     terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-    assert!(rendered.contains("Title:"));
-    assert!(rendered.contains("Body:"));
-    assert!(rendered.contains("Assignees:"));
-    assert!(rendered.contains("Labels:"));
+    let title_index = rendered.find("Title:").expect("title field");
+    let assign_index = rendered.find("Assign:").expect("assign field");
+    let labels_index = rendered.find("Labels:").expect("labels field");
+    let body_index = rendered.find("Body:").expect("body field");
+    assert!(title_index < assign_index);
+    assert!(assign_index < labels_index);
+    assert!(labels_index < body_index);
+    assert!(!rendered.contains("Assignees:"));
+    assert!(!rendered.contains("Assignee:"));
+    assert!(!rendered.contains("Label:"));
     assert!(!rendered.contains("repo:"));
     assert!(!rendered.contains("pull request:"));
     assert!(!rendered.contains("item: #"));
+}
+
+#[test]
+fn item_edit_cursor_positions_match_rendered_field_rows() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let area = Rect::new(0, 0, 120, 34);
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = item_edit_body_editor_height(dialog_area, ItemEditField::Labels);
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Labels;
+    app.item_edit_dialog.as_mut().expect("dialog").label_input = "bu".to_string();
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let lines = buffer_lines(terminal.backend().buffer());
+    let labels_y = lines
+        .iter()
+        .position(|line| line.contains("Labels:"))
+        .expect("labels line") as u16;
+    let labels_cursor = item_edit_dialog_cursor_position(
+        app.item_edit_dialog.as_ref().expect("dialog"),
+        0,
+        dialog_area,
+        editor_width,
+        editor_height,
+    )
+    .expect("labels cursor");
+    assert_eq!(labels_cursor.y, labels_y);
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.field = ItemEditField::Body;
+    dialog.body.set_text("first\nsecond");
+    dialog.body.set_cursor_byte("first\nse".len());
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let lines = buffer_lines(terminal.backend().buffer());
+    let body_first_y = lines
+        .iter()
+        .position(|line| line.contains("first"))
+        .expect("body first line") as u16;
+    let body_cursor = item_edit_dialog_cursor_position(
+        app.item_edit_dialog.as_ref().expect("dialog"),
+        0,
+        dialog_area,
+        editor_width,
+        item_edit_body_editor_height(dialog_area, ItemEditField::Body),
+    )
+    .expect("body cursor");
+    assert_eq!(body_cursor.y, body_first_y + 1);
+}
+
+#[test]
+fn item_edit_candidate_lists_only_show_for_focused_collection_field() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let area = Rect::new(0, 0, 120, 34);
+    let paths = test_paths();
+
+    let render = |app: &AppState| {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| draw(frame, app, &paths)).unwrap();
+        buffer_lines(terminal.backend().buffer()).join("\n")
+    };
+
+    {
+        let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+        dialog.assignee_suggestions = vec!["alice".to_string()];
+        dialog.label_suggestions = vec!["bug".to_string()];
+    }
+
+    let rendered = render(&app);
+    assert!(!rendered.contains("Assignee candidates"));
+    assert!(!rendered.contains("Label candidates"));
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Assignees;
+    let rendered = render(&app);
+    assert!(rendered.contains("Assignee candidates"));
+    assert!(!rendered.contains("Label candidates"));
+
+    app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Labels;
+    let rendered = render(&app);
+    assert!(!rendered.contains("Assignee candidates"));
+    assert!(rendered.contains("Label candidates"));
 }
 
 #[test]

@@ -32,7 +32,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if app.help_dialog {
         draw_help_dialog(frame, area, &app.command_palette_key);
     } else if let Some(dialog) = &app.item_edit_dialog {
-        draw_item_edit_dialog(frame, dialog, area);
+        draw_item_edit_dialog(frame, dialog, app.item_edit_running, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.label_dialog {
@@ -1337,13 +1337,6 @@ pub(super) fn footer_has_selected_comment(app: &AppState) -> bool {
             .is_some_and(|comment| !comment.kind.is_activity())
 }
 
-pub(super) fn footer_selected_comment_is_editable(app: &AppState) -> bool {
-    app.details_mode == DetailsMode::Conversation
-        && app
-            .current_selected_comment()
-            .is_some_and(CommentPreview::can_edit)
-}
-
 pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some(dialog) = &app.pr_action_dialog {
@@ -1388,6 +1381,9 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 }
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "i", "ignore", Color::LightRed);
+                if app.current_item().is_some_and(item_supports_metadata_edit) {
+                    push_footer_pair(&mut spans, "e", "edit", Color::LightBlue);
+                }
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             }
         }
@@ -1413,7 +1409,7 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 if footer_has_selected_comment(app) {
                     push_footer_pair(&mut spans, "R", "reply", Color::LightBlue);
                 }
-                if footer_selected_comment_is_editable(app) {
+                if app.current_item().is_some_and(item_supports_metadata_edit) {
                     push_footer_pair(&mut spans, "e", "edit", Color::LightBlue);
                 }
             }

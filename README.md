@@ -118,8 +118,8 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
-| `e` | Edit the focused comment when GitHub allows it; in diff mode, end a review range |
-| `T` | Edit the selected issue or PR title/body |
+| `e` | Edit the selected issue or PR title/body/assignees/labels; in diff mode, end a review range |
+| `T` | Edit the selected issue or PR title/body/assignees/labels |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close or reopen confirmation for the selected issue or PR |
@@ -139,7 +139,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `t` | Change or clear the selected issue/PR milestone |
 | `y` / `Enter` | Confirm the current action in the confirmation dialog |
 | `Enter` in Reviewer Action | Submit the reviewer login list |
-| `Ctrl+Enter` | Send or update a comment/title/body from the editor dialog |
+| `Ctrl+Enter` | Send a comment or save the active issue/PR editor dialog |
 | `Ctrl+S` / `Cmd+S` in editor dialogs | Save the current comment, issue, or pull request draft |
 | `Ctrl+Enter` in issue dialog | Create the issue |
 | `←` / `→` / `↑` / `↓` in editor dialogs | Move the cursor by character or rendered line |

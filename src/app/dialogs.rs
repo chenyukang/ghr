@@ -2746,25 +2746,77 @@ pub(super) fn draw_reviewer_dialog(
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(status));
 }
 
-pub(super) fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDialog, area: Rect) {
-    let dialog_area = centered_rect(66, 12, area);
-    let number = dialog
-        .item
-        .number
-        .map(|number| format!("#{number}"))
-        .unwrap_or_else(|| "-".to_string());
-    let item_kind = match dialog.item.kind {
-        ItemKind::PullRequest => "pull request",
-        ItemKind::Issue => "issue",
-        ItemKind::Notification => "item",
-    };
-    let lines = vec![
-        Line::from("Choose the field to edit on GitHub."),
-        Line::from(""),
-        key_value_line("repo", dialog.item.repo.clone()),
-        key_value_line(item_kind, number),
-        key_value_line("title", dialog.item.title.clone()),
+pub(super) fn draw_item_edit_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &ItemEditDialog,
+    running: bool,
+    area: Rect,
+) {
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let editor_width = inner.width.max(1);
+    let editor_height = item_edit_body_editor_height(dialog_area);
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), editor_width);
+    let max_scroll = max_comment_dialog_scroll(dialog.body.text(), editor_width, editor_height);
+    let scroll = dialog.body_scroll.min(max_scroll);
+    let mut lines = vec![
+        item_edit_field_input_line(
+            "Title",
+            dialog.title.text(),
+            ItemEditField::Title,
+            dialog.field,
+            editor_width,
+        ),
+        issue_dialog_separator_line(editor_width),
+        item_edit_field_label("Body", ItemEditField::Body, dialog.field),
     ];
+    lines.extend(
+        body_lines
+            .into_iter()
+            .skip(usize::from(scroll))
+            .take(usize::from(editor_height))
+            .map(Line::from),
+    );
+    while lines.len() < usize::from(3 + editor_height) {
+        lines.push(Line::from(""));
+    }
+    lines.push(issue_dialog_separator_line(editor_width));
+    lines.push(item_edit_collection_line(
+        "Assignees",
+        &dialog.assignees,
+        ItemEditField::Assignees,
+        dialog.field,
+        editor_width,
+    ));
+    lines.push(item_edit_plain_input_line(
+        "Assignee",
+        &dialog.assignee_input,
+        ItemEditField::Assignees,
+        dialog.field,
+        editor_width,
+    ));
+    item_edit_push_assignee_suggestions(lines.as_mut(), dialog);
+    lines.push(issue_dialog_separator_line(editor_width));
+    lines.push(item_edit_collection_line(
+        "Labels",
+        &dialog.labels,
+        ItemEditField::Labels,
+        dialog.field,
+        editor_width,
+    ));
+    lines.push(item_edit_plain_input_line(
+        "Label",
+        &dialog.label_input,
+        ItemEditField::Labels,
+        dialog.field,
+        editor_width,
+    ));
+    item_edit_push_label_suggestions(lines.as_mut(), dialog);
+    let footer = if running {
+        "working..."
+    } else {
+        "Tab: field  Ctrl+Enter: save  Enter: add/remove candidate  Backspace: remove last when empty  Esc: cancel"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(themed_fg_style(Color::LightMagenta))
@@ -2780,12 +2832,331 @@ pub(super) fn draw_item_edit_dialog(frame: &mut Frame<'_>, dialog: &ItemEditDial
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
-    draw_modal_footer(
-        frame,
-        area,
-        dialog_area,
-        modal_footer_line("t: title    b: body    Esc: cancel"),
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+    if let Some(position) =
+        item_edit_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
+    {
+        frame.set_cursor_position(position);
+    }
+}
+
+pub(super) fn item_edit_dialog_area(area: Rect) -> Rect {
+    centered_rect(84, 28, area)
+}
+
+pub(super) fn item_edit_body_editor_height(dialog_area: Rect) -> u16 {
+    block_inner(dialog_area).height.saturating_sub(17).max(4)
+}
+
+pub(super) fn item_edit_body_editor_size(area: Option<Rect>) -> (u16, u16) {
+    match area {
+        Some(area) => {
+            let dialog_area = item_edit_dialog_area(area);
+            (
+                block_inner(dialog_area).width.max(1),
+                item_edit_body_editor_height(dialog_area),
+            )
+        }
+        None => (COMMENT_DIALOG_FALLBACK_EDITOR_WIDTH, 6),
+    }
+}
+
+fn item_edit_field_input_line(
+    label: &'static str,
+    value: &str,
+    field: ItemEditField,
+    current: ItemEditField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
+    Line::from(vec![
+        Span::styled(prefix, item_edit_field_label_style(field, current)),
+        Span::styled(
+            issue_dialog_input_text(value, value_width),
+            active_theme().panel(),
+        ),
+    ])
+}
+
+fn item_edit_plain_input_line(
+    label: &'static str,
+    value: &str,
+    field: ItemEditField,
+    current: ItemEditField,
+    width: u16,
+) -> Line<'static> {
+    item_edit_field_input_line(label, value, field, current, width)
+}
+
+fn item_edit_field_label(
+    label: &'static str,
+    field: ItemEditField,
+    current: ItemEditField,
+) -> Line<'static> {
+    Line::from(Span::styled(
+        issue_dialog_field_prefix(label),
+        item_edit_field_label_style(field, current),
+    ))
+}
+
+fn item_edit_collection_line(
+    label: &'static str,
+    values: &[String],
+    field: ItemEditField,
+    current: ItemEditField,
+    width: u16,
+) -> Line<'static> {
+    let prefix = issue_dialog_field_prefix(label);
+    let value = if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(", ")
+    };
+    let value_width =
+        width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
+    Line::from(vec![
+        Span::styled(prefix, item_edit_field_label_style(field, current)),
+        Span::styled(
+            truncate_text(&value, usize::from(value_width)),
+            active_theme().panel(),
+        ),
+    ])
+}
+
+fn item_edit_field_label_style(field: ItemEditField, current: ItemEditField) -> Style {
+    if field == current {
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().muted()
+    }
+}
+
+fn item_edit_push_label_suggestions(lines: &mut Vec<Line<'static>>, dialog: &ItemEditDialog) {
+    item_edit_push_suggestion_lines(
+        lines,
+        dialog.label_suggestions_loading,
+        dialog.label_suggestions_error.as_deref(),
+        "Label candidates",
+        "No label candidates match.",
+        &item_edit_label_suggestion_matches(dialog),
+        dialog.selected_label_suggestion,
     );
+}
+
+fn item_edit_push_assignee_suggestions(lines: &mut Vec<Line<'static>>, dialog: &ItemEditDialog) {
+    item_edit_push_suggestion_lines(
+        lines,
+        dialog.assignee_suggestions_loading,
+        dialog.assignee_suggestions_error.as_deref(),
+        "Assignee candidates",
+        "No assignee candidates match.",
+        &item_edit_assignee_suggestion_matches(dialog),
+        dialog.selected_assignee_suggestion,
+    );
+}
+
+fn item_edit_push_suggestion_lines(
+    lines: &mut Vec<Line<'static>>,
+    loading: bool,
+    error: Option<&str>,
+    title: &'static str,
+    empty: &'static str,
+    matches: &[String],
+    selected: usize,
+) {
+    const LIMIT: usize = 3;
+    let initial_len = lines.len();
+    let start = if matches.len() <= LIMIT {
+        0
+    } else {
+        selected
+            .saturating_add(1)
+            .saturating_sub(LIMIT)
+            .min(matches.len().saturating_sub(LIMIT))
+    };
+    if loading {
+        lines.push(Line::from(vec![Span::styled(
+            format!("{title}: loading..."),
+            themed_fg_style(Color::Gray),
+        )]));
+    } else if let Some(error) = error {
+        lines.push(Line::from(vec![Span::styled(
+            format!("{title} unavailable"),
+            themed_bold_style(Color::LightRed),
+        )]));
+        lines.push(Line::from(vec![Span::styled(
+            truncate_text(error, 72),
+            themed_fg_style(Color::Gray),
+        )]));
+    } else if matches.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            empty,
+            themed_fg_style(Color::Gray),
+        )]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            title,
+            themed_bold_style(Color::Gray),
+        )]));
+        for (index, value) in matches.iter().enumerate().skip(start).take(LIMIT) {
+            let is_selected = index == selected;
+            let style = if is_selected {
+                themed_bold_style(Color::Yellow)
+            } else {
+                themed_fg_style(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if is_selected { "> " } else { "  " }, style),
+                Span::styled(value.clone(), style),
+            ]));
+        }
+    }
+    while lines.len().saturating_sub(initial_len) < 4 {
+        lines.push(Line::from(""));
+    }
+}
+
+pub(super) fn item_edit_dialog_cursor_position(
+    dialog: &ItemEditDialog,
+    scroll: u16,
+    dialog_area: Rect,
+    editor_width: u16,
+    editor_height: u16,
+) -> Option<Position> {
+    let inner = block_inner(dialog_area);
+    let clamp_x = |x: u16| x.min(inner.right().saturating_sub(1));
+    let field_position = |label: &'static str, value: &str, y_offset: u16| {
+        let prefix_width =
+            display_width(&issue_dialog_field_prefix(label)).min(usize::from(u16::MAX)) as u16;
+        Position::new(
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(prefix_width)
+                    .saturating_add(display_width(value).min(usize::from(u16::MAX)) as u16),
+            ),
+            inner.y.saturating_add(y_offset),
+        )
+    };
+    match dialog.field {
+        ItemEditField::Title => Some(Position::new(
+            clamp_x(
+                inner
+                    .x
+                    .saturating_add(
+                        display_width(&issue_dialog_field_prefix("Title"))
+                            .min(usize::from(u16::MAX)) as u16,
+                    )
+                    .saturating_add(text_before_cursor_width(
+                        dialog.title.text(),
+                        dialog.title.cursor_byte(),
+                    )),
+            ),
+            inner.y,
+        )),
+        ItemEditField::Body => {
+            let (line, column) = comment_dialog_cursor_offset_at(
+                dialog.body.text(),
+                dialog.body.cursor_byte(),
+                editor_width,
+            );
+            let visible_end = scroll.saturating_add(editor_height.max(1));
+            if line < scroll || line >= visible_end {
+                return None;
+            }
+            Some(Position::new(
+                clamp_x(inner.x.saturating_add(column)),
+                inner.y.saturating_add(3).saturating_add(line - scroll),
+            ))
+        }
+        ItemEditField::Assignees => Some(field_position(
+            "Assignee",
+            &dialog.assignee_input,
+            editor_height.saturating_add(5),
+        )),
+        ItemEditField::Labels => Some(field_position(
+            "Label",
+            &dialog.label_input,
+            editor_height.saturating_add(12),
+        )),
+    }
+}
+
+pub(super) fn item_edit_label_suggestion_matches(dialog: &ItemEditDialog) -> Vec<String> {
+    let query = label_completion_prefix(&dialog.label_input).to_ascii_lowercase();
+    dialog
+        .label_suggestions
+        .iter()
+        .filter(|label| {
+            !dialog
+                .labels
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(label))
+        })
+        .filter(|label| query.is_empty() || label.to_ascii_lowercase().starts_with(&query))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn selected_item_edit_label_suggestion(dialog: &ItemEditDialog) -> Option<String> {
+    let matches = item_edit_label_suggestion_matches(dialog);
+    matches
+        .get(
+            dialog
+                .selected_label_suggestion
+                .min(matches.len().saturating_sub(1)),
+        )
+        .cloned()
+}
+
+pub(super) fn clamp_item_edit_label_selection(dialog: &mut ItemEditDialog) {
+    let count = item_edit_label_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_label_suggestion = 0;
+    } else {
+        dialog.selected_label_suggestion = dialog.selected_label_suggestion.min(count - 1);
+    }
+}
+
+pub(super) fn item_edit_assignee_suggestion_matches(dialog: &ItemEditDialog) -> Vec<String> {
+    let prefix = assignee_input_prefix(&dialog.assignee_input);
+    dialog
+        .assignee_suggestions
+        .iter()
+        .filter(|login| {
+            !dialog
+                .assignees
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(login))
+        })
+        .filter(|login| prefix.is_empty() || login.to_ascii_lowercase().starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn selected_item_edit_assignee_suggestion(dialog: &ItemEditDialog) -> Option<String> {
+    let matches = item_edit_assignee_suggestion_matches(dialog);
+    matches
+        .get(
+            dialog
+                .selected_assignee_suggestion
+                .min(matches.len().saturating_sub(1)),
+        )
+        .cloned()
+}
+
+pub(super) fn clamp_item_edit_assignee_selection(dialog: &mut ItemEditDialog) {
+    let count = item_edit_assignee_suggestion_matches(dialog).len();
+    if count == 0 {
+        dialog.selected_assignee_suggestion = 0;
+    } else {
+        dialog.selected_assignee_suggestion = dialog.selected_assignee_suggestion.min(count - 1);
+    }
 }
 
 pub(super) fn draw_global_search_dialog(
@@ -3198,7 +3569,6 @@ pub(super) fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog,
         CommentDialogMode::Review { target } => {
             format!("Review {}", target.location_label())
         }
-        CommentDialogMode::ItemMetadata { field } => format!("Edit {}", field.title()),
     };
     draw_comment_editor(frame, &title, dialog, area);
 }
@@ -3325,11 +3695,8 @@ pub(super) fn draw_comment_editor(
     while lines.len() < usize::from(editor_height) {
         lines.push(Line::from(""));
     }
-    let footer = if matches!(dialog.mode, CommentDialogMode::ItemMetadata { .. }) {
-        "Ctrl+Enter: update    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
-    } else {
-        "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor"
-    };
+    let footer =
+        "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(themed_fg_style(Color::LightMagenta))
@@ -3725,7 +4092,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("f", "filter with state:closed label:bug author:alice"),
         help_key_line("v", "show pull request diff"),
-        help_key_line("T", "edit selected issue or PR title/body"),
+        help_key_line("e / T", "edit selected issue or PR fields"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open close or reopen confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),
@@ -3799,10 +4166,10 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("+", "add a reaction to the visible focused comment or item"),
-        help_key_line("e", "edit focused comment when GitHub allows it"),
+        help_key_line("e", "edit selected issue or PR fields"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
-        help_key_line("T", "edit selected issue or PR title/body"),
+        help_key_line("T", "edit selected issue or PR fields"),
         help_key_line("Palette", "subscribe or unsubscribe this issue or PR"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("M", "open PR merge confirmation"),

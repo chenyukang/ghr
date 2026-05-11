@@ -55,10 +55,6 @@ pub(super) fn review_comment_draft_key(item: &WorkItem, target: &DiffReviewTarge
     )
 }
 
-pub(super) fn item_metadata_draft_key(item: &WorkItem, field: ItemEditField) -> String {
-    format!("metadata:{}:{}", editor_draft_item_key(item), field.label())
-}
-
 pub(super) fn new_issue_draft_key(repo: &str) -> String {
     format!("issue:new:{}", repo.trim())
 }

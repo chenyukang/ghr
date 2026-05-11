@@ -4106,7 +4106,7 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("Tab / Shift+Tab"));
     assert!(text.contains(":"));
     assert!(text.contains("R"));
-    assert!(text.contains("edit focused comment"));
+    assert!(text.contains("edit selected issue or PR fields"));
     assert!(text.contains("drag split border"));
     assert!(text.contains("open PR merge confirmation"));
     assert!(text.contains("open close or reopen confirmation"));
@@ -6226,7 +6226,7 @@ fn footer_uses_list_shortcuts_and_status() {
     let text = footer_line(&app, &paths).to_string();
 
     assert!(text.contains(
-        "j/k/n/p move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  a comment"
+        "j/k/n/p move  [ ] page  tab Details  enter Details  / search  v diff  i ignore  e edit  a comment"
     ));
     assert!(!text.contains("List items"));
     assert!(!text.contains("Details content"));
@@ -6377,7 +6377,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
     assert!(!details.contains("Details content"));
     assert!(details.contains("tab List  v diff  / search  c/a comment"));
     assert!(!details.contains("R reply"));
-    assert!(!details.contains("e edit"));
+    assert!(details.contains("e edit"));
     assert!(!details.contains("enter expand"));
     assert!(details.contains("esc List"));
     assert!(!details.contains("g/G ends"));
@@ -6389,7 +6389,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
     let details_with_comment = footer_line(&app, &paths).to_string();
     assert!(details_with_comment.contains("n/p comment  enter expand"));
     assert!(details_with_comment.contains("R reply"));
-    assert!(!details_with_comment.contains("e edit"));
+    assert!(details_with_comment.contains("e edit"));
 
     app.details.insert(
         "1".to_string(),
@@ -11540,7 +11540,7 @@ fn capital_r_replies_in_details_while_lowercase_r_keeps_refreshing() {
 }
 
 #[test]
-fn e_key_edits_selected_own_comment() {
+fn e_key_opens_item_edit_dialog_from_details() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
     let config = Config::default();
@@ -11559,28 +11559,14 @@ fn e_key_edits_selected_own_comment() {
         &tx
     ));
 
-    assert_eq!(
-        app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
-        Some(&CommentDialogMode::Edit {
-            comment_index: 0,
-            comment_id: 42,
-            is_review: false,
-        })
-    );
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| dialog.body.as_str()),
-        Some("Original body")
-    );
+    assert!(app.item_edit_dialog.is_some());
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(app.status, "editing item");
 }
 
 #[test]
-fn e_key_edits_comment_when_github_allows_update() {
+fn start_edit_selected_comment_dialog_uses_github_update_permission() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config::default();
-    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.focus_details();
     let mut comment = comment("alice", "Editable by repository permission", None);
     comment.id = Some(42);
@@ -11588,13 +11574,7 @@ fn e_key_edits_comment_when_github_allows_update() {
     app.details
         .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
-    assert!(!handle_key(
-        &mut app,
-        key(KeyCode::Char('e')),
-        &config,
-        &store,
-        &tx
-    ));
+    app.start_edit_selected_comment_dialog();
 
     assert_eq!(
         app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
@@ -11607,24 +11587,15 @@ fn e_key_edits_comment_when_github_allows_update() {
 }
 
 #[test]
-fn e_key_rejects_comments_without_update_permission() {
+fn start_edit_selected_comment_dialog_rejects_without_update_permission() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config::default();
-    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.focus_details();
     let mut comment = comment("alice", "Not editable", None);
     comment.id = Some(42);
     app.details
         .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
-    assert!(!handle_key(
-        &mut app,
-        key(KeyCode::Char('e')),
-        &config,
-        &store,
-        &tx
-    ));
+    app.start_edit_selected_comment_dialog();
 
     assert!(app.comment_dialog.is_none());
     assert_eq!(app.status, "selected comment cannot be edited");
@@ -11633,22 +11604,13 @@ fn e_key_rejects_comments_without_update_permission() {
 #[test]
 fn github_update_permission_overrides_comment_ownership() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config::default();
-    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.focus_details();
     let mut comment = own_comment(42, "chenyukang", "Owned but locked", None);
     comment.viewer_can_update = Some(false);
     app.details
         .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
-    assert!(!handle_key(
-        &mut app,
-        key(KeyCode::Char('e')),
-        &config,
-        &store,
-        &tx
-    ));
+    app.start_edit_selected_comment_dialog();
 
     assert!(app.comment_dialog.is_none());
     assert_eq!(app.status, "selected comment cannot be edited");
@@ -13907,7 +13869,7 @@ fn auto_merge_action_rejects_non_pull_request() {
 }
 
 #[test]
-fn item_edit_key_opens_choice_from_list_and_details() {
+fn item_edit_key_opens_form_from_list_and_details() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
     let config = Config::default();
@@ -13915,186 +13877,209 @@ fn item_edit_key_opens_choice_from_list_and_details() {
 
     assert!(!handle_key(
         &mut app,
-        key(KeyCode::Char('T')),
+        key(KeyCode::Char('e')),
         &config,
         &store,
         &tx
     ));
 
     assert!(app.item_edit_dialog.is_some());
-    assert_eq!(app.status, "choose title or body to edit");
+    assert_eq!(app.status, "editing item");
 
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.focus_details();
 
     assert!(!handle_key(
         &mut app,
-        key(KeyCode::Char('T')),
+        key(KeyCode::Char('e')),
         &config,
         &store,
         &tx
     ));
 
     assert!(app.item_edit_dialog.is_some());
-    assert_eq!(app.status, "choose title or body to edit");
+    assert_eq!(app.status, "editing item");
 }
 
 #[test]
-fn item_edit_choice_opens_title_or_body_editor() {
+fn item_edit_form_prefills_editable_fields_without_repo_or_number() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
     app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
 
-    assert!(app.item_edit_dialog.is_none());
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| (&dialog.mode, dialog.body.as_str())),
-        Some((
-            &CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Title,
-            },
-            "Compiler diagnostics"
-        ))
-    );
-    assert_eq!(app.status, "editing title");
+    let dialog = app.item_edit_dialog.as_ref().expect("item edit dialog");
+    assert_eq!(dialog.title.text(), "Compiler diagnostics");
+    assert_eq!(dialog.body.text(), "A body with useful context");
+    assert_eq!(dialog.labels, vec!["T-compiler".to_string()]);
+    assert_eq!(dialog.assignees, Vec::<String>::new());
 
-    app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
-
-    assert_eq!(
-        app.comment_dialog
-            .as_ref()
-            .map(|dialog| (&dialog.mode, dialog.body.as_str())),
-        Some((
-            &CommentDialogMode::ItemMetadata {
-                field: ItemEditField::Body,
-            },
-            "A body with useful context"
-        ))
-    );
-    assert_eq!(app.status, "editing body");
+    let backend = ratatui::backend::TestBackend::new(100, 32);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("Title:"));
+    assert!(rendered.contains("Body:"));
+    assert!(rendered.contains("Assignees:"));
+    assert!(rendered.contains("Labels:"));
+    assert!(!rendered.contains("repo:"));
+    assert!(!rendered.contains("pull request:"));
+    assert!(!rendered.contains("item: #"));
 }
 
 #[test]
-fn item_title_edit_submit_updates_title() {
+fn item_edit_assignee_and_label_fields_use_candidates() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('t')));
-    app.comment_dialog
-        .as_mut()
-        .unwrap()
-        .body
-        .set_text("New title");
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.field = ItemEditField::Assignees;
+    dialog.assignee_suggestions = vec!["alice".to_string(), "bob".to_string()];
+    dialog.assignee_input = "bo".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(dialog.assignees, vec!["bob".to_string()]);
+    assert!(dialog.assignee_input.is_empty());
+    dialog.assignee_input = "bob".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert!(dialog.assignees.is_empty());
+    dialog.assignee_input = "alice bo".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(
+        dialog.assignees,
+        vec!["alice".to_string(), "bob".to_string()]
+    );
+    dialog.field = ItemEditField::Labels;
+    dialog.label_suggestions = vec!["bug".to_string(), "T-compiler".to_string()];
+    dialog.label_input = "bu".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    assert_eq!(
+        dialog.labels,
+        vec!["T-compiler".to_string(), "bug".to_string()]
+    );
+    assert!(dialog.label_input.is_empty());
+    dialog.label_input = "T-compiler".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    assert_eq!(
+        app.item_edit_dialog.as_ref().unwrap().labels,
+        vec!["bug".to_string()]
+    );
+    app.item_edit_dialog.as_mut().unwrap().label_input = "help wanted, T-".to_string();
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    assert_eq!(
+        app.item_edit_dialog.as_ref().unwrap().labels,
+        vec![
+            "bug".to_string(),
+            "help wanted".to_string(),
+            "T-compiler".to_string()
+        ]
+    );
+}
+
+#[test]
+fn item_edit_submit_sends_all_editable_fields() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_item_edit_dialog();
+    let dialog = app.item_edit_dialog.as_mut().expect("dialog");
+    dialog.title.set_text("New title");
+    dialog.body.clear();
+    dialog.assignees = vec!["alice".to_string(), "bob".to_string()];
+    dialog.labels = vec!["bug".to_string(), "T-compiler".to_string()];
     let mut submitted = None;
 
-    app.handle_comment_dialog_key_with_submit(
+    app.handle_item_edit_dialog_key_with_submit(
         KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
         None,
-        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        |pending| {
+            submitted = Some((
+                pending.item.id,
+                pending.title,
+                pending.body,
+                pending.assignees,
+                pending.labels,
+            ))
+        },
     );
 
-    assert!(app.comment_dialog.is_none());
-    assert!(app.posting_comment);
-    assert_eq!(app.status, "updating title");
-    assert_eq!(
-        app.message_dialog
-            .as_ref()
-            .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
-        Some((
-            "Updating Title",
-            "Waiting for GitHub to accept the title update..."
-        ))
-    );
+    assert!(app.item_edit_running);
+    assert_eq!(app.status, "updating item");
     assert_eq!(
         submitted,
         Some((
             "1".to_string(),
             "New title".to_string(),
-            PendingCommentMode::ItemMetadata {
-                field: ItemEditField::Title,
-            }
-        ))
-    );
-}
-
-#[test]
-fn item_body_edit_submit_allows_empty_body() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.start_item_edit_dialog();
-    app.handle_item_edit_dialog_key(key(KeyCode::Char('b')));
-    app.comment_dialog.as_mut().unwrap().body.clear();
-    let mut submitted = None;
-
-    app.handle_comment_dialog_key_with_submit(
-        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
-        None,
-        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
-    );
-
-    assert!(app.comment_dialog.is_none());
-    assert!(app.posting_comment);
-    assert_eq!(app.status, "updating body");
-    assert_eq!(
-        submitted,
-        Some((
-            "1".to_string(),
             String::new(),
-            PendingCommentMode::ItemMetadata {
-                field: ItemEditField::Body,
-            }
+            vec!["alice".to_string(), "bob".to_string()],
+            vec!["bug".to_string(), "T-compiler".to_string()],
         ))
     );
 }
 
 #[test]
-fn item_metadata_update_success_refreshes_cached_item() {
+fn item_edit_update_success_refreshes_cached_item() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.posting_comment = true;
+    app.item_edit_running = true;
+    app.start_item_edit_dialog();
 
-    app.handle_msg(AppMsg::ItemMetadataUpdated {
+    app.handle_msg(AppMsg::ItemEdited {
         item_id: "1".to_string(),
-        field: ItemEditField::Title,
-        result: Ok(ItemMetadataUpdate {
+        result: Ok(ItemEditUpdate {
             title: "New title".to_string(),
             body: Some("New body".to_string()),
+            labels: vec!["bug".to_string()],
+            assignees: vec!["alice".to_string()],
             updated_at: None,
         }),
     });
 
-    assert!(!app.posting_comment);
+    assert!(!app.item_edit_running);
+    assert!(app.item_edit_dialog.is_none());
     assert_eq!(app.sections[0].items[0].title, "New title");
     assert_eq!(app.sections[0].items[0].body.as_deref(), Some("New body"));
+    assert_eq!(app.sections[0].items[0].labels, vec!["bug".to_string()]);
+    assert_eq!(
+        app.sections[0].items[0].assignees,
+        vec!["alice".to_string()]
+    );
     assert!(app.details_stale.contains("1"));
-    assert_eq!(app.status, "title updated");
+    assert_eq!(app.status, "item updated");
     assert_eq!(
         app.message_dialog
             .as_ref()
             .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
-        Some((
-            "Title Updated",
-            "GitHub accepted the update and the current item was refreshed."
-        ))
+        Some(("Item Updated", "GitHub accepted the item update."))
     );
 }
 
 #[test]
-fn item_metadata_update_failure_reports_status() {
+fn item_edit_update_failure_reports_status() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.posting_comment = true;
+    app.item_edit_running = true;
 
-    app.handle_msg(AppMsg::ItemMetadataUpdated {
+    app.handle_msg(AppMsg::ItemEdited {
         item_id: "1".to_string(),
-        field: ItemEditField::Body,
         result: Err("gh api repos/owner/repo/issues/1 failed: validation failed".to_string()),
     });
 
-    assert!(!app.posting_comment);
-    assert_eq!(app.status, "body update failed");
+    assert!(!app.item_edit_running);
+    assert_eq!(app.status, "item update failed");
     let dialog = app.message_dialog.as_ref().expect("failure dialog");
-    assert_eq!(dialog.title, "Body Update Failed");
-    assert_eq!(dialog.kind, MessageDialogKind::RetryableError);
+    assert_eq!(dialog.title, "Item Update Failed");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
     assert!(dialog.body.contains("validation failed"));
     assert!(dialog.auto_close_at.is_none());
 }

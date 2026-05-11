@@ -23,6 +23,7 @@ use crate::model::{
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
+static GH_API_SLURP_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
 static USER_GH_REQUESTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
@@ -31,6 +32,7 @@ const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
 const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_PULL_REQUEST_COMMIT_ACTIVITIES: usize = 5;
 const MAX_PULL_REQUEST_ACTIVITY_COMMITS: usize = 20;
+const GITHUB_API_PAGE_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -1832,14 +1834,10 @@ async fn fetch_issue_details_output(repository: &str, number: u64) -> Result<Str
 
 async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
-    run_gh_json(&[
-        "api".to_string(),
-        "-H".to_string(),
-        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        path,
-    ])
+    fetch_paginated_api_array_output(
+        &path,
+        Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
+    )
     .await
 }
 
@@ -2024,28 +2022,132 @@ async fn fetch_pull_request_review_comments_output(
     number: u64,
 ) -> Result<String> {
     let path = format!("repos/{repository}/pulls/{number}/comments?per_page=100");
-    run_gh_json(&[
-        "api".to_string(),
-        "-H".to_string(),
-        "Accept: application/vnd.github.squirrel-girl-preview+json".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        path,
-    ])
+    fetch_paginated_api_array_output(
+        &path,
+        Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
+    )
     .await
 }
 
 async fn fetch_pull_request_timeline_output(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/issues/{number}/timeline?per_page=100");
-    run_gh_json(&[
-        "api".to_string(),
-        "-H".to_string(),
-        "Accept: application/vnd.github.mockingbird-preview+json".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        path,
-    ])
+    fetch_paginated_api_array_output(
+        &path,
+        Some("Accept: application/vnd.github.mockingbird-preview+json"),
+    )
     .await
+}
+
+async fn fetch_paginated_api_array_output(
+    path: &str,
+    accept_header: Option<&str>,
+) -> Result<String> {
+    if gh_api_slurp_supported().await {
+        return fetch_paginated_api_array_output_with_slurp(path, accept_header).await;
+    }
+
+    fetch_paginated_api_array_output_without_slurp(path, accept_header).await
+}
+
+async fn fetch_paginated_api_array_output_with_slurp(
+    path: &str,
+    accept_header: Option<&str>,
+) -> Result<String> {
+    run_gh_json(&paginated_api_slurp_args(path, accept_header)).await
+}
+
+async fn fetch_paginated_api_array_output_without_slurp(
+    path: &str,
+    accept_header: Option<&str>,
+) -> Result<String> {
+    let mut pages = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let page_path = paginated_api_page_path(path, page);
+        let output = run_gh_json(&paginated_api_array_args(&page_path, accept_header)).await?;
+        let page_value = serde_json::from_str::<serde_json::Value>(&output)
+            .with_context(|| format!("failed to parse gh api page {page} for {path}"))?;
+        let page_len = page_value
+            .as_array()
+            .ok_or_else(|| anyhow!("gh api page {page} for {path} did not return an array"))?
+            .len();
+        pages.push(page_value);
+        if page_len < GITHUB_API_PAGE_SIZE {
+            break;
+        }
+        page += 1;
+    }
+
+    serde_json::to_string(&pages).context("failed to encode paginated gh api output")
+}
+
+async fn gh_api_slurp_supported() -> bool {
+    *GH_API_SLURP_SUPPORTED
+        .get_or_init(detect_gh_api_slurp_support)
+        .await
+}
+
+async fn detect_gh_api_slurp_support() -> bool {
+    let output = Command::new("gh")
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(["api", "--help"])
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            gh_api_help_has_flag(&stdout, "--slurp") || gh_api_help_has_flag(&stderr, "--slurp")
+        }
+        Ok(output) => {
+            debug!(
+                status = %output.status,
+                "failed to inspect gh api help for --slurp support; assuming supported"
+            );
+            true
+        }
+        Err(error) => {
+            debug!(
+                error = %error,
+                "failed to inspect gh api help for --slurp support; assuming supported"
+            );
+            true
+        }
+    }
+}
+
+fn gh_api_help_has_flag(help: &str, flag: &str) -> bool {
+    help.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '[' | ']' | '(' | ')' | '`'))
+        .any(|token| token == flag)
+}
+
+fn paginated_api_slurp_args(path: &str, accept_header: Option<&str>) -> Vec<String> {
+    let mut args = vec!["api".to_string()];
+    if let Some(header) = accept_header {
+        args.push("-H".to_string());
+        args.push(header.to_string());
+    }
+    args.push("--paginate".to_string());
+    args.push("--slurp".to_string());
+    args.push(path.to_string());
+    args
+}
+
+fn paginated_api_array_args(page_path: &str, accept_header: Option<&str>) -> Vec<String> {
+    let mut args = vec!["api".to_string()];
+    if let Some(header) = accept_header {
+        args.push("-H".to_string());
+        args.push(header.to_string());
+    }
+    args.push(page_path.to_string());
+    args
+}
+
+fn paginated_api_page_path(path: &str, page: usize) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}page={}", page.max(1))
 }
 
 async fn fetch_pull_request_review_thread_states(
@@ -2349,37 +2451,19 @@ pub async fn post_issue_comment(
 }
 
 pub async fn fetch_repository_labels(repository: &str) -> Result<Vec<String>> {
-    let path = format!("repos/{repository}/labels");
-    let output = run_gh_json(&[
-        "api".to_string(),
-        "--method".to_string(),
-        "GET".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        path,
-        "-f".to_string(),
-        "per_page=100".to_string(),
-    ])
-    .await
-    .with_context(|| format!("failed to fetch labels for {repository}"))?;
+    let path = format!("repos/{repository}/labels?per_page=100");
+    let output = fetch_paginated_api_array_output(&path, None)
+        .await
+        .with_context(|| format!("failed to fetch labels for {repository}"))?;
     parse_repository_labels_output(&output)
         .with_context(|| format!("failed to parse labels for {repository}"))
 }
 
 pub async fn fetch_repository_assignees(repository: &str) -> Result<Vec<String>> {
-    let path = format!("repos/{repository}/assignees");
-    let output = run_gh_json(&[
-        "api".to_string(),
-        "--method".to_string(),
-        "GET".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        path,
-        "-f".to_string(),
-        "per_page=100".to_string(),
-    ])
-    .await
-    .with_context(|| format!("failed to fetch assignees for {repository}"))?;
+    let path = format!("repos/{repository}/assignees?per_page=100");
+    let output = fetch_paginated_api_array_output(&path, None)
+        .await
+        .with_context(|| format!("failed to fetch assignees for {repository}"))?;
     parse_repository_assignees_output(&output)
         .with_context(|| format!("failed to parse assignees for {repository}"))
 }
@@ -2496,7 +2580,7 @@ fn pull_request_number_from_create_output(output: &str) -> Option<u64> {
 }
 
 pub async fn fetch_open_milestones(repository: &str) -> Result<Vec<Milestone>> {
-    let output = run_gh_json(&open_milestones_args(repository)).await?;
+    let output = fetch_paginated_api_array_output(&open_milestones_path(repository), None).await?;
     parse_open_milestones_output(&output, repository)
 }
 
@@ -4955,13 +5039,12 @@ fn state_with_pull_request_merge(
     }
 }
 
+fn open_milestones_path(repository: &str) -> String {
+    format!("repos/{repository}/milestones?state=open&per_page=100")
+}
+
 fn open_milestones_args(repository: &str) -> Vec<String> {
-    vec![
-        "api".to_string(),
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-        format!("repos/{repository}/milestones?state=open&per_page=100"),
-    ]
+    paginated_api_slurp_args(&open_milestones_path(repository), None)
 }
 
 fn create_milestone_args(repository: &str, title: &str) -> Vec<String> {
@@ -5808,7 +5891,11 @@ mod tests {
     }
 
     #[test]
-    fn open_milestones_args_use_paginated_issue_metadata_api() {
+    fn paginated_api_helpers_fall_back_when_gh_slurp_is_missing() {
+        assert_eq!(
+            open_milestones_path("owner/repo"),
+            "repos/owner/repo/milestones?state=open&per_page=100"
+        );
         assert_eq!(
             open_milestones_args("owner/repo"),
             vec![
@@ -5818,6 +5905,50 @@ mod tests {
                 "repos/owner/repo/milestones?state=open&per_page=100"
             ]
         );
+        assert!(gh_api_help_has_flag(
+            "      --slurp               Use an array of arrays for paginated responses",
+            "--slurp"
+        ));
+        assert!(!gh_api_help_has_flag(
+            "      --paginate            Fetch all pages",
+            "--slurp"
+        ));
+        assert_eq!(
+            paginated_api_slurp_args(
+                "repos/owner/repo/issues/1/comments?per_page=100",
+                Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
+            ),
+            vec![
+                "api",
+                "-H",
+                "Accept: application/vnd.github.squirrel-girl-preview+json",
+                "--paginate",
+                "--slurp",
+                "repos/owner/repo/issues/1/comments?per_page=100"
+            ]
+        );
+        assert_eq!(
+            paginated_api_page_path("repos/owner/repo/issues/1/comments?per_page=100", 2),
+            "repos/owner/repo/issues/1/comments?per_page=100&page=2"
+        );
+        assert_eq!(
+            paginated_api_page_path("repos/owner/repo/labels", 0),
+            "repos/owner/repo/labels?page=1"
+        );
+        let args = paginated_api_array_args(
+            "repos/owner/repo/issues/1/comments?per_page=100&page=1",
+            Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "api",
+                "-H",
+                "Accept: application/vnd.github.squirrel-girl-preview+json",
+                "repos/owner/repo/issues/1/comments?per_page=100&page=1"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--slurp"));
     }
 
     #[test]

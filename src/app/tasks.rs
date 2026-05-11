@@ -841,6 +841,19 @@ pub(super) fn start_reviewer_suggestions_load(
     true
 }
 
+pub(super) fn start_mention_user_search_load(query: String, tx: UnboundedSender<AppMsg>) -> bool {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    handle.spawn(async move {
+        let result = search_github_users(&query)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx.send(AppMsg::MentionUserSearchLoaded { query, result });
+    });
+    true
+}
+
 pub(super) fn start_issue_create(
     pending: PendingIssueCreate,
     draft_clear: Option<DraftClearTask>,

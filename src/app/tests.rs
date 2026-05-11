@@ -15477,6 +15477,205 @@ fn comment_dialog_loads_existing_draft_on_open() {
 }
 
 #[test]
+fn mention_query_tracks_github_login_prefix_at_cursor() {
+    assert_eq!(
+        super::mentions::mention_query_at_cursor("ping @al", 8),
+        Some((5, "al".to_string()))
+    );
+    assert_eq!(
+        super::mentions::mention_query_at_cursor("@", 1),
+        Some((0, String::new()))
+    );
+    assert_eq!(
+        super::mentions::mention_query_at_cursor("cc @alice-bot", 13),
+        Some((3, "alice-bot".to_string()))
+    );
+    assert_eq!(
+        super::mentions::mention_query_at_cursor("ping @al ", 9),
+        None
+    );
+    assert_eq!(
+        super::mentions::mention_query_at_cursor("ping @al!", 9),
+        None
+    );
+}
+
+#[test]
+fn comment_editor_accepts_mention_candidate() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.assignee_suggestions_cache.insert(
+        "rust-lang/rust".to_string(),
+        vec!["alice".to_string(), "bob".to_string()],
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    app.start_new_comment_dialog();
+    for ch in "ping @bo".chars() {
+        app.handle_comment_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+    }
+
+    let view = app
+        .mention_candidate_view_for_target(MentionTarget::Comment)
+        .expect("mention candidates");
+    assert_eq!(view.candidates, vec!["bob"]);
+
+    app.handle_comment_dialog_key(key(KeyCode::Enter), &tx, None);
+
+    assert_eq!(
+        app.comment_dialog
+            .as_ref()
+            .map(|dialog| dialog.body.as_str()),
+        Some("ping @bob ")
+    );
+}
+
+#[test]
+fn edit_comment_renders_mention_candidates_after_at_trigger() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.assignee_suggestions_cache.insert(
+        "rust-lang/rust".to_string(),
+        vec!["alice".to_string(), "bob".to_string()],
+    );
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
+    );
+    app.handle_detail_action(DetailAction::EditComment(0), None, None);
+    if let Some(dialog) = &mut app.comment_dialog {
+        dialog.body.set_text("@");
+    }
+
+    let dialog = app.comment_dialog.as_ref().expect("edit comment").clone();
+    let backend = ratatui::backend::TestBackend::new(120, 28);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| draw_comment_dialog(frame, &app, &dialog, frame.area()))
+        .expect("draw edit comment dialog");
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+
+    assert!(rendered.contains("Mention candidates"));
+    assert!(rendered.contains("@alice"));
+}
+
+#[test]
+fn mention_candidates_include_github_user_search_results() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.mention_user_search_cache.insert(
+        "fe".to_string(),
+        vec!["ferris".to_string(), "ferrocene".to_string()],
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    app.start_new_comment_dialog();
+    for ch in "cc @fe".chars() {
+        app.handle_comment_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+    }
+
+    let view = app
+        .mention_candidate_view_for_target(MentionTarget::Comment)
+        .expect("mention candidates");
+    assert_eq!(view.candidates, vec!["ferris", "ferrocene"]);
+}
+
+#[test]
+fn mention_user_search_loaded_updates_active_candidates() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    app.start_new_comment_dialog();
+    for ch in "@swa".chars() {
+        app.handle_comment_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+    }
+    app.handle_msg(AppMsg::MentionUserSearchLoaded {
+        query: "swa".to_string(),
+        result: Ok(vec!["swananan".to_string()]),
+    });
+
+    let view = app
+        .mention_candidate_view_for_target(MentionTarget::Comment)
+        .expect("mention candidates");
+    assert_eq!(view.candidates, vec!["swananan"]);
+    assert!(!view.loading);
+}
+
+#[test]
+fn issue_title_accepts_mention_candidate_before_field_advance() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.assignee_suggestions_cache.insert(
+        "rust-lang/rust".to_string(),
+        vec!["alice".to_string(), "bob".to_string()],
+    );
+
+    app.start_new_issue_dialog();
+    for ch in "@bo".chars() {
+        app.handle_issue_dialog_key_with_submit(key(KeyCode::Char(ch)), None, |_| {});
+    }
+    app.handle_issue_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    let dialog = app.issue_dialog.as_ref().expect("issue dialog");
+    assert_eq!(dialog.title.as_str(), "@bob ");
+    assert_eq!(dialog.field, IssueDialogField::Title);
+}
+
+#[test]
+fn review_submit_editor_accepts_mention_candidate() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.assignee_suggestions_cache.insert(
+        "rust-lang/rust".to_string(),
+        vec!["alice".to_string(), "bob".to_string()],
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    app.start_review_submit_dialog(PullRequestReviewEvent::Comment);
+    for ch in "thanks @bo".chars() {
+        app.handle_review_submit_dialog_key(key(KeyCode::Char(ch)), &tx, None);
+    }
+    app.handle_review_submit_dialog_key(key(KeyCode::Enter), &tx, None);
+
+    assert_eq!(
+        app.review_submit_dialog
+            .as_ref()
+            .map(|dialog| dialog.body.as_str()),
+        Some("thanks @bob ")
+    );
+}
+
+#[test]
+fn item_edit_body_renders_and_accepts_mention_candidate() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.assignee_suggestions_cache.insert(
+        "rust-lang/rust".to_string(),
+        vec!["chenyukang".to_string(), "alice".to_string()],
+    );
+    app.start_item_edit_dialog();
+    if let Some(dialog) = &mut app.item_edit_dialog {
+        dialog.field = ItemEditField::Body;
+        dialog.body.set_text("cc @che");
+    }
+
+    let dialog = app.item_edit_dialog.as_ref().expect("item edit").clone();
+    let backend = ratatui::backend::TestBackend::new(100, 32);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            draw_item_edit_dialog(frame, &app, &dialog, false, frame.area());
+        })
+        .expect("draw item edit dialog");
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("Mention candidates"));
+    assert!(rendered.contains("@chenyukang"));
+
+    app.handle_item_edit_dialog_key_with_submit(key(KeyCode::Enter), None, |_| {});
+
+    assert_eq!(
+        app.item_edit_dialog
+            .as_ref()
+            .map(|dialog| dialog.body.as_str()),
+        Some("cc @chenyukang ")
+    );
+}
+
+#[test]
 fn saving_comment_draft_persists_and_reopens_it() {
     let paths = unique_test_paths("comment-draft-save");
     let store = SnapshotStore::new(paths.db_path.clone());

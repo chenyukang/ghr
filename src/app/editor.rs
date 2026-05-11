@@ -70,6 +70,22 @@ impl EditorText {
         *self = Self::from_text(text);
     }
 
+    pub(super) fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let start = clamp_text_cursor(self.text(), start);
+        let end = clamp_text_cursor(self.text(), end).max(start);
+        let mut next = String::with_capacity(
+            self.text
+                .len()
+                .saturating_sub(end.saturating_sub(start))
+                .saturating_add(replacement.len()),
+        );
+        next.push_str(&self.text[..start]);
+        next.push_str(replacement);
+        next.push_str(&self.text[end..]);
+        *self = Self::from_text(next);
+        self.set_cursor_byte(start.saturating_add(replacement.len()));
+    }
+
     fn sync_text(&mut self) {
         self.text = self.textarea.lines().join("\n");
     }

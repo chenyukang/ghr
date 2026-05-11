@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -320,6 +320,11 @@ struct RepositoryLabelRaw {
 #[derive(Debug, Deserialize)]
 struct RepositoryAssigneeRaw {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserSearchRaw {
+    items: Vec<SearchAuthorRaw>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2466,6 +2471,28 @@ pub async fn fetch_repository_assignees(repository: &str) -> Result<Vec<String>>
         .with_context(|| format!("failed to fetch assignees for {repository}"))?;
     parse_repository_assignees_output(&output)
         .with_context(|| format!("failed to parse assignees for {repository}"))
+}
+
+pub async fn search_github_users(query: &str) -> Result<Vec<String>> {
+    let query = query.trim().trim_start_matches('@');
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let search = format!("{query} in:login type:user");
+    let output = run_gh_json(&[
+        "api".to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "search/users".to_string(),
+        "-f".to_string(),
+        format!("q={search}"),
+        "-f".to_string(),
+        "per_page=20".to_string(),
+    ])
+    .await
+    .with_context(|| format!("failed to search GitHub users for {query}"))?;
+    parse_github_user_search_output(&output)
+        .with_context(|| format!("failed to parse GitHub users for {query}"))
 }
 
 pub async fn add_issue_label(repository: &str, number: u64, label: &str) -> Result<()> {
@@ -5179,6 +5206,31 @@ fn parse_repository_assignees_output(output: &str) -> Result<Vec<String>> {
     Ok(assignees)
 }
 
+fn parse_github_user_search_output(output: &str) -> Result<Vec<String>> {
+    let raw = serde_json::from_str::<UserSearchRaw>(output)
+        .context("failed to parse GitHub user search output")?;
+    Ok(dedup_preserving_order(
+        raw.items
+            .into_iter()
+            .map(|user| user.login.trim().to_string())
+            .filter(|login| !login.is_empty()),
+    ))
+}
+
+fn dedup_preserving_order<I>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        if seen.insert(value.to_ascii_lowercase()) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
 fn percent_encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
@@ -6066,6 +6118,23 @@ mod tests {
         assert_eq!(
             parse_repository_assignees_output(output).unwrap(),
             vec!["alice", "Bob", "chenyukang"]
+        );
+    }
+
+    #[test]
+    fn user_search_results_preserve_rank_and_deduplicate() {
+        let output = r#"{
+          "total_count": 3,
+          "items": [
+            {"login": "swananan"},
+            {"login": "Swananan"},
+            {"login": "swanandx"}
+          ]
+        }"#;
+
+        assert_eq!(
+            parse_github_user_search_output(output).unwrap(),
+            vec!["swananan", "swanandx"]
         );
     }
 

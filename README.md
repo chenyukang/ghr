@@ -141,6 +141,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Enter` in Reviewer Action | Submit the reviewer login list |
 | `Ctrl+Enter` | Send a comment or save the active issue/PR editor dialog |
 | `Ctrl+S` / `Cmd+S` in editor dialogs | Save the current comment, issue, or pull request draft |
+| `@` in editor dialogs | Search GitHub accounts for mention completion; `Up`/`Down` choose and `Tab`/`Enter` insert |
 | `Ctrl+Enter` in issue dialog | Create the issue |
 | `←` / `→` / `↑` / `↓` in editor dialogs | Move the cursor by character or rendered line |
 | `Home` / `End` in editor dialogs | Jump to the start or end of the current line |

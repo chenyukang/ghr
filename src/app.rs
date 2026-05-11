@@ -58,9 +58,10 @@ use crate::github::{
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
     refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
     reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
-    search_global, submit_pending_pull_request_review, submit_pull_request_review,
-    subscribe_notification_thread, unsubscribe_notification_thread, update_issue_assignees,
-    update_item_subscription, update_pull_request_branch, with_background_github_priority,
+    search_github_users, search_global, submit_pending_pull_request_review,
+    submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
+    update_issue_assignees, update_item_subscription, update_pull_request_branch,
+    with_background_github_priority,
 };
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, EditorDraft, FailedCheckRunSummary, ItemKind,
@@ -88,6 +89,7 @@ mod global_search;
 mod input;
 mod keymap;
 mod layout;
+mod mentions;
 mod participants;
 mod pr_checkout;
 mod render;
@@ -203,6 +205,10 @@ enum AppMsg {
     },
     ReviewerSuggestionsLoaded {
         repo: String,
+        result: std::result::Result<Vec<String>, String>,
+    },
+    MentionUserSearchLoaded {
+        query: String,
         result: std::result::Result<Vec<String>, String>,
     },
     IssueCreated {
@@ -574,6 +580,37 @@ struct DialogTextSelection {
     target: DialogTextTarget,
     start: DetailsTextPosition,
     end: DetailsTextPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MentionTarget {
+    Comment,
+    ReviewSubmit,
+    IssueTitle,
+    IssueBody,
+    PrCreateTitle,
+    PrCreateBody,
+    ItemEditTitle,
+    ItemEditBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionContext {
+    target: MentionTarget,
+    repo: String,
+    query: String,
+    trigger_start: usize,
+    cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionCandidateView {
+    repo: String,
+    query: String,
+    candidates: Vec<String>,
+    selected: usize,
+    loading: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1398,6 +1435,7 @@ const LABEL_SUGGESTION_LIMIT: usize = 6;
 const ASSIGNEE_SUGGESTION_LIMIT: usize = 6;
 const REVIEWER_SUGGESTION_LIMIT: usize = 6;
 const GLOBAL_SEARCH_SUGGESTION_LIMIT: usize = 6;
+const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 
@@ -1480,6 +1518,12 @@ struct AppState {
     label_suggestions_cache: HashMap<String, Vec<String>>,
     assignee_suggestions_cache: HashMap<String, Vec<String>>,
     reviewer_suggestions_cache: HashMap<String, Vec<String>>,
+    mention_candidate_loading_repos: HashSet<String>,
+    mention_candidate_errors: HashMap<String, String>,
+    mention_user_search_cache: HashMap<String, Vec<String>>,
+    mention_user_search_loading_queries: HashSet<String>,
+    mention_user_search_errors: HashMap<String, String>,
+    mention_selected: usize,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
@@ -2797,6 +2841,12 @@ impl AppState {
             label_suggestions_cache: HashMap::new(),
             assignee_suggestions_cache: HashMap::new(),
             reviewer_suggestions_cache: HashMap::new(),
+            mention_candidate_loading_repos: HashSet::new(),
+            mention_candidate_errors: HashMap::new(),
+            mention_user_search_cache: HashMap::new(),
+            mention_user_search_loading_queries: HashSet::new(),
+            mention_user_search_errors: HashMap::new(),
+            mention_selected: 0,
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
             pending_details_load: None,
@@ -3874,6 +3924,8 @@ impl AppState {
                 Ok(assignees) => {
                     self.assignee_suggestions_cache
                         .insert(repo.clone(), assignees.clone());
+                    self.mention_candidate_loading_repos.remove(&repo);
+                    self.mention_candidate_errors.remove(&repo);
                     if let Some(dialog) = &mut self.assignee_dialog
                         && dialog.action == AssigneeAction::Assign
                         && dialog.item.repo == repo
@@ -3911,6 +3963,13 @@ impl AppState {
                 Err(error) => {
                     let has_cached_suggestions =
                         self.assignee_suggestions_cache.contains_key(&repo);
+                    self.mention_candidate_loading_repos.remove(&repo);
+                    if has_cached_suggestions {
+                        self.mention_candidate_errors.remove(&repo);
+                    } else {
+                        self.mention_candidate_errors
+                            .insert(repo.clone(), error.clone());
+                    }
                     if let Some(dialog) = &mut self.assignee_dialog
                         && dialog.action == AssigneeAction::Assign
                         && dialog.item.repo == repo
@@ -3993,6 +4052,22 @@ impl AppState {
                     }
                 }
             },
+            AppMsg::MentionUserSearchLoaded { query, result } => {
+                self.mention_user_search_loading_queries.remove(&query);
+                match result {
+                    Ok(users) => {
+                        self.mention_user_search_cache.insert(query.clone(), users);
+                        self.mention_user_search_errors.remove(&query);
+                    }
+                    Err(error) => {
+                        if self.mention_user_search_cache.contains_key(&query) {
+                            self.mention_user_search_errors.remove(&query);
+                        } else {
+                            self.mention_user_search_errors.insert(query, error);
+                        }
+                    }
+                }
+            }
             AppMsg::IssueCreated { result } => {
                 self.issue_creating = false;
                 self.issue_dialog = None;
@@ -7937,10 +8012,12 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        let tx = tx.clone();
+        let tx_for_submit = tx.clone();
+        let tx_for_mentions = tx.clone();
         self.handle_item_edit_dialog_key_with_submit(key, area, move |pending| {
-            start_item_edit(pending, tx.clone());
+            start_item_edit(pending, tx_for_submit.clone());
         });
+        self.ensure_mention_candidates_for_active_editor(None, &tx_for_mentions);
     }
 
     fn handle_item_edit_dialog_key_with_submit<F>(
@@ -7953,6 +8030,9 @@ impl AppState {
     {
         if self.item_edit_running {
             self.status = "item edit already running".to_string();
+            return;
+        }
+        if self.handle_active_mention_key(key) {
             return;
         }
         match key.code {
@@ -8437,12 +8517,14 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        let tx = tx.clone();
+        let tx_for_submit = tx.clone();
+        let tx_for_pending = tx.clone();
+        let tx_for_mentions = tx.clone();
         self.handle_review_submit_dialog_key_with_submit(
             key,
             area,
             {
-                let tx = tx.clone();
+                let tx = tx_for_submit;
                 move |pending| match pending.mode {
                     ReviewSubmitMode::New => {
                         start_review_submit(pending.item, pending.event, pending.body, tx.clone());
@@ -8459,9 +8541,10 @@ impl AppState {
                 }
             },
             move |item, body| {
-                start_review_draft_create(item, body, tx.clone());
+                start_review_draft_create(item, body, tx_for_pending.clone());
             },
         );
+        self.ensure_mention_candidates_for_active_editor(None, &tx_for_mentions);
     }
 
     fn handle_review_submit_dialog_key_with_submit<F, G>(
@@ -8476,6 +8559,9 @@ impl AppState {
     {
         if self.review_submit_running {
             self.status = "review action already running".to_string();
+            return;
+        }
+        if self.handle_active_mention_key(key) {
             return;
         }
 
@@ -9271,15 +9357,17 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        let tx = tx.clone();
         let store = store.cloned();
+        let store_for_submit = store.clone();
+        let tx_for_submit = tx.clone();
+        let tx_for_mentions = tx.clone();
         self.handle_comment_dialog_key_with_submit(key, area, move |submit| match submit.mode {
             PendingCommentMode::Post => {
                 start_comment_submit(
                     submit.item,
                     submit.body,
-                    draft_clear_task(submit.draft_key, store.clone()),
-                    tx.clone(),
+                    draft_clear_task(submit.draft_key, store_for_submit.clone()),
+                    tx_for_submit.clone(),
                 );
             }
             PendingCommentMode::ReviewReply { comment_id } => {
@@ -9287,8 +9375,8 @@ impl AppState {
                     submit.item,
                     comment_id,
                     submit.body,
-                    draft_clear_task(submit.draft_key, store.clone()),
-                    tx.clone(),
+                    draft_clear_task(submit.draft_key, store_for_submit.clone()),
+                    tx_for_submit.clone(),
                 );
             }
             PendingCommentMode::Edit {
@@ -9302,8 +9390,8 @@ impl AppState {
                     comment_id,
                     is_review,
                     submit.body,
-                    draft_clear_task(submit.draft_key, store.clone()),
-                    tx.clone(),
+                    draft_clear_task(submit.draft_key, store_for_submit.clone()),
+                    tx_for_submit.clone(),
                 );
             }
             PendingCommentMode::Review { target } => {
@@ -9311,11 +9399,12 @@ impl AppState {
                     submit.item,
                     target,
                     submit.body,
-                    draft_clear_task(submit.draft_key, store.clone()),
-                    tx.clone(),
+                    draft_clear_task(submit.draft_key, store_for_submit.clone()),
+                    tx_for_submit.clone(),
                 );
             }
         });
+        self.ensure_mention_candidates_for_active_editor(store.as_ref(), &tx_for_mentions);
     }
 
     fn start_add_label_dialog_with_store(
@@ -9629,12 +9718,15 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        let tx = tx.clone();
         let store = store.cloned();
+        let store_for_submit = store.clone();
+        let tx_for_submit = tx.clone();
+        let tx_for_mentions = tx.clone();
         self.handle_issue_dialog_key_with_submit(key, area, move |pending| {
-            let draft_clear = draft_clear_task(pending.draft_key.clone(), store.clone());
-            start_issue_create(pending, draft_clear, tx.clone());
+            let draft_clear = draft_clear_task(pending.draft_key.clone(), store_for_submit.clone());
+            start_issue_create(pending, draft_clear, tx_for_submit.clone());
         });
+        self.ensure_mention_candidates_for_active_editor(store.as_ref(), &tx_for_mentions);
     }
 
     fn handle_issue_dialog_key_with_submit<F>(
@@ -9646,6 +9738,9 @@ impl AppState {
         F: FnMut(PendingIssueCreate),
     {
         if self.issue_creating {
+            return;
+        }
+        if self.handle_active_mention_key(key) {
             return;
         }
 
@@ -9781,12 +9876,15 @@ impl AppState {
         tx: &UnboundedSender<AppMsg>,
         area: Option<Rect>,
     ) {
-        let tx = tx.clone();
         let store = store.cloned();
+        let store_for_submit = store.clone();
+        let tx_for_submit = tx.clone();
+        let tx_for_mentions = tx.clone();
         self.handle_pr_create_dialog_key_with_submit(key, area, move |pending| {
-            let draft_clear = draft_clear_task(pending.draft_key.clone(), store.clone());
-            start_pr_create(pending, draft_clear, tx.clone());
+            let draft_clear = draft_clear_task(pending.draft_key.clone(), store_for_submit.clone());
+            start_pr_create(pending, draft_clear, tx_for_submit.clone());
         });
+        self.ensure_mention_candidates_for_active_editor(store.as_ref(), &tx_for_mentions);
     }
 
     fn handle_pr_create_dialog_key_with_submit<F>(
@@ -9798,6 +9896,9 @@ impl AppState {
         F: FnMut(PendingPrCreate),
     {
         if self.pr_creating {
+            return;
+        }
+        if self.handle_active_mention_key(key) {
             return;
         }
 
@@ -9928,6 +10029,9 @@ impl AppState {
         F: FnMut(PendingCommentSubmit),
     {
         if self.posting_comment {
+            return;
+        }
+        if self.handle_active_mention_key(key) {
             return;
         }
 

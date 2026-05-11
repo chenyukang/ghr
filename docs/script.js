@@ -43,6 +43,7 @@ const shortcuts = [
   ["Dialog", "y / Enter", "Confirm the current action"],
   ["Editor", "Ctrl+Enter", "Send, update, create, or submit from editor dialogs"],
   ["Editor", "Ctrl+S / Cmd+S", "Save the current comment, issue, or pull request draft"],
+  ["Editor", "@", "Search GitHub accounts for mention completion; Up/Down choose and Tab/Enter insert"],
   ["Editor", "Arrows", "Move the cursor by character or rendered line"],
   ["Editor", "Home / End", "Jump to the start or end of the current line"],
   ["Editor", "Ctrl+W / Alt+Backspace", "Delete the previous word"],

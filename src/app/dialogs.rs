@@ -1878,6 +1878,8 @@ pub(super) fn draw_issue_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::IssueTitle, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::IssueBody, dialog_area);
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) =
         issue_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
@@ -1948,6 +1950,8 @@ pub(super) fn draw_pr_create_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::PrCreateTitle, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::PrCreateBody, dialog_area);
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) =
         pr_create_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
@@ -2839,6 +2843,8 @@ pub(super) fn draw_item_edit_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::ItemEditTitle, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::ItemEditBody, dialog_area);
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) =
         item_edit_dialog_cursor_position(dialog, scroll, dialog_area, editor_width, editor_height)
@@ -3718,6 +3724,116 @@ pub(super) fn draw_comment_dialog(
     draw_comment_editor(frame, app, &title, dialog, area);
 }
 
+fn draw_mention_candidates(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    target: MentionTarget,
+    dialog_area: Rect,
+) {
+    let Some(view) = app.mention_candidate_view_for_target(target) else {
+        return;
+    };
+    let inner = block_inner(dialog_area);
+    if inner.width < 20 || inner.height < 5 {
+        return;
+    }
+    let popup_width = 42.min(inner.width.saturating_sub(1).max(20));
+    let content_width = usize::from(popup_width.saturating_sub(2).max(1));
+    let lines = mention_candidate_lines(&view, content_width);
+    let popup_height = (lines.len() as u16)
+        .saturating_add(2)
+        .min(inner.height.saturating_sub(1).max(3))
+        .max(3);
+    let popup_area = Rect::new(
+        inner.right().saturating_sub(popup_width),
+        inner.bottom().saturating_sub(popup_height),
+        popup_width,
+        popup_height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(themed_fg_style(Color::LightMagenta))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Mention candidates",
+            themed_bold_style(Color::LightMagenta),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn mention_candidate_lines(view: &MentionCandidateView, width: usize) -> Vec<Line<'static>> {
+    if view.loading && view.candidates.is_empty() {
+        return vec![
+            Line::from(vec![Span::styled(
+                "Loading GitHub accounts...",
+                themed_fg_style(Color::Gray),
+            )]),
+            key_value_line("repo", truncate_text(&view.repo, width)),
+        ];
+    }
+    if let Some(error) = &view.error {
+        return vec![
+            Line::from(vec![Span::styled(
+                "Candidates unavailable",
+                themed_bold_style(Color::LightRed),
+            )]),
+            Line::from(vec![Span::styled(
+                truncate_text(error, width),
+                themed_fg_style(Color::Gray),
+            )]),
+        ];
+    }
+    if view.candidates.is_empty() {
+        let message = if view.query.is_empty() {
+            "No GitHub account candidates loaded."
+        } else {
+            "No account matches this prefix."
+        };
+        return vec![Line::from(vec![Span::styled(
+            message,
+            themed_fg_style(Color::Gray),
+        )])];
+    }
+
+    let selected = view.selected.min(view.candidates.len() - 1);
+    let start = suggestion_window_start(view.candidates.len(), selected, MENTION_SUGGESTION_LIMIT);
+    let mut lines = view
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(MENTION_SUGGESTION_LIMIT)
+        .map(|(index, login)| {
+            let selected = index == selected;
+            let style = if selected {
+                themed_bold_style(Color::Yellow)
+            } else {
+                themed_fg_style(Color::Cyan)
+            };
+            let marker = if selected { "> " } else { "  " };
+            let login = format!("@{login}");
+            let text_width = width.saturating_sub(display_width(marker));
+            Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(truncate_inline(&login, text_width), style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if view.loading {
+        lines.push(Line::from(vec![Span::styled(
+            "  Loading more...",
+            themed_fg_style(Color::Gray),
+        )]));
+    }
+    lines
+}
+
 pub(super) fn draw_review_submit_dialog(
     frame: &mut Frame<'_>,
     app: &AppState,
@@ -3770,6 +3886,7 @@ pub(super) fn draw_review_submit_dialog(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::ReviewSubmit, dialog_area);
     draw_modal_footer(
         frame,
         area,
@@ -3867,6 +3984,7 @@ pub(super) fn draw_comment_editor(
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    draw_mention_candidates(frame, app, MentionTarget::Comment, dialog_area);
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
     if let Some(position) = comment_dialog_cursor_position(
         body,

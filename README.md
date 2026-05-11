@@ -118,7 +118,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
-| `e` | Edit the selected issue or PR title, assignees, labels, and body; in diff mode, end a review range |
+| `e` | Edit the focused comment in Details, edit the selected issue or PR when no comment is focused, or end a review range in diff mode |
 | `T` | Edit the selected issue or PR title, assignees, labels, and body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
@@ -205,8 +205,8 @@ Mouse behavior:
 - Click ghr or Sections tabs to switch views or sections.
 - Click list rows to select them and focus Details. Mouse hover and mouse wheel do not change PR/issue selection.
 - Click descriptions, comments, links, and visible actions in Details to focus, open, or copy code/quote blocks.
-- Click inside comment, review, issue, or PR editor dialogs to place the edit cursor.
-- Drag text inside Details to copy that rendered selection to the clipboard without leaving mouse mode.
+- Click inside comment, review, issue, PR, or item edit editor dialogs to place the edit cursor.
+- Drag text inside Details or editor body fields to copy that rendered selection to the clipboard without leaving mouse mode.
 - Scroll Details with the mouse wheel.
 - Drag the split between list and Details to resize panes; the ratio is saved.
 - Press `m` outside diff mode to temporarily disable TUI mouse capture for terminal text selection; press `m` again to restore mouse controls.

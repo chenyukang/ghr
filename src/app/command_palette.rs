@@ -596,10 +596,10 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             palette_key(KeyCode::Char('R')),
         ),
         palette_command(
-            "Edit Selected Item",
+            "Edit Focused Comment or Item",
             "e",
             "Details",
-            "Edit selected issue or pull request fields",
+            "Edit the focused comment, or the selected issue/PR when no comment is focused",
             palette_key(KeyCode::Char('e')),
         ),
         palette_command(

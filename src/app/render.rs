@@ -32,19 +32,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if app.help_dialog {
         draw_help_dialog(frame, area, &app.command_palette_key);
     } else if let Some(dialog) = &app.item_edit_dialog {
-        draw_item_edit_dialog(frame, dialog, app.item_edit_running, area);
+        draw_item_edit_dialog(frame, app, dialog, app.item_edit_running, area);
     } else if let Some(dialog) = &app.pr_action_dialog {
         draw_pr_action_dialog(frame, dialog, app.pr_action_running, area);
     } else if let Some(dialog) = &app.label_dialog {
         draw_label_dialog(frame, dialog, app.label_updating, area);
     } else if let Some(dialog) = &app.issue_dialog {
-        draw_issue_dialog(frame, dialog, app.issue_creating, area);
+        draw_issue_dialog(frame, app, dialog, app.issue_creating, area);
     } else if let Some(dialog) = &app.pr_create_dialog {
-        draw_pr_create_dialog(frame, dialog, app.pr_creating, area);
+        draw_pr_create_dialog(frame, app, dialog, app.pr_creating, area);
     } else if let Some(dialog) = &app.reaction_dialog {
         draw_reaction_dialog(frame, dialog, app.posting_reaction, area);
     } else if let Some(dialog) = &app.review_submit_dialog {
-        draw_review_submit_dialog(frame, dialog, area);
+        draw_review_submit_dialog(frame, app, dialog, area);
     } else if let Some(dialog) = &app.milestone_dialog {
         draw_milestone_dialog(frame, dialog, app.milestone_action_running, area);
     } else if let Some(dialog) = &app.assignee_dialog {
@@ -52,7 +52,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if let Some(dialog) = &app.reviewer_dialog {
         draw_reviewer_dialog(frame, dialog, app.reviewer_action_running, area);
     } else if let Some(dialog) = &app.comment_dialog {
-        draw_comment_dialog(frame, dialog, area);
+        draw_comment_dialog(frame, app, dialog, area);
     } else if app.global_search_active {
         if let Some(dialog) = &app.global_search_dialog {
             draw_global_search_dialog(frame, dialog, app, area);

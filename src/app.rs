@@ -554,6 +554,28 @@ struct DetailsTextSelection {
     end: DetailsTextPosition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogTextTarget {
+    Comment,
+    ReviewSubmit,
+    IssueBody,
+    PrCreateBody,
+    ItemEditBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogTextDrag {
+    target: DialogTextTarget,
+    start: DetailsTextPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogTextSelection {
+    target: DialogTextTarget,
+    start: DetailsTextPosition,
+    end: DetailsTextPosition,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LabelDialogMode {
     Add { repo: String },
@@ -1510,6 +1532,8 @@ struct AppState {
     mouse_capture_enabled: bool,
     details_text_drag: Option<DetailsTextDrag>,
     details_text_selection: Option<DetailsTextSelection>,
+    dialog_text_drag: Option<DialogTextDrag>,
+    dialog_text_selection: Option<DialogTextSelection>,
     help_dialog: bool,
     diff_return_state: Option<DiffReturnState>,
 }
@@ -2825,6 +2849,8 @@ impl AppState {
             mouse_capture_enabled: true,
             details_text_drag: None,
             details_text_selection: None,
+            dialog_text_drag: None,
+            dialog_text_selection: None,
             help_dialog: false,
             diff_return_state: None,
         };

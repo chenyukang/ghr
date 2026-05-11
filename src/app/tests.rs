@@ -11577,6 +11577,7 @@ fn e_key_opens_item_edit_dialog_from_details() {
         "1".to_string(),
         DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
     );
+    app.clear_selected_comment();
 
     assert!(!handle_key(
         &mut app,
@@ -11589,6 +11590,74 @@ fn e_key_opens_item_edit_dialog_from_details() {
     assert!(app.item_edit_dialog.is_some());
     assert!(app.comment_dialog.is_none());
     assert_eq!(app.status, "editing item");
+}
+
+#[test]
+fn e_key_edits_selected_comment_from_details() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![own_comment(42, "chenyukang", "Original body", None)]),
+    );
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('e')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert!(app.item_edit_dialog.is_none());
+    assert_eq!(
+        app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+        Some(&CommentDialogMode::Edit {
+            comment_index: 0,
+            comment_id: 42,
+            is_review: false,
+        })
+    );
+    assert_eq!(app.status, "editing comment");
+}
+
+#[test]
+fn e_key_edits_selected_issue_comment_from_details() {
+    let mut section = test_section();
+    section.key = "issues:test".to_string();
+    section.kind = SectionKind::Issues;
+    section.items[0].kind = ItemKind::Issue;
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![own_comment(84, "chenyukang", "Issue comment", None)]),
+    );
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('e')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert!(app.item_edit_dialog.is_none());
+    assert_eq!(
+        app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+        Some(&CommentDialogMode::Edit {
+            comment_index: 0,
+            comment_id: 84,
+            is_review: false,
+        })
+    );
+    assert_eq!(app.status, "editing comment");
 }
 
 #[test]
@@ -14076,6 +14145,128 @@ fn item_edit_cursor_positions_match_rendered_field_rows() {
 }
 
 #[test]
+fn mouse_dragging_item_edit_body_copies_selection() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.sections[0].items[0].body = Some("alpha beta gamma\nsecond line".to_string());
+    app.start_item_edit_dialog();
+    let area = Rect::new(0, 0, 120, 34);
+    let dialog = app.item_edit_dialog.as_ref().unwrap().clone();
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let layout = item_edit_layout_rows(dialog.field);
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    let row = inner.y + layout.body_text;
+    let end_column = display_width("alpha beta").min(usize::from(u16::MAX)) as u16;
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: inner.x + end_column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+
+    let selection = app
+        .dialog_text_selection
+        .clone()
+        .expect("active item edit body selection");
+    assert_eq!(selected_dialog_text(&body_lines, &selection), "alpha beta");
+    assert_eq!(app.status, "selecting item body text; release to copy");
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: inner.x + end_column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+
+    assert_eq!(app.status, "copied selected item body text");
+    assert_eq!(
+        selected_dialog_text(
+            &body_lines,
+            app.dialog_text_selection
+                .as_ref()
+                .expect("selection remains visible")
+        ),
+        "alpha beta"
+    );
+}
+
+#[test]
+fn mouse_releasing_item_edit_body_selection_outside_dialog_copies_selection() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.sections[0].items[0].body = Some("alpha beta gamma\nsecond line".to_string());
+    app.start_item_edit_dialog();
+    let area = Rect::new(0, 0, 120, 34);
+    let dialog = app.item_edit_dialog.as_ref().unwrap().clone();
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let layout = item_edit_layout_rows(dialog.field);
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    let row = inner.y + layout.body_text;
+    let end_column = display_width("alpha beta").min(usize::from(u16::MAX)) as u16;
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: inner.x + end_column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+
+    assert_eq!(app.status, "copied selected item body text");
+    assert_eq!(
+        selected_dialog_text(
+            &body_lines,
+            app.dialog_text_selection
+                .as_ref()
+                .expect("selection remains visible")
+        ),
+        "alpha beta"
+    );
+}
+
+#[test]
 fn item_edit_candidate_lists_only_show_for_focused_collection_field() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.start_item_edit_dialog();
@@ -15192,6 +15383,72 @@ fn mouse_clicking_comment_editor_moves_cursor() {
             .as_ref()
             .map(|dialog| (dialog.body.as_str(), dialog.body.cursor_byte())),
         Some(("hello Xworld", "hello X".len()))
+    );
+}
+
+#[test]
+fn mouse_dragging_comment_editor_text_copies_selection() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let area = Rect::new(0, 0, 100, 30);
+    app.start_new_comment_dialog();
+    {
+        let dialog = app.comment_dialog.as_mut().unwrap();
+        dialog.body.set_text("hello world\nsecond line");
+    }
+    let dialog = app.comment_dialog.as_ref().unwrap().clone();
+    let dialog_area = comment_dialog_area(&dialog, area);
+    let inner = block_inner(dialog_area);
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    let row = inner.y;
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: inner.x + 5,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+
+    let selection = app
+        .dialog_text_selection
+        .clone()
+        .expect("active dialog text selection");
+    assert_eq!(selected_dialog_text(&body_lines, &selection), "hello");
+    assert_eq!(app.status, "selecting comment text; release to copy");
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: inner.x + 5,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        area,
+    );
+
+    assert_eq!(app.status, "copied selected comment text");
+    assert_eq!(
+        selected_dialog_text(
+            &body_lines,
+            app.dialog_text_selection
+                .as_ref()
+                .expect("selection remains visible")
+        ),
+        "hello"
     );
 }
 

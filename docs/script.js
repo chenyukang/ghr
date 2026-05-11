@@ -60,7 +60,7 @@ const shortcuts = [
   ["Details", "n / p", "Focus comments; p from the first comment returns to PR/issue details"],
   ["Details", "Enter", "Expand or collapse a long focused comment"],
   ["Details", "R", "Reply to the focused comment"],
-  ["Details", "e", "Edit selected issue or pull request fields"],
+  ["Details", "e", "Edit the focused comment, or the selected issue/PR when no comment is focused"],
   ["Details", "c / a", "Add a comment in conversation mode"],
   ["Diff", "q / Esc", "Return to the state before opening diff mode"],
   ["Diff", "Tab / Shift+Tab", "Switch focus between changed files and the file diff"],
@@ -80,7 +80,7 @@ const shortcuts = [
   ["Mouse", "click descriptions/comments", "Focus the description or selected comment"],
   ["Mouse", "click editor text", "Move the editor cursor to that position"],
   ["Mouse", "click links/actions", "Open links, run visible actions, or copy code/quote blocks"],
-  ["Mouse", "drag Details text", "Copy the rendered selection to the clipboard"],
+  ["Mouse", "drag text", "Copy Details or editor body selection to the clipboard"],
   ["Mouse", "wheel", "Scroll list, details, or dialog under the pointer"],
   ["Mouse", "drag split border", "Resize list/details ratio"],
 ];

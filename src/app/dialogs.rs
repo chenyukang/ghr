@@ -1806,6 +1806,7 @@ pub(super) fn draw_label_dialog(
 
 pub(super) fn draw_issue_dialog(
     frame: &mut Frame<'_>,
+    app: &AppState,
     dialog: &IssueDialog,
     running: bool,
     area: Rect,
@@ -1855,6 +1856,7 @@ pub(super) fn draw_issue_dialog(
     while lines.len() < usize::from(7 + editor_height) {
         lines.push(Line::from(""));
     }
+    apply_dialog_text_selection(app, DialogTextTarget::IssueBody, scroll, 7, &mut lines);
     let footer = if running {
         "working..."
     } else {
@@ -1886,6 +1888,7 @@ pub(super) fn draw_issue_dialog(
 
 pub(super) fn draw_pr_create_dialog(
     frame: &mut Frame<'_>,
+    app: &AppState,
     dialog: &PrCreateDialog,
     running: bool,
     area: Rect,
@@ -1923,6 +1926,7 @@ pub(super) fn draw_pr_create_dialog(
     while lines.len() < usize::from(7 + editor_height) {
         lines.push(Line::from(""));
     }
+    apply_dialog_text_selection(app, DialogTextTarget::PrCreateBody, scroll, 7, &mut lines);
     let footer = if running {
         "working..."
     } else {
@@ -2748,6 +2752,7 @@ pub(super) fn draw_reviewer_dialog(
 
 pub(super) fn draw_item_edit_dialog(
     frame: &mut Frame<'_>,
+    app: &AppState,
     dialog: &ItemEditDialog,
     running: bool,
     area: Rect,
@@ -2807,6 +2812,13 @@ pub(super) fn draw_item_edit_dialog(
     while lines.len() < usize::from(layout.reserved_rows.saturating_add(editor_height)) {
         lines.push(Line::from(""));
     }
+    apply_dialog_text_selection(
+        app,
+        DialogTextTarget::ItemEditBody,
+        scroll,
+        usize::from(layout.body_text),
+        &mut lines,
+    );
     let footer = if running {
         "working..."
     } else {
@@ -2836,16 +2848,16 @@ pub(super) fn draw_item_edit_dialog(
 }
 
 // Keep these fixed row offsets in sync with draw_item_edit_dialog's line order.
-const ITEM_EDIT_TITLE_ROW: u16 = 0;
-const ITEM_EDIT_ASSIGN_ROW: u16 = 2;
+pub(super) const ITEM_EDIT_TITLE_ROW: u16 = 0;
+pub(super) const ITEM_EDIT_ASSIGN_ROW: u16 = 2;
 const ITEM_EDIT_SUGGESTION_ROWS: u16 = 4;
 const ITEM_EDIT_BODY_TRAILING_ROWS: u16 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ItemEditLayoutRows {
-    labels: u16,
-    body_text: u16,
-    reserved_rows: u16,
+    pub(super) labels: u16,
+    pub(super) body_text: u16,
+    pub(super) reserved_rows: u16,
 }
 
 pub(super) fn item_edit_layout_rows(field: ItemEditField) -> ItemEditLayoutRows {
@@ -3613,22 +3625,102 @@ pub(super) fn key_value_line(key: &'static str, value: String) -> Line<'static> 
     ])
 }
 
-pub(super) fn draw_comment_dialog(frame: &mut Frame<'_>, dialog: &CommentDialog, area: Rect) {
+fn apply_dialog_text_selection(
+    app: &AppState,
+    target: DialogTextTarget,
+    scroll: u16,
+    content_start: usize,
+    lines: &mut [Line<'static>],
+) {
+    let Some(selection) = app
+        .dialog_text_selection
+        .as_ref()
+        .filter(|selection| selection.target == target)
+    else {
+        return;
+    };
+    let ((start_line, start_col), (end_line, end_col)) = ordered_dialog_text_range(selection);
+    if start_line == end_line && start_col == end_col {
+        return;
+    }
+
+    for (line_index, line) in lines.iter_mut().enumerate().skip(content_start) {
+        let full_line = usize::from(scroll).saturating_add(line_index - content_start);
+        if full_line < start_line || full_line > end_line {
+            continue;
+        }
+        let line_width = display_width(&line.to_string());
+        let selection_start = if full_line == start_line {
+            usize::from(start_col).min(line_width)
+        } else {
+            0
+        };
+        let selection_end = if full_line == end_line {
+            usize::from(end_col).min(line_width)
+        } else {
+            line_width
+        };
+        if selection_start >= selection_end {
+            continue;
+        }
+
+        let spans = std::mem::take(&mut line.spans);
+        line.spans = highlight_dialog_text_spans(spans, selection_start, selection_end);
+    }
+}
+
+fn highlight_dialog_text_spans(
+    spans: Vec<Span<'static>>,
+    selection_start: usize,
+    selection_end: usize,
+) -> Vec<Span<'static>> {
+    let mut highlighted = Vec::new();
+    let mut column = 0_usize;
+    for span in spans {
+        let base_style = span.style;
+        let selected_style = dialog_text_selection_style(base_style);
+        for ch in span.content.as_ref().chars() {
+            let width = display_width_char(ch);
+            let next_column = column.saturating_add(width);
+            let selected = next_column > selection_start && column < selection_end;
+            highlighted.push(Span::styled(
+                ch.to_string(),
+                if selected { selected_style } else { base_style },
+            ));
+            column = next_column;
+        }
+    }
+    highlighted
+}
+
+fn dialog_text_selection_style(base: Style) -> Style {
+    base.fg(active_theme().highlight_fg)
+        .bg(active_theme().highlight_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub(super) fn draw_comment_dialog(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    dialog: &CommentDialog,
+    area: Rect,
+) {
     let title = match &dialog.mode {
         CommentDialogMode::New => "New Comment".to_string(),
         CommentDialogMode::Reply { author, .. } => {
-            return draw_reply_dialog(frame, dialog, author, area);
+            return draw_reply_dialog(frame, app, dialog, author, area);
         }
         CommentDialogMode::Edit { .. } => "Edit Comment".to_string(),
         CommentDialogMode::Review { target } => {
             format!("Review {}", target.location_label())
         }
     };
-    draw_comment_editor(frame, &title, dialog, area);
+    draw_comment_editor(frame, app, &title, dialog, area);
 }
 
 pub(super) fn draw_review_submit_dialog(
     frame: &mut Frame<'_>,
+    app: &AppState,
     dialog: &ReviewSubmitDialog,
     area: Rect,
 ) {
@@ -3660,6 +3752,13 @@ pub(super) fn draw_review_submit_dialog(
     while lines.len() < usize::from(header_height.saturating_add(editor_height)) {
         lines.push(Line::from(""));
     }
+    apply_dialog_text_selection(
+        app,
+        DialogTextTarget::ReviewSubmit,
+        scroll,
+        usize::from(header_height),
+        &mut lines,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(themed_fg_style(Color::LightMagenta))
@@ -3719,15 +3818,17 @@ pub(super) fn review_dialog_pr_label(dialog: &ReviewSubmitDialog) -> String {
 
 pub(super) fn draw_reply_dialog(
     frame: &mut Frame<'_>,
+    app: &AppState,
     dialog: &CommentDialog,
     author: &str,
     area: Rect,
 ) {
-    draw_comment_editor(frame, &format!("Reply to @{author}"), dialog, area);
+    draw_comment_editor(frame, app, &format!("Reply to @{author}"), dialog, area);
 }
 
 pub(super) fn draw_comment_editor(
     frame: &mut Frame<'_>,
+    app: &AppState,
     title: &str,
     dialog: &CommentDialog,
     area: Rect,
@@ -3749,6 +3850,7 @@ pub(super) fn draw_comment_editor(
     while lines.len() < usize::from(editor_height) {
         lines.push(Line::from(""));
     }
+    apply_dialog_text_selection(app, DialogTextTarget::Comment, scroll, 0, &mut lines);
     let footer =
         "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor";
     let block = Block::default()

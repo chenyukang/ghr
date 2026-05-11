@@ -316,6 +316,7 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if app.comment_dialog.is_some() {
+        clear_dialog_text_selection(app);
         if editor_save_draft_key(key) {
             app.save_active_comment_draft(store, DraftSaveTrigger::Manual, Instant::now());
         } else {
@@ -330,6 +331,7 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if app.issue_dialog.is_some() {
+        clear_dialog_text_selection(app);
         if editor_save_draft_key(key) {
             app.save_active_issue_draft(store, DraftSaveTrigger::Manual, Instant::now());
         } else {
@@ -339,6 +341,7 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if app.pr_create_dialog.is_some() {
+        clear_dialog_text_selection(app);
         if editor_save_draft_key(key) {
             app.save_active_pr_create_draft(store, DraftSaveTrigger::Manual, Instant::now());
         } else {
@@ -353,11 +356,13 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if app.review_submit_dialog.is_some() {
+        clear_dialog_text_selection(app);
         app.handle_review_submit_dialog_key(key, tx, area);
         return false;
     }
 
     if app.item_edit_dialog.is_some() {
+        clear_dialog_text_selection(app);
         app.handle_item_edit_dialog_key(key, tx, area);
         return false;
     }
@@ -639,7 +644,11 @@ pub(super) fn handle_key_in_area_mut(
                 app.start_keyboard_reaction_dialog(area)
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Conversation => {
-                app.start_item_edit_dialog_with_store(Some(store), Some(tx))
+                if app.selected_comment_is_visible(area) {
+                    app.start_edit_selected_comment_dialog();
+                } else {
+                    app.start_item_edit_dialog_with_store(Some(store), Some(tx));
+                }
             }
             KeyCode::Char('n') => app.move_comment_in_view(1, area),
             KeyCode::Char('p') => app.move_comment_in_view(-1, area),
@@ -943,6 +952,7 @@ pub(super) fn handle_mouse_with_sync(
         return false;
     }
     if app.item_edit_dialog.is_some() {
+        handle_item_edit_dialog_mouse(app, mouse, area);
         return false;
     }
     if app.review_submit_dialog.is_some() {
@@ -1054,6 +1064,256 @@ pub(super) fn handle_startup_dialog_mouse(
     false
 }
 
+fn dialog_text_target_label(target: DialogTextTarget) -> &'static str {
+    match target {
+        DialogTextTarget::Comment => "comment",
+        DialogTextTarget::ReviewSubmit => "review summary",
+        DialogTextTarget::IssueBody => "issue body",
+        DialogTextTarget::PrCreateBody => "pull request body",
+        DialogTextTarget::ItemEditBody => "item body",
+    }
+}
+
+fn dialog_text_drag_matches(app: &AppState, target: DialogTextTarget) -> bool {
+    app.dialog_text_drag
+        .as_ref()
+        .is_some_and(|drag| drag.target == target)
+}
+
+fn clear_dialog_text_selection(app: &mut AppState) {
+    app.dialog_text_drag = None;
+    app.dialog_text_selection = None;
+}
+
+fn dialog_text_position_from_mouse(
+    mouse: MouseEvent,
+    editor_area: Rect,
+    scroll: u16,
+    lines: &[String],
+    clamp: bool,
+) -> Option<DetailsTextPosition> {
+    if editor_area.width == 0 || editor_area.height == 0 || lines.is_empty() {
+        return None;
+    }
+
+    let (row, column) = if clamp {
+        let row = mouse.row.clamp(
+            editor_area.y,
+            editor_area
+                .y
+                .saturating_add(editor_area.height.saturating_sub(1)),
+        );
+        let column = mouse.column.clamp(
+            editor_area.x,
+            editor_area
+                .x
+                .saturating_add(editor_area.width.saturating_sub(1)),
+        );
+        (row, column)
+    } else {
+        if !rect_contains(editor_area, mouse.column, mouse.row) {
+            return None;
+        }
+        (mouse.row, mouse.column)
+    };
+
+    let visible_line = row.saturating_sub(editor_area.y);
+    let line = usize::from(scroll)
+        .saturating_add(usize::from(visible_line))
+        .min(lines.len().saturating_sub(1));
+    let line_width = display_width(&lines[line]).min(usize::from(u16::MAX));
+    let column = usize::from(column.saturating_sub(editor_area.x))
+        .min(line_width)
+        .min(usize::from(u16::MAX)) as u16;
+
+    Some(DetailsTextPosition { line, column })
+}
+
+fn start_dialog_text_drag(
+    app: &mut AppState,
+    target: DialogTextTarget,
+    position: DetailsTextPosition,
+) {
+    app.dialog_text_drag = Some(DialogTextDrag {
+        target,
+        start: position,
+    });
+    app.dialog_text_selection = None;
+}
+
+fn update_dialog_text_drag(
+    app: &mut AppState,
+    target: DialogTextTarget,
+    position: DetailsTextPosition,
+) {
+    let Some(drag) = app
+        .dialog_text_drag
+        .clone()
+        .filter(|drag| drag.target == target)
+    else {
+        return;
+    };
+    app.dialog_text_selection = Some(DialogTextSelection {
+        target,
+        start: drag.start,
+        end: position,
+    });
+    app.status = format!(
+        "selecting {} text; release to copy",
+        dialog_text_target_label(target)
+    );
+}
+
+fn finish_dialog_text_drag(
+    app: &mut AppState,
+    target: DialogTextTarget,
+    position: DetailsTextPosition,
+    lines: &[String],
+) {
+    let Some(drag) = app
+        .dialog_text_drag
+        .take()
+        .filter(|drag| drag.target == target)
+    else {
+        return;
+    };
+    let mut selection = app
+        .dialog_text_selection
+        .clone()
+        .filter(|selection| selection.target == target)
+        .unwrap_or(DialogTextSelection {
+            target,
+            start: drag.start,
+            end: position,
+        });
+    selection.end = position;
+    app.dialog_text_selection = Some(selection.clone());
+
+    let selected = selected_dialog_text(lines, &selection);
+    if selected.trim().is_empty() {
+        app.dialog_text_selection = None;
+        return;
+    }
+
+    match copy_text_to_clipboard(&selected) {
+        Ok(()) => {
+            app.status = format!("copied selected {} text", dialog_text_target_label(target));
+        }
+        Err(error) => {
+            app.status = format!("copy failed: {error}");
+        }
+    }
+}
+
+fn handle_active_dialog_text_drag(
+    app: &mut AppState,
+    target: DialogTextTarget,
+    mouse: MouseEvent,
+    editor_area: Rect,
+    scroll: u16,
+    lines: &[String],
+) -> bool {
+    if !dialog_text_drag_matches(app, target) {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(position) =
+                dialog_text_position_from_mouse(mouse, editor_area, scroll, lines, true)
+            {
+                update_dialog_text_drag(app, target, position);
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let position = if rect_contains(editor_area, mouse.column, mouse.row) {
+                dialog_text_position_from_mouse(mouse, editor_area, scroll, lines, true)
+            } else {
+                app.dialog_text_selection
+                    .as_ref()
+                    .filter(|selection| selection.target == target)
+                    .map(|selection| selection.end)
+                    .or_else(|| {
+                        dialog_text_position_from_mouse(mouse, editor_area, scroll, lines, true)
+                    })
+            };
+            if let Some(position) = position {
+                finish_dialog_text_drag(app, target, position, lines);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn selected_dialog_text(lines: &[String], selection: &DialogTextSelection) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let ((start_line, start_col), (end_line, end_col)) = ordered_dialog_text_range(selection);
+    let last_line = end_line.min(lines.len().saturating_sub(1));
+    if start_line > last_line {
+        return String::new();
+    }
+
+    let mut selected = Vec::new();
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .take(last_line.saturating_add(1))
+        .skip(start_line)
+    {
+        let line_width = display_width(line);
+        let start = if line_index == start_line {
+            usize::from(start_col).min(line_width)
+        } else {
+            0
+        };
+        let end = if line_index == end_line {
+            usize::from(end_col).min(line_width)
+        } else {
+            line_width
+        };
+        selected.push(selected_visible_text_line(line, start, end));
+    }
+
+    selected.join("\n").trim_end_matches('\n').to_string()
+}
+
+fn selected_visible_text_line(line: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    let mut column = 0_usize;
+    for ch in line.chars() {
+        let width = display_width_char(ch);
+        let next_column = column.saturating_add(width);
+        if next_column > start && column < end {
+            output.push(ch);
+        }
+        column = next_column;
+        if column >= end {
+            break;
+        }
+    }
+    output
+}
+
+pub(super) fn ordered_dialog_text_range(
+    selection: &DialogTextSelection,
+) -> ((usize, u16), (usize, u16)) {
+    let start = (selection.start.line, selection.start.column);
+    let end = (selection.end.line, selection.end.column);
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
 pub(super) fn handle_comment_dialog_mouse(
     app: &mut AppState,
     dialog: CommentDialog,
@@ -1062,6 +1322,19 @@ pub(super) fn handle_comment_dialog_mouse(
     store: Option<&SnapshotStore>,
 ) {
     let dialog_area = comment_dialog_area(&dialog, area);
+    let inner = block_inner(dialog_area);
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    if handle_active_dialog_text_drag(
+        app,
+        DialogTextTarget::Comment,
+        mouse,
+        inner,
+        dialog.scroll,
+        &body_lines,
+    ) {
+        return;
+    }
+
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && modal_footer_area(area, dialog_area)
             .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
@@ -1085,7 +1358,8 @@ pub(super) fn handle_comment_dialog_mouse(
             app.scroll_comment_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let inner = block_inner(dialog_area);
+            app.dialog_text_drag = None;
+            app.dialog_text_selection = None;
             if !rect_contains(inner, mouse.column, mouse.row) {
                 return;
             }
@@ -1100,6 +1374,11 @@ pub(super) fn handle_comment_dialog_mouse(
                 );
                 active.body.set_cursor_byte(cursor);
             }
+            if let Some(position) =
+                dialog_text_position_from_mouse(mouse, inner, dialog.scroll, &body_lines, false)
+            {
+                start_dialog_text_drag(app, DialogTextTarget::Comment, position);
+            }
             app.scroll_comment_dialog_to_cursor_in_area(Some(area));
             app.status = "comment cursor moved".to_string();
         }
@@ -1112,6 +1391,26 @@ pub(super) fn handle_review_submit_dialog_mouse(app: &mut AppState, mouse: Mouse
         return;
     };
     let dialog_area = review_submit_dialog_area(&dialog, area);
+    let inner = block_inner(dialog_area);
+    let header_height = 3_u16.min(inner.height);
+    let editor_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(header_height),
+        inner.width,
+        inner.height.saturating_sub(header_height),
+    );
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), editor_area.width.max(1));
+    if handle_active_dialog_text_drag(
+        app,
+        DialogTextTarget::ReviewSubmit,
+        mouse,
+        editor_area,
+        dialog.scroll,
+        &body_lines,
+    ) {
+        return;
+    }
+
     if !rect_contains(dialog_area, mouse.column, mouse.row) {
         return;
     }
@@ -1124,14 +1423,8 @@ pub(super) fn handle_review_submit_dialog_mouse(app: &mut AppState, mouse: Mouse
             app.scroll_review_submit_dialog(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let inner = block_inner(dialog_area);
-            let header_height = 3_u16.min(inner.height);
-            let editor_area = Rect::new(
-                inner.x,
-                inner.y.saturating_add(header_height),
-                inner.width,
-                inner.height.saturating_sub(header_height),
-            );
+            app.dialog_text_drag = None;
+            app.dialog_text_selection = None;
             if !rect_contains(editor_area, mouse.column, mouse.row) {
                 return;
             }
@@ -1149,6 +1442,15 @@ pub(super) fn handle_review_submit_dialog_mouse(app: &mut AppState, mouse: Mouse
             }
             app.scroll_review_submit_dialog_to_cursor_in_area(Some(area));
             app.status = "review summary cursor moved".to_string();
+            if let Some(position) = dialog_text_position_from_mouse(
+                mouse,
+                editor_area,
+                dialog.scroll,
+                &body_lines,
+                false,
+            ) {
+                start_dialog_text_drag(app, DialogTextTarget::ReviewSubmit, position);
+            }
         }
         _ => {}
     }
@@ -1164,6 +1466,25 @@ pub(super) fn handle_issue_dialog_mouse(
         return;
     };
     let dialog_area = issue_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let body_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(7),
+        inner.width,
+        inner.height.saturating_sub(7),
+    );
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    if handle_active_dialog_text_drag(
+        app,
+        DialogTextTarget::IssueBody,
+        mouse,
+        body_area,
+        dialog.body_scroll,
+        &body_lines,
+    ) {
+        return;
+    }
+
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && modal_footer_area(area, dialog_area)
             .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
@@ -1187,7 +1508,8 @@ pub(super) fn handle_issue_dialog_mouse(
             app.scroll_issue_dialog_body(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let inner = block_inner(dialog_area);
+            app.dialog_text_drag = None;
+            app.dialog_text_selection = None;
             if !rect_contains(inner, mouse.column, mouse.row) {
                 return;
             }
@@ -1244,6 +1566,15 @@ pub(super) fn handle_issue_dialog_mouse(
                         );
                         active.body.set_cursor_byte(cursor);
                         app.status = "editing issue body".to_string();
+                        if let Some(position) = dialog_text_position_from_mouse(
+                            mouse,
+                            body_area,
+                            dialog.body_scroll,
+                            &body_lines,
+                            false,
+                        ) {
+                            start_dialog_text_drag(app, DialogTextTarget::IssueBody, position);
+                        }
                     }
                     _ => {}
                 }
@@ -1264,6 +1595,25 @@ pub(super) fn handle_pr_create_dialog_mouse(
         return;
     };
     let dialog_area = pr_create_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let body_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(7),
+        inner.width,
+        inner.height.saturating_sub(7),
+    );
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    if handle_active_dialog_text_drag(
+        app,
+        DialogTextTarget::PrCreateBody,
+        mouse,
+        body_area,
+        dialog.body_scroll,
+        &body_lines,
+    ) {
+        return;
+    }
+
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && modal_footer_area(area, dialog_area)
             .is_some_and(|footer| rect_contains(footer, mouse.column, mouse.row))
@@ -1287,7 +1637,8 @@ pub(super) fn handle_pr_create_dialog_mouse(
             app.scroll_pr_create_dialog_body(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let inner = block_inner(dialog_area);
+            app.dialog_text_drag = None;
+            app.dialog_text_selection = None;
             if !rect_contains(inner, mouse.column, mouse.row) {
                 return;
             }
@@ -1322,11 +1673,123 @@ pub(super) fn handle_pr_create_dialog_mouse(
                         );
                         active.body.set_cursor_byte(cursor);
                         app.status = "editing pull request body".to_string();
+                        if let Some(position) = dialog_text_position_from_mouse(
+                            mouse,
+                            body_area,
+                            dialog.body_scroll,
+                            &body_lines,
+                            false,
+                        ) {
+                            start_dialog_text_drag(app, DialogTextTarget::PrCreateBody, position);
+                        }
                     }
                     _ => {}
                 }
             }
             app.scroll_pr_create_dialog_to_cursor_in_area(Some(area));
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn handle_item_edit_dialog_mouse(app: &mut AppState, mouse: MouseEvent, area: Rect) {
+    let Some(dialog) = app.item_edit_dialog.clone() else {
+        return;
+    };
+    let dialog_area = item_edit_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let layout = item_edit_layout_rows(dialog.field);
+    let editor_height = item_edit_body_editor_height(dialog_area, dialog.field);
+    let body_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(layout.body_text),
+        inner.width,
+        editor_height,
+    );
+    let body_lines = comment_dialog_body_lines(dialog.body.text(), inner.width.max(1));
+    if handle_active_dialog_text_drag(
+        app,
+        DialogTextTarget::ItemEditBody,
+        mouse,
+        body_area,
+        dialog.body_scroll,
+        &body_lines,
+    ) {
+        return;
+    }
+
+    if !rect_contains(dialog_area, mouse.column, mouse.row) {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            app.scroll_item_edit_body(MOUSE_COMMENT_SCROLL_LINES as i16, Some(area));
+        }
+        MouseEventKind::ScrollUp => {
+            app.scroll_item_edit_body(-(MOUSE_COMMENT_SCROLL_LINES as i16), Some(area));
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.dialog_text_drag = None;
+            app.dialog_text_selection = None;
+            if !rect_contains(inner, mouse.column, mouse.row) {
+                return;
+            }
+            let row = mouse.row.saturating_sub(inner.y);
+            if let Some(active) = &mut app.item_edit_dialog {
+                match row {
+                    ITEM_EDIT_TITLE_ROW => {
+                        active.field = ItemEditField::Title;
+                        let cursor = issue_dialog_mouse_input_cursor(
+                            "Title",
+                            active.title.text(),
+                            inner,
+                            mouse,
+                        );
+                        active.title.set_cursor_byte(cursor);
+                        app.status = "editing title".to_string();
+                    }
+                    ITEM_EDIT_ASSIGN_ROW => {
+                        active.field = ItemEditField::Assignees;
+                        app.status = "editing assignees".to_string();
+                    }
+                    row if row == layout.labels => {
+                        active.field = ItemEditField::Labels;
+                        app.status = "editing labels".to_string();
+                    }
+                    row if row == layout.body_text.saturating_sub(1) => {
+                        active.field = ItemEditField::Body;
+                        app.status = "editing body".to_string();
+                    }
+                    row if row >= layout.body_text
+                        && row < layout.body_text.saturating_add(editor_height) =>
+                    {
+                        active.field = ItemEditField::Body;
+                        let line = usize::from(dialog.body_scroll)
+                            .saturating_add(usize::from(row.saturating_sub(layout.body_text)));
+                        let column = mouse.column.saturating_sub(inner.x);
+                        let cursor = comment_dialog_cursor_for_position(
+                            active.body.text(),
+                            inner.width.max(1),
+                            line,
+                            column,
+                        );
+                        active.body.set_cursor_byte(cursor);
+                        app.status = "editing body".to_string();
+                        if let Some(position) = dialog_text_position_from_mouse(
+                            mouse,
+                            body_area,
+                            dialog.body_scroll,
+                            &body_lines,
+                            false,
+                        ) {
+                            start_dialog_text_drag(app, DialogTextTarget::ItemEditBody, position);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            app.scroll_item_edit_body_to_cursor_in_area(Some(area));
         }
         _ => {}
     }

@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+use std::env;
 use std::io;
 use std::io::IsTerminal;
 #[cfg(not(test))]
@@ -2076,6 +2078,70 @@ fn item_supports_metadata_edit(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
 
+#[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardCommand {
+    command: &'static str,
+    args: &'static [&'static str],
+    required_env: Option<&'static str>,
+}
+
+#[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
+const UNIX_CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[
+    ClipboardCommand {
+        command: "wl-copy",
+        args: &[],
+        required_env: Some("WAYLAND_DISPLAY"),
+    },
+    ClipboardCommand {
+        command: "xclip",
+        args: &["-selection", "clipboard"],
+        required_env: Some("DISPLAY"),
+    },
+    ClipboardCommand {
+        command: "xsel",
+        args: &["--clipboard", "--input"],
+        required_env: Some("DISPLAY"),
+    },
+];
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn env_var_present(name: &str) -> bool {
+    env::var_os(name).is_some_and(|value| !value.as_os_str().is_empty())
+}
+
+#[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
+fn clipboard_command_enabled(command: ClipboardCommand, has_env: impl Fn(&str) -> bool) -> bool {
+    command.required_env.is_none_or(has_env)
+}
+
+#[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+
+        encoded.push(TABLE[(first >> 2) as usize] as char);
+        encoded.push(TABLE[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(third & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
+
 fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(test)]
     {
@@ -2095,27 +2161,45 @@ fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
 
     #[cfg(all(not(test), unix, not(target_os = "macos")))]
     {
-        let mut last_error = None;
-        for (command, args) in [
-            ("wl-copy", Vec::<&str>::new()),
-            ("xclip", vec!["-selection", "clipboard"]),
-            ("xsel", vec!["--clipboard", "--input"]),
-        ] {
-            match copy_text_with_command(command, &args, text) {
+        let mut errors = Vec::new();
+
+        if env_var_present("TMUX") {
+            match copy_text_with_tmux(text) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    last_error = Some(error);
+                    errors.push("tmux not found".to_string());
                 }
-                Err(error) => return Err(error),
+                Err(error) => errors.push(error.to_string()),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "no clipboard command found; tried wl-copy, xclip, and xsel",
-            )
-        }))
+        for command in UNIX_CLIPBOARD_COMMANDS {
+            if !clipboard_command_enabled(*command, env_var_present) {
+                if let Some(required_env) = command.required_env {
+                    errors.push(format!(
+                        "{} skipped; {required_env} is not set",
+                        command.command
+                    ));
+                }
+                continue;
+            }
+
+            match copy_text_with_command(command.command, command.args, text) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    errors.push(format!("{} not found", command.command));
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        match copy_text_with_osc52(text) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                errors.push(error.to_string());
+                Err(clipboard_copy_error(&errors))
+            }
+        }
     }
 
     #[cfg(not(any(test, unix, target_os = "windows")))]
@@ -2133,25 +2217,148 @@ fn copy_text_with_command(command: &str, args: &[&str], text: &str) -> io::Resul
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
+    let write_result = {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 format!("failed to open stdin for {command}"),
             )
         })?;
-        stdin.write_all(text.as_bytes())?;
+        stdin.write_all(text.as_bytes())
+    };
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(command_failure_message(
+            command,
+            &output.status.to_string(),
+            &output.stderr,
+        )));
     }
 
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
+    write_result
+}
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn copy_text_with_tmux(text: &str) -> io::Result<()> {
+    let mut errors = Vec::new();
+
+    match tmux_current_client() {
+        Ok(client) => {
+            let args = ["load-buffer", "-w", "-t", client.as_str(), "-"];
+            match copy_text_with_command("tmux", &args, text) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+        Err(error) => errors.push(format!("failed to resolve tmux client: {error}")),
+    }
+
+    match copy_text_with_command("tmux", &["load-buffer", "-w", "-"], text) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
+        Err(error) => {
+            errors.push(error.to_string());
+            match copy_text_with_command("tmux", &["load-buffer", "-"], text) {
+                Ok(()) => Ok(()),
+                Err(buffer_error) if buffer_error.kind() == io::ErrorKind::NotFound => {
+                    Err(buffer_error)
+                }
+                Err(buffer_error) => {
+                    errors.push(buffer_error.to_string());
+                    Err(tmux_clipboard_error(&errors))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn tmux_current_client() -> io::Result<String> {
+    let mut command = Command::new("tmux");
+    command.arg("display-message").arg("-p");
+    if let Some(pane) = env::var_os("TMUX_PANE").filter(|pane| !pane.is_empty()) {
+        command.arg("-t").arg(pane);
+    }
+    let output = command
+        .arg("#{client_name}")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::other(command_failure_message(
+            "tmux",
+            &output.status.to_string(),
+            &output.stderr,
+        )));
+    }
+
+    let client = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if client.is_empty() {
+        Err(io::Error::other("tmux client name is empty"))
     } else {
-        Err(io::Error::other(format!(
-            "{command} exited with status {status}"
-        )))
+        Ok(client)
+    }
+}
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn copy_text_with_osc52(text: &str) -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Err(io::Error::other("OSC 52 requires terminal stdout"));
+    }
+
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\x1b]52;c;")?;
+    stdout.write_all(encoded.as_bytes())?;
+    stdout.write_all(b"\x07")?;
+    stdout.flush()
+}
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn tmux_clipboard_error(errors: &[String]) -> io::Error {
+    let detail = errors
+        .iter()
+        .filter(|error| !error.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        io::Error::other("tmux clipboard copy failed")
+    } else {
+        io::Error::other(format!("tmux clipboard copy failed: {detail}"))
+    }
+}
+
+fn command_failure_message(command: &str, status: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        format!("{command} failed ({status})")
+    } else {
+        format!("{command} failed ({status}): {detail}")
+    }
+}
+
+#[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
+fn clipboard_copy_error(errors: &[String]) -> io::Error {
+    let detail = errors
+        .iter()
+        .filter(|error| !error.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        io::Error::other("no usable clipboard target; tried wl-copy, xclip, xsel, tmux, and OSC 52")
+    } else {
+        io::Error::other(format!("no usable clipboard target: {detail}"))
     }
 }
 

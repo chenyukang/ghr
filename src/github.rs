@@ -5043,6 +5043,7 @@ fn open_milestones_path(repository: &str) -> String {
     format!("repos/{repository}/milestones?state=open&per_page=100")
 }
 
+#[cfg(test)]
 fn open_milestones_args(repository: &str) -> Vec<String> {
     paginated_api_slurp_args(&open_milestones_path(repository), None)
 }

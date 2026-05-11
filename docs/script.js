@@ -60,7 +60,7 @@ const shortcuts = [
   ["Details", "n / p", "Focus comments; p from the first comment returns to PR/issue details"],
   ["Details", "Enter", "Expand or collapse a long focused comment"],
   ["Details", "R", "Reply to the focused comment"],
-  ["Details", "e", "Edit the focused comment when it is yours"],
+  ["Details", "e", "Edit the focused comment when GitHub allows it"],
   ["Details", "c / a", "Add a comment in conversation mode"],
   ["Diff", "q / Esc", "Return to the state before opening diff mode"],
   ["Diff", "Tab / Shift+Tab", "Switch focus between changed files and the file diff"],

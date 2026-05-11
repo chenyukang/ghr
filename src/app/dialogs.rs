@@ -3799,7 +3799,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("@ / -", "assign or unassign issue and PR assignees"),
         help_key_line("R", "reply to focused comment"),
         help_key_line("+", "add a reaction to the visible focused comment or item"),
-        help_key_line("e", "edit focused comment when it is yours"),
+        help_key_line("e", "edit focused comment when GitHub allows it"),
         help_key_line("L", "add a label to the selected issue or PR"),
         help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
         help_key_line("T", "edit selected issue or PR title/body"),

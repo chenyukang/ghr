@@ -8466,6 +8466,7 @@ fn inbox_details_mark_new_since_last_read_updates() {
             url: None,
             parent_id: None,
             is_mine: false,
+            viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
         }]),
@@ -10150,6 +10151,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 url: None,
                 parent_id: None,
                 is_mine: false,
+                viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
             },
@@ -10163,6 +10165,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 url: Some("https://github.com/rust-lang/rust/pull/1#issuecomment-2".to_string()),
                 parent_id: None,
                 is_mine: false,
+                viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
             },
@@ -11100,6 +11103,31 @@ fn own_comment_has_edit_action() {
 }
 
 #[test]
+fn comment_with_github_update_permission_has_edit_action() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    let mut editable = comment("alice", "Editable by viewer permissions", None);
+    editable.id = Some(42);
+    editable.viewer_can_update = Some(true);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![editable]));
+
+    let document = build_details_document(&app, 100);
+    let header_index = document
+        .lines
+        .iter()
+        .position(|line| line.to_string().contains("alice"))
+        .expect("comment header");
+    let header = document.lines[header_index].to_string();
+    let edit_column = display_width(&header[..header.find("edit").expect("edit button")]) as u16;
+
+    assert_eq!(
+        document.action_at(header_index, edit_column),
+        Some(DetailAction::EditComment(0))
+    );
+}
+
+#[test]
 fn edit_action_opens_dialog_prefilled_with_comment_body() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details.insert(
@@ -11548,16 +11576,47 @@ fn e_key_edits_selected_own_comment() {
 }
 
 #[test]
-fn e_key_rejects_comments_not_owned_by_viewer() {
+fn e_key_edits_comment_when_github_allows_update() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
     let config = Config::default();
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.focus_details();
-    app.details.insert(
-        "1".to_string(),
-        DetailState::Loaded(vec![comment("alice", "Not mine", None)]),
+    let mut comment = comment("alice", "Editable by repository permission", None);
+    comment.id = Some(42);
+    comment.viewer_can_update = Some(true);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('e')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert_eq!(
+        app.comment_dialog.as_ref().map(|dialog| &dialog.mode),
+        Some(&CommentDialogMode::Edit {
+            comment_index: 0,
+            comment_id: 42,
+            is_review: false,
+        })
     );
+}
+
+#[test]
+fn e_key_rejects_comments_without_update_permission() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    let mut comment = comment("alice", "Not editable", None);
+    comment.id = Some(42);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
 
     assert!(!handle_key(
         &mut app,
@@ -11568,7 +11627,31 @@ fn e_key_rejects_comments_not_owned_by_viewer() {
     ));
 
     assert!(app.comment_dialog.is_none());
-    assert_eq!(app.status, "only your comments can be edited");
+    assert_eq!(app.status, "selected comment cannot be edited");
+}
+
+#[test]
+fn github_update_permission_overrides_comment_ownership() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    let mut comment = own_comment(42, "chenyukang", "Owned but locked", None);
+    comment.viewer_can_update = Some(false);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![comment]));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('e')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(app.status, "selected comment cannot be edited");
 }
 
 #[test]
@@ -16109,6 +16192,7 @@ fn details_comment_bodies_are_not_truncated() {
             url: None,
             parent_id: None,
             is_mine: false,
+            viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
         }]),
@@ -18611,6 +18695,7 @@ fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         url: url.map(str::to_string),
         parent_id: None,
         is_mine: false,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     }
@@ -18627,6 +18712,7 @@ fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentP
         url: url.map(str::to_string),
         parent_id: None,
         is_mine: true,
+        viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
     }

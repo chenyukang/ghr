@@ -118,7 +118,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `@` / `-` | Assign or unassign assignees on the selected issue or PR |
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
-| `e` | Edit the focused comment when it is yours; in diff mode, end a review range |
+| `e` | Edit the focused comment when GitHub allows it; in diff mode, end a review range |
 | `T` | Edit the selected issue or PR title/body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
@@ -304,7 +304,7 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 
 Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 
-Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. `RUST_LOG` still overrides this config value when it is set.
+Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed `gh` executions and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. `RUST_LOG` still overrides this config value when it is set.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

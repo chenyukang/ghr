@@ -32,7 +32,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::{
     Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, SavedSearchFilterConfig,
@@ -1765,21 +1765,46 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
         .arg("--version")
         .output();
     match &result {
-        Ok(output) => debug!(
-            command = "gh --version",
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        ),
-        Err(error) => debug!(
-            command = "gh --version",
-            error = %error,
-            "gh request failed to start"
-        ),
+        Ok(output) => {
+            debug!(
+                command = "gh --version",
+                status = %output.status,
+                success = output.status.success(),
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "gh request finished"
+            );
+            if !output.status.success() {
+                error!(
+                    command = "gh --version",
+                    status = %output.status,
+                    message = %gh_version_output_message(output),
+                    stdout_bytes = output.stdout.len(),
+                    stderr_bytes = output.stderr.len(),
+                    "gh request returned failure"
+                );
+            }
+        }
+        Err(error) => {
+            debug!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
+            error!(
+                command = "gh --version",
+                error = %error,
+                "gh request failed to start"
+            );
+        }
     }
     startup_setup_dialog_from_gh_probe(result.map(|_| ()))
+}
+
+fn gh_version_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stderr.is_empty() { stdout } else { stderr }
 }
 
 fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {
@@ -8475,14 +8500,14 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
-        if !comment.is_mine {
-            self.status = "only your comments can be edited".to_string();
-            return;
-        }
         let Some(comment_id) = comment.id else {
             self.status = "comment id unavailable; cannot edit".to_string();
             return;
         };
+        if !comment.can_edit() {
+            self.status = "selected comment cannot be edited".to_string();
+            return;
+        }
 
         self.finish_details_visit(Instant::now());
         self.focus = FocusTarget::Details;

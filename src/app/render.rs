@@ -1341,7 +1341,7 @@ pub(super) fn footer_selected_comment_is_editable(app: &AppState) -> bool {
     app.details_mode == DetailsMode::Conversation
         && app
             .current_selected_comment()
-            .is_some_and(|comment| comment.is_mine && comment.id.is_some())
+            .is_some_and(CommentPreview::can_edit)
 }
 
 pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {

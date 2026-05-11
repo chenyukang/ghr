@@ -2090,7 +2090,7 @@ pub(super) fn push_diff_inline_comment(
         "reply",
         DetailAction::ReplyComment(index),
     ));
-    if comment.is_mine && comment.id.is_some() {
+    if comment.can_edit() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "edit",
@@ -2881,7 +2881,7 @@ pub(super) fn push_comment(
             "reply",
             DetailAction::ReplyComment(index),
         ));
-        if comment.is_mine && comment.id.is_some() {
+        if comment.can_edit() {
             header.push(DetailSegment::raw("  "));
             header.push(DetailSegment::action(
                 "edit",

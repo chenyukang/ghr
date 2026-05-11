@@ -21,7 +21,7 @@
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
-- Recent Items command for jumping back to the last 200 PRs and issues, including linked inbox notifications, where you spent at least 10 seconds in Details.
+- Recent Items command for jumping back to the last 200 PRs and issues, including linked inbox notifications, where you spent at least 5 seconds in Details.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.

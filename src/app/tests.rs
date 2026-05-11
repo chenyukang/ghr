@@ -4580,7 +4580,7 @@ fn explicit_color_theme_disables_auto_theme_refresh() {
 }
 
 #[test]
-fn recent_items_only_records_details_visits_after_ten_seconds() {
+fn recent_items_only_records_details_visits_after_dwell_time() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
     app.focus_details();
@@ -4717,6 +4717,33 @@ fn recent_items_candidates_omit_current_item() {
         matches,
         vec!["[pr] #2 Fix funding state.  nervosnetwork/fiber"]
     );
+
+    let matches = app
+        .recent_item_candidates_for_query("compiler")
+        .into_iter()
+        .map(|item| recent_item_label(&item))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matches,
+        vec!["[pr] #1 Compiler diagnostics.  rust-lang/rust"]
+    );
+}
+
+#[test]
+fn recent_items_recording_marks_ui_state_dirty_once() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.details_visit
+        .as_mut()
+        .expect("details visit")
+        .started_at = Instant::now() - RECENT_ITEM_DWELL - Duration::from_millis(100);
+
+    app.sync_recent_details_visit(Instant::now());
+
+    assert_eq!(app.recent_items.len(), 1);
+    assert!(app.take_recent_items_dirty());
+    assert!(!app.take_recent_items_dirty());
 }
 
 #[test]

@@ -1365,7 +1365,7 @@ const DETAILS_LOAD_DEBOUNCE: Duration = Duration::from_millis(350);
 const COMMENTS_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const COMMENTS_POST_REFRESH_DELAY: Duration = Duration::from_secs(1);
 const EDITOR_DRAFT_AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(2);
-const RECENT_ITEM_DWELL: Duration = Duration::from_secs(10);
+const RECENT_ITEM_DWELL: Duration = Duration::from_secs(5);
 const AUTO_THEME_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -1419,6 +1419,7 @@ struct AppState {
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     recent_items: Vec<RecentItem>,
+    recent_items_dirty: bool,
     recent_commands: Vec<RecentCommand>,
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
     details_visit: Option<DetailsVisitState>,
@@ -1876,6 +1877,9 @@ async fn run_loop(
         needs_draw |= app.ensure_current_comments_auto_refresh(tx);
         needs_draw |= app.ensure_current_diff_loading(tx);
         app.sync_recent_details_visit(Instant::now());
+        if app.take_recent_items_dirty() {
+            save_ui_state(app, paths);
+        }
         needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
@@ -2525,6 +2529,7 @@ impl AppState {
             theme_switcher: None,
             recent_items_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
+            recent_items_dirty: false,
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
             repo_unseen_items: HashMap::new(),
             details_visit: None,
@@ -10890,6 +10895,13 @@ impl AppState {
         self.recent_items
             .sort_by_key(|item| std::cmp::Reverse(item.visited_at));
         self.recent_items.truncate(MAX_RECENT_ITEMS);
+        self.recent_items_dirty = true;
+    }
+
+    fn take_recent_items_dirty(&mut self) -> bool {
+        let dirty = self.recent_items_dirty;
+        self.recent_items_dirty = false;
+        dirty
     }
 
     fn jump_to_recent_item(&mut self, item: &RecentItem) -> bool {

@@ -33,6 +33,8 @@ const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_PULL_REQUEST_COMMIT_ACTIVITIES: usize = 5;
 const MAX_PULL_REQUEST_ACTIVITY_COMMITS: usize = 20;
 const GITHUB_API_PAGE_SIZE: usize = 100;
+const GH_JSON_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(300), Duration::from_millis(1_000)];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -70,8 +72,8 @@ impl MergeMethod {
 
 pub struct CommentFetchResult {
     pub item_metadata: Option<ItemDetailsMetadata>,
-    pub item_reactions: ReactionSummary,
-    pub item_milestone: Option<Milestone>,
+    pub item_reactions: Option<ReactionSummary>,
+    pub item_milestone: Option<Option<Milestone>>,
     pub comments: Vec<CommentPreview>,
 }
 
@@ -1775,7 +1777,7 @@ pub async fn fetch_comments(
         ItemKind::Issue => fetch_issue_comments(repository, number).await,
         ItemKind::Notification => Ok(CommentFetchResult {
             item_metadata: None,
-            item_reactions: ReactionSummary::default(),
+            item_reactions: None,
             item_milestone: None,
             comments: Vec::new(),
         }),
@@ -1808,14 +1810,36 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
             HashMap::new()
         }
     };
-    let mut issue_details = parse_issue_details_output(&issue_output?, repository, number)?;
-    if let Some(metadata) = issue_details.item_metadata.as_mut() {
+    let mut issue_details = match issue_output {
+        Ok(output) => Some(parse_issue_details_output(&output, repository, number)?),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load issue details while loading comments"
+            );
+            None
+        }
+    };
+    if let Some(metadata) = issue_details
+        .as_mut()
+        .and_then(|details| details.item_metadata.as_mut())
+    {
         metadata.viewer_subscription = viewer_subscription;
     }
+    let (item_metadata, item_reactions, item_milestone) = match issue_details {
+        Some(details) => (
+            details.item_metadata,
+            Some(details.reactions),
+            Some(details.milestone),
+        ),
+        None => (None, None, None),
+    };
     Ok(CommentFetchResult {
-        item_metadata: issue_details.item_metadata,
-        item_reactions: issue_details.reactions,
-        item_milestone: issue_details.milestone,
+        item_metadata,
+        item_reactions,
+        item_milestone,
         comments: parse_issue_comments_output(
             &comments_output?,
             repository,
@@ -1960,13 +1984,6 @@ pub async fn fetch_pull_request_comments(
             HashMap::new()
         }
     };
-    let mut comments = parse_issue_comments_output(
-        &issue_output?,
-        repository,
-        number,
-        viewer_login,
-        &issue_comment_permissions,
-    )?;
     let review_thread_states = match review_thread_states {
         Ok(states) => states,
         Err(error) => {
@@ -1979,13 +1996,19 @@ pub async fn fetch_pull_request_comments(
             HashMap::new()
         }
     };
-    comments.append(&mut parse_pull_request_review_comments_output(
-        &review_output?,
-        repository,
-        number,
-        viewer_login,
-        &review_thread_states,
-    )?);
+    let mut comments = Vec::new();
+    append_pull_request_comment_outputs(
+        &mut comments,
+        PullRequestCommentOutputContext {
+            repository,
+            number,
+            viewer_login,
+            issue_comment_permissions: &issue_comment_permissions,
+            review_thread_states: &review_thread_states,
+        },
+        issue_output.map_err(|error| error.to_string()),
+        review_output.map_err(|error| error.to_string()),
+    )?;
     match timeline_output {
         Ok(output) => {
             match parse_pull_request_timeline_commit_activities(&output, repository, number) {
@@ -2010,14 +2033,36 @@ pub async fn fetch_pull_request_comments(
         }
     }
     comments.sort_by_key(|comment| comment.created_at);
-    let mut issue_details = parse_issue_details_output(&issue_details?, repository, number)?;
-    if let Some(metadata) = issue_details.item_metadata.as_mut() {
+    let mut issue_details = match issue_details {
+        Ok(output) => Some(parse_issue_details_output(&output, repository, number)?),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load pull request details while loading comments"
+            );
+            None
+        }
+    };
+    if let Some(metadata) = issue_details
+        .as_mut()
+        .and_then(|details| details.item_metadata.as_mut())
+    {
         metadata.viewer_subscription = viewer_subscription;
     }
+    let (item_metadata, item_reactions, item_milestone) = match issue_details {
+        Some(details) => (
+            details.item_metadata,
+            Some(details.reactions),
+            Some(details.milestone),
+        ),
+        None => (None, None, None),
+    };
     Ok(CommentFetchResult {
-        item_metadata: issue_details.item_metadata,
-        item_reactions: issue_details.reactions,
-        item_milestone: issue_details.milestone,
+        item_metadata,
+        item_reactions,
+        item_milestone,
         comments,
     })
 }
@@ -2032,6 +2077,77 @@ async fn fetch_pull_request_review_comments_output(
         Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
     )
     .await
+}
+
+fn append_pull_request_comment_outputs(
+    comments: &mut Vec<CommentPreview>,
+    context: PullRequestCommentOutputContext<'_>,
+    issue_output: std::result::Result<String, String>,
+    review_output: std::result::Result<String, String>,
+) -> Result<()> {
+    let mut comment_source_loaded = false;
+    let mut comment_source_errors = Vec::new();
+
+    match issue_output {
+        Ok(output) => {
+            comment_source_loaded = true;
+            comments.append(&mut parse_issue_comments_output(
+                &output,
+                context.repository,
+                context.number,
+                context.viewer_login,
+                context.issue_comment_permissions,
+            )?);
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository = context.repository,
+                number = context.number,
+                "failed to load pull request conversation comments"
+            );
+            comment_source_errors.push(format!("conversation comments: {error}"));
+        }
+    }
+
+    match review_output {
+        Ok(output) => {
+            comment_source_loaded = true;
+            comments.append(&mut parse_pull_request_review_comments_output(
+                &output,
+                context.repository,
+                context.number,
+                context.viewer_login,
+                context.review_thread_states,
+            )?);
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository = context.repository,
+                number = context.number,
+                "failed to load pull request review comments"
+            );
+            comment_source_errors.push(format!("review comments: {error}"));
+        }
+    }
+
+    if !comment_source_loaded {
+        bail!(
+            "failed to load pull request comments: {}",
+            comment_source_errors.join("; ")
+        );
+    }
+
+    Ok(())
+}
+
+struct PullRequestCommentOutputContext<'a> {
+    repository: &'a str,
+    number: u64,
+    viewer_login: Option<&'a str>,
+    issue_comment_permissions: &'a HashMap<u64, bool>,
+    review_thread_states: &'a HashMap<u64, ReviewThreadState>,
 }
 
 async fn fetch_pull_request_timeline_output(repository: &str, number: u64) -> Result<String> {
@@ -4300,6 +4416,30 @@ async fn run_gh_json(args: &[String]) -> Result<String> {
 }
 
 async fn run_gh_json_raw(args: &[String]) -> Result<String> {
+    for (attempt, delay) in GH_JSON_RETRY_DELAYS.iter().copied().enumerate() {
+        match run_gh_json_raw_once(args).await {
+            Ok(output) => return Ok(output),
+            Err(error)
+                if is_retryable_gh_json_request(args)
+                    && is_retryable_gh_json_error(&error.to_string()) =>
+            {
+                warn!(
+                    attempt = attempt + 1,
+                    retry_in_ms = delay.as_millis(),
+                    error = %error,
+                    command = %gh_command_display(args),
+                    "retrying transient gh request failure"
+                );
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    run_gh_json_raw_once(args).await
+}
+
+async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
     debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
@@ -4325,6 +4465,71 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("gh output was not UTF-8")
+}
+
+fn is_retryable_gh_json_request(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("search") => true,
+        Some("api") if args.get(1).is_some_and(|arg| arg == "graphql") => !args.iter().any(|arg| {
+            arg.trim_start_matches("query=")
+                .trim_start()
+                .starts_with("mutation")
+        }),
+        Some("api") => gh_api_method(args)
+            .map(|method| method.eq_ignore_ascii_case("GET"))
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn gh_api_method(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "-X" | "--method" | "--request") {
+            return args.get(index + 1).map(String::as_str);
+        }
+        if let Some(method) = arg
+            .strip_prefix("--method=")
+            .or_else(|| arg.strip_prefix("--request="))
+        {
+            return Some(method);
+        }
+        if let Some(method) = arg.strip_prefix("-X")
+            && !method.is_empty()
+        {
+            return Some(method);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_retryable_gh_json_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "tls handshake timeout",
+        "i/o timeout",
+        "timeout awaiting response headers",
+        "client.timeout",
+        "connection reset",
+        "connection refused",
+        "connection timed out",
+        "error connecting to api.github.com",
+        "check your internet connection",
+        "unexpected eof",
+        " eof",
+        ": eof",
+        "temporary failure",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
@@ -5461,6 +5666,75 @@ mod tests {
     }
 
     #[test]
+    fn retryable_gh_json_error_detects_transient_network_failures() {
+        assert!(is_retryable_gh_json_error(
+            r#"gh api repos/owner/repo/issues/1/comments failed: Get "https://api.github.com": net/http: TLS handshake timeout"#
+        ));
+        assert!(is_retryable_gh_json_error(
+            r#"gh api user failed: Get "https://api.github.com/user": EOF"#
+        ));
+        assert!(is_retryable_gh_json_error(
+            "gh api repos/owner/repo/pulls/1/comments failed: HTTP 503"
+        ));
+        assert!(is_retryable_gh_json_error(
+            "gh api user failed: error connecting to api.github.com\ncheck your internet connection"
+        ));
+    }
+
+    #[test]
+    fn retryable_gh_json_error_rejects_auth_and_not_found_failures() {
+        assert!(!is_retryable_gh_json_error(
+            "gh api repos/owner/repo/issues/1/comments failed: HTTP 401"
+        ));
+        assert!(!is_retryable_gh_json_error("gh: Not Found (HTTP 404)"));
+    }
+
+    #[test]
+    fn retryable_gh_json_request_allows_only_read_only_requests() {
+        assert!(is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "repos/owner/repo/issues/1/comments".to_string(),
+        ]));
+        assert!(is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "--method".to_string(),
+            "GET".to_string(),
+            "search/issues".to_string(),
+        ]));
+        assert!(is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            "query=query { viewer { login } }".to_string(),
+        ]));
+        assert!(is_retryable_gh_json_request(&[
+            "search".to_string(),
+            "prs".to_string(),
+            "--json".to_string(),
+            "number,title".to_string(),
+        ]));
+
+        assert!(!is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "-X".to_string(),
+            "POST".to_string(),
+            "repos/owner/repo/issues/1/comments".to_string(),
+        ]));
+        assert!(!is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "--method=PATCH".to_string(),
+            "repos/owner/repo/issues/1".to_string(),
+        ]));
+        assert!(!is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            "query=mutation($id: ID!) { updateSubscription(input: {subscribableId: $id}) { subscribable { id } } }"
+                .to_string(),
+        ]));
+    }
+
+    #[test]
     fn wildcard_excludes_repositories() {
         assert!(wildcard_match("nervosnetwork/*", "nervosnetwork/ckb"));
         assert!(wildcard_match("*/sandbox", "me/sandbox"));
@@ -6185,6 +6459,103 @@ mod tests {
             parse_issue_comments_output(output, "owner/repo", 1, None, &HashMap::new()).unwrap();
         assert_eq!(comments[0].reactions.plus_one, 2);
         assert_eq!(comments[0].reactions.rocket, 1);
+    }
+
+    #[test]
+    fn pull_request_comment_outputs_keep_conversation_comments_when_review_comments_fail() {
+        let issue_output = r##"[
+          [{
+            "id": 1,
+            "body": "conversation comment",
+            "html_url": "https://github.com/owner/repo/pull/1#issuecomment-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "user": { "login": "alice" }
+          }]
+        ]"##;
+        let mut comments = Vec::new();
+
+        append_pull_request_comment_outputs(
+            &mut comments,
+            PullRequestCommentOutputContext {
+                repository: "owner/repo",
+                number: 1,
+                viewer_login: None,
+                issue_comment_permissions: &HashMap::new(),
+                review_thread_states: &HashMap::new(),
+            },
+            Ok(issue_output.to_string()),
+            Err("TLS handshake timeout".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "conversation comment");
+        assert!(comments[0].review.is_none());
+    }
+
+    #[test]
+    fn pull_request_comment_outputs_keep_review_comments_when_conversation_comments_fail() {
+        let review_output = r##"[
+          [{
+            "id": 2,
+            "body": "inline comment",
+            "html_url": "https://github.com/owner/repo/pull/1#discussion_r2",
+            "created_at": "2026-01-02T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "user": { "login": "bob" },
+            "path": "src/lib.rs",
+            "line": 7,
+            "side": "RIGHT"
+          }]
+        ]"##;
+        let mut comments = Vec::new();
+
+        append_pull_request_comment_outputs(
+            &mut comments,
+            PullRequestCommentOutputContext {
+                repository: "owner/repo",
+                number: 1,
+                viewer_login: None,
+                issue_comment_permissions: &HashMap::new(),
+                review_thread_states: &HashMap::new(),
+            },
+            Err("EOF".to_string()),
+            Ok(review_output.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "inline comment");
+        assert_eq!(
+            comments[0]
+                .review
+                .as_ref()
+                .map(|review| review.path.as_str()),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn pull_request_comment_outputs_fail_when_all_comment_sources_fail() {
+        let mut comments = Vec::new();
+        let error = append_pull_request_comment_outputs(
+            &mut comments,
+            PullRequestCommentOutputContext {
+                repository: "owner/repo",
+                number: 1,
+                viewer_login: None,
+                issue_comment_permissions: &HashMap::new(),
+                review_thread_states: &HashMap::new(),
+            },
+            Err("conversation timeout".to_string()),
+            Err("review timeout".to_string()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("conversation comments: conversation timeout"));
+        assert!(error.contains("review comments: review timeout"));
     }
 
     #[test]

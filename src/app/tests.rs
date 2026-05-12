@@ -3323,8 +3323,8 @@ fn comments_loaded_records_item_updated_at_for_cache_freshness() {
                 comments: Some(1),
                 viewer_subscription: None,
             }),
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![comment("alice", "fresh comment", None)],
         }),
     });
@@ -3375,8 +3375,8 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
                 comments: Some(3),
                 viewer_subscription: None,
             }),
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![comment("rust-bors[bot]", "fresh", None)],
         }),
     });
@@ -3418,8 +3418,8 @@ fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
                 comments: Some(3),
                 viewer_subscription: None,
             }),
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![comment("alice", "old", None), comment("bob", "new", None)],
         }),
     });
@@ -8518,11 +8518,11 @@ fn comments_loaded_updates_details_milestone_metadata() {
         item_id: "1".to_string(),
         comments: Ok(CommentFetchResult {
             item_metadata: None,
-            item_reactions: ReactionSummary::default(),
-            item_milestone: Some(Milestone {
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(Some(Milestone {
                 number: 9,
                 title: "next-release".to_string(),
-            }),
+            })),
             comments: Vec::new(),
         }),
     });
@@ -8534,6 +8534,35 @@ fn comments_loaded_updates_details_milestone_metadata() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("milestone: next-release"));
+}
+
+#[test]
+fn comments_loaded_preserves_item_reactions_and_milestone_when_details_are_unknown() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let cached_reactions = ReactionSummary {
+        eyes: 2,
+        ..ReactionSummary::default()
+    };
+    let cached_milestone = Milestone {
+        number: 7,
+        title: "cached-release".to_string(),
+    };
+    app.sections[0].items[0].reactions = cached_reactions.clone();
+    app.sections[0].items[0].milestone = Some(cached_milestone.clone());
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "1".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: None,
+            item_reactions: None,
+            item_milestone: None,
+            comments: Vec::new(),
+        }),
+    });
+
+    let item = &app.sections[0].items[0];
+    assert_eq!(item.reactions, cached_reactions);
+    assert_eq!(item.milestone, Some(cached_milestone));
 }
 
 #[test]
@@ -8570,8 +8599,8 @@ fn comments_loaded_updates_inbox_notification_description_from_lazy_metadata() {
                 comments: Some(3),
                 viewer_subscription: None,
             }),
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: Vec::new(),
         }),
     });
@@ -16434,8 +16463,8 @@ fn stale_comments_refresh_keeps_optimistic_posted_comment_until_api_returns_it()
         item_id: "1".to_string(),
         comments: Ok(CommentFetchResult {
             item_metadata: None,
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![existing.clone()],
         }),
     });
@@ -16461,8 +16490,8 @@ fn stale_comments_refresh_keeps_optimistic_posted_comment_until_api_returns_it()
         item_id: "1".to_string(),
         comments: Ok(CommentFetchResult {
             item_metadata: None,
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![existing, posted],
         }),
     });
@@ -16522,8 +16551,8 @@ fn comment_update_success_opens_result_dialog() {
         comment_index: 0,
         result: Ok(CommentFetchResult {
             item_metadata: None,
-            item_reactions: ReactionSummary::default(),
-            item_milestone: None,
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
             comments: vec![own_comment(42, "chenyukang", "updated", None)],
         }),
     });

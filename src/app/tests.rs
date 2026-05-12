@@ -10375,6 +10375,85 @@ fn markdown_images_render_as_clickable_image_links() {
 }
 
 #[test]
+fn markdown_images_reserve_preview_regions_when_image_previews_are_enabled() {
+    let url = "https://example.com/architecture.png";
+    let mut section = test_section();
+    section.items[0].body = Some(format!("Screenshot:\n\n![Architecture diagram]({url})"));
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    app.image_previews.enable_halfblocks();
+
+    let document = build_details_document(&app, 100);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let image_line = rendered
+        .iter()
+        .position(|line| line.contains("[image: Architecture diagram]"))
+        .expect("image label line");
+    let preview = document.images.first().expect("image preview region");
+
+    assert_eq!(preview.url, url);
+    assert!(preview.start_line > image_line);
+    assert_eq!(preview.end_line - preview.start_line, 22);
+    for line in preview.start_line..preview.end_line {
+        assert!(document.copy_skip_lines.contains(&line));
+    }
+}
+
+#[test]
+fn image_preview_height_scales_loaded_images_by_aspect_ratio() {
+    assert_eq!(image_preview_height_for_dimensions(50, 1403, 988), 18);
+    assert_eq!(image_preview_height_for_dimensions(100, 1403, 988), 32);
+    assert_eq!(image_preview_height_for_dimensions(20, 1403, 988), 8);
+}
+
+#[test]
+fn image_preview_load_priority_prefers_visible_regions() {
+    let visible = ImagePreviewRegion {
+        url: "visible".to_string(),
+        start_line: 12,
+        end_line: 20,
+        column: 0,
+        width: 80,
+    };
+    let below = ImagePreviewRegion {
+        url: "below".to_string(),
+        start_line: 50,
+        end_line: 58,
+        column: 0,
+        width: 80,
+    };
+
+    assert_eq!(image_preview_load_priority(&visible, 10, 30), 0);
+    assert!(image_preview_load_priority(&below, 10, 30) > 0);
+}
+
+#[test]
+fn image_preview_cache_tracks_loading_and_loaded_state() {
+    let url = "https://example.com/architecture.png";
+    let mut cache = ImagePreviewCache::default();
+
+    assert_eq!(cache.status(url), ImagePreviewStatus::Disabled);
+    cache.enable_halfblocks();
+    assert_eq!(cache.status(url), ImagePreviewStatus::Queued);
+    assert!(cache.start_loading(url));
+    assert_eq!(cache.status(url), ImagePreviewStatus::Loading);
+    assert!(!cache.start_loading(url));
+
+    cache.finish_loading(url.to_string(), Ok(tiny_test_image()));
+    assert_eq!(
+        cache.status(url),
+        ImagePreviewStatus::Loaded {
+            width: 2,
+            height: 2
+        }
+    );
+    assert!(cache.loaded_protocol_mut(url).is_some());
+}
+
+#[test]
 fn github_html_image_tags_render_as_clickable_image_links() {
     let url = "https://github.com/user-attachments/assets/c84fe1a4-44bc-4b62-bc58-ca0aa3c437fd";
     let mut builder = DetailsBuilder::new(100);

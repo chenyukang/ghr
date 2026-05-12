@@ -1,4 +1,5 @@
 use super::*;
+use ratatui_image::{FilterType, Resize, StatefulImage};
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     set_active_theme(app.theme_name);
@@ -909,6 +910,81 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         DetailsLines::new(&document.lines, app.details_scroll, active_theme().panel()),
         inner,
     );
+    render_image_previews(frame, app, &document, inner);
+}
+
+fn render_image_previews(
+    frame: &mut Frame<'_>,
+    app: &AppState,
+    document: &DetailsDocument,
+    area: Rect,
+) {
+    if area.is_empty() || document.images.is_empty() {
+        return;
+    }
+
+    for image in &document.images {
+        let Some(area) = visible_image_preview_area(image, app.details_scroll, area) else {
+            continue;
+        };
+        match app.image_previews.status(&image.url) {
+            ImagePreviewStatus::Loaded { .. } => {
+                if let Some(mut protocol) = app.image_previews.loaded_protocol_mut(&image.url) {
+                    let widget =
+                        StatefulImage::new().resize(Resize::Fit(Some(FilterType::Lanczos3)));
+                    frame.render_stateful_widget(widget, area, &mut *protocol);
+                }
+            }
+            status => render_image_preview_status(frame, area, status),
+        }
+    }
+}
+
+fn visible_image_preview_area(image: &ImagePreviewRegion, scroll: u16, area: Rect) -> Option<Rect> {
+    if image.width == 0 || image.start_line >= image.end_line {
+        return None;
+    }
+    let viewport_start = usize::from(scroll);
+    let viewport_end = viewport_start.saturating_add(usize::from(area.height));
+    let start = image.start_line.max(viewport_start);
+    let end = image.end_line.min(viewport_end);
+    if start >= end {
+        return None;
+    }
+
+    let x = area.x.saturating_add(image.column);
+    if x >= area.right() {
+        return None;
+    }
+    let width = image.width.min(area.right().saturating_sub(x));
+    if width == 0 {
+        return None;
+    }
+
+    Some(Rect {
+        x,
+        y: area
+            .y
+            .saturating_add(start.saturating_sub(viewport_start) as u16),
+        width,
+        height: end.saturating_sub(start).min(usize::from(u16::MAX)) as u16,
+    })
+}
+
+fn render_image_preview_status(frame: &mut Frame<'_>, area: Rect, status: ImagePreviewStatus) {
+    let label = match status {
+        ImagePreviewStatus::Disabled => return,
+        ImagePreviewStatus::Queued => "image preview queued".to_string(),
+        ImagePreviewStatus::Loading => "loading image preview...".to_string(),
+        ImagePreviewStatus::Loaded { .. } => return,
+        ImagePreviewStatus::Error(error) => {
+            format!("image preview unavailable: {}", compact_error_label(&error))
+        }
+    };
+    let paragraph = Paragraph::new(Line::from(Span::styled(label, active_theme().muted())))
+        .style(active_theme().panel())
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
 }
 
 pub(super) struct DetailsLines<'a> {

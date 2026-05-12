@@ -9,11 +9,14 @@ const DESCRIPTION_BODY_PADDING: usize = 2;
 const BLOCK_COPY_BUTTON_LABEL: &str = "copy";
 const INLINE_COMMENT_MARKER: &str = "💬 ";
 const INLINE_COMMENT_MULTIPLE_MARKER: &str = "💬* ";
+const IMAGE_PREVIEW_MIN_WIDTH: usize = 12;
+const IMAGE_PREVIEW_MIN_HEIGHT: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
     pub(super) lines: Vec<Line<'static>>,
     pub(super) links: Vec<LinkRegion>,
+    pub(super) images: Vec<ImagePreviewRegion>,
     pub(super) actions: Vec<ActionRegion>,
     pub(super) copy_exclusions: Vec<CopyExclusionRegion>,
     pub(super) copy_skip_lines: Vec<usize>,
@@ -78,6 +81,15 @@ pub(super) struct LinkRegion {
     pub(super) start: u16,
     pub(super) end: u16,
     pub(super) url: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ImagePreviewRegion {
+    pub(super) url: String,
+    pub(super) start_line: usize,
+    pub(super) end_line: usize,
+    pub(super) column: u16,
+    pub(super) width: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -456,17 +468,24 @@ pub(super) struct MarkdownRenderOptions {
     pub(super) right_padding: usize,
 }
 
-pub(super) struct DetailsBuilder {
+pub(super) struct DetailsBuilder<'a> {
     pub(super) document: DetailsDocument,
     pub(super) width: usize,
+    image_previews: Option<&'a ImagePreviewCache>,
 }
 
-impl DetailsBuilder {
+impl<'a> DetailsBuilder<'a> {
+    #[cfg(test)]
     pub(super) fn new(width: u16) -> Self {
+        Self::new_with_image_previews(width, None)
+    }
+
+    fn new_with_image_previews(width: u16, image_previews: Option<&'a ImagePreviewCache>) -> Self {
         Self {
             document: DetailsDocument {
                 lines: Vec::new(),
                 links: Vec::new(),
+                images: Vec::new(),
                 actions: Vec::new(),
                 copy_exclusions: Vec::new(),
                 copy_skip_lines: Vec::new(),
@@ -478,6 +497,7 @@ impl DetailsBuilder {
                 selected_diff_line: None,
             },
             width: usize::from(width.max(1)),
+            image_previews,
         }
     }
 
@@ -695,10 +715,13 @@ impl DetailsBuilder {
                 display_width(BLOCK_COPY_BUTTON_LABEL).saturating_add(1)
             });
             let line_start = self.document.lines.len();
+            let block_kind = block.kind;
+            let quote_depth = block.quote_depth;
+            let image_urls = markdown_block_image_preview_urls(&block.segments);
             if copy_reserve > 0 {
                 self.width = reserved_width(self.width, copy_reserve);
             }
-            match block.kind {
+            match block_kind {
                 MarkdownBlockKind::Text | MarkdownBlockKind::ListItem => {
                     if !self.push_wrapped_prefixed(
                         &block.segments,
@@ -727,10 +750,18 @@ impl DetailsBuilder {
                 self.add_block_copy_button(
                     line_start,
                     block_width,
-                    block.kind,
-                    block.quote_depth,
+                    block_kind,
+                    quote_depth,
                     copy_text,
                 );
+            }
+            if !self.push_image_previews_for_urls(
+                image_urls,
+                line_prefix.as_slice(),
+                &mut emitted,
+                max_lines,
+            ) {
+                break;
             }
         }
         self.width = original_width;
@@ -782,6 +813,77 @@ impl DetailsBuilder {
             start: line_width.min(usize::from(u16::MAX)) as u16,
             end,
         });
+    }
+
+    fn push_image_previews_for_urls(
+        &mut self,
+        urls: Vec<String>,
+        prefix: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        if urls.is_empty()
+            || self
+                .image_previews
+                .is_none_or(|previews| !previews.enabled())
+        {
+            return true;
+        }
+
+        for url in urls {
+            if !self.push_image_preview_region(url, prefix, emitted, max_lines) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn push_image_preview_region(
+        &mut self,
+        url: String,
+        prefix: &[DetailSegment],
+        emitted: &mut usize,
+        max_lines: usize,
+    ) -> bool {
+        if *emitted >= max_lines {
+            self.push_plain("...");
+            return false;
+        }
+
+        let prefix_width = segments_width(prefix);
+        if prefix_width >= self.width {
+            return true;
+        }
+        let preview_width = self.width.saturating_sub(prefix_width);
+        if preview_width < IMAGE_PREVIEW_MIN_WIDTH {
+            return true;
+        }
+
+        let available_lines = max_lines.saturating_sub(*emitted);
+        let preview_height = self
+            .image_previews
+            .map(|previews| image_preview_height_for_status(preview_width, previews.status(&url)))
+            .unwrap_or_else(|| image_preview_height(preview_width))
+            .min(available_lines);
+        if preview_height == 0 {
+            return true;
+        }
+
+        let start_line = self.document.lines.len();
+        for _ in 0..preview_height {
+            let mut segments = prefix.to_vec();
+            segments.push(DetailSegment::chrome(" ".repeat(preview_width)));
+            self.push_chrome_line(segments);
+        }
+        self.document.images.push(ImagePreviewRegion {
+            url,
+            start_line,
+            end_line: self.document.lines.len(),
+            column: prefix_width.min(usize::from(u16::MAX)) as u16,
+            width: preview_width.min(usize::from(u16::MAX)) as u16,
+        });
+        *emitted = (*emitted).saturating_add(preview_height);
+        true
     }
 
     fn push_markdown_gap(
@@ -1257,7 +1359,10 @@ pub(super) fn build_details_document(app: &AppState, width: u16) -> DetailsDocum
 }
 
 pub(super) fn build_conversation_document(app: &AppState, width: u16) -> DetailsDocument {
-    let mut builder = DetailsBuilder::new(width);
+    let mut builder = DetailsBuilder::new_with_image_previews(
+        width,
+        app.image_previews.enabled().then_some(&app.image_previews),
+    );
     let Some(item) = app.current_item() else {
         builder.push_plain("No item selected");
         return builder.finish();
@@ -1560,7 +1665,10 @@ pub(super) fn push_description_block(
 }
 
 pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument {
-    let mut builder = DetailsBuilder::new(width);
+    let mut builder = DetailsBuilder::new_with_image_previews(
+        width,
+        app.image_previews.enabled().then_some(&app.image_previews),
+    );
     let Some(item) = app.current_item() else {
         builder.push_plain("No item selected");
         return builder.finish();
@@ -4485,6 +4593,75 @@ pub(super) fn is_html_attr_name_byte(byte: u8) -> bool {
 
 pub(super) fn image_segment(image: &MarkdownImage) -> DetailSegment {
     DetailSegment::link(image_label(image), image.url.clone())
+}
+
+pub(super) fn markdown_block_image_preview_urls(segments: &[DetailSegment]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for segment in segments {
+        let Some(url) = &segment.link else {
+            continue;
+        };
+        if !is_image_preview_label(&segment.text) {
+            continue;
+        }
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
+    }
+    urls
+}
+
+pub(super) fn is_image_preview_label(label: &str) -> bool {
+    label.starts_with("[image") && label.ends_with(']')
+}
+
+pub(super) fn image_preview_height(width: usize) -> usize {
+    if width < 32 {
+        8
+    } else if width < 64 {
+        16
+    } else {
+        22
+    }
+}
+
+pub(super) fn image_preview_height_for_status(
+    preview_width: usize,
+    status: ImagePreviewStatus,
+) -> usize {
+    match status {
+        ImagePreviewStatus::Loaded { width, height } => {
+            image_preview_height_for_dimensions(preview_width, width, height)
+        }
+        _ => image_preview_height(preview_width),
+    }
+}
+
+pub(super) fn image_preview_height_for_dimensions(
+    preview_width: usize,
+    image_width: u32,
+    image_height: u32,
+) -> usize {
+    if preview_width == 0 || image_width == 0 || image_height == 0 {
+        return image_preview_height(preview_width);
+    }
+
+    let halfblock_height =
+        (preview_width as f64 * image_height as f64 / image_width as f64 / 2.0).ceil() as usize;
+    halfblock_height.clamp(
+        IMAGE_PREVIEW_MIN_HEIGHT,
+        image_preview_max_height(preview_width),
+    )
+}
+
+pub(super) fn image_preview_max_height(width: usize) -> usize {
+    if width < 32 {
+        12
+    } else if width < 64 {
+        22
+    } else {
+        32
+    }
 }
 
 pub(super) fn image_label(image: &MarkdownImage) -> String {

@@ -86,6 +86,7 @@ mod diff;
 mod drafts;
 mod editor;
 mod global_search;
+mod images;
 mod input;
 mod keymap;
 mod layout;
@@ -114,6 +115,7 @@ use diff::{
 use drafts::*;
 use editor::*;
 use global_search::*;
+use images::*;
 use input::*;
 use keymap::{command_palette_key_binding, normalized_command_palette_key};
 use layout::{
@@ -172,6 +174,10 @@ enum AppMsg {
     DiffLoaded {
         item_id: String,
         diff: std::result::Result<PullRequestDiff, String>,
+    },
+    ImagePreviewLoaded {
+        url: String,
+        result: std::result::Result<ImagePreviewData, String>,
     },
     CommentPosted {
         item_id: String,
@@ -1438,6 +1444,7 @@ const GLOBAL_SEARCH_SUGGESTION_LIMIT: usize = 6;
 const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
+const IMAGE_PREVIEW_LOAD_LIMIT: usize = 6;
 
 struct AppState {
     theme_name: ThemeName,
@@ -1524,6 +1531,7 @@ struct AppState {
     mention_user_search_loading_queries: HashSet<String>,
     mention_user_search_errors: HashMap<String, String>,
     mention_selected: usize,
+    image_previews: ImagePreviewCache,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
@@ -1835,6 +1843,30 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     )?;
+    match app.image_previews.enable_from_environment() {
+        Ok(ImagePreviewBackend::Disabled) => {
+            debug!("image previews disabled by environment");
+        }
+        Ok(ImagePreviewBackend::Halfblocks) => {
+            debug!("image previews enabled with half-block renderer");
+        }
+        Ok(ImagePreviewBackend::Native(protocol)) => {
+            debug!(
+                protocol = ?protocol,
+                "image previews enabled with native terminal protocol"
+            );
+        }
+        Ok(ImagePreviewBackend::Auto | ImagePreviewBackend::QueryNative) => {
+            debug!("image previews enabled with queried terminal protocol");
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to initialize native terminal image previews; falling back to half-block renderer"
+            );
+            app.image_previews.enable_halfblocks();
+        }
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     start_terminal_disconnect_watchdog();
@@ -1979,6 +2011,7 @@ async fn run_loop(
         needs_draw |= drain_app_messages(app, rx);
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
+        needs_draw |= app.ensure_current_image_previews_loading(tx, area);
         if area != last_area {
             last_area = area;
             needs_draw = true;
@@ -2720,6 +2753,25 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
     !recent.id.is_empty() && item.id == recent.id
 }
 
+fn image_preview_load_priority(
+    image: &ImagePreviewRegion,
+    viewport_start: usize,
+    viewport_end: usize,
+) -> usize {
+    if image.end_line > viewport_start && image.start_line < viewport_end {
+        return 0;
+    }
+    if image.start_line >= viewport_end {
+        return image
+            .start_line
+            .saturating_sub(viewport_end)
+            .saturating_add(1);
+    }
+    viewport_start
+        .saturating_sub(image.end_line)
+        .saturating_add(1)
+}
+
 impl AppState {
     fn with_ui_state(
         active_view: SectionKind,
@@ -2847,6 +2899,7 @@ impl AppState {
             mention_user_search_loading_queries: HashSet::new(),
             mention_user_search_errors: HashMap::new(),
             mention_selected: 0,
+            image_previews: ImagePreviewCache::default(),
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
             pending_details_load: None,
@@ -3637,6 +3690,9 @@ impl AppState {
                     self.status = "diff load failed".to_string();
                 }
             },
+            AppMsg::ImagePreviewLoaded { url, result } => {
+                self.image_previews.finish_loading(url, result);
+            }
             AppMsg::CommentPosted { item_id, result } => match result {
                 Ok(comment) => {
                     let index = self.append_local_comment(&item_id, comment);
@@ -5911,6 +5967,44 @@ impl AppState {
         self.diffs.insert(item.id.clone(), DiffState::Loading);
         start_diff_load(item, tx.clone());
         true
+    }
+
+    fn ensure_current_image_previews_loading(
+        &mut self,
+        tx: &UnboundedSender<AppMsg>,
+        area: Rect,
+    ) -> bool {
+        if !self.image_previews.enabled() {
+            return false;
+        }
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.width == 0 || inner.height == 0 {
+            return false;
+        }
+
+        let document = build_details_document(self, inner.width);
+        let viewport_start = usize::from(self.details_scroll);
+        let viewport_end = viewport_start.saturating_add(usize::from(inner.height));
+        let mut images = document.images.iter().collect::<Vec<_>>();
+        images
+            .sort_by_key(|image| image_preview_load_priority(image, viewport_start, viewport_end));
+
+        let mut started = false;
+        let mut seen = HashSet::new();
+        for image in images {
+            if !seen.insert(image.url.clone()) {
+                continue;
+            }
+            if self.image_previews.start_loading(&image.url) {
+                start_image_preview_load(image.url.clone(), tx.clone());
+                started = true;
+            }
+            if seen.len() >= IMAGE_PREVIEW_LOAD_LIMIT {
+                break;
+            }
+        }
+        started
     }
 
     fn current_diff(&self) -> Option<&DiffState> {

@@ -23,7 +23,7 @@
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
 - Recent Items command for jumping back to the last 200 PRs and issues, including linked inbox notifications, where you spent at least 5 seconds in Details.
 - Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
-- Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
+- Details pane with rendered Markdown, clickable links, inline image previews with native terminal protocols when available and clickable attachment fallbacks, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
 - Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
@@ -306,6 +306,8 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 
 Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed `gh` executions and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. `RUST_LOG` still overrides this config value when it is set.
+
+Image previews use native terminal protocols on known compatible terminals, fall back to terminal-safe half-block rendering elsewhere, and cache downloaded image bytes under `~/.ghr/image-cache`. Set `GHR_IMAGE_PREVIEW_PROTOCOL=iterm2`, `kitty`, `sixel`, or `halfblocks` to force a renderer; use `GHR_IMAGE_PREVIEW_PROTOCOL=off` to disable inline previews.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

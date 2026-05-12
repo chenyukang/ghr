@@ -359,6 +359,15 @@ pub(super) fn start_diff_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
     });
 }
 
+pub(super) fn start_image_preview_load(url: String, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = download_image_preview(&url)
+            .await
+            .map_err(error_chain_message);
+        let _ = tx.send(AppMsg::ImagePreviewLoaded { url, result });
+    });
+}
+
 pub(super) fn error_chain_message(error: anyhow::Error) -> String {
     let mut messages = Vec::new();
     for cause in error.chain() {

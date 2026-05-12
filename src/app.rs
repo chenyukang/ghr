@@ -5538,8 +5538,12 @@ impl AppState {
         if let Some(metadata) = &result.item_metadata {
             self.apply_item_details_metadata(item_id, metadata);
         }
-        self.update_item_reactions(item_id, result.item_reactions.clone());
-        self.mark_item_milestone(item_id, result.item_milestone.as_ref());
+        if let Some(reactions) = &result.item_reactions {
+            self.update_item_reactions(item_id, reactions.clone());
+        }
+        if let Some(milestone) = &result.item_milestone {
+            self.mark_item_milestone(item_id, milestone.as_ref());
+        }
     }
 
     fn remember_details_synced_at(&mut self, item_id: &str, result: &CommentFetchResult) {

@@ -323,7 +323,7 @@ pub(super) fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
                 .map_err(|error| error.to_string()),
             None => Ok(CommentFetchResult {
                 item_metadata: None,
-                item_reactions: ReactionSummary::default(),
+                item_reactions: None,
                 item_milestone: None,
                 comments: Vec::new(),
             }),

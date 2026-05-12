@@ -16416,6 +16416,61 @@ fn comment_post_success_opens_result_dialog() {
 }
 
 #[test]
+fn stale_comments_refresh_keeps_optimistic_posted_comment_until_api_returns_it() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut existing = comment("bob", "old comment", None);
+    existing.id = Some(1);
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![existing.clone()]));
+
+    let mut posted = comment("alice", "posted comment", None);
+    posted.id = Some(99);
+    app.handle_msg(AppMsg::CommentPosted {
+        item_id: "1".to_string(),
+        result: Ok(posted.clone()),
+    });
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "1".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: None,
+            item_reactions: ReactionSummary::default(),
+            item_milestone: None,
+            comments: vec![existing.clone()],
+        }),
+    });
+
+    let comments = match app.details.get("1") {
+        Some(DetailState::Loaded(comments)) => comments,
+        other => panic!("expected loaded comments, got {other:?}"),
+    };
+    assert_eq!(
+        comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old comment", "posted comment"]
+    );
+    assert!(
+        app.optimistic_comment_ids
+            .get("1")
+            .is_some_and(|ids| ids.contains(&99))
+    );
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "1".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: None,
+            item_reactions: ReactionSummary::default(),
+            item_milestone: None,
+            comments: vec![existing, posted],
+        }),
+    });
+
+    assert!(!app.optimistic_comment_ids.contains_key("1"));
+}
+
+#[test]
 fn comment_post_failure_opens_result_dialog() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.posting_comment = true;

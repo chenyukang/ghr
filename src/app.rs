@@ -1500,6 +1500,7 @@ struct AppState {
     details: HashMap<String, DetailState>,
     details_synced_at: HashMap<String, DateTime<Utc>>,
     details_refreshed_at: HashMap<String, DateTime<Utc>>,
+    optimistic_comment_ids: HashMap<String, HashSet<u64>>,
     diffs: HashMap<String, DiffState>,
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
@@ -2823,6 +2824,7 @@ impl AppState {
             details: HashMap::new(),
             details_synced_at: HashMap::new(),
             details_refreshed_at: HashMap::new(),
+            optimistic_comment_ids: HashMap::new(),
             diffs: HashMap::new(),
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
@@ -3549,11 +3551,12 @@ impl AppState {
                 }
             }
             AppMsg::CommentsLoaded { item_id, comments } => match comments {
-                Ok(result) => {
+                Ok(mut result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
                     self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
+                    self.merge_optimistic_comments(&item_id, &mut result.comments);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -3639,6 +3642,7 @@ impl AppState {
             },
             AppMsg::CommentPosted { item_id, result } => match result {
                 Ok(comment) => {
+                    self.remember_optimistic_comment(&item_id, &comment);
                     let index = self.append_local_comment(&item_id, comment);
                     self.selected_comment_index = index;
                     self.details_stale.remove(&item_id);
@@ -3679,13 +3683,14 @@ impl AppState {
                 comment_index,
                 result,
             } => match result {
-                Ok(result) => {
+                Ok(mut result) => {
                     self.selected_comment_index =
                         comment_index.min(result.comments.len().saturating_sub(1));
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
                     self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
+                    self.merge_optimistic_comments(&item_id, &mut result.comments);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -3720,6 +3725,7 @@ impl AppState {
             },
             AppMsg::ReviewCommentPosted { item_id, result } => match result {
                 Ok(comment) => {
+                    self.remember_optimistic_comment(&item_id, &comment);
                     let index = self.append_local_comment(&item_id, comment);
                     self.selected_comment_index = index;
                     self.details_stale.remove(&item_id);
@@ -3756,7 +3762,7 @@ impl AppState {
                 }
             },
             AppMsg::ReactionPosted { item_id, result } => match result {
-                Ok(result) => {
+                Ok(mut result) => {
                     if let Some(dialog) = &self.reaction_dialog {
                         match dialog.target {
                             ReactionTarget::IssueComment { index, .. }
@@ -3771,6 +3777,7 @@ impl AppState {
                     self.details_refreshing.remove(&item_id);
                     self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
+                    self.merge_optimistic_comments(&item_id, &mut result.comments);
                     self.details
                         .insert(item_id.clone(), DetailState::Loaded(result.comments));
                     self.clamp_selected_comment();
@@ -5551,6 +5558,56 @@ impl AppState {
         }
         self.details_refreshed_at
             .insert(item_id.to_string(), Utc::now());
+    }
+
+    fn remember_optimistic_comment(&mut self, item_id: &str, comment: &CommentPreview) {
+        let Some(comment_id) = comment.id else {
+            return;
+        };
+        self.optimistic_comment_ids
+            .entry(item_id.to_string())
+            .or_default()
+            .insert(comment_id);
+    }
+
+    fn merge_optimistic_comments(&mut self, item_id: &str, comments: &mut Vec<CommentPreview>) {
+        let Some(tracked_ids) = self.optimistic_comment_ids.get(item_id).cloned() else {
+            return;
+        };
+
+        let fetched_ids = comments
+            .iter()
+            .filter_map(|comment| comment.id)
+            .collect::<HashSet<_>>();
+        let tracking_empty = if let Some(ids) = self.optimistic_comment_ids.get_mut(item_id) {
+            ids.retain(|id| !fetched_ids.contains(id));
+            ids.is_empty()
+        } else {
+            false
+        };
+        if tracking_empty {
+            self.optimistic_comment_ids.remove(item_id);
+            return;
+        }
+
+        let missing_ids = tracked_ids
+            .difference(&fetched_ids)
+            .copied()
+            .collect::<HashSet<_>>();
+        if missing_ids.is_empty() {
+            return;
+        }
+
+        let Some(DetailState::Loaded(current_comments)) = self.details.get(item_id) else {
+            return;
+        };
+        comments.extend(current_comments.iter().filter_map(|comment| {
+            comment
+                .id
+                .filter(|id| missing_ids.contains(id))
+                .map(|_| comment.clone())
+        }));
+        comments.sort_by_key(|comment| comment.created_at);
     }
 
     fn item_updated_at_by_id(&self, item_id: &str) -> Option<DateTime<Utc>> {

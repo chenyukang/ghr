@@ -347,9 +347,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         active_theme().subtle().add_modifier(Modifier::BOLD)
     };
-    let header = Row::new(list_table_header(section))
-        .style(header_style)
-        .bottom_margin(1);
+    let header = Row::new(list_table_header(section)).style(header_style);
 
     let mut title = if app.search_query.is_empty() {
         section.title.clone()

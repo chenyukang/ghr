@@ -6119,6 +6119,35 @@ fn repo_list_table_hides_redundant_repo_column() {
 }
 
 #[test]
+fn list_rows_start_immediately_after_header() {
+    let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+
+    terminal
+        .draw(|frame| draw(frame, &app, &paths))
+        .expect("draw");
+
+    let lines = buffer_lines(terminal.backend().buffer());
+    let header_index = lines
+        .iter()
+        .position(|line| {
+            line.contains("#")
+                && line.contains("Title")
+                && line.contains("Updated")
+                && line.contains("Meta")
+        })
+        .expect("list header");
+    let selected_row_index = lines
+        .iter()
+        .position(|line| line.contains("Compiler diagnostics"))
+        .expect("selected row");
+
+    assert_eq!(selected_row_index, header_index + 1);
+}
+
+#[test]
 fn notification_list_table_hides_meta_and_moves_updated_right() {
     let mut item = notification_item("thread-1", true);
     item.title = "Notification title".to_string();
@@ -7318,7 +7347,7 @@ fn list_title_shows_visible_loaded_and_total_count() {
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-    assert!(rendered.contains("showing 1-18/120 | page 1/3"));
+    assert!(rendered.contains("showing 1-19/120 | page 1/3"));
 }
 
 #[test]
@@ -7337,7 +7366,7 @@ fn list_title_offsets_visible_range_for_result_page() {
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-    assert!(rendered.contains("showing 51-68/120 | page 2/3"));
+    assert!(rendered.contains("showing 51-69/120 | page 2/3"));
 }
 
 #[test]
@@ -17460,7 +17489,7 @@ fn mouse_wheel_scrolls_list_when_pointer_is_over_list() {
     assert_eq!(app.current_selected_position(), 0);
     assert_eq!(
         app.current_list_scroll_offset(30, visible_rows),
-        usize::from(MOUSE_LIST_SCROLL_LINES)
+        usize::from(MOUSE_LIST_SCROLL_LINES).min(max_table_viewport_offset(30, visible_rows))
     );
     assert_eq!(app.current_item().map(|item| item.id.as_str()), Some("1"));
 }

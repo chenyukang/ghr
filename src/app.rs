@@ -1394,7 +1394,7 @@ enum DraftSaveOutcome {
     MissingTarget,
 }
 
-const TABLE_HEADER_HEIGHT: u16 = 2;
+const TABLE_HEADER_HEIGHT: u16 = 1;
 const SUCCESS_DIALOG_AUTO_CLOSE: Duration = Duration::from_secs(1);
 const TAB_DIVIDER_WIDTH: u16 = 3;
 const MOUSE_LIST_SCROLL_LINES: u16 = 2;

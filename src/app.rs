@@ -74,8 +74,8 @@ use crate::model::{
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
     GlobalSearchSavedState, GlobalSearchState, MAX_GLOBAL_SAVED_SEARCHES_PER_REPO,
-    MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState, UiState,
-    ViewSnapshot as SavedViewSnapshot,
+    MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState,
+    RepoUnseenItemsState, UiState, ViewSnapshot as SavedViewSnapshot,
 };
 use crate::theme::{ThemeFamily, ThemeName, ThemePreference, active_theme, set_active_theme};
 
@@ -1484,6 +1484,7 @@ struct AppState {
     recent_items_dirty: bool,
     recent_commands: Vec<RecentCommand>,
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
+    repo_views_seen_this_session: HashSet<String>,
     details_visit: Option<DetailsVisitState>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
@@ -1613,6 +1614,20 @@ impl RepoUnseenItems {
                 self.pull_requests.insert(item_id);
             }
             SectionKind::Notifications => {}
+        }
+    }
+
+    fn from_saved(saved: &RepoUnseenItemsState) -> Self {
+        Self {
+            issues: saved.issues.iter().cloned().collect(),
+            pull_requests: saved.pull_requests.iter().cloned().collect(),
+        }
+    }
+
+    fn to_saved(&self) -> RepoUnseenItemsState {
+        RepoUnseenItemsState {
+            issues: sorted_strings(&self.issues),
+            pull_requests: sorted_strings(&self.pull_requests),
         }
     }
 }
@@ -2807,7 +2822,12 @@ impl AppState {
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_items_dirty: false,
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
-            repo_unseen_items: HashMap::new(),
+            repo_unseen_items: ui_state
+                .repo_unseen_items
+                .iter()
+                .map(|(view, unseen)| (view.clone(), RepoUnseenItems::from_saved(unseen)))
+                .collect(),
+            repo_views_seen_this_session: HashSet::new(),
             details_visit: None,
             project_add_dialog: None,
             project_remove_dialog: None,
@@ -3091,6 +3111,11 @@ impl AppState {
             ignored_items: sorted_strings(&self.ignored_items),
             recent_items: recent_items_to_saved(&self.recent_items),
             recent_commands: recent_commands_to_saved(&self.recent_commands),
+            repo_unseen_items: self
+                .repo_unseen_items
+                .iter()
+                .map(|(view, unseen)| (view.clone(), unseen.to_saved()))
+                .collect(),
             global_search_by_repo,
             global_search_saved_by_repo: HashMap::new(),
         }
@@ -3308,7 +3333,9 @@ impl AppState {
                 continue;
             }
 
-            if same_view_key(&view_key, &self.active_view) {
+            if same_view_key(&view_key, &self.active_view)
+                && self.repo_view_seen_this_session(&view_key)
+            {
                 self.clear_repo_unseen_for_view(&view_key);
                 continue;
             }
@@ -3360,6 +3387,22 @@ impl AppState {
     fn clear_repo_unseen_for_view(&mut self, view: &str) {
         self.repo_unseen_items
             .retain(|key, _| !same_view_key(key, view));
+    }
+
+    fn mark_repo_view_seen(&mut self, view: &str) {
+        if !view.starts_with("repo:") {
+            return;
+        }
+        self.repo_views_seen_this_session
+            .retain(|key| !same_view_key(key, view));
+        self.repo_views_seen_this_session.insert(view.to_string());
+        self.clear_repo_unseen_for_view(view);
+    }
+
+    fn repo_view_seen_this_session(&self, view: &str) -> bool {
+        self.repo_views_seen_this_session
+            .iter()
+            .any(|seen| same_view_key(seen, view))
     }
 
     fn repo_unseen_items_for_view(&self, view: &str) -> Option<&RepoUnseenItems> {
@@ -6230,7 +6273,7 @@ impl AppState {
             });
         self.active_view = requested_view;
         let active_view = self.active_view.clone();
-        self.clear_repo_unseen_for_view(&active_view);
+        self.mark_repo_view_seen(&active_view);
         self.details_scroll = 0;
         self.selected_comment_index = 0;
         self.comment_dialog = None;

@@ -3001,6 +3001,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         ignored_items: Vec::new(),
         recent_items: Vec::new(),
         recent_commands: Vec::new(),
+        repo_unseen_items: HashMap::new(),
         global_search_by_repo: HashMap::new(),
         global_search_saved_by_repo: HashMap::new(),
     };
@@ -17157,6 +17158,90 @@ fn repo_top_tab_shows_unseen_issue_and_pr_counts_until_opened() {
         .find(|view| view.key == "repo:ghr")
         .expect("repo tab");
     assert_eq!(repo_tab.label, "ghr");
+}
+
+#[test]
+fn repo_unseen_counts_survive_restart_and_active_refresh_until_opened() {
+    let now = Utc::now();
+    let mut issue_one = work_item("issue-1", "chenyukang/ghr", 1, "Issue one", None);
+    issue_one.kind = ItemKind::Issue;
+    issue_one.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    let pr_one = work_item("pr-1", "chenyukang/ghr", 11, "PR one", None);
+    let pr_two = work_item("pr-2", "chenyukang/ghr", 12, "PR two", None);
+    let pr_three = work_item("pr-3", "chenyukang/ghr", 13, "PR three", None);
+    let issue_section = SectionSnapshot {
+        key: "repo:ghr:issues:Issues".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: "repo:chenyukang/ghr is:open".to_string(),
+        items: vec![issue_one],
+        total_count: Some(1),
+        page: 1,
+        page_size: 50,
+        refreshed_at: Some(now),
+        error: None,
+    };
+    let pr_section = SectionSnapshot {
+        key: "repo:ghr:pull_requests:Pull Requests".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: "repo:chenyukang/ghr is:open".to_string(),
+        items: vec![pr_one.clone()],
+        total_count: Some(1),
+        page: 1,
+        page_size: 50,
+        refreshed_at: Some(now),
+        error: None,
+    };
+    let mut app = AppState::with_ui_state(
+        SectionKind::PullRequests,
+        vec![test_section(), issue_section, pr_section.clone()],
+        UiState {
+            active_view: "repo:ghr".to_string(),
+            repo_unseen_items: HashMap::from([(
+                "repo:ghr".to_string(),
+                RepoUnseenItemsState {
+                    issues: vec!["issue-2".to_string()],
+                    pull_requests: vec!["pr-2".to_string()],
+                },
+            )]),
+            ..UiState::default()
+        },
+    );
+
+    app.apply_refreshed_section(
+        SectionSnapshot {
+            items: vec![pr_three, pr_two, pr_one],
+            total_count: Some(3),
+            refreshed_at: Some(now + chrono::Duration::minutes(1)),
+            ..pr_section
+        },
+        None,
+    );
+
+    let repo_tab = app
+        .view_tabs()
+        .into_iter()
+        .find(|view| view.key == "repo:ghr")
+        .expect("repo tab");
+    assert_eq!(repo_tab.label, "ghr(1|2)");
+    assert_eq!(
+        app.ui_state()
+            .repo_unseen_items
+            .get("repo:ghr")
+            .map(|unseen| unseen.pull_requests.clone()),
+        Some(vec!["pr-2".to_string(), "pr-3".to_string()])
+    );
+
+    app.switch_view("repo:ghr");
+
+    let repo_tab = app
+        .view_tabs()
+        .into_iter()
+        .find(|view| view.key == "repo:ghr")
+        .expect("repo tab");
+    assert_eq!(repo_tab.label, "ghr");
+    assert!(!app.ui_state().repo_unseen_items.contains_key("repo:ghr"));
 }
 
 #[test]

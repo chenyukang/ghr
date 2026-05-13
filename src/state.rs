@@ -36,6 +36,7 @@ pub struct UiState {
     pub ignored_items: Vec<String>,
     pub recent_items: Vec<RecentItemState>,
     pub recent_commands: Vec<RecentCommandState>,
+    pub repo_unseen_items: HashMap<String, RepoUnseenItemsState>,
     pub global_search_by_repo: HashMap<String, GlobalSearchState>,
     pub global_search_saved_by_repo: HashMap<String, Vec<GlobalSearchSavedState>>,
 }
@@ -128,6 +129,21 @@ impl GlobalSearchSavedState {
             return None;
         }
         Some(self)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoUnseenItemsState {
+    pub issues: Vec<String>,
+    pub pull_requests: Vec<String>,
+}
+
+impl RepoUnseenItemsState {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.issues = normalized_string_list(self.issues);
+        self.pull_requests = normalized_string_list(self.pull_requests);
+        (!self.issues.is_empty() || !self.pull_requests.is_empty()).then_some(self)
     }
 }
 
@@ -235,6 +251,7 @@ impl UiState {
         self.ignored_items.sort();
         self.recent_items = normalized_recent_items(self.recent_items);
         self.recent_commands = normalized_recent_commands(self.recent_commands);
+        self.repo_unseen_items = normalized_repo_unseen_items(self.repo_unseen_items);
         self.global_search_by_repo = normalized_global_search_by_repo(self.global_search_by_repo);
         self.global_search_saved_by_repo =
             normalized_global_search_saved_by_repo(self.global_search_saved_by_repo);
@@ -264,6 +281,7 @@ impl Default for UiState {
             ignored_items: Vec::new(),
             recent_items: Vec::new(),
             recent_commands: Vec::new(),
+            repo_unseen_items: HashMap::new(),
             global_search_by_repo: HashMap::new(),
             global_search_saved_by_repo: HashMap::new(),
         }
@@ -307,6 +325,34 @@ fn normalized_recent_commands(items: Vec<RecentCommandState>) -> Vec<RecentComma
     normalized.retain(|item| seen.insert(item.id.to_ascii_lowercase()));
     normalized.truncate(MAX_RECENT_COMMANDS);
     normalized
+}
+
+fn normalized_string_list(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut items = items
+        .into_iter()
+        .filter_map(|item| {
+            let item = item.trim().to_string();
+            (!item.is_empty() && seen.insert(item.clone())).then_some(item)
+        })
+        .collect::<Vec<_>>();
+    items.sort();
+    items
+}
+
+fn normalized_repo_unseen_items(
+    items: HashMap<String, RepoUnseenItemsState>,
+) -> HashMap<String, RepoUnseenItemsState> {
+    items
+        .into_iter()
+        .filter_map(|(view, unseen)| {
+            let view = view.trim().to_string();
+            if !view.starts_with("repo:") {
+                return None;
+            }
+            unseen.normalized().map(|unseen| (view, unseen))
+        })
+        .collect()
 }
 
 fn normalized_global_search_by_repo(
@@ -454,6 +500,13 @@ mod tests {
                     selected_at: Some(DateTime::from_timestamp(1_700_000_020, 0).unwrap()),
                 },
             ],
+            repo_unseen_items: HashMap::from([(
+                "repo:GHR".to_string(),
+                RepoUnseenItemsState {
+                    issues: vec!["issue-2".to_string(), "issue-2".to_string(), String::new()],
+                    pull_requests: vec!["pr-3".to_string()],
+                },
+            )]),
             global_search_by_repo: HashMap::from([(
                 "Rust-Lang/Rust".to_string(),
                 GlobalSearchState {
@@ -561,6 +614,13 @@ mod tests {
                 id: "Refresh".to_string(),
                 selected_at: Some(DateTime::from_timestamp(1_700_000_010, 0).unwrap()),
             }]
+        );
+        assert_eq!(
+            state.repo_unseen_items.get("repo:GHR"),
+            Some(&RepoUnseenItemsState {
+                issues: vec!["issue-2".to_string()],
+                pull_requests: vec!["pr-3".to_string()],
+            })
         );
         assert_eq!(
             state.global_search_by_repo.get("rust-lang/rust"),

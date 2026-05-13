@@ -64,16 +64,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (updated_config, repo_save_result) =
-        config.include_current_git_repo_and_save(&paths.config_path);
-    config = updated_config;
-    if let Some(result) = repo_save_result {
-        match result {
-            Ok(repo) => info!(repo, "saved current git repo to config"),
-            Err(error) => warn!(
-                error = %error,
-                "failed to save current git repo to config; using it for this run only"
-            ),
+    let current_repo_remote_prompt = (!cli.no_tui)
+        .then(|| config.current_repo_remote_prompt())
+        .flatten();
+    if current_repo_remote_prompt.is_none() {
+        let (updated_config, repo_save_result) =
+            config.include_current_git_repo_and_save(&paths.config_path);
+        config = updated_config;
+        if let Some(result) = repo_save_result {
+            match result {
+                Ok(repo) => info!(repo, "saved current git repo to config"),
+                Err(error) => warn!(
+                    error = %error,
+                    "failed to save current git repo to config; using it for this run only"
+                ),
+            }
         }
     }
 
@@ -101,7 +106,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    app::run(config, paths, store).await
+    app::run(config, paths, store, current_repo_remote_prompt).await
 }
 
 fn init_logging(

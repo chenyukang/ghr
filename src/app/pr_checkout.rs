@@ -146,10 +146,17 @@ pub(super) fn resolve_pr_checkout_directory(
     config: &Config,
     repository: &str,
 ) -> std::result::Result<PathBuf, String> {
-    if let Some(directory) = configured_local_dir_for_repo(config, repository) {
-        ensure_directory_tracks_repo(&directory, repository).map_err(|error| {
+    if let Some(repo) = config
+        .repos
+        .iter()
+        .find(|repo| repo.repo.eq_ignore_ascii_case(repository))
+        && let Some(local_dir) = repo.local_dir.as_deref().map(str::trim)
+        && !local_dir.is_empty()
+    {
+        let directory = expand_user_path(local_dir);
+        ensure_directory_tracks_configured_repo(&directory, repository, repo.remote.as_deref()).map_err(|error| {
             format!(
-                "Configured local_dir for {repository} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repository}."
+                "Configured local_dir for {repository} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir and [[repos]].remote to a checkout remote that points at {repository}."
             )
         })?;
         return Ok(directory);
@@ -226,6 +233,30 @@ pub(super) fn ensure_directory_tracks_repo(
         "{} does not track {repository}; found {remote_list}.",
         directory.display()
     ))
+}
+
+pub(super) fn ensure_directory_tracks_configured_repo(
+    directory: &Path,
+    repository: &str,
+    remote: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(remote) = remote.map(str::trim).filter(|remote| !remote.is_empty()) else {
+        return ensure_directory_tracks_repo(directory, repository);
+    };
+    if !directory.is_dir() {
+        return Err(format!("{} is not a directory.", directory.display()));
+    }
+    match git_remote_repo(directory, remote) {
+        Some(repo) if repo.eq_ignore_ascii_case(repository) => Ok(()),
+        Some(repo) => Err(format!(
+            "{} remote {remote} points at {repo}, expected {repository}.",
+            directory.display()
+        )),
+        None => Err(format!(
+            "{} has no GitHub remote named {remote}.",
+            directory.display()
+        )),
+    }
 }
 
 pub(super) fn current_git_branch_for_directory(

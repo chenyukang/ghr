@@ -230,6 +230,11 @@ pub(super) fn handle_key_in_area_mut(
         return false;
     }
 
+    if app.current_repo_remote_dialog.is_some() {
+        app.handle_current_repo_remote_key(key, config, paths, store, tx);
+        return false;
+    }
+
     if let Some(dialog) = app.startup_dialog {
         match (dialog, key.code) {
             (StartupDialog::Initializing, _) => {}

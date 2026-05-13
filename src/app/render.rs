@@ -25,6 +25,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
 
     if let Some(dialog) = app.setup_dialog {
         draw_setup_dialog(frame, dialog, area);
+    } else if let Some(dialog) = &app.current_repo_remote_dialog {
+        draw_current_repo_remote_dialog(frame, dialog, area);
     } else if let Some(dialog) = app.startup_dialog {
         draw_startup_dialog(frame, app, paths, dialog, area);
     } else if let Some(dialog) = &app.message_dialog {

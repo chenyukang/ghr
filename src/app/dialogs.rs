@@ -1125,6 +1125,92 @@ pub(super) fn project_add_dialog_cursor_position(
     })
 }
 
+pub(super) fn draw_current_repo_remote_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &CurrentRepoRemoteDialog,
+    area: Rect,
+) {
+    let dialog_area = current_repo_remote_dialog_area(dialog, area);
+    let inner = block_inner(dialog_area);
+    let width = usize::from(inner.width.max(1));
+    let mut lines = vec![
+        Line::from("Choose which git remote ghr should use for this checkout."),
+        key_value_line("local_dir", dialog.directory.display().to_string()),
+        Line::from(""),
+    ];
+
+    if dialog.candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No GitHub remotes found",
+            active_theme().subtle(),
+        )));
+    } else {
+        for (index, candidate) in dialog.candidates.iter().enumerate() {
+            lines.push(current_repo_remote_candidate_line(
+                candidate,
+                index == dialog.selected,
+                width,
+            ));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "The selected non-origin remote is saved as [[repos]].remote.",
+        active_theme().subtle(),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            "Current Repo Remote",
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line("arrows/Tab: select    Enter: save    Esc: skip"),
+    );
+}
+
+pub(super) fn current_repo_remote_dialog_area(
+    dialog: &CurrentRepoRemoteDialog,
+    area: Rect,
+) -> Rect {
+    let height = 9_u16
+        .saturating_add(dialog.candidates.len().min(8) as u16)
+        .min(area.height);
+    centered_rect(86, height, area)
+}
+
+fn current_repo_remote_candidate_line(
+    candidate: &GitHubRemoteCandidate,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let label = format!("{marker}{} -> {}", candidate.remote, candidate.repo);
+    let style = if selected {
+        active_theme().active().add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().panel()
+    };
+    Line::from(Span::styled(truncate_inline(&label, width), style))
+}
+
 pub(super) fn draw_project_remove_dialog(
     frame: &mut Frame<'_>,
     dialog: &ProjectRemoveDialog,

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use crate::theme::{ThemeName, ThemePreference};
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_REPO_REMOTE: &str = "origin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -59,6 +60,8 @@ pub struct RepoConfig {
     pub name: String,
     pub repo: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub local_dir: Option<String>,
     pub show_prs: bool,
     pub show_issues: bool,
@@ -68,6 +71,18 @@ pub struct RepoConfig {
     pub pr_labels: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issue_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRemoteCandidate {
+    pub remote: String,
+    pub repo: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentRepoRemotePrompt {
+    pub directory: PathBuf,
+    pub candidates: Vec<GitHubRemoteCandidate>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +193,27 @@ impl Config {
         self.include_git_repo_at_and_save(path, &directory)
     }
 
+    pub fn current_repo_remote_prompt(&self) -> Option<CurrentRepoRemotePrompt> {
+        let directory = std::env::current_dir().ok()?;
+        self.current_repo_remote_prompt_for_directory(&directory)
+    }
+
+    pub fn current_repo_remote_prompt_for_directory(
+        &self,
+        directory: &Path,
+    ) -> Option<CurrentRepoRemotePrompt> {
+        let candidates = current_github_remote_candidates(directory);
+        if candidates.len() <= 1
+            || self.current_directory_remote_is_configured(directory, &candidates)
+        {
+            return None;
+        }
+        Some(CurrentRepoRemotePrompt {
+            directory: directory.to_path_buf(),
+            candidates,
+        })
+    }
+
     pub fn remove_repo_at(&mut self, index: usize) -> Option<RepoConfig> {
         (index < self.repos.len()).then(|| self.repos.remove(index))
     }
@@ -187,19 +223,34 @@ impl Config {
         path: &Path,
         directory: &Path,
     ) -> (Self, Option<Result<String>>) {
-        let Some(repo) = current_github_repo_in(directory) else {
+        let Some(candidate) = current_github_repo_in(directory) else {
             return (self, None);
         };
         let local_dir = Some(directory.display().to_string());
-        if !self.add_runtime_repo_with_local_dir(repo.clone(), local_dir) {
+        let remote = repo_remote_config_value(&candidate.remote);
+        if !self.add_runtime_repo_with_local_dir_and_remote(
+            candidate.repo.clone(),
+            local_dir,
+            remote,
+        ) {
             return (self, None);
         }
 
-        let save_result = self.save(path).map(|()| repo);
+        let save_result = self.save(path).map(|()| candidate.repo);
         (self, Some(save_result))
     }
 
+    #[cfg(test)]
     fn add_runtime_repo_with_local_dir(&mut self, repo: String, local_dir: Option<String>) -> bool {
+        self.add_runtime_repo_with_local_dir_and_remote(repo, local_dir, None)
+    }
+
+    pub fn add_runtime_repo_with_local_dir_and_remote(
+        &mut self,
+        repo: String,
+        local_dir: Option<String>,
+        remote: Option<String>,
+    ) -> bool {
         if let Some(configured) = self
             .repos
             .iter_mut()
@@ -209,10 +260,21 @@ impl Config {
                 .local_dir
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty());
-            if has_local_dir || local_dir.is_none() {
+            let has_remote = configured
+                .remote
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let should_set_local_dir = !has_local_dir && local_dir.is_some();
+            let should_set_remote = !has_remote && remote.is_some();
+            if !should_set_local_dir && !should_set_remote {
                 return false;
             }
-            configured.local_dir = local_dir;
+            if should_set_local_dir {
+                configured.local_dir = local_dir;
+            }
+            if should_set_remote {
+                configured.remote = remote;
+            }
             return true;
         }
 
@@ -222,6 +284,7 @@ impl Config {
             RepoConfig {
                 name,
                 repo,
+                remote,
                 local_dir,
                 show_prs: true,
                 show_issues: true,
@@ -232,21 +295,70 @@ impl Config {
         );
         true
     }
+
+    pub fn repo_name_for_repo(&self, repo: &str) -> Option<&str> {
+        self.repos
+            .iter()
+            .find(|configured| configured.repo.eq_ignore_ascii_case(repo))
+            .map(|configured| configured.name.as_str())
+    }
+
+    fn current_directory_remote_is_configured(
+        &self,
+        directory: &Path,
+        candidates: &[GitHubRemoteCandidate],
+    ) -> bool {
+        self.repos.iter().any(|repo| {
+            let Some(local_dir) = repo.local_dir.as_deref() else {
+                return false;
+            };
+            if !same_local_dir(local_dir, directory) {
+                return false;
+            }
+
+            let matches = candidates
+                .iter()
+                .filter(|candidate| candidate.repo.eq_ignore_ascii_case(&repo.repo))
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return true;
+            }
+
+            let configured_remote = repo.remote.as_deref().unwrap_or(DEFAULT_REPO_REMOTE);
+            matches
+                .iter()
+                .any(|candidate| candidate.remote == configured_remote)
+        })
+    }
 }
 
-fn current_github_repo_in(directory: &Path) -> Option<String> {
-    if git_output(directory, ["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
-        return None;
+fn current_github_repo_in(directory: &Path) -> Option<GitHubRemoteCandidate> {
+    current_github_remote_candidates(directory)
+        .into_iter()
+        .next()
+}
+
+pub fn current_github_remote_candidates(directory: &Path) -> Vec<GitHubRemoteCandidate> {
+    if git_output(directory, ["rev-parse", "--is-inside-work-tree"])
+        .is_none_or(|output| output.trim() != "true")
+    {
+        return Vec::new();
     }
 
     git_remote_candidates(directory)
         .into_iter()
-        .filter_map(|remote| git_output(directory, ["remote", "get-url", remote.as_str()]))
-        .find_map(|url| github_repo_from_remote_url(url.trim()))
+        .filter_map(|remote| {
+            let url = git_output(directory, ["remote", "get-url", remote.as_str()])?;
+            let repo = github_repo_from_remote_url(url.trim())?;
+            Some(GitHubRemoteCandidate { remote, repo })
+        })
+        .collect()
 }
 
 fn git_remote_candidates(directory: &Path) -> Vec<String> {
     let mut remotes = Vec::new();
+
+    push_unique_remote(&mut remotes, DEFAULT_REPO_REMOTE);
 
     if let Some(branch) = git_output(directory, ["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         let key = format!("branch.{}.remote", branch.trim());
@@ -254,8 +366,6 @@ fn git_remote_candidates(directory: &Path) -> Vec<String> {
             push_unique_remote(&mut remotes, remote.trim());
         }
     }
-
-    push_unique_remote(&mut remotes, "origin");
 
     if let Some(output) = git_output(directory, ["remote"]) {
         for remote in output.lines() {
@@ -311,6 +421,54 @@ pub(crate) fn github_repo_from_remote_url(url: &str) -> Option<String> {
     }
 
     Some(format!("{owner}/{name}"))
+}
+
+pub fn repo_remote_config_value(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() || remote == DEFAULT_REPO_REMOTE {
+        None
+    } else {
+        Some(remote.to_string())
+    }
+}
+
+fn same_local_dir(configured: &str, directory: &Path) -> bool {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return false;
+    }
+    let configured = expand_user_path(configured);
+    let directory = directory.to_path_buf();
+    paths_equal(&configured, &directory)
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn expand_user_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(value)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(::dirs::home_dir)
 }
 
 fn runtime_repo_name(configured_repos: &[RepoConfig], repo: &str) -> String {
@@ -428,6 +586,7 @@ impl Default for RepoConfig {
         Self {
             name: String::new(),
             repo: String::new(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -661,6 +820,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "ghr".to_string(),
             repo: "someone-else/ghr".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -683,6 +843,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "Fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -706,6 +867,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "ghr".to_string(),
             repo: "chenyukang/ghr".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -729,6 +891,7 @@ mod tests {
         config.repos.push(RepoConfig {
             name: "ghr".to_string(),
             repo: "chenyukang/ghr".to_string(),
+            remote: None,
             local_dir: Some("/tmp/original-ghr".to_string()),
             show_prs: true,
             show_issues: true,
@@ -775,6 +938,75 @@ mod tests {
             saved.repos[0].local_dir.as_deref(),
             Some(local_dir.as_str())
         );
+    }
+
+    #[test]
+    fn current_git_repo_with_multiple_github_remotes_prompts_for_remote() {
+        let repo_dir = test_git_repo("https://github.com/Officeyutong/tentacle.git");
+        add_git_remote(
+            &repo_dir,
+            "upstream",
+            "https://github.com/nervosnetwork/tentacle.git",
+        );
+
+        let prompt = Config::default()
+            .current_repo_remote_prompt_for_directory(&repo_dir)
+            .expect("multiple remotes should prompt");
+
+        assert_eq!(prompt.directory, repo_dir);
+        assert_eq!(
+            prompt
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.remote.as_str(), candidate.repo.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("origin", "Officeyutong/tentacle"),
+                ("upstream", "nervosnetwork/tentacle")
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_current_repo_remote_does_not_prompt_again() {
+        let repo_dir = test_git_repo("https://github.com/Officeyutong/tentacle.git");
+        add_git_remote(
+            &repo_dir,
+            "upstream",
+            "https://github.com/nervosnetwork/tentacle.git",
+        );
+        let mut config = Config::default();
+        config.repos.push(RepoConfig {
+            name: "tentacle".to_string(),
+            repo: "nervosnetwork/tentacle".to_string(),
+            remote: Some("upstream".to_string()),
+            local_dir: Some(repo_dir.display().to_string()),
+            show_prs: true,
+            show_issues: true,
+            labels: Vec::new(),
+            pr_labels: Vec::new(),
+            issue_labels: Vec::new(),
+        });
+
+        assert!(
+            config
+                .current_repo_remote_prompt_for_directory(&repo_dir)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_repo_saves_non_origin_remote() {
+        let mut config = Config::default();
+
+        assert!(config.add_runtime_repo_with_local_dir_and_remote(
+            "nervosnetwork/tentacle".to_string(),
+            Some("/tmp/tentacle".to_string()),
+            repo_remote_config_value("upstream"),
+        ));
+
+        assert_eq!(config.repos[0].repo, "nervosnetwork/tentacle");
+        assert_eq!(config.repos[0].remote.as_deref(), Some("upstream"));
     }
 
     #[test]
@@ -847,6 +1079,7 @@ mod tests {
             [[repos]]
             name = "fiber"
             repo = "nervosnetwork/fiber"
+            remote = "upstream"
             local_dir = "~/code/fiber"
             show_prs = true
             show_issues = true
@@ -889,6 +1122,7 @@ mod tests {
         assert_eq!(config.exclude_repos, vec!["nervosnetwork/archive-*"]);
         assert_eq!(config.repos[0].name, "fiber");
         assert_eq!(config.repos[0].repo, "nervosnetwork/fiber");
+        assert_eq!(config.repos[0].remote.as_deref(), Some("upstream"));
         assert_eq!(config.repos[0].local_dir.as_deref(), Some("~/code/fiber"));
         assert!(config.repos[0].show_prs);
         assert!(config.repos[0].show_issues);
@@ -903,6 +1137,7 @@ mod tests {
         let repo = RepoConfig {
             name: "Rust".to_string(),
             repo: "rust-lang/rust".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -1036,5 +1271,19 @@ mod tests {
         );
 
         dir
+    }
+
+    fn add_git_remote(directory: &Path, name: &str, remote_url: &str) {
+        let remote = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["remote", "add", name, remote_url])
+            .output()
+            .expect("run git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {}",
+            String::from_utf8_lossy(&remote.stderr)
+        );
     }
 }

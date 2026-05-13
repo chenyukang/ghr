@@ -749,6 +749,7 @@ mod tests {
         config.repos.push(crate::config::RepoConfig {
             name: "fiber".to_string(),
             repo: "nervosnetwork/fiber".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,
@@ -779,6 +780,7 @@ mod tests {
         config.repos.push(crate::config::RepoConfig {
             name: "rust".to_string(),
             repo: "rust-lang/rust".to_string(),
+            remote: None,
             local_dir: None,
             show_prs: true,
             show_issues: true,

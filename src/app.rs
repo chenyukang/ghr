@@ -37,8 +37,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, warn};
 
 use crate::config::{
-    Config, DEFAULT_COMMAND_PALETTE_KEY, RepoConfig, SavedSearchFilterConfig,
-    github_repo_from_remote_url,
+    Config, CurrentRepoRemotePrompt, DEFAULT_COMMAND_PALETTE_KEY, GitHubRemoteCandidate,
+    RepoConfig, SavedSearchFilterConfig, github_repo_from_remote_url, repo_remote_config_value,
 };
 use crate::dirs::Paths;
 use crate::github::{
@@ -124,8 +124,8 @@ use layout::{
 use participants::*;
 use pr_checkout::{
     PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
-    current_git_branch_for_directory, ensure_directory_tracks_repo, resolve_pr_checkout_directory,
-    resolve_pull_request_head_ref, run_pr_checkout,
+    current_git_branch_for_directory, ensure_directory_tracks_configured_repo,
+    resolve_pr_checkout_directory, resolve_pull_request_head_ref, run_pr_checkout,
 };
 use render::*;
 use runtime::*;
@@ -1169,6 +1169,13 @@ struct ProjectAddDialog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CurrentRepoRemoteDialog {
+    directory: PathBuf,
+    candidates: Vec<GitHubRemoteCandidate>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectRemoveCandidate {
     index: usize,
     name: String,
@@ -1486,6 +1493,7 @@ struct AppState {
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
     repo_views_seen_this_session: HashSet<String>,
     details_visit: Option<DetailsVisitState>,
+    current_repo_remote_dialog: Option<CurrentRepoRemoteDialog>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
     cache_clear_dialog: Option<CacheClearDialog>,
@@ -1797,7 +1805,12 @@ enum RefreshPriority {
     Background,
 }
 
-pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Result<()> {
+pub async fn run(
+    mut config: Config,
+    paths: Paths,
+    store: SnapshotStore,
+    current_repo_remote_prompt: Option<CurrentRepoRemotePrompt>,
+) -> Result<()> {
     let cached = store.load_all()?;
     let show_startup_dialog = should_show_startup_dialog(&cached);
     let sections = merge_cached_sections(configured_sections(&config), cached);
@@ -1827,9 +1840,12 @@ pub async fn run(mut config: Config, paths: Paths, store: SnapshotStore) -> Resu
     } else if show_startup_dialog {
         app.show_startup_initializing();
     }
+    if let Some(prompt) = current_repo_remote_prompt {
+        app.show_current_repo_remote_dialog(prompt);
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    if startup_setup_dialog.is_none() {
+    if startup_setup_dialog.is_none() && app.current_repo_remote_dialog.is_none() {
         start_refresh(
             config.clone(),
             store.clone(),
@@ -2829,6 +2845,7 @@ impl AppState {
                 .collect(),
             repo_views_seen_this_session: HashSet::new(),
             details_visit: None,
+            current_repo_remote_dialog: None,
             project_add_dialog: None,
             project_remove_dialog: None,
             cache_clear_dialog: None,
@@ -3304,6 +3321,15 @@ impl AppState {
                 "GitHub CLI auth required: run `gh auth login`".to_string()
             }
         };
+    }
+
+    fn show_current_repo_remote_dialog(&mut self, prompt: CurrentRepoRemotePrompt) {
+        self.current_repo_remote_dialog = Some(CurrentRepoRemoteDialog {
+            directory: prompt.directory,
+            candidates: prompt.candidates,
+            selected: 0,
+        });
+        self.status = "choose git remote for current repo".to_string();
     }
 
     fn should_start_idle_sweep(&self, config: &Config) -> bool {
@@ -9764,9 +9790,14 @@ impl AppState {
             ));
             return;
         };
-        if let Err(error) = ensure_directory_tracks_repo(&local_dir, &repo) {
+        let remote = config
+            .repos
+            .iter()
+            .find(|configured| configured.repo.eq_ignore_ascii_case(&repo))
+            .and_then(|configured| configured.remote.as_deref());
+        if let Err(error) = ensure_directory_tracks_configured_repo(&local_dir, &repo, remote) {
             self.show_new_pull_request_unavailable(format!(
-                "Configured local_dir for {repo} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir to a checkout whose git remote points at {repo}."
+                "Configured local_dir for {repo} cannot be used.\n\n{error}\n\nSet [[repos]].local_dir and [[repos]].remote to a checkout remote that points at {repo}."
             ));
             return;
         }

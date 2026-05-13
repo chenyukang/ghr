@@ -5212,6 +5212,7 @@ fn project_switcher_lists_repo_tabs_and_filters_by_prefix() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5222,6 +5223,7 @@ fn project_switcher_lists_repo_tabs_and_filters_by_prefix() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5232,6 +5234,7 @@ fn project_switcher_lists_repo_tabs_and_filters_by_prefix() {
     config.repos.push(crate::config::RepoConfig {
         name: "CKB".to_string(),
         repo: "nervosnetwork/ckb".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5265,6 +5268,7 @@ fn command_palette_switch_project_opens_project_switcher() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5409,6 +5413,7 @@ fn project_switcher_enter_switches_to_selected_project() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5419,6 +5424,7 @@ fn project_switcher_enter_switches_to_selected_project() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -5489,6 +5495,53 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
 }
 
 #[test]
+fn current_repo_remote_dialog_saves_selected_remote_and_adds_project_tab() {
+    let paths = unique_test_paths("current-repo-remote");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let directory =
+        std::env::temp_dir().join(format!("ghr-current-repo-remote-{}", std::process::id()));
+    let mut config = Config::default();
+    config.save(&paths.config_path).expect("save config");
+    let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
+    app.show_current_repo_remote_dialog(CurrentRepoRemotePrompt {
+        directory: directory.clone(),
+        candidates: vec![
+            GitHubRemoteCandidate {
+                remote: "origin".to_string(),
+                repo: "Officeyutong/tentacle".to_string(),
+            },
+            GitHubRemoteCandidate {
+                remote: "upstream".to_string(),
+                repo: "nervosnetwork/tentacle".to_string(),
+            },
+        ],
+    });
+
+    app.handle_current_repo_remote_key(key(KeyCode::Down), &mut config, &paths, &store, &tx);
+    app.handle_current_repo_remote_key(key(KeyCode::Enter), &mut config, &paths, &store, &tx);
+
+    assert!(app.current_repo_remote_dialog.is_none());
+    assert_eq!(config.repos[0].name, "tentacle");
+    assert_eq!(config.repos[0].repo, "nervosnetwork/tentacle");
+    assert_eq!(config.repos[0].remote.as_deref(), Some("upstream"));
+    let directory_string = directory.display().to_string();
+    assert_eq!(
+        config.repos[0].local_dir.as_deref(),
+        Some(directory_string.as_str())
+    );
+    assert_eq!(app.active_view, "repo:tentacle");
+    assert!(
+        app.view_tabs()
+            .iter()
+            .any(|view| view.key == "repo:tentacle")
+    );
+
+    let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
+    assert_eq!(saved.repos[0].remote.as_deref(), Some("upstream"));
+}
+
+#[test]
 fn project_add_uses_custom_title_and_local_dir() {
     let paths = unique_test_paths("project-add-custom");
     let mut config = Config::default();
@@ -5547,6 +5600,7 @@ fn command_palette_project_remove_opens_configured_project_picker() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: Some("/tmp/fiber".to_string()),
         show_prs: true,
         show_issues: true,
@@ -5590,6 +5644,7 @@ fn project_remove_confirmation_removes_repo_from_config_and_ui() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: Some("/tmp/ghr".to_string()),
         show_prs: true,
         show_issues: true,
@@ -5600,6 +5655,7 @@ fn project_remove_confirmation_removes_repo_from_config_and_ui() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: Some("/tmp/fiber".to_string()),
         show_prs: true,
         show_issues: true,
@@ -12208,6 +12264,7 @@ fn capital_n_in_pr_repo_with_local_dir_opens_pr_create_dialog() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: Some(local_dir.display().to_string()),
         show_prs: true,
         show_issues: true,
@@ -12251,6 +12308,7 @@ fn capital_n_in_pr_repo_with_fork_local_dir_uses_owner_qualified_head() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: Some(local_dir.display().to_string()),
         show_prs: true,
         show_issues: true,
@@ -12269,6 +12327,38 @@ fn capital_n_in_pr_repo_with_fork_local_dir_uses_owner_qualified_head() {
         "chenyukang:fix/mpp-force-close-preimage-retention"
     );
     assert_eq!(app.status, "new pull request");
+}
+
+#[test]
+fn configured_repo_remote_is_used_when_validating_local_dir() {
+    let local_dir = checkout_test_fork_repo_dir_on_branch(
+        "feature/upstream-base",
+        "Officeyutong/tentacle",
+        "nervosnetwork/tentacle",
+    );
+    let mut config = Config::default();
+    config.repos.push(crate::config::RepoConfig {
+        name: "tentacle".to_string(),
+        repo: "nervosnetwork/tentacle".to_string(),
+        remote: Some("origin".to_string()),
+        local_dir: Some(local_dir.display().to_string()),
+        show_prs: true,
+        show_issues: true,
+        labels: Vec::new(),
+        pr_labels: Vec::new(),
+        issue_labels: Vec::new(),
+    });
+
+    let error = resolve_pr_checkout_directory(&config, "nervosnetwork/tentacle")
+        .expect_err("origin points at the fork, not the configured base repo");
+    assert!(error.contains("remote origin points at Officeyutong/tentacle"));
+
+    config.repos[0].remote = Some("upstream".to_string());
+
+    assert_eq!(
+        resolve_pr_checkout_directory(&config, "nervosnetwork/tentacle").expect("upstream remote"),
+        local_dir
+    );
 }
 
 #[test]
@@ -12322,6 +12412,7 @@ fn capital_n_in_pr_repo_with_invalid_local_dir_opens_message_dialog() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: Some(local_dir.display().to_string()),
         show_prs: true,
         show_issues: true,
@@ -12429,6 +12520,7 @@ fn capital_n_in_pr_details_opens_pr_create_dialog() {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: Some(local_dir.display().to_string()),
         show_prs: true,
         show_issues: true,
@@ -17087,6 +17179,7 @@ fn current_repo_tab_can_lead_configured_repo_tabs() {
     config.repos.push(crate::config::RepoConfig {
         name: "runnel".to_string(),
         repo: "chenyukang/runnel".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -17097,6 +17190,7 @@ fn current_repo_tab_can_lead_configured_repo_tabs() {
     config.repos.push(crate::config::RepoConfig {
         name: "Fiber".to_string(),
         repo: "nervosnetwork/fiber".to_string(),
+        remote: None,
         local_dir: None,
         show_prs: true,
         show_issues: true,
@@ -19286,6 +19380,7 @@ fn checkout_test_config() -> Config {
     config.repos.push(crate::config::RepoConfig {
         name: "ghr".to_string(),
         repo: "chenyukang/ghr".to_string(),
+        remote: None,
         local_dir: Some(local_dir.display().to_string()),
         show_prs: true,
         show_issues: true,

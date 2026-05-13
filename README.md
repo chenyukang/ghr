@@ -195,6 +195,8 @@ Local PR checkout:
 name = "Rust"
 repo = "rust-lang/rust"
 local_dir = "~/code/rust"
+# Optional. Defaults to origin when omitted.
+remote = "upstream"
 show_prs = true
 show_issues = true
 ```
@@ -299,7 +301,7 @@ Use `[[repos]]` to add repository tabs to the top bar. Each configured repo show
 
 Use `[[saved_search_filters]]` for named PR/issue searches that should be editable in `config.toml`. From the search dialog, `Ctrl+S` prompts for a name and saves the current repo, PR/issue kind, and filter fields back to the active config file.
 
-When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
+When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the checkout has more than one GitHub remote, ghr opens a startup modal so you can choose the remote, then stores non-origin choices as `remote = "upstream"` or whichever remote you selected. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 
 Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
 

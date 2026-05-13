@@ -418,6 +418,7 @@ impl AppState {
     pub(super) fn show_project_add_dialog(&mut self) {
         self.finish_details_visit(Instant::now());
         self.command_palette = None;
+        self.current_repo_remote_dialog = None;
         self.project_switcher = None;
         self.top_menu_switcher = None;
         self.theme_switcher = None;
@@ -445,6 +446,93 @@ impl AppState {
             field: ProjectAddField::RepoUrl,
         });
         self.status = "project add".to_string();
+    }
+
+    pub(super) fn handle_current_repo_remote_key(
+        &mut self,
+        key: KeyEvent,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => self.dismiss_current_repo_remote_dialog(config, store, tx),
+            KeyCode::Enter => self.confirm_current_repo_remote(config, paths, store, tx),
+            KeyCode::Down | KeyCode::Tab => self.move_current_repo_remote_selection(1),
+            KeyCode::Up | KeyCode::BackTab => self.move_current_repo_remote_selection(-1),
+            _ => {}
+        }
+    }
+
+    pub(super) fn move_current_repo_remote_selection(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.current_repo_remote_dialog else {
+            return;
+        };
+        dialog.selected = move_wrapping(dialog.selected, dialog.candidates.len(), delta);
+        self.status = "choose git remote for current repo".to_string();
+    }
+
+    pub(super) fn dismiss_current_repo_remote_dialog(
+        &mut self,
+        config: &Config,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        self.current_repo_remote_dialog = None;
+        self.status = "current repo remote skipped".to_string();
+        #[cfg(not(test))]
+        trigger_refresh(self, config, store, tx);
+        #[cfg(test)]
+        let _ = (config, store, tx);
+    }
+
+    pub(super) fn confirm_current_repo_remote(
+        &mut self,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        let Some(dialog) = self.current_repo_remote_dialog.take() else {
+            return;
+        };
+        let selected = dialog
+            .selected
+            .min(dialog.candidates.len().saturating_sub(1));
+        let Some(candidate) = dialog.candidates.get(selected).cloned() else {
+            self.current_repo_remote_dialog = Some(dialog);
+            self.status = "no git remote selected".to_string();
+            return;
+        };
+
+        let previous_config = config.clone();
+        config.add_runtime_repo_with_local_dir_and_remote(
+            candidate.repo.clone(),
+            Some(dialog.directory.display().to_string()),
+            repo_remote_config_value(&candidate.remote),
+        );
+        if let Err(error) = config.save(&paths.config_path) {
+            *config = previous_config;
+            self.current_repo_remote_dialog = Some(dialog);
+            self.status = format!("remote selection save failed: {error}");
+            return;
+        }
+
+        let name = config
+            .repo_name_for_repo(&candidate.repo)
+            .map(str::to_string)
+            .unwrap_or_else(|| candidate.repo.clone());
+        self.add_project_view_from_config(config, &name);
+        self.switch_project_view(repo_view_key(&name));
+        self.status = format!(
+            "current repo remote: {} -> {}",
+            candidate.remote, candidate.repo
+        );
+        #[cfg(not(test))]
+        trigger_refresh(self, config, store, tx);
+        #[cfg(test)]
+        let _ = (store, tx);
     }
 
     pub(super) fn dismiss_project_add_dialog(&mut self) {
@@ -552,6 +640,7 @@ impl AppState {
         let repo_config = RepoConfig {
             name: name.clone(),
             repo: repo.clone(),
+            remote: None,
             local_dir: Some(dialog.local_dir.trim().to_string()),
             show_prs: true,
             show_issues: true,

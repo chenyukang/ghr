@@ -26,6 +26,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -54,6 +56,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Test
         run: cargo test --locked
@@ -73,6 +77,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Package
         run: cargo package --locked

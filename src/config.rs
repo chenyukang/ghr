@@ -640,6 +640,18 @@ impl Default for Defaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_test_suffix() -> String {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let counter = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{unique}-{counter}", std::process::id())
+    }
 
     #[test]
     fn parses_pull_requests_view_name() {
@@ -740,13 +752,9 @@ mod tests {
 
     #[test]
     fn generated_default_config_includes_current_inbox_sections() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "ghr-generated-config-test-{}-{unique}",
-            std::process::id()
+            "ghr-generated-config-test-{}",
+            unique_test_suffix()
         ));
         fs::create_dir_all(&dir).expect("create generated config test dir");
         let config_path = dir.join("config.toml");
@@ -1238,12 +1246,7 @@ mod tests {
     }
 
     fn test_git_repo(remote_url: &str) -> std::path::PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("ghr-config-test-{}-{unique}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ghr-config-test-{}", unique_test_suffix()));
         fs::create_dir_all(&dir).expect("create config test dir");
 
         let init = Command::new("git")

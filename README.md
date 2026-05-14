@@ -45,7 +45,16 @@ gh auth login
 
 ## Installation
 
-You can install `ghr` with Cargo:
+You can install `ghr` with Homebrew on macOS or Linux through the project tap:
+
+```bash
+brew install chenyukang/tap/ghr-cli
+```
+
+The Homebrew formula is named `ghr-cli` because Homebrew core already has an
+unrelated `ghr` formula. The installed executable is still `ghr`.
+
+You can also install `ghr` with Cargo:
 
 ```bash
 cargo install ghr-cli

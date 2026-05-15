@@ -208,6 +208,7 @@ show_issues = true
 ```
 
 - If `local_dir` is not set, `ghr` tries the directory where it was launched when that directory has a GitHub remote for the pull request repository. If neither path matches, `ghr` shows a hint instead of running checkout.
+- Creating a pull request from `local_dir` runs a local preflight before pushing or calling `gh pr create`. It blocks with a dialog when the title is empty, the checkout has moved branches, the worktree is dirty, the head has no commit, no matching GitHub push remote exists, or the branch has no commits ahead of the local base branch.
 
 Mouse behavior:
 

@@ -1,6 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use tokio::process::Command as TokioCommand;
 use tracing::{debug, error};
@@ -257,6 +257,303 @@ pub(super) fn ensure_directory_tracks_configured_repo(
             directory.display()
         )),
     }
+}
+
+pub(super) fn validate_pr_create_preflight(
+    directory: &Path,
+    repository: &str,
+    branch: &str,
+    head_ref: &str,
+    title: &str,
+) -> std::result::Result<(), String> {
+    let mut issues = Vec::new();
+    let branch = branch.trim();
+    let head_ref = head_ref.trim();
+
+    if title.trim().is_empty() {
+        issues.push("Title is empty.".to_string());
+    }
+    if branch.is_empty() {
+        issues.push("Current branch is empty.".to_string());
+    }
+    if head_ref.is_empty() {
+        issues.push("Head ref is empty.".to_string());
+    }
+    if !directory.is_dir() {
+        issues.push(format!("{} is not a directory.", directory.display()));
+        return Err(pr_create_preflight_body(issues));
+    }
+
+    if let Err(error) = ensure_directory_tracks_repo(directory, repository) {
+        issues.push(error);
+    }
+
+    match current_git_branch_for_directory(directory) {
+        Ok(current) if current != branch => issues.push(format!(
+            "Dialog was opened for branch {branch}, but the checkout is now on {current}."
+        )),
+        Ok(_) => {}
+        Err(error) => issues.push(error),
+    }
+
+    let head_branch = pull_request_head_branch_for_preflight(head_ref);
+    if !head_branch.is_empty() && head_branch != branch {
+        issues.push(format!(
+            "Head ref {head_ref} points at branch {head_branch}, but the checkout branch is {branch}."
+        ));
+    }
+
+    let resolved_head_ref = resolve_pull_request_head_ref(directory, repository, branch);
+    if !head_ref.is_empty() && resolved_head_ref != head_ref {
+        issues.push(format!(
+            "Head ref changed from {head_ref} to {resolved_head_ref}. Reopen the dialog and retry."
+        ));
+    }
+
+    if let Err(error) = ensure_clean_worktree(directory) {
+        issues.push(error);
+    }
+
+    if let Err(error) = ensure_head_commit_exists(directory) {
+        issues.push(error);
+    }
+
+    match matching_push_remote_for_head_ref(directory, repository, head_ref) {
+        Ok(Some(_)) => {}
+        Ok(None) => issues.push(format!(
+            "No GitHub push remote matches head {head_ref} for {repository}."
+        )),
+        Err(error) => issues.push(error),
+    }
+
+    match local_base_ref_for_repository(directory, repository) {
+        Ok(Some(base)) => match commits_ahead_of(directory, &base.rev) {
+            Ok(0) => issues.push(format!(
+                "No commits between {} and {branch}. Commit changes on {branch} before creating a PR.",
+                base.display
+            )),
+            Ok(_) => {}
+            Err(error) => issues.push(error),
+        },
+        Ok(None) => issues.push(format!(
+            "Could not find a local base branch for {repository}. Run `git fetch` for the base remote and retry."
+        )),
+        Err(error) => issues.push(error),
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(pr_create_preflight_body(issues))
+    }
+}
+
+fn pr_create_preflight_body(issues: Vec<String>) -> String {
+    let mut body = String::from("Fix these before creating the pull request:\n");
+    for issue in issues {
+        body.push_str("\n- ");
+        body.push_str(&issue);
+    }
+    body
+}
+
+fn pull_request_head_branch_for_preflight(head: &str) -> &str {
+    head.rsplit_once(':')
+        .map(|(_, branch)| branch)
+        .unwrap_or(head)
+        .trim()
+}
+
+fn pull_request_head_owner_for_preflight(head: &str) -> Option<&str> {
+    head.split_once(':')
+        .map(|(owner, _)| owner.trim())
+        .filter(|owner| !owner.is_empty())
+}
+
+fn ensure_clean_worktree(directory: &Path) -> std::result::Result<(), String> {
+    let status = git_text(directory, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Working tree has uncommitted changes. Commit, stash, or discard them first:\n{}",
+        git_status_preview(&status)
+    ))
+}
+
+fn git_status_preview(status: &str) -> String {
+    let mut lines = status
+        .lines()
+        .take(8)
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>();
+    if status.lines().count() > lines.len() {
+        lines.push("  ...".to_string());
+    }
+    lines.join("\n")
+}
+
+fn ensure_head_commit_exists(directory: &Path) -> std::result::Result<(), String> {
+    if git_ref_exists(directory, "HEAD") {
+        Ok(())
+    } else {
+        Err("HEAD has no commit yet. Commit changes before creating a PR.".to_string())
+    }
+}
+
+fn matching_push_remote_for_head_ref(
+    directory: &Path,
+    repository: &str,
+    head_ref: &str,
+) -> std::result::Result<Option<String>, String> {
+    let Some((base_owner, base_name)) = repository.split_once('/') else {
+        return Ok(None);
+    };
+    let expected_owner = pull_request_head_owner_for_preflight(head_ref).unwrap_or(base_owner);
+    Ok(git_push_remotes_for_directory(directory)?
+        .into_iter()
+        .find(|(_, repo)| {
+            repo.split_once('/').is_some_and(|(owner, name)| {
+                owner.eq_ignore_ascii_case(expected_owner) && name.eq_ignore_ascii_case(base_name)
+            })
+        })
+        .map(|(remote, _)| remote))
+}
+
+fn git_push_remotes_for_directory(
+    directory: &Path,
+) -> std::result::Result<Vec<(String, String)>, String> {
+    let output = git_text(directory, &["remote", "-v"])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?.trim();
+            let url = parts.next()?.trim();
+            let kind = parts.next()?.trim();
+            if kind != "(push)" {
+                return None;
+            }
+            Some((name.to_string(), github_repo_from_remote_url(url)?))
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalBaseRef {
+    display: String,
+    rev: String,
+}
+
+fn local_base_ref_for_repository(
+    directory: &Path,
+    repository: &str,
+) -> std::result::Result<Option<LocalBaseRef>, String> {
+    let remotes = git_remotes_for_directory(directory)?;
+    let Some((remote, _)) = remotes
+        .into_iter()
+        .find(|(_, repo)| repo.eq_ignore_ascii_case(repository))
+    else {
+        return Ok(None);
+    };
+
+    if let Some(remote_head) = remote_head_ref(directory, &remote)? {
+        let display = remote_head
+            .strip_prefix(&format!("{remote}/"))
+            .unwrap_or(remote_head.as_str())
+            .to_string();
+        return Ok(Some(LocalBaseRef {
+            display,
+            rev: remote_head,
+        }));
+    }
+
+    for branch in ["main", "master", "develop"] {
+        let rev = format!("refs/remotes/{remote}/{branch}");
+        if git_ref_exists(directory, &rev) {
+            return Ok(Some(LocalBaseRef {
+                display: branch.to_string(),
+                rev,
+            }));
+        }
+    }
+
+    for branch in ["main", "master", "develop"] {
+        if git_ref_exists(directory, branch) {
+            return Ok(Some(LocalBaseRef {
+                display: branch.to_string(),
+                rev: branch.to_string(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn remote_head_ref(directory: &Path, remote: &str) -> std::result::Result<Option<String>, String> {
+    let output = git_output(
+        directory,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|remote_head| !remote_head.is_empty()),
+    )
+}
+
+fn commits_ahead_of(directory: &Path, base: &str) -> std::result::Result<u64, String> {
+    let output = git_text(
+        directory,
+        &["rev-list", "--count", &format!("{base}..HEAD")],
+    )?;
+    output.trim().parse::<u64>().map_err(|error| {
+        format!(
+            "failed to parse commit count for {base}..HEAD in {}: {error}",
+            directory.display()
+        )
+    })
+}
+
+fn git_ref_exists(directory: &Path, rev: &str) -> bool {
+    git_output(directory, &["rev-parse", "--verify", "--quiet", rev])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_text(directory: &Path, args: &[&str]) -> std::result::Result<String, String> {
+    let output = git_output(directory, args)?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    Err(format!(
+        "git {} failed in {}: {}",
+        args.join(" "),
+        directory.display(),
+        command_output_text(&output.stdout, &output.stderr)
+    ))
+}
+
+fn git_output(directory: &Path, args: &[&str]) -> std::result::Result<Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run git {} in {}: {error}",
+                args.join(" "),
+                directory.display()
+            )
+        })
 }
 
 pub(super) fn current_git_branch_for_directory(

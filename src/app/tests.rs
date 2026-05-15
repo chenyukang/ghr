@@ -12589,7 +12589,7 @@ fn capital_n_in_issue_details_opens_issue_dialog() {
 
 #[test]
 fn pr_create_dialog_submits_title_body_and_branch() {
-    let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
+    let local_dir = checkout_test_repo_dir_with_main_and_branch("feature/pr-body", true);
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.pr_create_dialog = Some(PrCreateDialog {
         repo: "chenyukang/ghr".to_string(),
@@ -12611,6 +12611,65 @@ fn pr_create_dialog_submits_title_body_and_branch() {
     assert_eq!(pending.head_ref, "feature/pr-body");
     assert_eq!(pending.title, "Add PR creation");
     assert_eq!(pending.body, "Created from the TUI");
+}
+
+#[test]
+fn pr_create_preflight_failure_restores_dialog_and_shows_modal() {
+    let local_dir = checkout_test_repo_dir_with_main_and_branch("feature/no-diff", false);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.pr_create_dialog = Some(PrCreateDialog {
+        repo: "chenyukang/ghr".to_string(),
+        local_dir,
+        branch: "feature/no-diff".to_string(),
+        head_ref: "feature/no-diff".to_string(),
+        title: EditorText::from_text("No diff"),
+        body: EditorText::from_text("This should not submit"),
+        field: PrCreateField::Body,
+        body_scroll: 0,
+    });
+
+    assert!(app.prepare_pr_create().is_none());
+
+    assert!(!app.pr_creating);
+    assert!(app.pending_pr_create.is_none());
+    assert!(app.pr_create_dialog.is_some());
+    assert_eq!(app.status, "pull request preflight failed");
+    let message = app.message_dialog.as_ref().expect("preflight dialog");
+    assert_eq!(message.title, "Pull Request Preflight Failed");
+    assert_eq!(message.kind, MessageDialogKind::Error);
+    assert!(
+        message
+            .body
+            .contains("No commits between main and feature/no-diff")
+    );
+}
+
+#[test]
+fn pr_create_preflight_blocks_dirty_worktree_before_submit() {
+    let local_dir = checkout_test_repo_dir_with_main_and_branch("feature/dirty", true);
+    std::fs::write(local_dir.join("dirty.txt"), "uncommitted\n").expect("write dirty file");
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.pr_create_dialog = Some(PrCreateDialog {
+        repo: "chenyukang/ghr".to_string(),
+        local_dir,
+        branch: "feature/dirty".to_string(),
+        head_ref: "feature/dirty".to_string(),
+        title: EditorText::from_text("Dirty"),
+        body: EditorText::from_text("This should not submit"),
+        field: PrCreateField::Body,
+        body_scroll: 0,
+    });
+
+    assert!(app.prepare_pr_create().is_none());
+
+    let message = app.message_dialog.as_ref().expect("preflight dialog");
+    assert_eq!(message.title, "Pull Request Preflight Failed");
+    assert!(
+        message
+            .body
+            .contains("Working tree has uncommitted changes")
+    );
+    assert!(message.body.contains("dirty.txt"));
 }
 
 #[test]
@@ -16127,10 +16186,11 @@ fn successful_pr_create_clears_saved_draft_state() {
     let store = SnapshotStore::new(paths.db_path.clone());
     store.init().expect("init store");
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let local_dir = checkout_test_repo_dir_with_main_and_branch("feature/draft", true);
 
     app.open_pr_create_dialog_with_draft(
-        "rust-lang/rust".to_string(),
-        PathBuf::from("/tmp/rust"),
+        "chenyukang/ghr".to_string(),
+        local_dir,
         "feature/draft".to_string(),
     );
     app.pr_create_dialog
@@ -16143,8 +16203,8 @@ fn successful_pr_create_clears_saved_draft_state() {
     app.prepare_pr_create().expect("pending PR create");
 
     let item = work_item(
-        "rust-lang/rust#100",
-        "rust-lang/rust",
+        "chenyukang/ghr#100",
+        "chenyukang/ghr",
         100,
         "draft PR",
         None,
@@ -19546,6 +19606,32 @@ fn checkout_test_repo_dir_on_branch(branch: &str) -> PathBuf {
         "git checkout -b failed: {}",
         command_output_text(&checkout.stdout, &checkout.stderr)
     );
+    dir
+}
+
+fn checkout_test_repo_dir_with_main_and_branch(branch: &str, branch_commit: bool) -> PathBuf {
+    let dir = checkout_test_repo_dir();
+    run_checkout_test_git(&dir, &["config", "user.email", "ghr@example.com"]);
+    run_checkout_test_git(&dir, &["config", "user.name", "ghr test"]);
+    run_checkout_test_git(&dir, &["checkout", "-q", "-b", "main"]);
+    std::fs::write(dir.join("README.md"), "base\n").expect("write base file");
+    run_checkout_test_git(&dir, &["add", "README.md"]);
+    run_checkout_test_git(&dir, &["commit", "-q", "-m", "base"]);
+    run_checkout_test_git(&dir, &["update-ref", "refs/remotes/origin/main", "main"]);
+    run_checkout_test_git(
+        &dir,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    run_checkout_test_git(&dir, &["checkout", "-q", "-b", branch]);
+    if branch_commit {
+        std::fs::write(dir.join("feature.txt"), "feature\n").expect("write feature file");
+        run_checkout_test_git(&dir, &["add", "feature.txt"]);
+        run_checkout_test_git(&dir, &["commit", "-q", "-m", "feature"]);
+    }
     dir
 }
 

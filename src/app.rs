@@ -126,6 +126,7 @@ use pr_checkout::{
     PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
     current_git_branch_for_directory, ensure_directory_tracks_configured_repo,
     resolve_pr_checkout_directory, resolve_pull_request_head_ref, run_pr_checkout,
+    validate_pr_create_preflight,
 };
 use render::*;
 use runtime::*;
@@ -10134,9 +10135,21 @@ impl AppState {
         let title = dialog.title.text().trim().to_string();
         let body = dialog.body.text().trim().to_string();
 
-        if title.is_empty() {
+        if let Err(error) = validate_pr_create_preflight(
+            &dialog.local_dir,
+            &dialog.repo,
+            &dialog.branch,
+            &dialog.head_ref,
+            &title,
+        ) {
             self.pr_create_dialog = Some(dialog);
-            self.status = "pull request title is empty".to_string();
+            self.pr_creating = false;
+            self.pending_pr_create = None;
+            self.status = "pull request preflight failed".to_string();
+            self.message_dialog = Some(message_dialog(
+                "Pull Request Preflight Failed",
+                truncate_text(&error, 1200),
+            ));
             return None;
         }
 

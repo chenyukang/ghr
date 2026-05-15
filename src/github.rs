@@ -13,7 +13,7 @@ use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, SearchSection};
+use crate::config::{Config, SearchSection, github_repo_from_remote_url};
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, FailedCheckRunSummary, ItemKind,
     MergeQueueInfo, Milestone, PullRequestBranch, PullRequestReviewActor,
@@ -2677,6 +2677,7 @@ pub async fn create_pull_request(
     title: &str,
     body: &str,
 ) -> Result<WorkItem> {
+    push_pull_request_head(repository, local_dir, head).await?;
     let args = create_pull_request_args(repository, head, title, body);
     let output = run_gh_text_in_dir(&args, local_dir)
         .await
@@ -2704,6 +2705,104 @@ fn create_pull_request_args(repository: &str, head: &str, title: &str, body: &st
         title.to_string(),
         "--body".to_string(),
         body.to_string(),
+    ]
+}
+
+async fn push_pull_request_head(repository: &str, local_dir: &Path, head: &str) -> Result<()> {
+    let branch = pull_request_head_branch(head);
+    if branch.is_empty() {
+        bail!("cannot create pull request with an empty head branch");
+    }
+
+    let remote = pull_request_push_remote(repository, local_dir, head)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "could not find a git remote in {} that matches pull request head {head} for {repository}",
+                local_dir.display()
+            )
+        })?;
+    let args = git_push_pull_request_head_args(&remote, branch);
+    run_git_text_in_dir(&args, local_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to push branch {branch} to remote {remote} before creating pull request"
+            )
+        })?;
+    Ok(())
+}
+
+fn pull_request_head_branch(head: &str) -> &str {
+    head.rsplit_once(':')
+        .map(|(_, branch)| branch)
+        .unwrap_or(head)
+        .trim()
+}
+
+fn pull_request_head_owner(head: &str) -> Option<&str> {
+    head.split_once(':')
+        .map(|(owner, _)| owner.trim())
+        .filter(|owner| !owner.is_empty())
+}
+
+async fn pull_request_push_remote(
+    repository: &str,
+    local_dir: &Path,
+    head: &str,
+) -> Result<Option<String>> {
+    let remotes = git_push_remotes(local_dir).await?;
+    let Some((base_owner, base_name)) = repository.split_once('/') else {
+        return Ok(None);
+    };
+    let expected_owner = pull_request_head_owner(head).unwrap_or(base_owner);
+
+    Ok(remotes
+        .into_iter()
+        .find(|remote| {
+            remote.repo.split_once('/').is_some_and(|(owner, name)| {
+                owner.eq_ignore_ascii_case(expected_owner) && name.eq_ignore_ascii_case(base_name)
+            })
+        })
+        .map(|remote| remote.name))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitPushRemote {
+    name: String,
+    repo: String,
+}
+
+async fn git_push_remotes(local_dir: &Path) -> Result<Vec<GitPushRemote>> {
+    let output = run_git_text_in_dir(&["remote".to_string(), "-v".to_string()], local_dir).await?;
+    Ok(parse_git_push_remotes(&output))
+}
+
+fn parse_git_push_remotes(output: &str) -> Vec<GitPushRemote> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?.trim();
+            let url = parts.next()?.trim();
+            let kind = parts.next()?.trim();
+            if kind != "(push)" {
+                return None;
+            }
+            Some(GitPushRemote {
+                name: name.to_string(),
+                repo: github_repo_from_remote_url(url)?,
+            })
+        })
+        .collect()
+}
+
+fn git_push_pull_request_head_args(remote: &str, branch: &str) -> Vec<String> {
+    vec![
+        "push".to_string(),
+        "-u".to_string(),
+        remote.to_string(),
+        format!("HEAD:refs/heads/{branch}"),
     ]
 }
 
@@ -4564,6 +4663,55 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
     }
 
     String::from_utf8(output.stdout).context("gh output was not UTF-8")
+}
+
+async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
+    let command = format!("git {}", args.join(" "));
+    debug!(command = %command, cwd = %directory.display(), "git request started");
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| {
+            error!(
+                command = %command,
+                cwd = %directory.display(),
+                error = %error,
+                "git request failed to start"
+            );
+            anyhow!(
+                "failed to run {command} in {}: {error}",
+                directory.display()
+            )
+        })?;
+    debug!(
+        command = %command,
+        cwd = %directory.display(),
+        status = %output.status,
+        success = output.status.success(),
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        "git request finished"
+    );
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        error!(
+            command = %command,
+            cwd = %directory.display(),
+            status = %output.status,
+            message = %message,
+            stdout_bytes = output.stdout.len(),
+            stderr_bytes = output.stderr.len(),
+            "git request returned failure"
+        );
+        bail!("{command} failed: {message}");
+    }
+
+    String::from_utf8(output.stdout).context("git output was not UTF-8")
 }
 
 fn gh_missing_message(args: &[String]) -> String {
@@ -7711,6 +7859,54 @@ mod tests {
                 "Add feature".to_string(),
                 "--body".to_string(),
                 "Body text".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_request_head_branch_accepts_owner_qualified_heads() {
+        assert_eq!(
+            pull_request_head_branch("chenyukang:feature/new-pr"),
+            "feature/new-pr"
+        );
+        assert_eq!(pull_request_head_branch("feature/new-pr"), "feature/new-pr");
+        assert_eq!(
+            pull_request_head_owner("chenyukang:feature/new-pr"),
+            Some("chenyukang")
+        );
+        assert_eq!(pull_request_head_owner("feature/new-pr"), None);
+    }
+
+    #[test]
+    fn parse_git_push_remotes_keeps_github_push_urls() {
+        assert_eq!(
+            parse_git_push_remotes(
+                "origin\tgit@github.com:chenyukang/ghr.git (fetch)\n\
+                 origin\tgit@github.com:chenyukang/ghr.git (push)\n\
+                 upstream\thttps://github.com/nervosnetwork/ghr.git (push)\n",
+            ),
+            vec![
+                GitPushRemote {
+                    name: "origin".to_string(),
+                    repo: "chenyukang/ghr".to_string(),
+                },
+                GitPushRemote {
+                    name: "upstream".to_string(),
+                    repo: "nervosnetwork/ghr".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn git_push_pull_request_head_pushes_head_to_branch() {
+        assert_eq!(
+            git_push_pull_request_head_args("origin", "feature/new-pr"),
+            vec![
+                "push".to_string(),
+                "-u".to_string(),
+                "origin".to_string(),
+                "HEAD:refs/heads/feature/new-pr".to_string(),
             ]
         );
     }

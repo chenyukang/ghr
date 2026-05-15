@@ -18241,6 +18241,104 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
 }
 
 #[test]
+fn ghr_tab_navigation_preserves_focus_when_target_view_snapshot_was_details() {
+    let fiber_key = "repo:Fiber:pull_requests:Pull Requests";
+    let ghr_key = "repo:ghr:pull_requests:Pull Requests";
+    let sections = vec![
+        test_section(),
+        SectionSnapshot {
+            key: fiber_key.to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: String::new(),
+            items: vec![
+                work_item("fiber-1", "nervosnetwork/fiber", 1, "First", None),
+                work_item("fiber-2", "nervosnetwork/fiber", 2, "Second", None),
+            ],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+        SectionSnapshot {
+            key: ghr_key.to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Pull Requests".to_string(),
+            filters: String::new(),
+            items: vec![work_item("ghr-1", "chenyukang/ghr", 1, "Ghr", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let fiber_view = repo_view_key("Fiber");
+    let tabs = app.view_tabs();
+    let fiber_pos = tabs
+        .iter()
+        .position(|view| view.key == fiber_view)
+        .expect("fiber repo view should be a top tab");
+    let start_pos = if fiber_pos == 0 {
+        tabs.len() - 1
+    } else {
+        fiber_pos - 1
+    };
+    let start_view = tabs[start_pos].key.clone();
+
+    app.switch_view(fiber_view.clone());
+    app.set_selection(1);
+    app.details.insert(
+        "fiber-2".to_string(),
+        DetailState::Loaded(vec![
+            comment("alice", "first", None),
+            comment("bob", "second", None),
+        ]),
+    );
+    app.focus_details();
+    app.details_scroll = 9;
+    app.selected_comment_index = 1;
+    app.set_current_list_scroll_offset(4);
+
+    app.switch_view(start_view.clone());
+    app.focus_ghr();
+    assert_eq!(app.active_view, start_view);
+    assert_eq!(app.focus, FocusTarget::Ghr);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('l')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.active_view, fiber_view);
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert_eq!(
+        app.current_item().map(|item| item.id.as_str()),
+        Some("fiber-2")
+    );
+    assert_eq!(app.details_scroll, 9);
+    assert_eq!(app.selected_comment_index, 1);
+    assert_eq!(app.list_scroll_offset.get(fiber_key), Some(&4));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('l')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_ne!(app.active_view, fiber_view);
+    assert_eq!(app.focus, FocusTarget::Ghr);
+}
+
+#[test]
 fn tab_switches_the_current_focused_tab_group() {
     let mut issue = work_item("issue-1", "nervosnetwork/fiber", 1, "Issue", None);
     issue.kind = ItemKind::Issue;

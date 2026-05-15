@@ -1840,15 +1840,12 @@ pub(super) fn handle_left_click(
             to = %view,
             "mouse click handled"
         );
-        let restored = app.switch_view(view);
+        app.switch_top_menu_view(view);
         app.search_active = false;
         app.comment_search_active = false;
         app.global_search_active = false;
         app.filter_input_active = false;
-        if !restored {
-            app.focus = FocusTarget::Ghr;
-            app.status = "GHR focused".to_string();
-        }
+        app.status = "GHR focused".to_string();
         return;
     }
 

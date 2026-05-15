@@ -6354,15 +6354,19 @@ impl AppState {
                 to = %view.key,
                 "ui view tab moved"
             );
-            self.switch_view(view.key.clone());
+            if self.focus == FocusTarget::Ghr {
+                self.switch_top_menu_view(view.key.clone());
+            } else {
+                self.switch_view(view.key.clone());
+            }
         }
     }
 
     fn move_focused_tab_group(&mut self, delta: isize) {
-        if self.focus == FocusTarget::Sections {
-            self.move_section(delta);
-        } else {
-            self.move_view(delta);
+        match self.focus {
+            FocusTarget::Ghr => self.move_view(delta),
+            FocusTarget::Sections => self.move_section(delta),
+            FocusTarget::List | FocusTarget::Details => {}
         }
     }
 

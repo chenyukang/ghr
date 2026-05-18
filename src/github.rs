@@ -535,7 +535,6 @@ struct PullRequestTimelineEventRaw {
 
 #[derive(Debug, Deserialize)]
 struct GitCommitAuthorRaw {
-    name: Option<String>,
     date: Option<DateTime<Utc>>,
 }
 
@@ -1996,6 +1995,22 @@ pub async fn fetch_pull_request_comments(
             HashMap::new()
         }
     };
+    let mut issue_details = match issue_details {
+        Ok(output) => Some(parse_issue_details_output(&output, repository, number)?),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load pull request details while loading comments"
+            );
+            None
+        }
+    };
+    let timeline_actor_fallback = issue_details
+        .as_ref()
+        .and_then(|details| details.item_metadata.as_ref())
+        .and_then(|metadata| metadata.author.clone());
     let mut comments = Vec::new();
     append_pull_request_comment_outputs(
         &mut comments,
@@ -2011,7 +2026,12 @@ pub async fn fetch_pull_request_comments(
     )?;
     match timeline_output {
         Ok(output) => {
-            match parse_pull_request_timeline_commit_activities(&output, repository, number) {
+            match parse_pull_request_timeline_commit_activities(
+                &output,
+                repository,
+                number,
+                timeline_actor_fallback.as_deref(),
+            ) {
                 Ok(mut activities) => comments.append(&mut activities),
                 Err(error) => {
                     warn!(
@@ -2033,18 +2053,6 @@ pub async fn fetch_pull_request_comments(
         }
     }
     comments.sort_by_key(|comment| comment.created_at);
-    let mut issue_details = match issue_details {
-        Ok(output) => Some(parse_issue_details_output(&output, repository, number)?),
-        Err(error) => {
-            warn!(
-                error = %error,
-                repository,
-                number,
-                "failed to load pull request details while loading comments"
-            );
-            None
-        }
-    };
     if let Some(metadata) = issue_details
         .as_mut()
         .and_then(|details| details.item_metadata.as_mut())
@@ -4008,6 +4016,7 @@ fn parse_pull_request_timeline_commit_activities(
     output: &str,
     repository: &str,
     number: u64,
+    actor_fallback: Option<&str>,
 ) -> Result<Vec<CommentPreview>> {
     let pages = serde_json::from_str::<Vec<Vec<PullRequestTimelineEventRaw>>>(output)
         .with_context(|| format!("failed to parse timeline for {repository}#{number}"))?;
@@ -4025,12 +4034,7 @@ fn parse_pull_request_timeline_commit_activities(
                     number,
                 );
                 current = Some(PullRequestCommitActivityBuilder {
-                    actor: event
-                        .actor
-                        .as_ref()
-                        .map(|actor| actor.login.as_str())
-                        .unwrap_or("github")
-                        .to_string(),
+                    actor: pull_request_timeline_commit_actor(&event, actor_fallback),
                     started_at: event.created_at,
                     commits: Vec::new(),
                     explicit_push_event: true,
@@ -4042,7 +4046,7 @@ fn parse_pull_request_timeline_commit_activities(
                 };
                 if current.is_none() {
                     current = Some(PullRequestCommitActivityBuilder {
-                        actor: pull_request_timeline_commit_actor(&event),
+                        actor: pull_request_timeline_commit_actor(&event, actor_fallback),
                         started_at: None,
                         commits: Vec::new(),
                         explicit_push_event: false,
@@ -4162,12 +4166,17 @@ fn pull_request_timeline_commit_from_event(
     })
 }
 
-fn pull_request_timeline_commit_actor(event: &PullRequestTimelineEventRaw) -> String {
+fn pull_request_timeline_commit_actor(
+    event: &PullRequestTimelineEventRaw,
+    actor_fallback: Option<&str>,
+) -> String {
     event
-        .author
+        .actor
         .as_ref()
-        .and_then(|author| author.name.as_deref())
-        .filter(|name| !name.trim().is_empty())
+        .or(event.user.as_ref())
+        .map(|user| user.login.as_str())
+        .or(actor_fallback)
+        .filter(|login| !login.trim().is_empty())
         .unwrap_or("github")
         .to_string()
 }
@@ -7029,9 +7038,13 @@ mod tests {
         ]
         "##;
 
-        let activities =
-            parse_pull_request_timeline_commit_activities(output, "nervosnetwork/fiber", 1257)
-                .unwrap();
+        let activities = parse_pull_request_timeline_commit_activities(
+            output,
+            "nervosnetwork/fiber",
+            1257,
+            Some("fallback-author"),
+        )
+        .unwrap();
 
         assert_eq!(activities.len(), 1);
         let activity = &activities[0];
@@ -7068,6 +7081,46 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_timeline_commit_activity_uses_login_fallback_not_commit_author_name() {
+        let output = r#"
+        [
+          [
+            {
+              "event": "committed",
+              "sha": "871a2ae0504e67d6c88ba1699d90d696bb014a8e",
+              "message": "c ffi document fixes for c_short.md",
+              "html_url": "https://github.com/rust-lang/rust/commit/871a2ae0504e67d6c88ba1699d90d696bb014a8e",
+              "author": {
+                "name": "Yonggang Luo",
+                "email": "luoyonggang@gmail.com",
+                "date": "2025-09-21T15:28:07Z"
+              },
+              "committer": {
+                "name": "Yonggang Luo",
+                "email": "luoyonggang@gmail.com",
+                "date": "2026-05-15T22:00:48Z"
+              }
+            }
+          ]
+        ]
+        "#;
+
+        let activities = parse_pull_request_timeline_commit_activities(
+            output,
+            "rust-lang/rust",
+            156624,
+            Some("lygstate"),
+        )
+        .unwrap();
+
+        assert_eq!(activities.len(), 1);
+        let activity = &activities[0];
+        assert_eq!(activity.author, "lygstate");
+        assert!(!activity.author.contains(' '));
+        assert!(activity.body.contains("c ffi document fixes"));
+    }
+
+    #[test]
     fn pull_request_timeline_includes_review_summary_comments() {
         let output = r#"
         [
@@ -7086,7 +7139,7 @@ mod tests {
         "#;
 
         let comments =
-            parse_pull_request_timeline_commit_activities(output, "rust-lang/rust", 156194)
+            parse_pull_request_timeline_commit_activities(output, "rust-lang/rust", 156194, None)
                 .unwrap();
 
         assert_eq!(comments.len(), 1);

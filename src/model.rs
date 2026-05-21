@@ -144,7 +144,15 @@ pub struct CommentPreview {
 
 impl CommentPreview {
     pub fn can_edit(&self) -> bool {
-        self.id.is_some() && self.viewer_can_update.unwrap_or(self.is_mine)
+        self.kind.can_edit() && self.id.is_some() && self.viewer_can_update.unwrap_or(self.is_mine)
+    }
+
+    pub fn can_react(&self) -> bool {
+        self.kind.can_react()
+    }
+
+    pub fn can_reply(&self) -> bool {
+        self.kind.can_reply()
     }
 }
 
@@ -153,6 +161,7 @@ impl CommentPreview {
 pub enum CommentPreviewKind {
     #[default]
     Comment,
+    ReviewSummary,
     Activity,
 }
 
@@ -161,8 +170,16 @@ impl CommentPreviewKind {
         matches!(kind, Self::Comment)
     }
 
-    pub fn is_activity(self) -> bool {
-        matches!(self, Self::Activity)
+    pub fn can_edit(self) -> bool {
+        matches!(self, Self::Comment)
+    }
+
+    pub fn can_react(self) -> bool {
+        matches!(self, Self::Comment)
+    }
+
+    pub fn can_reply(self) -> bool {
+        matches!(self, Self::Comment | Self::ReviewSummary)
     }
 }
 

@@ -7013,6 +7013,36 @@ fn comment_search_n_and_p_cycle_matching_comments() {
 }
 
 #[test]
+fn comment_navigation_skips_activity_timeline_entries() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let item_id = app.current_item().expect("item").id.clone();
+    let mut activity = comment("bot", "pushed 1 commit", None);
+    activity.kind = CommentPreviewKind::Activity;
+    app.details.insert(
+        item_id,
+        DetailState::Loaded(vec![
+            comment("alice", "first comment", None),
+            activity,
+            comment("bob", "second comment", None),
+        ]),
+    );
+    app.focus_details();
+    app.selected_comment_index = 0;
+
+    app.move_comment(1);
+    assert_eq!(app.selected_comment_index, 2);
+    assert_eq!(app.status, "comment 2/2 focused");
+
+    app.move_comment(1);
+    assert_eq!(app.selected_comment_index, 2);
+    assert_eq!(app.status, "comment 2/2 focused");
+
+    app.selected_comment_index = 1;
+    app.clamp_selected_comment();
+    assert_eq!(app.selected_comment_index, 0);
+}
+
+#[test]
 fn details_title_shows_comment_search_input_prompt() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let item_id = app.current_item().expect("item").id.clone();
@@ -10387,14 +10417,21 @@ fn details_activity_hides_comment_actions() {
     app.details
         .insert("1".to_string(), DetailState::Loaded(vec![activity]));
 
-    let rendered = build_details_document(&app, 120)
+    let document = build_details_document(&app, 120);
+    let rendered = document
         .lines
         .iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
+    assert!(rendered.contains("No comments."));
+    assert!(rendered.contains("Activity"));
     assert!(rendered.contains("pushed 3 commits"));
+    assert!(
+        rendered.find("Activity").unwrap() < rendered.find("Comments").unwrap(),
+        "activity timeline should render before comments: {rendered:?}"
+    );
     assert!(
         rendered.lines().any(|line| line.contains("- ee8130a fix")),
         "first commit should render as its own list line: {rendered:?}"
@@ -10413,8 +10450,10 @@ fn details_activity_hides_comment_actions() {
         .lines()
         .find(|line| line.contains("doitian"))
         .expect("activity header");
+    assert!(activity_header.contains("activity:"));
     assert!(!activity_header.contains("+ react"));
     assert!(!activity_header.contains("reply"));
+    assert!(document.comments.is_empty());
 }
 
 #[test]
@@ -11313,6 +11352,190 @@ fn reply_action_opens_dialog_prefilled_with_quote() {
     );
     assert!(dialog.body.contains("> @alice wrote:"));
     assert!(dialog.body.contains("> Quoted body"));
+}
+
+#[test]
+fn description_reply_action_opens_prefilled_conversation_comment() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.sections[0].items[0].author = Some("chenyukang".to_string());
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    app.start_reply_to_selected_comment();
+
+    let dialog = app.comment_dialog.as_mut().expect("reply dialog");
+    assert_eq!(dialog.mode, CommentDialogMode::New);
+    assert!(
+        dialog
+            .body
+            .text()
+            .contains("> @chenyukang wrote in the pull request description:")
+    );
+    assert!(dialog.body.text().contains("> A body with useful context"));
+    dialog.body.set_text("reply to description");
+
+    let mut submitted = None;
+    app.handle_comment_dialog_key_with_submit(
+        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+        None,
+        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+    );
+
+    assert!(app.comment_dialog.is_none());
+    assert!(app.posting_comment);
+    assert_eq!(app.status, "posting comment");
+    assert_eq!(
+        submitted,
+        Some((
+            "1".to_string(),
+            "reply to description".to_string(),
+            PendingCommentMode::Post
+        ))
+    );
+}
+
+#[test]
+fn issue_description_reply_uses_issue_description_quote() {
+    let mut section = test_section();
+    section.kind = SectionKind::Issues;
+    section.key = "issues:test".to_string();
+    section.items[0].kind = ItemKind::Issue;
+    section.items[0].id = "issue-1".to_string();
+    section.items[0].url = "https://github.com/owner/repo/issues/1".to_string();
+    section.items[0].author = Some("chenyukang".to_string());
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    app.start_reply_to_selected_comment();
+
+    let dialog = app.comment_dialog.expect("reply dialog");
+    assert_eq!(dialog.mode, CommentDialogMode::New);
+    assert!(
+        dialog
+            .body
+            .text()
+            .contains("> @chenyukang wrote in the issue description:")
+    );
+    assert!(dialog.body.text().contains("> A body with useful context"));
+    assert_eq!(app.status, "replying to issue description");
+}
+
+#[test]
+fn description_reactions_line_exposes_reply_action() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let reactions_line = rendered
+        .iter()
+        .position(|line| line.contains("reactions:"))
+        .expect("description reactions line");
+
+    assert!(rendered[reactions_line].contains("reply"));
+    let reply_column = rendered[reactions_line]
+        .find("reply")
+        .expect("reply action") as u16;
+    assert_eq!(
+        document.action_at(reactions_line, reply_column),
+        Some(DetailAction::ReplyItemDescription)
+    );
+}
+
+#[test]
+fn review_summary_reply_submits_as_conversation_comment() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![review_summary_comment(
+            4229433610,
+            "alice",
+            "Review summary body",
+            Some("https://github.com/owner/repo/pull/1#pullrequestreview-4229433610"),
+        )]),
+    );
+
+    app.handle_detail_action(DetailAction::ReplyComment(0), None, None);
+
+    let dialog = app.comment_dialog.as_mut().expect("reply dialog");
+    assert_eq!(
+        dialog.mode,
+        CommentDialogMode::Reply {
+            comment_index: 0,
+            author: "alice".to_string(),
+            review_comment_id: None,
+        }
+    );
+    assert!(dialog.body.text().contains("> @alice wrote:"));
+    assert!(dialog.body.text().contains("> Review summary body"));
+    dialog.body.set_text("reply to summary");
+
+    let mut submitted = None;
+    app.handle_comment_dialog_key_with_submit(
+        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+        None,
+        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+    );
+
+    assert!(app.comment_dialog.is_none());
+    assert!(app.posting_comment);
+    assert_eq!(app.status, "posting comment");
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+        Some((
+            "Posting Comment",
+            "Waiting for GitHub to accept the comment..."
+        ))
+    );
+    assert_eq!(
+        submitted,
+        Some((
+            "1".to_string(),
+            "reply to summary".to_string(),
+            PendingCommentMode::Post
+        ))
+    );
+}
+
+#[test]
+fn review_summary_details_show_reply_without_reaction_action() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![review_summary_comment(
+            4229433610,
+            "alice",
+            "Review summary body",
+            Some("https://github.com/owner/repo/pull/1#pullrequestreview-4229433610"),
+        )]),
+    );
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let header_line = rendered
+        .iter()
+        .position(|line| line.contains("alice"))
+        .expect("review summary header");
+
+    assert!(rendered[header_line].contains("reply"));
+    assert!(!rendered[header_line].contains("+ react"));
+    let reply_column = rendered[header_line].find("reply").expect("reply action") as u16;
+    assert_eq!(
+        document.action_at(header_line, reply_column),
+        Some(DetailAction::ReplyComment(0))
+    );
 }
 
 #[test]
@@ -19800,6 +20023,13 @@ fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         reactions: ReactionSummary::default(),
         review: None,
     }
+}
+
+fn review_summary_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentPreview {
+    let mut comment = comment(author, body, url);
+    comment.id = Some(id);
+    comment.kind = CommentPreviewKind::ReviewSummary;
+    comment
 }
 
 fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentPreview {

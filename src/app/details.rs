@@ -287,6 +287,7 @@ impl DiffReviewTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DetailAction {
+    ReplyItemDescription,
     ReplyComment(usize),
     EditComment(usize),
     ToggleCommentExpanded(usize),
@@ -1401,20 +1402,38 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     builder.push_blank();
     push_description_block(&mut builder, app, item);
-    push_reactions_line(&mut builder, &item.reactions, item.supports_reactions());
+    push_reactions_line(
+        &mut builder,
+        &item.reactions,
+        item.supports_reactions(),
+        item_description_can_reply(item),
+    );
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
-        builder.push_heading("Comments");
-        builder.push_blank();
         match app.details.get(&item.id) {
             Some(DetailState::Loading) => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain("loading comments...");
             }
-            Some(DetailState::Loaded(comments)) if comments.is_empty() => {
-                builder.push_plain("No comments.");
-            }
             Some(DetailState::Loaded(comments)) => {
+                let comment_entries = comment_display_entries(comments);
+                let activity_indices = activity_display_indices(comments);
+                if !activity_indices.is_empty() {
+                    builder.push_heading("Activity");
+                    builder.push_blank();
+                    for (position, index) in activity_indices.iter().enumerate() {
+                        if position > 0 {
+                            builder.push_blank();
+                        }
+                        push_timeline_activity(&mut builder, &comments[*index]);
+                    }
+                    builder.push_blank();
+                }
+
+                builder.push_heading("Comments");
+                builder.push_blank();
                 let comment_search_query = app.comment_search_query.trim();
                 let search_matches = (!comment_search_query.is_empty())
                     .then(|| comment_search_matches(comments, comment_search_query));
@@ -1422,12 +1441,15 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                     builder.push_plain(format!(
                         "Comment search: {}/{} matches for /{}",
                         matches.len(),
-                        comments.len(),
+                        comment_entries.len(),
                         comment_search_query
                     ));
                     builder.push_blank();
                 }
-                for (position, entry) in comment_display_entries(comments).iter().enumerate() {
+                if comment_entries.is_empty() {
+                    builder.push_plain("No comments.");
+                }
+                for (position, entry) in comment_entries.iter().enumerate() {
                     if position > 0 {
                         builder.push_blank();
                     }
@@ -1461,9 +1483,13 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                 }
             }
             Some(DetailState::Error(error)) => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain(format!("Failed to load comments: {error}"));
             }
             None => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain("loading comments...");
             }
         }
@@ -2078,18 +2104,20 @@ pub(super) fn push_diff_inline_comment(
         append_review_state_segments(&mut header, review);
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    if !comment.kind.is_activity() {
+    if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "+ react",
             DetailAction::ReactComment(index),
         ));
     }
-    header.push(DetailSegment::raw("  "));
-    header.push(DetailSegment::action(
-        "reply",
-        DetailAction::ReplyComment(index),
-    ));
+    if comment.can_reply() {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            "reply",
+            DetailAction::ReplyComment(index),
+        ));
+    }
     if comment.can_edit() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
@@ -2706,8 +2734,9 @@ pub(super) fn push_reactions_line(
     builder: &mut DetailsBuilder,
     reactions: &ReactionSummary,
     can_react: bool,
+    can_reply: bool,
 ) {
-    if reactions.is_empty() && !can_react {
+    if reactions.is_empty() && !can_react && !can_reply {
         return;
     }
     builder.push_blank();
@@ -2727,6 +2756,17 @@ pub(super) fn push_reactions_line(
             "  "
         }));
         segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+    }
+    if can_reply {
+        segments.push(DetailSegment::raw(if reactions.is_empty() && !can_react {
+            " "
+        } else {
+            "  "
+        }));
+        segments.push(DetailSegment::action(
+            "reply",
+            DetailAction::ReplyItemDescription,
+        ));
     }
     builder.push_prefixed_wrapped_limited(
         segments,
@@ -2845,7 +2885,7 @@ pub(super) fn push_comment(
         header.push(DetailSegment::link("open", url.clone()));
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    if !comment.kind.is_activity() {
+    if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "+ react",
@@ -2875,7 +2915,7 @@ pub(super) fn push_comment(
             DetailAction::ToggleCommentExpanded(index),
         ));
     }
-    if !comment.kind.is_activity() {
+    if comment.can_reply() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "reply",
@@ -2946,6 +2986,35 @@ pub(super) fn push_comment(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &CommentPreview) {
+    let timestamp = activity
+        .updated_at
+        .as_ref()
+        .or(activity.created_at.as_ref())
+        .cloned();
+    let prefix = padding_prefix(DESCRIPTION_BODY_PADDING);
+    let mut header = vec![
+        DetailSegment::styled("activity: ", active_theme().muted()),
+        comment_author_link_segment(&activity.author, false),
+        DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
+    ];
+    if let Some(url) = &activity.url {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::link("open", url.clone()));
+    }
+    builder.push_prefixed_wrapped_limited(header, prefix.clone(), DESCRIPTION_BODY_PADDING, 2);
+    builder.push_markdown_block_prefixed(
+        &activity.body,
+        "No activity body.",
+        usize::MAX,
+        usize::MAX,
+        MarkdownRenderOptions {
+            prefix,
+            right_padding: DESCRIPTION_BODY_PADDING,
+        },
+    );
 }
 
 pub(super) fn push_comment_body_gap(
@@ -3989,6 +4058,40 @@ pub(super) fn push_check_part(segments: &mut Vec<DetailSegment>, text: String, s
 pub(super) fn quote_comment_for_reply(comment: &CommentPreview) -> String {
     let quote = truncate_text(&normalize_text(&comment.body), 1_200);
     let mut body = format!("> @{} wrote:\n", comment.author);
+    push_quote_excerpt(&mut body, &quote);
+    body
+}
+
+pub(super) fn quote_item_description_for_reply(item: &WorkItem) -> String {
+    let quote = truncate_text(
+        &normalize_text(item.body.as_deref().unwrap_or_default()),
+        1_200,
+    );
+    let target = match item.kind {
+        ItemKind::PullRequest => "pull request description",
+        ItemKind::Issue => "issue description",
+        ItemKind::Notification => "description",
+    };
+    let mut body = item
+        .author
+        .as_deref()
+        .filter(|author| !author.trim().is_empty())
+        .map(|author| format!("> @{author} wrote in the {target}:\n"))
+        .unwrap_or_else(|| format!("> {target}:\n"));
+    push_quote_excerpt(&mut body, &quote);
+    body
+}
+
+pub(super) fn item_description_can_reply(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
+        && item.number.is_some()
+        && item
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty())
+}
+
+fn push_quote_excerpt(body: &mut String, quote: &str) {
     if quote.trim().is_empty() {
         body.push_str(">\n");
     } else {
@@ -4006,7 +4109,6 @@ pub(super) fn quote_comment_for_reply(comment: &CommentPreview) -> String {
         }
     }
     body.push('\n');
-    body
 }
 
 pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {

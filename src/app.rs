@@ -64,12 +64,12 @@ use crate::github::{
     with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, EditorDraft, FailedCheckRunSummary, ItemKind,
-    Milestone, PullRequestBranch, PullRequestReviewActor, ReactionSummary, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
-    mark_all_notifications_read_in_section, mark_notification_done_in_section,
-    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    repo_view_key, section_view_key,
+    ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
+    FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
+    ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
+    global_search_view_key, mark_all_notifications_read_in_section,
+    mark_notification_done_in_section, mark_notification_read_in_section, merge_cached_sections,
+    merge_refreshed_sections, repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
@@ -7676,6 +7676,10 @@ impl AppState {
         tx: Option<&UnboundedSender<AppMsg>>,
     ) {
         match action {
+            DetailAction::ReplyItemDescription => {
+                self.select_details_body_without_scroll();
+                self.start_reply_to_item_description();
+            }
             DetailAction::ReplyComment(index) => {
                 self.select_comment(index);
                 self.start_reply_to_selected_comment();
@@ -7763,7 +7767,7 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
-        if comment.kind.is_activity() {
+        if !comment.can_react() {
             self.status = "activity cannot be reacted to".to_string();
             return;
         }
@@ -9339,10 +9343,14 @@ impl AppState {
             return;
         };
         let Some(comment) = self.current_selected_comment().cloned() else {
+            if self.comment_selection_cleared() {
+                self.start_reply_to_item_description_with_item(item);
+                return;
+            }
             self.status = "no comment selected".to_string();
             return;
         };
-        if comment.kind.is_activity() {
+        if !comment.can_reply() {
             self.status = "activity cannot be replied to".to_string();
             return;
         }
@@ -9376,6 +9384,56 @@ impl AppState {
             format!("loaded reply draft for @{author}")
         } else {
             format!("replying to @{author}")
+        };
+    }
+
+    fn start_reply_to_item_description(&mut self) {
+        if !self.current_item_supports_comments() {
+            self.status = "selected item cannot be commented on".to_string();
+            return;
+        }
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        self.start_reply_to_item_description_with_item(item);
+    }
+
+    fn start_reply_to_item_description_with_item(&mut self, item: WorkItem) {
+        if !item_description_can_reply(&item) {
+            self.status = "description cannot be replied to".to_string();
+            return;
+        }
+        self.finish_details_visit(Instant::now());
+        self.focus = FocusTarget::Details;
+        self.clear_selected_comment();
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
+        let body = quote_item_description_for_reply(&item);
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::New,
+            body,
+            reply_item_description_draft_key(&item),
+        );
+        self.scroll_comment_dialog_to_cursor();
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request description",
+            ItemKind::Issue => "issue description",
+            ItemKind::Notification => "description",
+        };
+        self.status = if loaded {
+            format!("loaded reply draft for {label}")
+        } else {
+            format!("replying to {label}")
         };
     }
 
@@ -11527,7 +11585,8 @@ impl AppState {
         if self.comment_selection_cleared() {
             return None;
         }
-        self.current_comments()?.get(self.selected_comment_index)
+        let comment = self.current_comments()?.get(self.selected_comment_index)?;
+        (comment.kind != CommentPreviewKind::Activity).then_some(comment)
     }
 
     fn comment_collapse_state(
@@ -11717,11 +11776,18 @@ impl AppState {
         if self.comment_selection_cleared() {
             return;
         }
-        let len = self.current_comments().map(Vec::len).unwrap_or(0);
-        if len == 0 {
-            self.selected_comment_index = 0;
-        } else {
-            self.selected_comment_index = self.selected_comment_index.min(len - 1);
+        let Some(comments) = self.current_comments() else {
+            self.clear_selected_comment();
+            return;
+        };
+        let order = comment_display_entries(comments)
+            .into_iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        if order.is_empty() {
+            self.clear_selected_comment();
+        } else if !order.contains(&self.selected_comment_index) {
+            self.selected_comment_index = order[0];
         }
     }
 
@@ -11888,6 +11954,13 @@ fn comment_search_matches(comments: &[CommentPreview], query: &str) -> Vec<usize
 }
 
 fn comment_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEntry> {
+    conversation_display_entries(comments)
+        .into_iter()
+        .filter(|entry| comments[entry.index].kind != CommentPreviewKind::Activity)
+        .collect()
+}
+
+fn conversation_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEntry> {
     let mut id_to_index = HashMap::new();
     for (index, comment) in comments.iter().enumerate() {
         if let Some(id) = comment.id {
@@ -11923,6 +11996,16 @@ fn comment_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEnt
         }
     }
     entries
+}
+
+fn activity_display_indices(comments: &[CommentPreview]) -> Vec<usize> {
+    comments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, comment)| {
+            (comment.kind == CommentPreviewKind::Activity).then_some(index)
+        })
+        .collect()
 }
 
 fn push_comment_display_entry(

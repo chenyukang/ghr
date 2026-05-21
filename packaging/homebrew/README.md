@@ -45,7 +45,7 @@ For each `ghr` release:
 2. Verify the four prebuilt tarball checksums from the GitHub Release:
 
    ```bash
-   tag=v0.8.0
+   tag=v0.8.1
    for target in \
      aarch64-apple-darwin \
      x86_64-apple-darwin \

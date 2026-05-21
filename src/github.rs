@@ -4112,7 +4112,7 @@ fn pull_request_timeline_review_summary_comment(
     let timestamp = event.submitted_at.or(event.created_at);
     Some(CommentPreview {
         id: event.id,
-        kind: CommentPreviewKind::Activity,
+        kind: CommentPreviewKind::ReviewSummary,
         author,
         body,
         created_at: timestamp,
@@ -7145,7 +7145,9 @@ mod tests {
         assert_eq!(comments.len(), 1);
         let comment = &comments[0];
         assert_eq!(comment.id, Some(4229433610));
-        assert_eq!(comment.kind, CommentPreviewKind::Activity);
+        assert_eq!(comment.kind, CommentPreviewKind::ReviewSummary);
+        assert!(comment.can_reply());
+        assert!(!comment.can_react());
         assert_eq!(comment.author, "chenyukang");
         assert!(comment.body.contains("according to the blame history"));
         assert_eq!(

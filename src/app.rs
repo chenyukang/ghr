@@ -7763,7 +7763,7 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
-        if comment.kind.is_activity() {
+        if !comment.can_react() {
             self.status = "activity cannot be reacted to".to_string();
             return;
         }
@@ -9342,7 +9342,7 @@ impl AppState {
             self.status = "no comment selected".to_string();
             return;
         };
-        if comment.kind.is_activity() {
+        if !comment.can_reply() {
             self.status = "activity cannot be replied to".to_string();
             return;
         }

@@ -1334,7 +1334,7 @@ pub(super) fn footer_has_selected_comment(app: &AppState) -> bool {
     app.details_mode == DetailsMode::Conversation
         && app
             .current_selected_comment()
-            .is_some_and(|comment| !comment.kind.is_activity())
+            .is_some_and(|comment| comment.can_reply())
 }
 
 pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {

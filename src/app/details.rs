@@ -2078,18 +2078,20 @@ pub(super) fn push_diff_inline_comment(
         append_review_state_segments(&mut header, review);
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    if !comment.kind.is_activity() {
+    if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "+ react",
             DetailAction::ReactComment(index),
         ));
     }
-    header.push(DetailSegment::raw("  "));
-    header.push(DetailSegment::action(
-        "reply",
-        DetailAction::ReplyComment(index),
-    ));
+    if comment.can_reply() {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::action(
+            "reply",
+            DetailAction::ReplyComment(index),
+        ));
+    }
     if comment.can_edit() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
@@ -2845,7 +2847,7 @@ pub(super) fn push_comment(
         header.push(DetailSegment::link("open", url.clone()));
     }
     append_reaction_segments(&mut header, &comment.reactions);
-    if !comment.kind.is_activity() {
+    if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "+ react",
@@ -2875,7 +2877,7 @@ pub(super) fn push_comment(
             DetailAction::ToggleCommentExpanded(index),
         ));
     }
-    if !comment.kind.is_activity() {
+    if comment.can_reply() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
             "reply",

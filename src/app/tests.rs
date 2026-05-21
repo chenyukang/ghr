@@ -7013,6 +7013,36 @@ fn comment_search_n_and_p_cycle_matching_comments() {
 }
 
 #[test]
+fn comment_navigation_skips_activity_timeline_entries() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let item_id = app.current_item().expect("item").id.clone();
+    let mut activity = comment("bot", "pushed 1 commit", None);
+    activity.kind = CommentPreviewKind::Activity;
+    app.details.insert(
+        item_id,
+        DetailState::Loaded(vec![
+            comment("alice", "first comment", None),
+            activity,
+            comment("bob", "second comment", None),
+        ]),
+    );
+    app.focus_details();
+    app.selected_comment_index = 0;
+
+    app.move_comment(1);
+    assert_eq!(app.selected_comment_index, 2);
+    assert_eq!(app.status, "comment 2/2 focused");
+
+    app.move_comment(1);
+    assert_eq!(app.selected_comment_index, 2);
+    assert_eq!(app.status, "comment 2/2 focused");
+
+    app.selected_comment_index = 1;
+    app.clamp_selected_comment();
+    assert_eq!(app.selected_comment_index, 0);
+}
+
+#[test]
 fn details_title_shows_comment_search_input_prompt() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let item_id = app.current_item().expect("item").id.clone();
@@ -10387,14 +10417,21 @@ fn details_activity_hides_comment_actions() {
     app.details
         .insert("1".to_string(), DetailState::Loaded(vec![activity]));
 
-    let rendered = build_details_document(&app, 120)
+    let document = build_details_document(&app, 120);
+    let rendered = document
         .lines
         .iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
+    assert!(rendered.contains("No comments."));
+    assert!(rendered.contains("Activity"));
     assert!(rendered.contains("pushed 3 commits"));
+    assert!(
+        rendered.find("Activity").unwrap() < rendered.find("Comments").unwrap(),
+        "activity timeline should render before comments: {rendered:?}"
+    );
     assert!(
         rendered.lines().any(|line| line.contains("- ee8130a fix")),
         "first commit should render as its own list line: {rendered:?}"
@@ -10413,8 +10450,10 @@ fn details_activity_hides_comment_actions() {
         .lines()
         .find(|line| line.contains("doitian"))
         .expect("activity header");
+    assert!(activity_header.contains("activity:"));
     assert!(!activity_header.contains("+ react"));
     assert!(!activity_header.contains("reply"));
+    assert!(document.comments.is_empty());
 }
 
 #[test]

@@ -1411,16 +1411,29 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
-        builder.push_heading("Comments");
-        builder.push_blank();
         match app.details.get(&item.id) {
             Some(DetailState::Loading) => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain("loading comments...");
             }
-            Some(DetailState::Loaded(comments)) if comments.is_empty() => {
-                builder.push_plain("No comments.");
-            }
             Some(DetailState::Loaded(comments)) => {
+                let comment_entries = comment_display_entries(comments);
+                let activity_indices = activity_display_indices(comments);
+                if !activity_indices.is_empty() {
+                    builder.push_heading("Activity");
+                    builder.push_blank();
+                    for (position, index) in activity_indices.iter().enumerate() {
+                        if position > 0 {
+                            builder.push_blank();
+                        }
+                        push_timeline_activity(&mut builder, &comments[*index]);
+                    }
+                    builder.push_blank();
+                }
+
+                builder.push_heading("Comments");
+                builder.push_blank();
                 let comment_search_query = app.comment_search_query.trim();
                 let search_matches = (!comment_search_query.is_empty())
                     .then(|| comment_search_matches(comments, comment_search_query));
@@ -1428,12 +1441,15 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                     builder.push_plain(format!(
                         "Comment search: {}/{} matches for /{}",
                         matches.len(),
-                        comments.len(),
+                        comment_entries.len(),
                         comment_search_query
                     ));
                     builder.push_blank();
                 }
-                for (position, entry) in comment_display_entries(comments).iter().enumerate() {
+                if comment_entries.is_empty() {
+                    builder.push_plain("No comments.");
+                }
+                for (position, entry) in comment_entries.iter().enumerate() {
                     if position > 0 {
                         builder.push_blank();
                     }
@@ -1467,9 +1483,13 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                 }
             }
             Some(DetailState::Error(error)) => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain(format!("Failed to load comments: {error}"));
             }
             None => {
+                builder.push_heading("Comments");
+                builder.push_blank();
                 builder.push_plain("loading comments...");
             }
         }
@@ -2966,6 +2986,35 @@ pub(super) fn push_comment(
         start_line,
         end_line: builder.document.lines.len(),
     });
+}
+
+pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &CommentPreview) {
+    let timestamp = activity
+        .updated_at
+        .as_ref()
+        .or(activity.created_at.as_ref())
+        .cloned();
+    let prefix = padding_prefix(DESCRIPTION_BODY_PADDING);
+    let mut header = vec![
+        DetailSegment::styled("activity: ", active_theme().muted()),
+        comment_author_link_segment(&activity.author, false),
+        DetailSegment::raw(format!(" - {}", relative_time(timestamp))),
+    ];
+    if let Some(url) = &activity.url {
+        header.push(DetailSegment::raw("  "));
+        header.push(DetailSegment::link("open", url.clone()));
+    }
+    builder.push_prefixed_wrapped_limited(header, prefix.clone(), DESCRIPTION_BODY_PADDING, 2);
+    builder.push_markdown_block_prefixed(
+        &activity.body,
+        "No activity body.",
+        usize::MAX,
+        usize::MAX,
+        MarkdownRenderOptions {
+            prefix,
+            right_padding: DESCRIPTION_BODY_PADDING,
+        },
+    );
 }
 
 pub(super) fn push_comment_body_gap(

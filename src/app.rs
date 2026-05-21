@@ -64,12 +64,12 @@ use crate::github::{
     with_background_github_priority,
 };
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, EditorDraft, FailedCheckRunSummary, ItemKind,
-    Milestone, PullRequestBranch, PullRequestReviewActor, ReactionSummary, SectionKind,
-    SectionSnapshot, WorkItem, builtin_view_key, configured_sections, global_search_view_key,
-    mark_all_notifications_read_in_section, mark_notification_done_in_section,
-    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
-    repo_view_key, section_view_key,
+    ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
+    FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
+    ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
+    global_search_view_key, mark_all_notifications_read_in_section,
+    mark_notification_done_in_section, mark_notification_read_in_section, merge_cached_sections,
+    merge_refreshed_sections, repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
@@ -11585,7 +11585,8 @@ impl AppState {
         if self.comment_selection_cleared() {
             return None;
         }
-        self.current_comments()?.get(self.selected_comment_index)
+        let comment = self.current_comments()?.get(self.selected_comment_index)?;
+        (comment.kind != CommentPreviewKind::Activity).then_some(comment)
     }
 
     fn comment_collapse_state(
@@ -11775,11 +11776,18 @@ impl AppState {
         if self.comment_selection_cleared() {
             return;
         }
-        let len = self.current_comments().map(Vec::len).unwrap_or(0);
-        if len == 0 {
-            self.selected_comment_index = 0;
-        } else {
-            self.selected_comment_index = self.selected_comment_index.min(len - 1);
+        let Some(comments) = self.current_comments() else {
+            self.clear_selected_comment();
+            return;
+        };
+        let order = comment_display_entries(comments)
+            .into_iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        if order.is_empty() {
+            self.clear_selected_comment();
+        } else if !order.contains(&self.selected_comment_index) {
+            self.selected_comment_index = order[0];
         }
     }
 
@@ -11946,6 +11954,13 @@ fn comment_search_matches(comments: &[CommentPreview], query: &str) -> Vec<usize
 }
 
 fn comment_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEntry> {
+    conversation_display_entries(comments)
+        .into_iter()
+        .filter(|entry| comments[entry.index].kind != CommentPreviewKind::Activity)
+        .collect()
+}
+
+fn conversation_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEntry> {
     let mut id_to_index = HashMap::new();
     for (index, comment) in comments.iter().enumerate() {
         if let Some(id) = comment.id {
@@ -11981,6 +11996,16 @@ fn comment_display_entries(comments: &[CommentPreview]) -> Vec<CommentDisplayEnt
         }
     }
     entries
+}
+
+fn activity_display_indices(comments: &[CommentPreview]) -> Vec<usize> {
+    comments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, comment)| {
+            (comment.kind == CommentPreviewKind::Activity).then_some(index)
+        })
+        .collect()
 }
 
 fn push_comment_display_entry(

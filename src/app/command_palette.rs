@@ -589,10 +589,10 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             palette_key(KeyCode::Char('p')),
         ),
         palette_command(
-            "Reply to Focused Comment",
+            "Reply to Focused Description or Comment",
             "R",
             "Details",
-            "Quote reply to the focused comment",
+            "Quote reply to the focused description or comment",
             palette_key(KeyCode::Char('R')),
         ),
         palette_command(

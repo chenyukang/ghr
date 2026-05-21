@@ -1331,10 +1331,18 @@ pub(super) fn footer_mouse_shortcut(
 }
 
 pub(super) fn footer_has_selected_comment(app: &AppState) -> bool {
-    app.details_mode == DetailsMode::Conversation
-        && app
-            .current_selected_comment()
-            .is_some_and(|comment| comment.can_reply())
+    if app.details_mode != DetailsMode::Conversation {
+        return false;
+    }
+    if app
+        .current_selected_comment()
+        .is_some_and(|comment| comment.can_reply())
+    {
+        return true;
+    }
+    app.focus == FocusTarget::Details
+        && app.comment_selection_cleared()
+        && app.current_item().is_some_and(item_description_can_reply)
 }
 
 pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {

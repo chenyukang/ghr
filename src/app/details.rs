@@ -287,6 +287,7 @@ impl DiffReviewTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DetailAction {
+    ReplyItemDescription,
     ReplyComment(usize),
     EditComment(usize),
     ToggleCommentExpanded(usize),
@@ -1401,7 +1402,12 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
 
     builder.push_blank();
     push_description_block(&mut builder, app, item);
-    push_reactions_line(&mut builder, &item.reactions, item.supports_reactions());
+    push_reactions_line(
+        &mut builder,
+        &item.reactions,
+        item.supports_reactions(),
+        item_description_can_reply(item),
+    );
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -2708,8 +2714,9 @@ pub(super) fn push_reactions_line(
     builder: &mut DetailsBuilder,
     reactions: &ReactionSummary,
     can_react: bool,
+    can_reply: bool,
 ) {
-    if reactions.is_empty() && !can_react {
+    if reactions.is_empty() && !can_react && !can_reply {
         return;
     }
     builder.push_blank();
@@ -2729,6 +2736,17 @@ pub(super) fn push_reactions_line(
             "  "
         }));
         segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+    }
+    if can_reply {
+        segments.push(DetailSegment::raw(if reactions.is_empty() && !can_react {
+            " "
+        } else {
+            "  "
+        }));
+        segments.push(DetailSegment::action(
+            "reply",
+            DetailAction::ReplyItemDescription,
+        ));
     }
     builder.push_prefixed_wrapped_limited(
         segments,
@@ -3991,6 +4009,40 @@ pub(super) fn push_check_part(segments: &mut Vec<DetailSegment>, text: String, s
 pub(super) fn quote_comment_for_reply(comment: &CommentPreview) -> String {
     let quote = truncate_text(&normalize_text(&comment.body), 1_200);
     let mut body = format!("> @{} wrote:\n", comment.author);
+    push_quote_excerpt(&mut body, &quote);
+    body
+}
+
+pub(super) fn quote_item_description_for_reply(item: &WorkItem) -> String {
+    let quote = truncate_text(
+        &normalize_text(item.body.as_deref().unwrap_or_default()),
+        1_200,
+    );
+    let target = match item.kind {
+        ItemKind::PullRequest => "pull request description",
+        ItemKind::Issue => "issue description",
+        ItemKind::Notification => "description",
+    };
+    let mut body = item
+        .author
+        .as_deref()
+        .filter(|author| !author.trim().is_empty())
+        .map(|author| format!("> @{author} wrote in the {target}:\n"))
+        .unwrap_or_else(|| format!("> {target}:\n"));
+    push_quote_excerpt(&mut body, &quote);
+    body
+}
+
+pub(super) fn item_description_can_reply(item: &WorkItem) -> bool {
+    matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest)
+        && item.number.is_some()
+        && item
+            .body
+            .as_deref()
+            .is_some_and(|body| !body.trim().is_empty())
+}
+
+fn push_quote_excerpt(body: &mut String, quote: &str) {
     if quote.trim().is_empty() {
         body.push_str(">\n");
     } else {
@@ -4008,7 +4060,6 @@ pub(super) fn quote_comment_for_reply(comment: &CommentPreview) -> String {
         }
     }
     body.push('\n');
-    body
 }
 
 pub(super) fn markdown_blocks(text: &str) -> Vec<MarkdownBlock> {

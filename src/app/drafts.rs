@@ -28,6 +28,10 @@ pub(super) fn reply_comment_draft_key(
     format!("comment:{}:reply:{target}", editor_draft_item_key(item))
 }
 
+pub(super) fn reply_item_description_draft_key(item: &WorkItem) -> String {
+    format!("comment:{}:reply:description", editor_draft_item_key(item))
+}
+
 pub(super) fn edit_comment_draft_key(item: &WorkItem, comment_id: u64, is_review: bool) -> String {
     let kind = if is_review { "review" } else { "issue" };
     format!(

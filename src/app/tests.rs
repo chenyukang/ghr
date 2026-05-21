@@ -11316,6 +11316,100 @@ fn reply_action_opens_dialog_prefilled_with_quote() {
 }
 
 #[test]
+fn description_reply_action_opens_prefilled_conversation_comment() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.sections[0].items[0].author = Some("chenyukang".to_string());
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    app.start_reply_to_selected_comment();
+
+    let dialog = app.comment_dialog.as_mut().expect("reply dialog");
+    assert_eq!(dialog.mode, CommentDialogMode::New);
+    assert!(
+        dialog
+            .body
+            .text()
+            .contains("> @chenyukang wrote in the pull request description:")
+    );
+    assert!(dialog.body.text().contains("> A body with useful context"));
+    dialog.body.set_text("reply to description");
+
+    let mut submitted = None;
+    app.handle_comment_dialog_key_with_submit(
+        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+        None,
+        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+    );
+
+    assert!(app.comment_dialog.is_none());
+    assert!(app.posting_comment);
+    assert_eq!(app.status, "posting comment");
+    assert_eq!(
+        submitted,
+        Some((
+            "1".to_string(),
+            "reply to description".to_string(),
+            PendingCommentMode::Post
+        ))
+    );
+}
+
+#[test]
+fn issue_description_reply_uses_issue_description_quote() {
+    let mut section = test_section();
+    section.kind = SectionKind::Issues;
+    section.key = "issues:test".to_string();
+    section.items[0].kind = ItemKind::Issue;
+    section.items[0].id = "issue-1".to_string();
+    section.items[0].url = "https://github.com/owner/repo/issues/1".to_string();
+    section.items[0].author = Some("chenyukang".to_string());
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    app.start_reply_to_selected_comment();
+
+    let dialog = app.comment_dialog.expect("reply dialog");
+    assert_eq!(dialog.mode, CommentDialogMode::New);
+    assert!(
+        dialog
+            .body
+            .text()
+            .contains("> @chenyukang wrote in the issue description:")
+    );
+    assert!(dialog.body.text().contains("> A body with useful context"));
+    assert_eq!(app.status, "replying to issue description");
+}
+
+#[test]
+fn description_reactions_line_exposes_reply_action() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let reactions_line = rendered
+        .iter()
+        .position(|line| line.contains("reactions:"))
+        .expect("description reactions line");
+
+    assert!(rendered[reactions_line].contains("reply"));
+    let reply_column = rendered[reactions_line]
+        .find("reply")
+        .expect("reply action") as u16;
+    assert_eq!(
+        document.action_at(reactions_line, reply_column),
+        Some(DetailAction::ReplyItemDescription)
+    );
+}
+
+#[test]
 fn review_summary_reply_submits_as_conversation_comment() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details.insert(

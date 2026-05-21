@@ -7676,6 +7676,10 @@ impl AppState {
         tx: Option<&UnboundedSender<AppMsg>>,
     ) {
         match action {
+            DetailAction::ReplyItemDescription => {
+                self.select_details_body_without_scroll();
+                self.start_reply_to_item_description();
+            }
             DetailAction::ReplyComment(index) => {
                 self.select_comment(index);
                 self.start_reply_to_selected_comment();
@@ -9339,6 +9343,10 @@ impl AppState {
             return;
         };
         let Some(comment) = self.current_selected_comment().cloned() else {
+            if self.comment_selection_cleared() {
+                self.start_reply_to_item_description_with_item(item);
+                return;
+            }
             self.status = "no comment selected".to_string();
             return;
         };
@@ -9376,6 +9384,56 @@ impl AppState {
             format!("loaded reply draft for @{author}")
         } else {
             format!("replying to @{author}")
+        };
+    }
+
+    fn start_reply_to_item_description(&mut self) {
+        if !self.current_item_supports_comments() {
+            self.status = "selected item cannot be commented on".to_string();
+            return;
+        }
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        self.start_reply_to_item_description_with_item(item);
+    }
+
+    fn start_reply_to_item_description_with_item(&mut self, item: WorkItem) {
+        if !item_description_can_reply(&item) {
+            self.status = "description cannot be replied to".to_string();
+            return;
+        }
+        self.finish_details_visit(Instant::now());
+        self.focus = FocusTarget::Details;
+        self.clear_selected_comment();
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.pr_action_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.assignee_dialog = None;
+        let body = quote_item_description_for_reply(&item);
+        let loaded = self.open_comment_dialog_with_draft(
+            CommentDialogMode::New,
+            body,
+            reply_item_description_draft_key(&item),
+        );
+        self.scroll_comment_dialog_to_cursor();
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request description",
+            ItemKind::Issue => "issue description",
+            ItemKind::Notification => "description",
+        };
+        self.status = if loaded {
+            format!("loaded reply draft for {label}")
+        } else {
+            format!("replying to {label}")
         };
     }
 

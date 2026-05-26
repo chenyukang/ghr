@@ -3032,6 +3032,37 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
 }
 
 #[test]
+fn ui_state_save_tolerates_description_selection_sentinel() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus = FocusTarget::Details;
+    app.selected_comment_index = NO_SELECTED_COMMENT_INDEX;
+
+    let state = app.ui_state();
+    assert_eq!(state.selected_comment_index, NO_SELECTED_COMMENT_INDEX);
+    assert_eq!(
+        state.selected_comment_index_by_item.get("1"),
+        Some(&NO_SELECTED_COMMENT_INDEX)
+    );
+
+    let path = std::env::temp_dir().join(format!(
+        "ghr-app-ui-state-{}-{}.toml",
+        std::process::id(),
+        "description-sentinel"
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    state
+        .save(&path)
+        .expect("save ui state with description selected");
+
+    let saved = UiState::load_or_default(&path);
+    assert_eq!(saved.selected_comment_index, 0);
+    assert_eq!(saved.selected_comment_index_by_item.get("1"), Some(&0));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn ui_state_restores_diff_mode_for_selected_pull_request() {
     let state = UiState {
         active_view: builtin_view_key(SectionKind::PullRequests),

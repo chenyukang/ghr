@@ -62,6 +62,9 @@ impl ViewSnapshot {
         if !matches!(self.details_mode.as_str(), "conversation" | "diff") {
             self.details_mode = "conversation".to_string();
         }
+        self.selected_index = normalized_persisted_index(self.selected_index);
+        self.list_scroll_offset = normalized_persisted_index(self.list_scroll_offset);
+        self.selected_comment_index = normalized_persisted_index(self.selected_comment_index);
         self.section_key = self.section_key.filter(|value| !value.trim().is_empty());
         self.item_id = self.item_id.filter(|value| !value.trim().is_empty());
         self
@@ -227,6 +230,9 @@ impl UiState {
         if !matches!(self.details_mode.as_str(), "conversation" | "diff") {
             self.details_mode = "conversation".to_string();
         }
+        self.selected_comment_index = normalized_persisted_index(self.selected_comment_index);
+        self.section_index = normalized_index_map(self.section_index);
+        self.selected_index = normalized_index_map(self.selected_index);
         let mut seen = HashSet::new();
         self.expanded_comments
             .retain(|key| !key.trim().is_empty() && seen.insert(key.clone()));
@@ -240,9 +246,11 @@ impl UiState {
         });
         self.details_scroll_by_item
             .retain(|key, _| !key.trim().is_empty());
-        self.selected_comment_index_by_item
-            .retain(|key, _| !key.trim().is_empty());
+        self.selected_comment_index_by_item =
+            normalized_index_map(self.selected_comment_index_by_item);
         self.viewed_item_at.retain(|key, _| !key.trim().is_empty());
+        self.selected_diff_file = normalized_index_map(self.selected_diff_file);
+        self.selected_diff_line = normalized_index_map(self.selected_diff_line);
         self.diff_file_details_scroll
             .retain(|key, _| !key.trim().is_empty());
         let mut seen_ignored = HashSet::new();
@@ -338,6 +346,24 @@ fn normalized_string_list(items: Vec<String>) -> Vec<String> {
         .collect::<Vec<_>>();
     items.sort();
     items
+}
+
+fn normalized_persisted_index(value: usize) -> usize {
+    if i64::try_from(value).is_ok() {
+        value
+    } else {
+        0
+    }
+}
+
+fn normalized_index_map(items: HashMap<String, usize>) -> HashMap<String, usize> {
+    items
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let key = key.trim().to_string();
+            (!key.is_empty()).then_some((key, normalized_persisted_index(value)))
+        })
+        .collect()
 }
 
 fn normalized_repo_unseen_items(
@@ -745,5 +771,59 @@ mod tests {
 
         assert_eq!(state.focus, "list");
         assert_eq!(state.details_mode, "conversation");
+    }
+
+    #[test]
+    fn oversized_indices_are_normalized_before_save() {
+        let path = std::env::temp_dir().join(format!(
+            "ghr-ui-state-{}-{}.toml",
+            std::process::id(),
+            "oversized-indices"
+        ));
+        let _ = fs::remove_file(&path);
+
+        UiState {
+            selected_comment_index: usize::MAX,
+            section_index: HashMap::from([("issues".to_string(), usize::MAX)]),
+            selected_index: HashMap::from([("issues".to_string(), usize::MAX)]),
+            view_snapshots: HashMap::from([(
+                "issues".to_string(),
+                ViewSnapshot {
+                    selected_index: usize::MAX,
+                    list_scroll_offset: usize::MAX,
+                    selected_comment_index: usize::MAX,
+                    ..ViewSnapshot::default()
+                },
+            )]),
+            selected_comment_index_by_item: HashMap::from([("issue-3".to_string(), usize::MAX)]),
+            selected_diff_file: HashMap::from([("issue-3".to_string(), usize::MAX)]),
+            selected_diff_line: HashMap::from([("issue-3".to_string(), usize::MAX)]),
+            ..UiState::default()
+        }
+        .save(&path)
+        .expect("save ui state with oversized indices");
+
+        let content = fs::read_to_string(&path).expect("read saved ui state");
+        assert!(!content.contains(&usize::MAX.to_string()));
+
+        let state = UiState::load_or_default(&path);
+        assert_eq!(state.selected_comment_index, 0);
+        assert_eq!(state.section_index.get("issues"), Some(&0));
+        assert_eq!(state.selected_index.get("issues"), Some(&0));
+        assert_eq!(
+            state
+                .view_snapshots
+                .get("issues")
+                .map(|snapshot| snapshot.selected_comment_index),
+            Some(0)
+        );
+        assert_eq!(
+            state.selected_comment_index_by_item.get("issue-3"),
+            Some(&0)
+        );
+        assert_eq!(state.selected_diff_file.get("issue-3"), Some(&0));
+        assert_eq!(state.selected_diff_line.get("issue-3"), Some(&0));
+
+        let _ = fs::remove_file(path);
     }
 }

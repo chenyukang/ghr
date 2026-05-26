@@ -888,9 +888,9 @@ pub(super) fn refresh_scope_view_label(view: &str) -> String {
 pub(super) fn save_ui_state(app: &mut AppState, paths: &Paths) {
     app.sync_recent_details_visit(Instant::now());
     if let Err(error) = app.ui_state().save(&paths.state_path) {
-        let message = error.to_string();
+        let message = format!("{error:#}");
         warn!(error = %message, "failed to save ui state");
-        app.status = format!("layout save failed: {message}");
+        app.status = format!("state save failed: {message}");
     }
 }
 

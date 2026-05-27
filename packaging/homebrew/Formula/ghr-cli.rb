@@ -1,32 +1,32 @@
 class GhrCli < Formula
   desc "Fast terminal workspace for GitHub pull requests, issues, and notifications"
   homepage "https://github.com/chenyukang/ghr"
-  version "0.7.8"
+  version "0.8.1"
   license "MIT"
 
   depends_on "gh"
 
   on_macos do
     on_arm do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.7.8/ghr-v0.7.8-aarch64-apple-darwin.tar.gz"
-      sha256 "e1cfa6a27acad0520c5f8d0065f22a228e6653dc6706357a9ab3622900a5d892"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.8.1/ghr-v0.8.1-aarch64-apple-darwin.tar.gz"
+      sha256 "0f22862d105f614877ab8a45ac38cbc378a172b43a7d989d87e4cebd3c430b6f"
     end
 
     on_intel do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.7.8/ghr-v0.7.8-x86_64-apple-darwin.tar.gz"
-      sha256 "95cf45d45f3ac568a5f6ec2b90d96077d3a089ca36744f9958cc64b445386157"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.8.1/ghr-v0.8.1-x86_64-apple-darwin.tar.gz"
+      sha256 "7a3063fbc9162f9b987dad2bd820b4edf54c04456b61bf3940e0a10d31d5c0e7"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.7.8/ghr-v0.7.8-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "704a03e5a145db4682f3bfde958913d026068899b3e06e48e85ac5976e65e164"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.8.1/ghr-v0.8.1-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "b167fb7bd415c18d351558101322a89cd027ffc283e53d46f97910847d45ad3a"
     end
 
     on_intel do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.7.8/ghr-v0.7.8-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "8c1e77506792ebe7f517c73f636aa93bdbe876be68f1d700a152c68d1cc26f9c"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.8.1/ghr-v0.8.1-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "ed577ef0a7198f8105e1d5e816af028bb591cbe6396d9238fb29526acf8357d1"
     end
   end
 

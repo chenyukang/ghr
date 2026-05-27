@@ -9,6 +9,8 @@ env:
   CARGO_TERM_COLOR: always
   BIN_NAME: ghr
   CRATE_NAME: ghr-cli
+  HOMEBREW_TAP_REPOSITORY: chenyukang/homebrew-tap
+  HOMEBREW_TAP_FORMULA: Formula/ghr-cli.rb
 
 permissions:
   contents: write
@@ -226,3 +228,89 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+
+  homebrew:
+    name: Update Homebrew formula
+    runs-on: ubuntu-latest
+    needs:
+      - publish
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v6
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate Homebrew formula
+        shell: bash
+        run: |
+          mkdir -p generated
+          packaging/homebrew/update-formula.sh generated/ghr-cli.rb "$GITHUB_REF_NAME" dist
+
+      - name: Verify Homebrew tap token
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is required to update ${HOMEBREW_TAP_REPOSITORY}" >&2
+            exit 1
+          fi
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: chenyukang/homebrew-tap
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update Homebrew tap formula
+        shell: bash
+        run: |
+          formula_source="$PWD/generated/ghr-cli.rb"
+          formula_path="$HOMEBREW_TAP_FORMULA"
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$(dirname "$formula_path")"
+          cp "$formula_source" "$formula_path"
+
+          if git diff --quiet -- "$formula_path"; then
+            echo "${HOMEBREW_TAP_REPOSITORY}/${formula_path} is already up to date"
+          else
+            git add "$formula_path"
+            git commit -m "Update ghr-cli to ${GITHUB_REF_NAME}"
+            git push origin HEAD:main
+          fi
+
+      - name: Checkout source main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: ghr-main
+          token: ${{ github.token }}
+
+      - name: Update staged Homebrew formula
+        shell: bash
+        run: |
+          formula_source="$PWD/generated/ghr-cli.rb"
+          formula_path="packaging/homebrew/Formula/ghr-cli.rb"
+
+          cd ghr-main
+          git fetch origin main
+          git checkout -B main origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$formula_source" "$formula_path"
+
+          if git diff --quiet -- "$formula_path"; then
+            echo "${GITHUB_REPOSITORY}/${formula_path} is already up to date"
+          else
+            git add "$formula_path"
+            git commit -m "chore: update Homebrew formula for ${GITHUB_REF_NAME}"
+            git push origin HEAD:main
+          fi

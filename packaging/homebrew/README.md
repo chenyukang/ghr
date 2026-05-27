@@ -39,24 +39,12 @@ The formula name is `ghr-cli` because Homebrew core already has an unrelated `gh
 
 ## Release maintenance
 
+The release workflow updates `chenyukang/homebrew-tap` automatically after the GitHub Release assets are published. The workflow requires a repository secret named `HOMEBREW_TAP_TOKEN` with write access to `chenyukang/homebrew-tap`.
+
 For each `ghr` release:
 
-1. Update the release URLs and `sha256` values in `Formula/ghr-cli.rb`. Keep the formula without an explicit `version`; Homebrew derives it from the release URL.
-2. Verify the four prebuilt tarball checksums from the GitHub Release:
-
-   ```bash
-   tag=v0.8.1
-   for target in \
-     aarch64-apple-darwin \
-     x86_64-apple-darwin \
-     aarch64-unknown-linux-gnu \
-     x86_64-unknown-linux-gnu
-   do
-     curl -fsSL "https://github.com/chenyukang/ghr/releases/download/${tag}/ghr-${tag}-${target}.tar.gz.sha256"
-   done
-   ```
-
-3. Copy the updated formula into `chenyukang/homebrew-tap`, push the tap, then verify the published formula from a machine with Homebrew:
+1. Push the release tag. The `Update Homebrew formula` job generates `Formula/ghr-cli.rb` from the release artifacts, pushes it to `chenyukang/homebrew-tap`, and syncs this staged formula copy.
+2. Verify the published formula from a machine with Homebrew:
 
    ```bash
    brew update
@@ -64,5 +52,23 @@ For each `ghr` release:
    HOMEBREW_NO_AUTO_UPDATE=1 brew fetch chenyukang/tap/ghr-cli
    HOMEBREW_NO_AUTO_UPDATE=1 brew audit --strict --online chenyukang/tap/ghr-cli
    ```
+
+Manual fallback:
+
+```bash
+tag=v0.8.1
+tmp_dist="$(mktemp -d)"
+for target in \
+  aarch64-apple-darwin \
+  x86_64-apple-darwin \
+  aarch64-unknown-linux-gnu \
+  x86_64-unknown-linux-gnu
+do
+  curl -fsSL \
+    "https://github.com/chenyukang/ghr/releases/download/${tag}/ghr-${tag}-${target}.tar.gz.sha256" \
+    -o "${tmp_dist}/ghr-${tag}-${target}.tar.gz.sha256"
+done
+packaging/homebrew/update-formula.sh Formula/ghr-cli.rb "$tag" "$tmp_dist"
+```
 
 The release workflow already publishes the binary assets consumed by this formula, so the tap should stay thin and avoid building from source.

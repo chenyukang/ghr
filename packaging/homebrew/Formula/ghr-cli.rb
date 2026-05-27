@@ -1,7 +1,6 @@
 class GhrCli < Formula
   desc "Fast terminal workspace for GitHub pull requests, issues, and notifications"
   homepage "https://github.com/chenyukang/ghr"
-  version "0.8.1"
   license "MIT"
 
   depends_on "gh"

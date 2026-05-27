@@ -41,7 +41,7 @@ The formula name is `ghr-cli` because Homebrew core already has an unrelated `gh
 
 For each `ghr` release:
 
-1. Update `version`, release URLs, and `sha256` values in `Formula/ghr-cli.rb`.
+1. Update the release URLs and `sha256` values in `Formula/ghr-cli.rb`. Keep the formula without an explicit `version`; Homebrew derives it from the release URL.
 2. Verify the four prebuilt tarball checksums from the GitHub Release:
 
    ```bash
@@ -56,12 +56,13 @@ For each `ghr` release:
    done
    ```
 
-3. Run local Homebrew checks from a machine with Homebrew:
+3. Copy the updated formula into `chenyukang/homebrew-tap`, push the tap, then verify the published formula from a machine with Homebrew:
 
    ```bash
-   brew install --formula ./Formula/ghr-cli.rb
-   brew test ghr-cli
-   brew audit --strict --online ghr-cli
+   brew update
+   HOMEBREW_NO_AUTO_UPDATE=1 brew info chenyukang/tap/ghr-cli
+   HOMEBREW_NO_AUTO_UPDATE=1 brew fetch chenyukang/tap/ghr-cli
+   HOMEBREW_NO_AUTO_UPDATE=1 brew audit --strict --online chenyukang/tap/ghr-cli
    ```
 
 The release workflow already publishes the binary assets consumed by this formula, so the tap should stay thin and avoid building from source.

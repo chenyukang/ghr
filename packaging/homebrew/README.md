@@ -41,6 +41,12 @@ The formula name is `ghr-cli` because Homebrew core already has an unrelated `gh
 
 The release workflow updates `chenyukang/homebrew-tap` automatically after the GitHub Release assets are published. The workflow requires a repository secret named `HOMEBREW_TAP_TOKEN` with write access to `chenyukang/homebrew-tap`.
 
+Configure the token once:
+
+```bash
+gh secret set HOMEBREW_TAP_TOKEN --repo chenyukang/ghr
+```
+
 For each `ghr` release:
 
 1. Push the release tag. The `Update Homebrew formula` job generates `Formula/ghr-cli.rb` from the release artifacts, pushes it to `chenyukang/homebrew-tap`, and syncs this staged formula copy.

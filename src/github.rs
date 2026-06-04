@@ -14,6 +14,10 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
+use crate::gh_log::{
+    GhLogRequest, fail_gh_request_to_start as record_gh_request_failed_to_start,
+    finish_gh_request as record_gh_request_finished, start_gh_request as record_gh_request_started,
+};
 use crate::model::{
     ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, FailedCheckRunSummary, ItemKind,
     MergeQueueInfo, Milestone, PullRequestBranch, PullRequestReviewActor,
@@ -150,7 +154,7 @@ fn gh_command_display(args: &[String]) -> String {
     format!("gh {}", args.join(" "))
 }
 
-fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) {
+fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) -> GhLogRequest {
     let kind = gh_request_kind(args);
     let command = gh_command_display(args);
     if let Some(directory) = directory {
@@ -163,9 +167,11 @@ fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) {
     } else {
         debug!(kind, command = %command, "gh request started");
     }
+    record_gh_request_started(kind, command, directory)
 }
 
 fn debug_log_gh_request_finished(
+    request: GhLogRequest,
     args: &[String],
     directory: Option<&Path>,
     output: &std::process::Output,
@@ -194,9 +200,11 @@ fn debug_log_gh_request_finished(
             "gh request finished"
         );
     }
+    record_gh_request_finished(request, output);
 }
 
 fn log_gh_request_failed_to_start(
+    request: GhLogRequest,
     args: &[String],
     directory: Option<&Path>,
     error: &std::io::Error,
@@ -232,6 +240,7 @@ fn log_gh_request_failed_to_start(
             "gh request failed to start"
         );
     }
+    record_gh_request_failed_to_start(request, error);
 }
 
 fn log_gh_request_failed_result(
@@ -2218,19 +2227,23 @@ async fn gh_api_slurp_supported() -> bool {
 }
 
 async fn detect_gh_api_slurp_support() -> bool {
+    let args = vec!["api".to_string(), "--help".to_string()];
+    let gh_request = debug_log_gh_request_started(&args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
-        .args(["api", "--help"])
+        .args(&args)
         .output()
         .await;
 
     match output {
         Ok(output) if output.status.success() => {
+            debug_log_gh_request_finished(gh_request, &args, None, &output);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             gh_api_help_has_flag(&stdout, "--slurp") || gh_api_help_has_flag(&stderr, "--slurp")
         }
         Ok(output) => {
+            debug_log_gh_request_finished(gh_request, &args, None, &output);
             debug!(
                 status = %output.status,
                 "failed to inspect gh api help for --slurp support; assuming supported"
@@ -2238,6 +2251,7 @@ async fn detect_gh_api_slurp_support() -> bool {
             true
         }
         Err(error) => {
+            log_gh_request_failed_to_start(gh_request, &args, None, &error);
             debug!(
                 error = %error,
                 "failed to inspect gh api help for --slurp support; assuming supported"
@@ -2517,21 +2531,21 @@ fn rerun_failed_check_run_args(repository: &str, run_id: u64) -> Vec<String> {
 }
 
 async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
-    debug_log_gh_request_started(args, None);
+    let gh_request = debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .args(args)
         .output()
         .await
         .map_err(|error| {
-            log_gh_request_failed_to_start(args, None, &error);
+            log_gh_request_failed_to_start(gh_request.clone(), args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
                 anyhow!("failed to run gh {}: {error}", args.join(" "))
             }
         })?;
-    debug_log_gh_request_finished(args, None, &output);
+    debug_log_gh_request_finished(gh_request, args, None, &output);
 
     if !output.status.success() {
         log_gh_request_failed_result(args, None, &output);
@@ -4548,21 +4562,21 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
 }
 
 async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
-    debug_log_gh_request_started(args, None);
+    let gh_request = debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .args(args)
         .output()
         .await
         .map_err(|error| {
-            log_gh_request_failed_to_start(args, None, &error);
+            log_gh_request_failed_to_start(gh_request.clone(), args, None, &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
                 anyhow!("failed to run gh {}: {error}", args.join(" "))
             }
         })?;
-    debug_log_gh_request_finished(args, None, &output);
+    debug_log_gh_request_finished(gh_request, args, None, &output);
 
     if !output.status.success() {
         log_gh_request_failed_result(args, None, &output);
@@ -4642,7 +4656,7 @@ fn is_retryable_gh_json_error(error: &str) -> bool {
 
 async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
     let _guard = UserGhRequestGuard::new();
-    debug_log_gh_request_started(args, Some(directory));
+    let gh_request = debug_log_gh_request_started(args, Some(directory));
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(directory)
@@ -4650,7 +4664,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
         .output()
         .await
         .map_err(|error| {
-            log_gh_request_failed_to_start(args, Some(directory), &error);
+            log_gh_request_failed_to_start(gh_request.clone(), args, Some(directory), &error);
             if error.kind() == ErrorKind::NotFound {
                 anyhow!("{}", gh_missing_message(args))
             } else {
@@ -4661,7 +4675,7 @@ async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String>
                 )
             }
         })?;
-    debug_log_gh_request_finished(args, Some(directory), &output);
+    debug_log_gh_request_finished(gh_request, args, Some(directory), &output);
 
     if !output.status.success() {
         log_gh_request_failed_result(args, Some(directory), &output);

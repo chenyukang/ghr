@@ -41,6 +41,7 @@ use crate::config::{
     RepoConfig, SavedSearchFilterConfig, github_repo_from_remote_url, repo_remote_config_value,
 };
 use crate::dirs::Paths;
+use crate::gh_log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::github::{
     AssigneeAction, CommentFetchResult, ItemDetailsMetadata, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
@@ -132,12 +133,12 @@ use render::*;
 use runtime::*;
 use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
 use status::{
-    comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
-    operation_error_body, persistent_success_message_dialog, pr_action_error_body,
-    pr_action_error_status, pr_action_error_title, pr_action_success_body, pr_action_success_title,
-    refresh_error_status, retryable_message_dialog, reviewer_action_error_status,
-    reviewer_action_error_title, reviewer_action_success_body, reviewer_action_success_title,
-    setup_dialog_from_error, success_message_dialog,
+    comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
+    persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
+    pr_action_error_title, pr_action_success_body, pr_action_success_title, refresh_error_status,
+    retryable_message_dialog, reviewer_action_error_status, reviewer_action_error_title,
+    reviewer_action_success_body, reviewer_action_success_title, setup_dialog_from_error,
+    success_message_dialog,
 };
 use switchers::*;
 use tasks::*;
@@ -907,6 +908,23 @@ struct RecentItemsDialog {
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticsDialog {
+    kind: DiagnosticsDialogKind,
+    title: String,
+    lines: Vec<String>,
+    line_details: Vec<Vec<String>>,
+    return_dialog: Option<Box<DiagnosticsDialog>>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticsDialogKind {
+    Info,
+    GhLog,
+    GhLogDetail,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalSearchField {
     Title,
@@ -1488,6 +1506,7 @@ struct AppState {
     top_menu_switcher: Option<TopMenuSwitcher>,
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
+    diagnostics_dialog: Option<DiagnosticsDialog>,
     recent_items: Vec<RecentItem>,
     recent_items_dirty: bool,
     recent_commands: Vec<RecentCommand>,
@@ -1900,6 +1919,7 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
+    let gh_request = start_gh_request("gh", "gh --version", None);
     debug!(command = "gh --version", "gh request started");
     let result = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
@@ -1907,6 +1927,7 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
         .output();
     match &result {
         Ok(output) => {
+            finish_gh_request(gh_request, output);
             debug!(
                 command = "gh --version",
                 status = %output.status,
@@ -1927,6 +1948,7 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
             }
         }
         Err(error) => {
+            fail_gh_request_to_start(gh_request, error);
             debug!(
                 command = "gh --version",
                 error = %error,
@@ -2572,6 +2594,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.cache_clear_dialog.is_some()
@@ -2836,6 +2859,7 @@ impl AppState {
             top_menu_switcher: None,
             theme_switcher: None,
             recent_items_dialog: None,
+            diagnostics_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_items_dirty: false,
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
@@ -4929,6 +4953,7 @@ impl AppState {
         self.top_menu_switcher = None;
         self.theme_switcher = None;
         self.cache_clear_dialog = None;
+        self.diagnostics_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
         self.item_edit_dialog = None;
@@ -4950,14 +4975,143 @@ impl AppState {
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
+        self.diagnostics_dialog = None;
         self.status = "command palette".to_string();
     }
 
     fn show_info_dialog(&mut self, config: &Config, paths: &Paths) {
-        let body = runtime_info_body(self, config, paths);
-        self.message_dialog = Some(info_message_dialog("Info", body));
-        self.status = "info".to_string();
+        let lines = info_lines(self, config, paths);
+        self.show_diagnostics_dialog(
+            DiagnosticsDialogKind::Info,
+            "Info",
+            lines,
+            Vec::new(),
+            "info",
+        );
         debug!("info dialog opened");
+    }
+
+    fn show_gh_log_dialog(&mut self) {
+        let (lines, line_details) = gh_log_lines_with_details();
+        self.show_diagnostics_dialog(
+            DiagnosticsDialogKind::GhLog,
+            "Log",
+            lines,
+            line_details,
+            "log",
+        );
+        debug!("log dialog opened");
+    }
+
+    fn show_diagnostics_dialog(
+        &mut self,
+        kind: DiagnosticsDialogKind,
+        title: impl Into<String>,
+        lines: Vec<String>,
+        line_details: Vec<Vec<String>>,
+        status: impl Into<String>,
+    ) {
+        self.finish_details_visit(Instant::now());
+        self.message_dialog = None;
+        self.help_dialog = false;
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.top_menu_switcher = None;
+        self.theme_switcher = None;
+        self.recent_items_dialog = None;
+        self.saved_search_dialog = None;
+        self.save_search_dialog = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.diagnostics_dialog = Some(DiagnosticsDialog {
+            kind,
+            title: title.into(),
+            lines,
+            line_details,
+            return_dialog: None,
+            selected: 0,
+        });
+        self.status = status.into();
+    }
+
+    fn dismiss_diagnostics_dialog(&mut self) {
+        self.diagnostics_dialog = None;
+        self.status = "diagnostics closed".to_string();
+    }
+
+    fn handle_diagnostics_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc
+                if self.diagnostics_dialog_kind() == Some(DiagnosticsDialogKind::GhLogDetail) =>
+            {
+                self.return_to_gh_log_dialog()
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_diagnostics_dialog(),
+            KeyCode::Enter
+                if self.diagnostics_dialog_kind() == Some(DiagnosticsDialogKind::GhLog) =>
+            {
+                self.show_selected_gh_log_detail()
+            }
+            KeyCode::Enter => self.dismiss_diagnostics_dialog(),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                self.move_diagnostics_dialog_selection(1)
+            }
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                self.move_diagnostics_dialog_selection(-1)
+            }
+            KeyCode::PageDown => self.move_diagnostics_dialog_selection(8),
+            KeyCode::PageUp => self.move_diagnostics_dialog_selection(-8),
+            _ => {}
+        }
+    }
+
+    fn diagnostics_dialog_kind(&self) -> Option<DiagnosticsDialogKind> {
+        self.diagnostics_dialog.as_ref().map(|dialog| dialog.kind)
+    }
+
+    fn show_selected_gh_log_detail(&mut self) {
+        let return_dialog = self.diagnostics_dialog.clone();
+        let Some(lines) = self
+            .diagnostics_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.line_details.get(dialog.selected).cloned())
+        else {
+            self.status = "no log entry selected".to_string();
+            return;
+        };
+        self.diagnostics_dialog = Some(DiagnosticsDialog {
+            kind: DiagnosticsDialogKind::GhLogDetail,
+            title: "Log Detail".to_string(),
+            lines,
+            line_details: Vec::new(),
+            return_dialog: return_dialog.map(Box::new),
+            selected: 0,
+        });
+        self.status = "log detail".to_string();
+    }
+
+    fn return_to_gh_log_dialog(&mut self) {
+        let Some(return_dialog) = self
+            .diagnostics_dialog
+            .as_mut()
+            .and_then(|dialog| dialog.return_dialog.take())
+        else {
+            self.dismiss_diagnostics_dialog();
+            return;
+        };
+        self.diagnostics_dialog = Some(*return_dialog);
+        self.status = "log".to_string();
+    }
+
+    fn move_diagnostics_dialog_selection(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.diagnostics_dialog {
+            dialog.selected = move_wrapping(dialog.selected, dialog.lines.len(), delta);
+        }
     }
 
     fn dismiss_command_palette(&mut self) {
@@ -5054,6 +5208,10 @@ impl AppState {
             PaletteAction::Quit => true,
             PaletteAction::ShowInfo => {
                 self.show_info_dialog(config, paths);
+                false
+            }
+            PaletteAction::ShowGhLog => {
+                self.show_gh_log_dialog();
                 false
             }
             PaletteAction::ShowHelp => {
@@ -11382,6 +11540,7 @@ impl AppState {
             || self.top_menu_switcher.is_some()
             || self.theme_switcher.is_some()
             || self.recent_items_dialog.is_some()
+            || self.diagnostics_dialog.is_some()
             || self.project_add_dialog.is_some()
             || self.project_remove_dialog.is_some()
             || self.cache_clear_dialog.is_some()

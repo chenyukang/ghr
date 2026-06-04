@@ -31,6 +31,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_startup_dialog(frame, app, paths, dialog, area);
     } else if let Some(dialog) = &app.message_dialog {
         draw_message_dialog(frame, dialog, area);
+    } else if let Some(dialog) = &app.diagnostics_dialog {
+        draw_diagnostics_dialog(frame, dialog, area);
     } else if app.help_dialog {
         draw_help_dialog(frame, area, &app.command_palette_key);
     } else if let Some(dialog) = &app.item_edit_dialog {
@@ -1175,7 +1177,7 @@ pub(super) fn draw_top_status(frame: &mut Frame<'_>, app: &AppState, area: Rect)
 }
 
 pub(super) fn top_status_area(area: Rect) -> Option<Rect> {
-    let max_width = area.width.saturating_sub(4).min(46);
+    let max_width = area.width.saturating_sub(24).min(72);
     if max_width < 12 || area.height == 0 {
         return None;
     }
@@ -1190,10 +1192,38 @@ pub(super) fn top_status_area(area: Rect) -> Option<Rect> {
 
 pub(super) fn top_status_line(app: &AppState, width: usize) -> Line<'static> {
     let value_width = width.saturating_sub(display_width("status: "));
-    let value = truncate_inline(&footer_status(app), value_width);
+    let value = top_status_value(app, value_width);
     let mut spans = Vec::new();
     push_status_spans(&mut spans, value);
     Line::from(fit_footer_spans_to_width(spans, width))
+}
+
+pub(super) fn top_status_value(app: &AppState, width: usize) -> String {
+    if app.section_page_loading.is_some() || app.refreshing {
+        return truncate_inline(&footer_status(app), width);
+    }
+
+    if app.status.is_empty() {
+        return truncate_inline(&refresh_age_status(app), width);
+    }
+
+    let status_width = display_width(&app.status);
+    if status_width >= width {
+        return truncate_inline(&app.status, width);
+    }
+
+    let age = refresh_age_status(app);
+    if age.is_empty() {
+        return app.status.clone();
+    }
+
+    let separator_width = display_width(" · ");
+    let age_width = display_width(&age);
+    if status_width + separator_width + age_width > width {
+        app.status.clone()
+    } else {
+        format!("{} · {}", app.status, age)
+    }
 }
 
 #[cfg(test)]

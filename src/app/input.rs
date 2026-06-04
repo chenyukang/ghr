@@ -104,6 +104,7 @@ pub(super) fn mouse_wheel_target(
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()
@@ -263,6 +264,11 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.diagnostics_dialog.is_some() {
+        app.handle_diagnostics_dialog_key(key);
         return false;
     }
 
@@ -926,6 +932,7 @@ pub(super) fn handle_mouse_with_sync(
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()

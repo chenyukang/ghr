@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod dirs;
+mod gh_log;
 mod github;
 mod model;
 mod snapshot;

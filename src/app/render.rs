@@ -34,7 +34,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     } else if let Some(dialog) = &app.diagnostics_dialog {
         draw_diagnostics_dialog(frame, dialog, area);
     } else if app.help_dialog {
-        draw_help_dialog(frame, area, &app.command_palette_key);
+        draw_help_dialog(
+            frame,
+            area,
+            &app.command_palette_key,
+            app.help_dialog_scroll,
+        );
     } else if let Some(dialog) = &app.item_edit_dialog {
         draw_item_edit_dialog(frame, app, dialog, app.item_edit_running, area);
     } else if let Some(dialog) = &app.pr_action_dialog {

@@ -50,6 +50,7 @@ pub(super) enum PaletteAction {
     InboxMarkAllRead,
     InboxThreadAction(InboxThreadAction),
     ItemSubscriptionAction(ItemSubscriptionAction),
+    ToggleReviewThreadResolution,
 }
 
 pub(super) fn command_palette_area(area: Rect) -> Rect {
@@ -609,6 +610,13 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             "Details",
             "Edit the focused comment, or the selected issue/PR when no comment is focused",
             palette_key(KeyCode::Char('e')),
+        ),
+        palette_command(
+            "Toggle Review Thread Resolution",
+            "z",
+            "Details",
+            "Resolve or unresolve the focused inline review thread",
+            PaletteAction::ToggleReviewThreadResolution,
         ),
         palette_command(
             "Previous Diff File",

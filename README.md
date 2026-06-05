@@ -26,7 +26,7 @@
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
-- Comment, reply, edit, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
+- Comment, reply, edit, resolve review threads, milestone, merge, close/reopen, update-branch, rerun-failed-checks, local PR checkout, draft / ready-for-review, and full PR review submit flows from inside the TUI.
 - Inbox read/done/mute handling with explicit commands, local cache updates, GitHub sync, and dimmed read items.
 - Mouse support for tabs, lists, links, descriptions, comments, editor cursor placement, details drag-copy, scrolling, text selection mode, and split resizing.
 - Built-in `auto` plus named light and dark color themes configured through `defaults.theme` / `defaults.theme_name`; `auto` follows the macOS appearance when available.
@@ -125,6 +125,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `c` in Details | Add a normal comment in conversation mode, or an inline review comment in diff mode |
 | `R` | Reply to the focused comment |
 | `e` | Edit the focused comment in Details, edit the selected issue or PR when no comment is focused, or end a review range in diff mode |
+| `z` | Resolve or unresolve the focused inline review thread |
 | `T` | Edit the selected issue or PR title, assignees, labels, and body |
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |

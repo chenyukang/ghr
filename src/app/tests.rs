@@ -350,6 +350,7 @@ fn diff_details_render_inline_review_comments_below_target_line() {
     );
 
     let review = crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -482,6 +483,7 @@ fn text_selection_mode_omits_inline_thread_markers() {
     );
 
     let review = crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -542,6 +544,7 @@ fn diff_mode_can_hide_inline_review_comment_bodies_but_keeps_markers() {
     let mut inline = comment("alice", "Hidden until marker is opened.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -610,6 +613,7 @@ fn clicking_hidden_diff_inline_comment_marker_reveals_that_thread() {
     let mut inline = comment("alice", "Revealed by marker click.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -677,6 +681,7 @@ fn mouse_clicking_hidden_diff_inline_comment_marker_toggles_that_thread() {
     let mut inline = comment("alice", "Toggle me from the marker.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -776,6 +781,7 @@ fn mouse_clicking_inline_comment_author_opens_profile() {
     );
     comment.id = Some(1);
     comment.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -846,6 +852,7 @@ fn diff_details_render_resolved_and_outdated_review_comment_states() {
     let mut resolved = comment("alice", "Fixed now.", None);
     resolved.id = Some(1);
     resolved.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -860,6 +867,7 @@ fn diff_details_render_resolved_and_outdated_review_comment_states() {
     let mut outdated = comment("bob", "This pointed at an old line.", None);
     outdated.id = Some(2);
     outdated.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(99),
         original_line: Some(99),
@@ -1220,6 +1228,7 @@ fn n_and_p_focus_comments_in_diff_details() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     let mut first = comment("alice", "first inline", None);
     first.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -1233,6 +1242,7 @@ fn n_and_p_focus_comments_in_diff_details() {
     });
     let mut second = comment("bob", "second inline", None);
     second.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
         original_line: None,
@@ -1298,6 +1308,7 @@ fn n_and_p_reveal_hidden_diff_inline_comment_threads_one_at_a_time() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     let mut first = comment("alice", "first hidden inline", None);
     first.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -1311,6 +1322,7 @@ fn n_and_p_reveal_hidden_diff_inline_comment_threads_one_at_a_time() {
     });
     let mut second = comment("bob", "second hidden inline", None);
     second.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
         original_line: None,
@@ -2120,6 +2132,7 @@ diff --git a/src/github.rs b/src/github.rs
     let mut app_comment = comment("alice", "inline", None);
     app_comment.id = Some(1);
     app_comment.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/app.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -2137,6 +2150,7 @@ diff --git a/src/github.rs b/src/github.rs
     let mut github_comment = comment("carol", "inline", None);
     github_comment.id = Some(3);
     github_comment.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -10210,6 +10224,7 @@ fn selected_details_text_uses_segment_copy_metadata() {
     child.id = Some(2);
     child.parent_id = Some(1);
     let review = crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
         original_line: None,
@@ -11116,6 +11131,7 @@ fn github_mentions_in_comments_are_clickable() {
 fn review_replies_render_under_parent_comment() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let review = crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(10),
         original_line: None,
@@ -11254,6 +11270,7 @@ fn details_comments_show_inline_review_location() {
         Some("https://github.com/chenyukang/ghr/pull/8#discussion_r88"),
     );
     inline.review = Some(crate::model::ReviewCommentPreview {
+            thread_id: None,
             path: "src/github.rs".to_string(),
             line: Some(876),
             original_line: None,
@@ -11312,6 +11329,7 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         Some("https://github.com/rust-lang/rust/pull/156000#discussion_r99"),
     );
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "tests/ui/drop/explicit-drop-call-error.stderr".to_string(),
         line: Some(10),
         original_line: None,
@@ -11377,6 +11395,7 @@ fn inline_review_context_can_fall_back_to_original_line() {
     }
     diff_hunk.push_str("+outputsData: [ccc.bytesFrom(scriptBinary)],");
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "skill/deployment.md".to_string(),
         line: Some(56),
         original_line: Some(50),
@@ -16884,6 +16903,7 @@ fn inline_review_comment_edit_uses_review_edit_mode() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let mut inline = own_comment(88, "chenyukang", "old inline", None);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(876),
         original_line: None,
@@ -16920,6 +16940,7 @@ fn ctrl_enter_in_inline_review_reply_submits_review_reply() {
     );
     inline.id = Some(88);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(876),
         original_line: None,
@@ -17383,6 +17404,73 @@ fn review_comment_result_dialog_reports_success_and_failure() {
 }
 
 #[test]
+fn z_on_inline_review_comment_without_thread_id_reports_refresh_needed() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus = FocusTarget::Details;
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![test_review_comment(88, "src/github.rs")]),
+    );
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('z')),
+        &Config::default(),
+        &store,
+        &tx
+    ));
+
+    assert!(!app.resolving_review_thread);
+    assert_eq!(app.status, "review thread id unavailable; refresh comments");
+}
+
+#[test]
+fn review_thread_resolution_success_refreshes_comments_and_selection() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut inline = test_review_comment(88, "src/github.rs");
+    inline.review.as_mut().unwrap().thread_id = Some("PRRT_1".to_string());
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![inline]));
+    app.resolving_review_thread = true;
+
+    let mut refreshed = test_review_comment(88, "src/github.rs");
+    let review = refreshed.review.as_mut().unwrap();
+    review.thread_id = Some("PRRT_1".to_string());
+    review.is_resolved = true;
+
+    app.handle_msg(AppMsg::ReviewThreadResolutionUpdated {
+        item_id: "1".to_string(),
+        comment_index: 0,
+        resolved: true,
+        result: Ok(CommentFetchResult {
+            item_metadata: None,
+            item_reactions: None,
+            item_milestone: None,
+            comments: vec![refreshed],
+        }),
+    });
+
+    assert!(!app.resolving_review_thread);
+    assert_eq!(app.status, "review thread resolved");
+    assert_eq!(app.selected_comment_index, 0);
+    let comments = match app.details.get("1") {
+        Some(DetailState::Loaded(comments)) => comments,
+        other => panic!("expected loaded comments, got {other:?}"),
+    };
+    let review = comments[0].review.as_ref().expect("review metadata");
+    assert_eq!(review.thread_id.as_deref(), Some("PRRT_1"));
+    assert!(review.is_resolved);
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Review Thread Updated")
+    );
+}
+
+#[test]
 fn posted_review_comment_is_rendered_locally_in_diff_mode() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details_mode = DetailsMode::Diff;
@@ -17402,6 +17490,7 @@ fn posted_review_comment_is_rendered_locally_in_diff_mode() {
     posted.id = Some(99);
     posted.is_mine = true;
     posted.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
         original_line: Some(2),
@@ -20039,6 +20128,7 @@ fn test_review_comment(id: u64, path: &str) -> CommentPreview {
     let mut comment = comment("alice", "inline", None);
     comment.id = Some(id);
     comment.review = Some(crate::model::ReviewCommentPreview {
+        thread_id: None,
         path: path.to_string(),
         line: Some(1),
         original_line: None,

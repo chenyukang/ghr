@@ -58,10 +58,10 @@ use crate::github::{
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
     refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
     reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
-    search_github_users, search_global, submit_pending_pull_request_review,
-    submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
-    update_issue_assignees, update_item_subscription, update_pull_request_branch,
-    with_background_github_priority,
+    search_github_users, search_global, set_pull_request_review_thread_resolved,
+    submit_pending_pull_request_review, submit_pull_request_review, subscribe_notification_thread,
+    unsubscribe_notification_thread, update_issue_assignees, update_item_subscription,
+    update_pull_request_branch, with_background_github_priority,
 };
 use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
@@ -191,6 +191,12 @@ enum AppMsg {
     },
     ReactionPosted {
         item_id: String,
+        result: std::result::Result<CommentFetchResult, String>,
+    },
+    ReviewThreadResolutionUpdated {
+        item_id: String,
+        comment_index: usize,
+        resolved: bool,
         result: std::result::Result<CommentFetchResult, String>,
     },
     LabelUpdated {
@@ -1290,6 +1296,22 @@ fn item_subscription_action_success_status(
     }
 }
 
+fn review_thread_resolution_running_status(resolved: bool) -> &'static str {
+    if resolved {
+        "resolving review thread"
+    } else {
+        "marking review thread unresolved"
+    }
+}
+
+fn review_thread_resolution_success_status(resolved: bool) -> &'static str {
+    if resolved {
+        "review thread resolved"
+    } else {
+        "review thread marked unresolved"
+    }
+}
+
 fn item_kind_label(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::Issue => "issue",
@@ -1574,6 +1596,7 @@ struct AppState {
     posting_comment: bool,
     reaction_dialog: Option<ReactionDialog>,
     posting_reaction: bool,
+    resolving_review_thread: bool,
     pending_comment_submit: Option<PendingCommentSubmit>,
     label_dialog: Option<LabelDialog>,
     label_updating: bool,
@@ -2932,6 +2955,7 @@ impl AppState {
             posting_comment: false,
             reaction_dialog: None,
             posting_reaction: false,
+            resolving_review_thread: false,
             pending_comment_submit: None,
             label_dialog: None,
             label_updating: false,
@@ -3903,6 +3927,48 @@ impl AppState {
                     self.posting_reaction = false;
                     self.reaction_dialog = None;
                     self.status = "reaction failed".to_string();
+                }
+            },
+            AppMsg::ReviewThreadResolutionUpdated {
+                item_id,
+                comment_index,
+                resolved,
+                result,
+            } => match result {
+                Ok(mut result) => {
+                    self.selected_comment_index =
+                        comment_index.min(result.comments.len().saturating_sub(1));
+                    self.details_stale.remove(&item_id);
+                    self.details_refreshing.remove(&item_id);
+                    self.remember_details_synced_at(&item_id, &result);
+                    self.apply_comment_fetch_result_metadata(&item_id, &result);
+                    self.merge_optimistic_comments(&item_id, &mut result.comments);
+                    self.details
+                        .insert(item_id.clone(), DetailState::Loaded(result.comments));
+                    self.clamp_selected_comment();
+                    self.mark_current_details_viewed_if_current(&item_id);
+                    self.resolving_review_thread = false;
+                    self.status = review_thread_resolution_success_status(resolved).to_string();
+                    self.message_dialog = Some(success_message_dialog(
+                        "Review Thread Updated",
+                        "GitHub accepted the review thread update and comments were refreshed.",
+                    ));
+                }
+                Err(error) => {
+                    let setup_dialog = setup_dialog_from_error(&error);
+                    if self.setup_dialog.is_none() {
+                        self.setup_dialog = setup_dialog;
+                    }
+                    if setup_dialog.is_none() {
+                        self.message_dialog = Some(message_dialog(
+                            "Review Thread Update Failed",
+                            operation_error_body(&error),
+                        ));
+                    } else {
+                        self.message_dialog = None;
+                    }
+                    self.resolving_review_thread = false;
+                    self.status = "review thread update failed".to_string();
                 }
             },
             AppMsg::LabelUpdated {
@@ -5303,6 +5369,10 @@ impl AppState {
             }
             PaletteAction::ItemSubscriptionAction(action) => {
                 self.start_item_subscription_action(action, tx);
+                false
+            }
+            PaletteAction::ToggleReviewThreadResolution => {
+                self.toggle_selected_review_thread_resolution(tx);
                 false
             }
         }
@@ -8190,6 +8260,58 @@ impl AppState {
         self.posting_reaction = true;
         self.status = format!("adding reaction {} {}", reaction.emoji(), reaction.label());
         start_reaction_submit(item, target, reaction, tx.clone());
+    }
+
+    fn toggle_selected_review_thread_resolution(&mut self, tx: &UnboundedSender<AppMsg>) {
+        if self.resolving_review_thread {
+            self.status = "review thread update already running".to_string();
+            return;
+        }
+        let Some(item) = self.current_item().cloned() else {
+            self.status = "nothing selected".to_string();
+            return;
+        };
+        if item.kind != ItemKind::PullRequest || item.number.is_none() {
+            self.status = "review threads are available for pull requests".to_string();
+            return;
+        }
+        let Some(comment) = self.current_selected_comment().cloned() else {
+            self.status = "no comment selected".to_string();
+            return;
+        };
+        let Some(review) = comment.review.as_ref() else {
+            self.status = "selected comment is not an inline review thread".to_string();
+            return;
+        };
+        let Some(thread_id) = review.thread_id.clone() else {
+            self.status = "review thread id unavailable; refresh comments".to_string();
+            return;
+        };
+
+        let resolved = !review.is_resolved;
+        self.finish_details_visit(Instant::now());
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.milestone_dialog = None;
+        self.pr_action_dialog = None;
+        self.assignee_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.focus = FocusTarget::Details;
+        self.resolving_review_thread = true;
+        self.status = review_thread_resolution_running_status(resolved).to_string();
+        start_review_thread_resolution_update(
+            item,
+            self.selected_comment_index,
+            thread_id,
+            resolved,
+            tx.clone(),
+        );
     }
 
     fn toggle_selected_comment_expanded(&mut self) {

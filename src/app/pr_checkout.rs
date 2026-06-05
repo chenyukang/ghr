@@ -7,6 +7,7 @@ use tracing::{debug, error};
 
 use super::text::truncate_text;
 use crate::config::{Config, github_repo_from_remote_url};
+use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{PullRequestBranch, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub(super) async fn run_pr_checkout(
         .ok_or_else(|| "selected item has no pull request number".to_string())?;
     let args = pr_checkout_command_args(&item.repo, number);
     let command = pr_checkout_command_display(&args);
+    let gh_request = start_gh_request("gh", command.clone(), Some(&directory));
     debug!(
         command = %command,
         cwd = %directory.display(),
@@ -43,6 +45,7 @@ pub(super) async fn run_pr_checkout(
         .output()
         .await
         .map_err(|error| {
+            fail_gh_request_to_start(gh_request.clone(), &error);
             debug!(
                 command = %command,
                 cwd = %directory.display(),
@@ -67,6 +70,7 @@ pub(super) async fn run_pr_checkout(
                 )
             }
         })?;
+    finish_gh_request(gh_request, &output);
     debug!(
         command = %command,
         cwd = %directory.display(),

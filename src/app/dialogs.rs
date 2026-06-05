@@ -807,6 +807,121 @@ pub(super) fn recent_item_candidate_line(
     Line::from(Span::styled(text, style))
 }
 
+pub(super) fn draw_diagnostics_dialog(
+    frame: &mut Frame<'_>,
+    dialog: &DiagnosticsDialog,
+    area: Rect,
+) {
+    let dialog_area = diagnostics_dialog_area(area);
+    let inner = block_inner(dialog_area);
+    let width = usize::from(inner.width.max(1));
+    let result_height = usize::from(inner.height.max(1));
+    let selected = dialog.selected.min(dialog.lines.len().saturating_sub(1));
+    let start = command_palette_visible_start(selected, dialog.lines.len(), result_height);
+    let lines = if dialog.lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "No diagnostics available",
+            active_theme().subtle(),
+        ))]
+    } else {
+        dialog
+            .lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(result_height)
+            .map(|(position, line)| {
+                diagnostics_dialog_line(dialog.kind, line, position == selected, width)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(active_theme().panel().fg(active_theme().focus))
+        .style(modal_surface_style())
+        .title(Span::styled(
+            dialog.title.clone(),
+            active_theme()
+                .panel()
+                .fg(active_theme().focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(modal_text_style())
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(paragraph, dialog_area);
+    draw_modal_footer(
+        frame,
+        area,
+        dialog_area,
+        modal_footer_line(diagnostics_dialog_footer(dialog.kind)),
+    );
+}
+
+fn diagnostics_dialog_footer(kind: DiagnosticsDialogKind) -> &'static str {
+    match kind {
+        DiagnosticsDialogKind::GhLog => {
+            "j/k/Up/Down: select    PageUp/PageDown: jump    Enter: details    Esc/q: close"
+        }
+        DiagnosticsDialogKind::Info => {
+            "j/k/Up/Down: scroll    PageUp/PageDown: jump    Enter/Esc/q: close"
+        }
+        DiagnosticsDialogKind::GhLogDetail => {
+            "j/k/Up/Down: scroll    PageUp/PageDown: jump    Esc: list    Enter/q: close"
+        }
+    }
+}
+
+pub(super) fn diagnostics_dialog_area(area: Rect) -> Rect {
+    let width = centered_rect_width(112, area).max(48).min(area.width);
+    let max_height = area.height.saturating_sub(2).max(3);
+    let height = 22.min(max_height).max(3);
+    centered_rect_with_size(width, height, area)
+}
+
+pub(super) fn diagnostics_dialog_line(
+    kind: DiagnosticsDialogKind,
+    text: &str,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    if kind == DiagnosticsDialogKind::GhLogDetail {
+        return diagnostics_detail_line(text, width);
+    }
+
+    let style = if selected {
+        active_theme().active()
+    } else if !text.is_empty() && !text.contains(':') {
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().panel()
+    };
+    let marker = if selected { "> " } else { "  " };
+    Line::from(Span::styled(
+        truncate_inline(&format!("{marker}{text}"), width),
+        style,
+    ))
+}
+
+fn diagnostics_detail_line(text: &str, width: usize) -> Line<'static> {
+    let style = if !text.is_empty() && !text.starts_with("  ") {
+        active_theme()
+            .panel()
+            .fg(active_theme().focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().panel()
+    };
+    Line::from(Span::styled(truncate_inline(text, width), style))
+}
+
 pub(super) fn draw_saved_search_dialog(
     frame: &mut Frame<'_>,
     app: &AppState,
@@ -4496,7 +4611,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("/", "search loaded comments by keyword"),
         help_key_line(
             "n / p",
-            "focus comments; p from first returns to PR/issue details",
+            "focus checks and comments; p returns toward PR/issue details",
         ),
         help_key_line(
             "h / l in diff",
@@ -4504,7 +4619,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         ),
         help_key_line(
             "Enter in conversation",
-            "expand or collapse a long focused comment",
+            "open a focused check, or expand/collapse a long focused comment",
         ),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
         help_key_line(
@@ -4546,7 +4661,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("P", "request or re-request PR reviewers"),
         help_key_line("Y", "remove pending PR review requests"),
-        help_key_line("o", "open selected item in browser"),
+        help_key_line("o", "open selected item or focused check in browser"),
         Line::from(""),
         help_heading("Editor"),
         help_key_line("Left / Right", "move cursor by character"),

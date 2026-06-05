@@ -3,6 +3,7 @@ use super::pr_checkout::{
     command_output_text, pr_checkout_command_args, pr_checkout_command_display,
 };
 use super::*;
+use crate::log::{clear_gh_log_entries, fail_gh_request_to_start, start_gh_request};
 use crate::model::CommentPreviewKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4424,25 +4425,175 @@ fn command_palette_info_opens_runtime_info_dialog() {
         None,
     ));
 
-    let dialog = app.message_dialog.as_ref().expect("info dialog");
-    assert_eq!(dialog.kind, MessageDialogKind::Info);
+    let dialog = app.diagnostics_dialog.as_ref().expect("info dialog");
+    assert_eq!(dialog.kind, DiagnosticsDialogKind::Info);
     assert_eq!(dialog.title, "Info");
-    assert!(dialog.body.contains("version:"));
-    assert!(dialog.body.contains("ghr memory:"));
-    assert!(dialog.body.contains("ignored items:"));
+    assert!(dialog.lines.iter().any(|line| line.starts_with("version:")));
+    assert!(dialog.lines.iter().any(|line| line == "terminal"));
+    assert!(dialog.lines.iter().any(|line| line.starts_with("TERM:")));
+    assert!(dialog.lines.iter().any(|line| line == "runtime"));
+    assert!(dialog.lines.iter().any(|line| line == "cache"));
     assert!(
         dialog
-            .body
-            .contains(&format!("config: {}", paths.config_path.display()))
+            .lines
+            .iter()
+            .any(|line| line == &format!("config: {}", paths.config_path.display()))
     );
     assert!(
         dialog
-            .body
-            .contains(&format!("db: {}", paths.db_path.display()))
+            .lines
+            .iter()
+            .any(|line| line == &format!("db: {}", paths.db_path.display()))
     );
-    assert!(dialog.body.contains("log_level: debug"));
+    assert!(dialog.lines.iter().any(|line| line == "log_level: debug"));
     assert!(app.command_palette.is_none());
     assert_eq!(app.status, "info");
+}
+
+#[test]
+fn command_palette_does_not_include_debug_command() {
+    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+    assert!(commands.iter().any(|command| command.title == "Info"));
+    assert!(!commands.iter().any(|command| command.title == "Debug"));
+}
+
+#[test]
+fn command_palette_log_opens_recent_gh_request_dialog() {
+    clear_gh_log_entries();
+    let request = start_gh_request("gh api", "gh api /rate_limit", None);
+    fail_gh_request_to_start(
+        request,
+        &std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "HTTP 403: API rate limit exceeded",
+        ),
+    );
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("gh-log");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "log".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    let dialog = app.diagnostics_dialog.as_ref().expect("gh log dialog");
+    assert_eq!(dialog.title, "Log");
+    assert_eq!(dialog.line_details.len(), dialog.lines.len());
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line.contains("rate-limited") && line.contains("gh api /rate_limit"))
+    );
+    assert_eq!(app.status, "log");
+    clear_gh_log_entries();
+}
+
+#[test]
+fn diagnostics_dialog_keys_move_and_close() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.diagnostics_dialog = Some(DiagnosticsDialog {
+        kind: DiagnosticsDialogKind::Info,
+        title: "Info".to_string(),
+        lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+        line_details: Vec::new(),
+        return_dialog: None,
+        selected: 0,
+    });
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Char('j')));
+    assert_eq!(
+        app.diagnostics_dialog
+            .as_ref()
+            .map(|dialog| dialog.selected),
+        Some(1)
+    );
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Char('k')));
+    assert_eq!(
+        app.diagnostics_dialog
+            .as_ref()
+            .map(|dialog| dialog.selected),
+        Some(0)
+    );
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Enter));
+    assert!(app.diagnostics_dialog.is_none());
+    assert_eq!(app.status, "diagnostics closed");
+}
+
+#[test]
+fn gh_log_dialog_enter_opens_selected_entry_detail() {
+    clear_gh_log_entries();
+    let older = start_gh_request("gh", "gh pr view 55", None);
+    fail_gh_request_to_start(
+        older,
+        &std::io::Error::new(std::io::ErrorKind::Other, "HTTP 500: old failure"),
+    );
+    let newer = start_gh_request("gh api", "gh api /rate_limit", None);
+    fail_gh_request_to_start(
+        newer,
+        &std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "HTTP 403: API rate limit exceeded",
+        ),
+    );
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.show_gh_log_dialog();
+
+    let dialog = app.diagnostics_dialog.as_ref().expect("gh log dialog");
+    assert_eq!(dialog.kind, DiagnosticsDialogKind::GhLog);
+    assert!(dialog.lines[0].contains("gh api /rate_limit"));
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Char('j')));
+    assert_eq!(
+        app.diagnostics_dialog
+            .as_ref()
+            .map(|dialog| dialog.selected),
+        Some(1)
+    );
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Enter));
+    let detail = app.diagnostics_dialog.as_ref().expect("detail dialog");
+    assert_eq!(detail.kind, DiagnosticsDialogKind::GhLogDetail);
+    assert_eq!(detail.title, "Log Detail");
+    assert!(detail.lines.iter().any(|line| line == "Result"));
+    assert!(detail.lines.iter().any(|line| line == "  Failed"));
+    assert!(detail.lines.iter().any(|line| line == "Command"));
+    assert!(detail.lines.iter().any(|line| line == "  gh pr view 55"));
+    assert!(detail.lines.iter().any(|line| line == "Message"));
+    assert!(
+        detail
+            .lines
+            .iter()
+            .any(|line| line == "  HTTP 500: old failure")
+    );
+    assert!(!detail.lines.iter().any(|line| line.starts_with("> ")));
+    assert_eq!(app.status, "log detail");
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Esc));
+    let list = app.diagnostics_dialog.as_ref().expect("gh log list");
+    assert_eq!(list.kind, DiagnosticsDialogKind::GhLog);
+    assert_eq!(list.title, "Log");
+    assert_eq!(list.selected, 1);
+    assert!(list.lines[1].contains("gh pr view 55"));
+    assert_eq!(app.status, "log");
+
+    app.handle_diagnostics_dialog_key(key(KeyCode::Esc));
+    assert!(app.diagnostics_dialog.is_none());
+    clear_gh_log_entries();
 }
 
 #[test]
@@ -6454,6 +6605,24 @@ fn status_age_prefers_details_refresh_source_while_details_focused() {
     assert!(status.contains("comment 4 focused"));
     assert!(status.contains("details refreshed"));
     assert!(!status.contains("list refreshed"));
+}
+
+#[test]
+fn top_status_keeps_current_status_when_refresh_age_does_not_fit() {
+    let mut section = test_section();
+    section.refreshed_at = Some(Utc::now() - chrono::Duration::seconds(34));
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    app.status = "current view latest".to_string();
+
+    assert_eq!(
+        top_status_line(&app, 46).to_string(),
+        "status: current view latest"
+    );
+
+    let wide = top_status_line(&app, 72).to_string();
+    assert!(wide.contains("current view latest"));
+    assert!(wide.contains("list refreshed"));
+    assert!(!wide.contains("..."));
 }
 
 #[test]
@@ -9258,6 +9427,130 @@ fn details_meta_shows_pr_action_hints() {
     assert!(
         action_line > branch_line,
         "action/checks should start on a new line"
+    );
+}
+
+#[test]
+fn pr_details_render_check_runs_as_openable_rows() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::Loaded(ActionHints {
+            checks: Some(CheckSummary {
+                passed: 3,
+                failed: 1,
+                pending: 1,
+                skipped: 0,
+                total: 5,
+                incomplete: false,
+            }),
+            check_runs: vec![
+                CheckRunSummary {
+                    name: "test".to_string(),
+                    workflow: Some("CI".to_string()),
+                    state: Some("FAILURE".to_string()),
+                    bucket: Some("fail".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+                    description: Some("failed after 2m".to_string()),
+                },
+                CheckRunSummary {
+                    name: "deploy".to_string(),
+                    workflow: Some("Release".to_string()),
+                    state: Some("PENDING".to_string()),
+                    bucket: Some("pending".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/11".to_string()),
+                    description: None,
+                },
+                CheckRunSummary {
+                    name: "fmt".to_string(),
+                    workflow: Some("CI".to_string()),
+                    state: Some("SUCCESS".to_string()),
+                    bucket: Some("pass".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/12".to_string()),
+                    description: None,
+                },
+            ],
+            ..ActionHints::default()
+        }),
+    );
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Checks"));
+    assert!(rendered.contains("fail     CI / test"));
+    assert!(rendered.contains("failed after 2m"));
+    assert!(rendered.contains("pending  Release / deploy"));
+    assert!(!rendered.contains("CI / fmt"));
+    assert_document_link_for_text(
+        &document,
+        "CI / test",
+        "https://github.com/rust-lang/rust/actions/runs/10",
+    );
+    assert_document_action_for_text_on_line(
+        &document,
+        "CI / test",
+        "open",
+        DetailAction::OpenUrl("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+    );
+}
+
+#[test]
+fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    app.select_details_body_without_scroll();
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::Loaded(ActionHints {
+            check_runs: vec![CheckRunSummary {
+                name: "test".to_string(),
+                workflow: Some("CI".to_string()),
+                state: Some("FAILURE".to_string()),
+                bucket: Some("fail".to_string()),
+                link: Some("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+                description: None,
+            }],
+            ..ActionHints::default()
+        }),
+    );
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('n')),
+        &config,
+        &store,
+        &tx,
+        Some(Rect::new(0, 0, 120, 30))
+    ));
+
+    assert_eq!(app.selected_check_run_index, 0);
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://github.com/rust-lang/rust/actions/runs/10")
+    );
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Enter),
+        &config,
+        &store,
+        &tx,
+        Some(Rect::new(0, 0, 120, 30))
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/rust-lang/rust/actions/runs/10"
     );
 }
 

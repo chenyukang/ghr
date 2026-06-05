@@ -210,12 +210,23 @@ pub struct ReviewCommentPreview {
 pub struct ActionHints {
     pub labels: Vec<String>,
     pub checks: Option<CheckSummary>,
+    pub check_runs: Vec<CheckRunSummary>,
     pub commits: Option<usize>,
     pub failed_check_runs: Vec<FailedCheckRunSummary>,
     pub note: Option<String>,
     pub head: Option<PullRequestBranch>,
     pub queue: Option<Box<MergeQueueInfo>>,
     pub reviews: Option<Box<PullRequestReviewSummary>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRunSummary {
+    pub name: String,
+    pub workflow: Option<String>,
+    pub state: Option<String>,
+    pub bucket: Option<String>,
+    pub link: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

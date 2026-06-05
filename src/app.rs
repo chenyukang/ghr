@@ -63,8 +63,9 @@ use crate::github::{
     update_issue_assignees, update_item_subscription, update_pull_request_branch,
     with_background_github_priority,
 };
+use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
+    ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
     FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
     ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
     global_search_view_key, mark_all_notifications_read_in_section,
@@ -132,18 +133,19 @@ use render::*;
 use runtime::*;
 use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
 use status::{
-    comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
-    operation_error_body, persistent_success_message_dialog, pr_action_error_body,
-    pr_action_error_status, pr_action_error_title, pr_action_success_body, pr_action_success_title,
-    refresh_error_status, retryable_message_dialog, reviewer_action_error_status,
-    reviewer_action_error_title, reviewer_action_success_body, reviewer_action_success_title,
-    setup_dialog_from_error, success_message_dialog,
+    comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
+    persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
+    pr_action_error_title, pr_action_success_body, pr_action_success_title, refresh_error_status,
+    retryable_message_dialog, reviewer_action_error_status, reviewer_action_error_title,
+    reviewer_action_success_body, reviewer_action_success_title, setup_dialog_from_error,
+    success_message_dialog,
 };
 use switchers::*;
 use tasks::*;
 use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
 const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
+const NO_SELECTED_CHECK_RUN_INDEX: usize = usize::MAX;
 
 enum AppMsg {
     RefreshStarted {
@@ -907,6 +909,23 @@ struct RecentItemsDialog {
     selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticsDialog {
+    kind: DiagnosticsDialogKind,
+    title: String,
+    lines: Vec<String>,
+    line_details: Vec<Vec<String>>,
+    return_dialog: Option<Box<DiagnosticsDialog>>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticsDialogKind {
+    Info,
+    GhLog,
+    GhLogDetail,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalSearchField {
     Title,
@@ -1488,6 +1507,7 @@ struct AppState {
     top_menu_switcher: Option<TopMenuSwitcher>,
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
+    diagnostics_dialog: Option<DiagnosticsDialog>,
     recent_items: Vec<RecentItem>,
     recent_items_dirty: bool,
     recent_commands: Vec<RecentCommand>,
@@ -1543,6 +1563,7 @@ struct AppState {
     notification_read_pending: HashSet<String>,
     notification_done_pending: HashSet<String>,
     selected_comment_index: usize,
+    selected_check_run_index: usize,
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     editor_drafts: HashMap<String, EditorDraft>,
@@ -1900,6 +1921,7 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
+    let gh_request = start_gh_request("gh", "gh --version", None);
     debug!(command = "gh --version", "gh request started");
     let result = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
@@ -1907,6 +1929,7 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
         .output();
     match &result {
         Ok(output) => {
+            finish_gh_request(gh_request, output);
             debug!(
                 command = "gh --version",
                 status = %output.status,
@@ -1927,6 +1950,7 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
             }
         }
         Err(error) => {
+            fail_gh_request_to_start(gh_request, error);
             debug!(
                 command = "gh --version",
                 error = %error,
@@ -2572,6 +2596,7 @@ fn text_input_active(app: &AppState) -> bool {
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.cache_clear_dialog.is_some()
@@ -2836,6 +2861,7 @@ impl AppState {
             top_menu_switcher: None,
             theme_switcher: None,
             recent_items_dialog: None,
+            diagnostics_dialog: None,
             recent_items: recent_items_from_saved(&ui_state.recent_items),
             recent_items_dirty: false,
             recent_commands: recent_commands_from_saved(&ui_state.recent_commands),
@@ -2895,6 +2921,7 @@ impl AppState {
             notification_read_pending: HashSet::new(),
             notification_done_pending: HashSet::new(),
             selected_comment_index: 0,
+            selected_check_run_index: NO_SELECTED_CHECK_RUN_INDEX,
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             editor_drafts: HashMap::new(),
@@ -4929,6 +4956,7 @@ impl AppState {
         self.top_menu_switcher = None;
         self.theme_switcher = None;
         self.cache_clear_dialog = None;
+        self.diagnostics_dialog = None;
         self.reaction_dialog = None;
         self.filter_input_active = false;
         self.item_edit_dialog = None;
@@ -4950,14 +4978,143 @@ impl AppState {
         self.project_add_dialog = None;
         self.project_remove_dialog = None;
         self.cache_clear_dialog = None;
+        self.diagnostics_dialog = None;
         self.status = "command palette".to_string();
     }
 
     fn show_info_dialog(&mut self, config: &Config, paths: &Paths) {
-        let body = runtime_info_body(self, config, paths);
-        self.message_dialog = Some(info_message_dialog("Info", body));
-        self.status = "info".to_string();
+        let lines = info_lines(self, config, paths);
+        self.show_diagnostics_dialog(
+            DiagnosticsDialogKind::Info,
+            "Info",
+            lines,
+            Vec::new(),
+            "info",
+        );
         debug!("info dialog opened");
+    }
+
+    fn show_gh_log_dialog(&mut self) {
+        let (lines, line_details) = gh_log_lines_with_details();
+        self.show_diagnostics_dialog(
+            DiagnosticsDialogKind::GhLog,
+            "Log",
+            lines,
+            line_details,
+            "log",
+        );
+        debug!("log dialog opened");
+    }
+
+    fn show_diagnostics_dialog(
+        &mut self,
+        kind: DiagnosticsDialogKind,
+        title: impl Into<String>,
+        lines: Vec<String>,
+        line_details: Vec<Vec<String>>,
+        status: impl Into<String>,
+    ) {
+        self.finish_details_visit(Instant::now());
+        self.message_dialog = None;
+        self.help_dialog = false;
+        self.command_palette = None;
+        self.project_switcher = None;
+        self.top_menu_switcher = None;
+        self.theme_switcher = None;
+        self.recent_items_dialog = None;
+        self.saved_search_dialog = None;
+        self.save_search_dialog = None;
+        self.project_add_dialog = None;
+        self.project_remove_dialog = None;
+        self.cache_clear_dialog = None;
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.global_search_active = false;
+        self.filter_input_active = false;
+        self.diagnostics_dialog = Some(DiagnosticsDialog {
+            kind,
+            title: title.into(),
+            lines,
+            line_details,
+            return_dialog: None,
+            selected: 0,
+        });
+        self.status = status.into();
+    }
+
+    fn dismiss_diagnostics_dialog(&mut self) {
+        self.diagnostics_dialog = None;
+        self.status = "diagnostics closed".to_string();
+    }
+
+    fn handle_diagnostics_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc
+                if self.diagnostics_dialog_kind() == Some(DiagnosticsDialogKind::GhLogDetail) =>
+            {
+                self.return_to_gh_log_dialog()
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.dismiss_diagnostics_dialog(),
+            KeyCode::Enter
+                if self.diagnostics_dialog_kind() == Some(DiagnosticsDialogKind::GhLog) =>
+            {
+                self.show_selected_gh_log_detail()
+            }
+            KeyCode::Enter => self.dismiss_diagnostics_dialog(),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                self.move_diagnostics_dialog_selection(1)
+            }
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                self.move_diagnostics_dialog_selection(-1)
+            }
+            KeyCode::PageDown => self.move_diagnostics_dialog_selection(8),
+            KeyCode::PageUp => self.move_diagnostics_dialog_selection(-8),
+            _ => {}
+        }
+    }
+
+    fn diagnostics_dialog_kind(&self) -> Option<DiagnosticsDialogKind> {
+        self.diagnostics_dialog.as_ref().map(|dialog| dialog.kind)
+    }
+
+    fn show_selected_gh_log_detail(&mut self) {
+        let return_dialog = self.diagnostics_dialog.clone();
+        let Some(lines) = self
+            .diagnostics_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.line_details.get(dialog.selected).cloned())
+        else {
+            self.status = "no log entry selected".to_string();
+            return;
+        };
+        self.diagnostics_dialog = Some(DiagnosticsDialog {
+            kind: DiagnosticsDialogKind::GhLogDetail,
+            title: "Log Detail".to_string(),
+            lines,
+            line_details: Vec::new(),
+            return_dialog: return_dialog.map(Box::new),
+            selected: 0,
+        });
+        self.status = "log detail".to_string();
+    }
+
+    fn return_to_gh_log_dialog(&mut self) {
+        let Some(return_dialog) = self
+            .diagnostics_dialog
+            .as_mut()
+            .and_then(|dialog| dialog.return_dialog.take())
+        else {
+            self.dismiss_diagnostics_dialog();
+            return;
+        };
+        self.diagnostics_dialog = Some(*return_dialog);
+        self.status = "log".to_string();
+    }
+
+    fn move_diagnostics_dialog_selection(&mut self, delta: isize) {
+        if let Some(dialog) = &mut self.diagnostics_dialog {
+            dialog.selected = move_wrapping(dialog.selected, dialog.lines.len(), delta);
+        }
     }
 
     fn dismiss_command_palette(&mut self) {
@@ -5054,6 +5211,10 @@ impl AppState {
             PaletteAction::Quit => true,
             PaletteAction::ShowInfo => {
                 self.show_info_dialog(config, paths);
+                false
+            }
+            PaletteAction::ShowGhLog => {
+                self.show_gh_log_dialog();
                 false
             }
             PaletteAction::ShowHelp => {
@@ -7302,6 +7463,7 @@ impl AppState {
     fn select_comment(&mut self, index: usize) {
         let previous = self.selected_comment_index;
         self.selected_comment_index = index;
+        self.clear_selected_check_run();
         self.clamp_selected_comment();
         self.status = if self.comment_selection_cleared() {
             "no comment focused".to_string()
@@ -7324,6 +7486,95 @@ impl AppState {
         self.selected_comment_index == NO_SELECTED_COMMENT_INDEX
     }
 
+    fn clear_selected_check_run(&mut self) {
+        self.selected_check_run_index = NO_SELECTED_CHECK_RUN_INDEX;
+    }
+
+    fn check_run_selection_cleared(&self) -> bool {
+        self.selected_check_run_index == NO_SELECTED_CHECK_RUN_INDEX
+    }
+
+    fn current_visible_check_run_indices(&self) -> Vec<usize> {
+        let Some(item) = self.current_item() else {
+            return Vec::new();
+        };
+        let Some(ActionHintState::Loaded(hints)) = self.action_hints.get(&item.id) else {
+            return Vec::new();
+        };
+        visible_check_run_indices(hints)
+    }
+
+    fn current_selected_check_run(&self) -> Option<&CheckRunSummary> {
+        if self.check_run_selection_cleared() {
+            return None;
+        }
+        let item = self.current_item()?;
+        let ActionHintState::Loaded(hints) = self.action_hints.get(&item.id)? else {
+            return None;
+        };
+        let check = hints.check_runs.get(self.selected_check_run_index)?;
+        check_run_visible(check).then_some(check)
+    }
+
+    fn selected_check_run_label(&self) -> Option<String> {
+        self.current_selected_check_run()
+            .map(check_run_display_label)
+    }
+
+    fn select_check_run(&mut self, index: usize, area: Option<Rect>) {
+        self.clear_selected_comment();
+        self.selected_check_run_index = index;
+        let position = self
+            .current_visible_check_run_indices()
+            .iter()
+            .position(|candidate| *candidate == index)
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        let total = self.current_visible_check_run_indices().len();
+        let label = self
+            .selected_check_run_label()
+            .unwrap_or_else(|| "check".to_string());
+        self.status = if total == 0 {
+            format!("check focused: {label}")
+        } else {
+            format!("check {position}/{total} focused: {label}")
+        };
+        self.scroll_selected_check_run_into_view(area);
+        self.remember_current_conversation_details_position();
+    }
+
+    fn scroll_selected_check_run_into_view(&mut self, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.remember_current_conversation_details_position();
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            self.remember_current_conversation_details_position();
+            return;
+        }
+        let document = build_details_document(self, inner.width);
+        let Some(region) = document.check_run_region(self.selected_check_run_index) else {
+            self.remember_current_conversation_details_position();
+            return;
+        };
+        let viewport_start = usize::from(self.details_scroll);
+        let viewport_height = usize::from(inner.height);
+        let viewport_end = viewport_start.saturating_add(viewport_height);
+        let line = region.line;
+        if line < viewport_start.saturating_add(1) {
+            self.details_scroll = line.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+        } else if line >= viewport_end.saturating_sub(2) {
+            let next_scroll = line.saturating_sub(viewport_height / 3);
+            self.details_scroll = next_scroll.min(usize::from(u16::MAX)) as u16;
+        }
+        self.details_scroll = self
+            .details_scroll
+            .min(max_details_scroll(self, details_area));
+        self.remember_current_conversation_details_position();
+    }
+
     fn select_details_body(&mut self) {
         self.details_scroll = 0;
         self.select_details_body_without_scroll();
@@ -7331,6 +7582,7 @@ impl AppState {
 
     fn select_details_body_without_scroll(&mut self) {
         self.clear_selected_comment();
+        self.clear_selected_check_run();
         self.status = self.details_body_focus_status();
         self.remember_current_conversation_details_position();
     }
@@ -7408,6 +7660,9 @@ impl AppState {
         if self.move_hidden_diff_inline_comment(delta, area) {
             return;
         }
+        if self.move_conversation_detail_focus(delta, area) {
+            return;
+        }
         if self.move_rendered_comment(delta, area) {
             return;
         }
@@ -7419,6 +7674,82 @@ impl AppState {
         } else {
             self.scroll_selected_comment_into_view(area);
         }
+    }
+
+    fn move_conversation_detail_focus(&mut self, delta: isize, area: Option<Rect>) -> bool {
+        if self.details_mode != DetailsMode::Conversation {
+            return false;
+        }
+        let check_order = self.current_visible_check_run_indices();
+        if check_order.is_empty() {
+            return false;
+        }
+        let comment_order = if let Some(area) = area {
+            let details_area = details_area_for(self, area);
+            let inner = block_inner(details_area);
+            if inner.height == 0 {
+                Vec::new()
+            } else {
+                build_details_document(self, inner.width)
+                    .comments
+                    .iter()
+                    .map(|comment| comment.index)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            self.current_comments()
+                .map(|comments| comment_display_entries(comments))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>()
+        };
+        let total = 1 + check_order.len() + comment_order.len();
+        if total <= 1 {
+            return false;
+        }
+
+        let current_position = if let Some(position) = check_order
+            .iter()
+            .position(|index| *index == self.selected_check_run_index)
+        {
+            1 + position
+        } else if let Some(position) = comment_order
+            .iter()
+            .position(|index| *index == self.selected_comment_index)
+        {
+            1 + check_order.len() + position
+        } else {
+            0
+        };
+        let next_position = if delta < 0 {
+            current_position.saturating_sub(1)
+        } else {
+            current_position.saturating_add(1).min(total - 1)
+        };
+        if next_position == current_position {
+            return false;
+        }
+
+        if next_position == 0 {
+            self.select_details_body();
+            return true;
+        }
+        if next_position <= check_order.len() {
+            self.select_check_run(check_order[next_position - 1], area);
+            return true;
+        }
+
+        let comment_position = next_position - 1 - check_order.len();
+        let comment_index = comment_order[comment_position];
+        self.select_comment(comment_index);
+        self.status = format!(
+            "comment {}/{} focused",
+            comment_position + 1,
+            comment_order.len()
+        );
+        self.scroll_selected_comment_into_view(area);
+        true
     }
 
     fn move_hidden_diff_inline_comment(&mut self, delta: isize, area: Option<Rect>) -> bool {
@@ -7698,6 +8029,7 @@ impl AppState {
                 self.start_comment_reaction_dialog(index);
             }
             DetailAction::CopyBlock(text) => self.copy_block_to_clipboard(&text),
+            DetailAction::OpenUrl(url) => self.open_url(&url),
             DetailAction::SubscribeItem => {
                 if let Some(tx) = tx {
                     self.start_item_subscription_action(ItemSubscriptionAction::Subscribe, tx);
@@ -11165,6 +11497,16 @@ impl AppState {
         if self.focus == FocusTarget::Details
             && self.details_mode == DetailsMode::Conversation
             && let Some(url) = self
+                .current_selected_check_run()
+                .and_then(|check| check.link.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some((url.to_string(), "check"));
+        }
+
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
                 .current_selected_comment()
                 .and_then(|comment| comment.url.as_deref())
                 .filter(|url| !url.trim().is_empty())
@@ -11208,6 +11550,16 @@ impl AppState {
     }
 
     fn selected_open_url(&self) -> Option<String> {
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
+                .current_selected_check_run()
+                .and_then(|check| check.link.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some(url.to_string());
+        }
+
         let item = self.current_item()?;
         if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
             return Some(pull_request_changes_url(item));
@@ -11382,6 +11734,7 @@ impl AppState {
             || self.top_menu_switcher.is_some()
             || self.theme_switcher.is_some()
             || self.recent_items_dialog.is_some()
+            || self.diagnostics_dialog.is_some()
             || self.project_add_dialog.is_some()
             || self.project_remove_dialog.is_some()
             || self.cache_clear_dialog.is_some()
@@ -11569,6 +11922,7 @@ impl AppState {
         if let Some(state) = state {
             self.details_scroll = state.details_scroll;
             self.selected_comment_index = state.selected_comment_index;
+            self.clear_selected_check_run();
             if self.current_comments().is_some() {
                 self.clamp_selected_comment();
             }
@@ -11578,6 +11932,7 @@ impl AppState {
     fn reset_or_restore_current_conversation_details_state(&mut self) {
         self.details_scroll = 0;
         self.selected_comment_index = 0;
+        self.clear_selected_check_run();
         self.restore_current_conversation_details_state();
     }
 

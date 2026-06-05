@@ -19,6 +19,7 @@ pub(super) struct DetailsDocument {
     pub(super) copy_skip_lines: Vec<usize>,
     pub(super) description: Option<DescriptionRegion>,
     pub(super) comments: Vec<CommentRegion>,
+    pub(super) check_runs: Vec<CheckRunRegion>,
     pub(super) diff_files: Vec<usize>,
     pub(super) diff_lines: Vec<DiffLineRegion>,
     pub(super) inline_comment_markers: Vec<DiffInlineCommentMarkerRegion>,
@@ -49,6 +50,17 @@ impl DetailsDocument {
 
     pub(super) fn comment_region(&self, index: usize) -> Option<&CommentRegion> {
         self.comments.iter().find(|comment| comment.index == index)
+    }
+
+    pub(super) fn check_run_at(&self, line: usize) -> Option<usize> {
+        self.check_runs
+            .iter()
+            .find(|check| line == check.line)
+            .map(|check| check.index)
+    }
+
+    pub(super) fn check_run_region(&self, index: usize) -> Option<&CheckRunRegion> {
+        self.check_runs.iter().find(|check| check.index == index)
     }
 
     pub(super) fn description_at(&self, line: usize) -> bool {
@@ -120,6 +132,12 @@ impl CommentRegion {
             .saturating_add(1)
             .min(self.end_line.saturating_sub(1))
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CheckRunRegion {
+    pub(super) index: usize,
+    pub(super) line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +312,7 @@ pub(super) enum DetailAction {
     ReactItem,
     ReactComment(usize),
     CopyBlock(String),
+    OpenUrl(String),
     SubscribeItem,
     UnsubscribeItem,
     AddLabel,
@@ -473,6 +492,7 @@ impl DetailsBuilder {
                 copy_skip_lines: Vec::new(),
                 description: None,
                 comments: Vec::new(),
+                check_runs: Vec::new(),
                 diff_files: Vec::new(),
                 diff_lines: Vec::new(),
                 inline_comment_markers: Vec::new(),
@@ -524,6 +544,13 @@ impl DetailsBuilder {
                 line,
                 comment_indices,
             });
+    }
+
+    fn mark_check_run(&mut self, index: usize) {
+        let line = self.document.lines.len();
+        self.document
+            .check_runs
+            .push(CheckRunRegion { index, line });
     }
 
     fn push_line(&mut self, segments: Vec<DetailSegment>) {
@@ -1400,6 +1427,8 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_key_value("extra", extra.clone());
     }
 
+    push_check_runs_block(&mut builder, app, item);
+
     builder.push_blank();
     push_description_block(&mut builder, app, item);
     push_reactions_line(
@@ -1528,7 +1557,8 @@ pub(super) fn push_description_block(
 ) {
     let selected = app.mouse_capture_enabled
         && app.focus == FocusTarget::Details
-        && app.comment_selection_cleared();
+        && app.comment_selection_cleared()
+        && app.check_run_selection_cleared();
     let start_line = builder.document.lines.len();
     if !selected {
         builder.push_heading("Description");
@@ -4032,6 +4062,213 @@ pub(super) fn check_summary_segments(summary: &CheckSummary) -> Vec<DetailSegmen
         );
     }
     segments
+}
+
+pub(super) fn push_check_runs_block(builder: &mut DetailsBuilder, app: &AppState, item: &WorkItem) {
+    if !matches!(item.kind, ItemKind::PullRequest) {
+        return;
+    }
+    let Some(ActionHintState::Loaded(hints)) = app.action_hints.get(&item.id) else {
+        return;
+    };
+    let indices = visible_check_run_indices(hints);
+    if indices.is_empty() {
+        return;
+    }
+
+    builder.push_blank();
+    builder.push_heading("Checks");
+    builder.push_blank();
+    for index in indices {
+        let selected = app.mouse_capture_enabled
+            && app.focus == FocusTarget::Details
+            && app.selected_check_run_index == index;
+        push_check_run_row(builder, index, &hints.check_runs[index], selected);
+    }
+}
+
+pub(super) fn visible_check_run_indices(hints: &ActionHints) -> Vec<usize> {
+    hints
+        .check_runs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, check)| check_run_visible(check).then_some(index))
+        .collect()
+}
+
+pub(super) fn check_run_visible(check: &CheckRunSummary) -> bool {
+    if let Some(bucket) = check
+        .bucket
+        .as_deref()
+        .filter(|bucket| !bucket.trim().is_empty())
+    {
+        return !check_run_matches(Some(bucket), &["pass"]);
+    }
+    check
+        .state
+        .as_deref()
+        .is_some_and(|state| !state.trim().is_empty())
+        && !check_run_matches(check.state.as_deref(), &["pass", "success"])
+}
+
+pub(super) fn check_run_display_label(check: &CheckRunSummary) -> String {
+    match check.workflow.as_deref().filter(|workflow| {
+        !workflow.trim().is_empty() && !workflow.eq_ignore_ascii_case(check.name.trim())
+    }) {
+        Some(workflow) => format!("{workflow} / {}", check.name),
+        None => check.name.clone(),
+    }
+}
+
+fn push_check_run_row(
+    builder: &mut DetailsBuilder,
+    index: usize,
+    check: &CheckRunSummary,
+    selected: bool,
+) {
+    builder.mark_check_run(index);
+    let mut segments = Vec::new();
+    segments.push(DetailSegment::styled_chrome(
+        if selected { "> " } else { "  " },
+        check_run_marker_style(selected),
+    ));
+    let status = check_run_status_label(check);
+    segments.push(DetailSegment::styled(
+        format!("{status:<8}"),
+        check_run_status_style(check),
+    ));
+    segments.push(DetailSegment::raw(" "));
+
+    let label_width = builder.width.saturating_sub(18).clamp(12, 80);
+    let label = truncate_inline(&check_run_display_label(check), label_width);
+    if let Some(url) = check.link.as_ref().filter(|url| !url.trim().is_empty()) {
+        segments.push(DetailSegment::styled_link(
+            label,
+            url.clone(),
+            check_run_link_style(selected),
+        ));
+    } else {
+        segments.push(DetailSegment::styled(label, check_run_link_style(selected)));
+    }
+
+    if let Some(detail) = check_run_secondary_text(check) {
+        let used = segments_width(&segments);
+        let action_reserve = check
+            .link
+            .as_ref()
+            .map(|_| display_width("  open"))
+            .unwrap_or(0);
+        let detail_width = builder
+            .width
+            .saturating_sub(used + action_reserve + display_width("  "))
+            .min(90);
+        if detail_width >= 8 {
+            segments.push(DetailSegment::raw("  "));
+            segments.push(DetailSegment::styled(
+                truncate_inline(&detail, detail_width),
+                active_theme().muted(),
+            ));
+        }
+    }
+
+    if let Some(url) = check.link.as_ref().filter(|url| !url.trim().is_empty()) {
+        segments.push(DetailSegment::raw("  "));
+        segments.push(DetailSegment::action(
+            "open",
+            DetailAction::OpenUrl(url.clone()),
+        ));
+    }
+
+    builder.push_line(segments);
+}
+
+fn check_run_status_label(check: &CheckRunSummary) -> String {
+    check
+        .bucket
+        .as_deref()
+        .or(check.state.as_deref())
+        .map(|value| value.to_ascii_lowercase().replace('_', " "))
+        .unwrap_or_else(|| "check".to_string())
+}
+
+fn check_run_secondary_text(check: &CheckRunSummary) -> Option<String> {
+    if let Some(description) = check
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+    {
+        return Some(description.trim().to_string());
+    }
+
+    let status = check_run_status_label(check);
+    let state = check.state.as_deref()?.trim();
+    if state.is_empty() || state.eq_ignore_ascii_case(&status) {
+        None
+    } else {
+        Some(state.to_ascii_lowercase().replace('_', " "))
+    }
+}
+
+fn check_run_status_style(check: &CheckRunSummary) -> Style {
+    if check_run_matches(check.bucket.as_deref(), &["fail", "cancel"])
+        || check_run_matches(
+            check.state.as_deref(),
+            &["failure", "error", "cancelled", "canceled", "timed_out"],
+        )
+    {
+        return active_theme()
+            .panel()
+            .fg(active_theme().error)
+            .add_modifier(Modifier::BOLD);
+    }
+    if check_run_matches(check.bucket.as_deref(), &["pending"])
+        || check_run_matches(
+            check.state.as_deref(),
+            &["pending", "queued", "in_progress"],
+        )
+    {
+        return active_theme()
+            .panel()
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD);
+    }
+    if check_run_matches(check.bucket.as_deref(), &["skipping"])
+        || check_run_matches(check.state.as_deref(), &["skipped", "neutral"])
+    {
+        return active_theme().subtle();
+    }
+    active_theme().muted()
+}
+
+fn check_run_link_style(selected: bool) -> Style {
+    if selected {
+        active_theme()
+            .panel()
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        link_style()
+    }
+}
+
+fn check_run_marker_style(selected: bool) -> Style {
+    if selected {
+        active_theme()
+            .panel()
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        active_theme().subtle()
+    }
+}
+
+fn check_run_matches(value: Option<&str>, expected: &[&str]) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    expected
+        .iter()
+        .any(|expected| value.eq_ignore_ascii_case(expected))
 }
 
 pub(super) fn failed_check_runs_summary(runs: &[FailedCheckRunSummary]) -> String {

@@ -104,6 +104,7 @@ pub(super) fn mouse_wheel_target(
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()
@@ -263,6 +264,11 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.diagnostics_dialog.is_some() {
+        app.handle_diagnostics_dialog_key(key);
         return false;
     }
 
@@ -684,6 +690,15 @@ pub(super) fn handle_key_in_area_mut(
                 app.scroll_diff_details_to_bottom(area)
             }
             KeyCode::Char('e') if app.details_mode == DetailsMode::Diff => app.end_diff_mark(),
+            KeyCode::Enter
+                if app.details_mode == DetailsMode::Conversation
+                    && app
+                        .current_selected_check_run()
+                        .and_then(|check| check.link.as_deref())
+                        .is_some() =>
+            {
+                app.open_selected()
+            }
             KeyCode::Enter if app.details_mode == DetailsMode::Conversation => {
                 app.toggle_selected_comment_expanded()
             }
@@ -926,6 +941,7 @@ pub(super) fn handle_mouse_with_sync(
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
         || app.recent_items_dialog.is_some()
+        || app.diagnostics_dialog.is_some()
         || app.saved_search_dialog.is_some()
         || app.save_search_dialog.is_some()
         || app.project_add_dialog.is_some()
@@ -1905,15 +1921,19 @@ pub(super) fn handle_left_click(
     }
     let clicked_comment = document.comment_at(line_index);
     let clicked_description = document.description_at(line_index);
+    let clicked_check_run = document.check_run_at(line_index);
     if let Some(url) = document.link_at(line_index, column) {
         debug!(
             url = %url,
             comment = ?clicked_comment,
+            check_run = ?clicked_check_run,
             description = clicked_description,
             "details link clicked"
         );
         if let Some(comment_index) = clicked_comment {
             app.select_comment(comment_index);
+        } else if let Some(check_run_index) = clicked_check_run {
+            app.select_check_run(check_run_index, None);
         } else if clicked_description {
             app.select_details_body_without_scroll();
         }
@@ -1932,6 +1952,10 @@ pub(super) fn handle_left_click(
     {
         debug!(line = ?diff_line, "diff line clicked");
         app.handle_diff_line_click(diff_line, None);
+        return;
+    }
+    if let Some(check_run_index) = clicked_check_run {
+        app.select_check_run(check_run_index, None);
         return;
     }
     if document.lines.get(line_index).is_some()

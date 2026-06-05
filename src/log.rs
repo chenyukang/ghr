@@ -158,16 +158,13 @@ fn looks_like_github_rate_limit(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Error, ErrorKind};
+    use std::io::Error;
 
     #[test]
     fn recent_entries_are_newest_first_and_flag_rate_limits() {
         clear_gh_log_entries();
         let request = start_gh_request("gh api", "gh api /rate_limit", None);
-        fail_gh_request_to_start(
-            request,
-            &Error::new(ErrorKind::Other, "HTTP 403: API rate limit exceeded"),
-        );
+        fail_gh_request_to_start(request, &Error::other("HTTP 403: API rate limit exceeded"));
 
         let entries = recent_gh_log_entries();
         assert_eq!(entries.len(), 1);

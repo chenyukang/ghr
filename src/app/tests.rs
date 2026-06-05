@@ -4477,10 +4477,7 @@ fn command_palette_log_opens_recent_gh_request_dialog() {
     let request = start_gh_request("gh api", "gh api /rate_limit", None);
     fail_gh_request_to_start(
         request,
-        &std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "HTTP 403: API rate limit exceeded",
-        ),
+        &std::io::Error::other("HTTP 403: API rate limit exceeded"),
     );
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -4552,17 +4549,11 @@ fn diagnostics_dialog_keys_move_and_close() {
 fn gh_log_dialog_enter_opens_selected_entry_detail() {
     clear_gh_log_entries();
     let older = start_gh_request("gh", "gh pr view 55", None);
-    fail_gh_request_to_start(
-        older,
-        &std::io::Error::new(std::io::ErrorKind::Other, "HTTP 500: old failure"),
-    );
+    fail_gh_request_to_start(older, &std::io::Error::other("HTTP 500: old failure"));
     let newer = start_gh_request("gh api", "gh api /rate_limit", None);
     fail_gh_request_to_start(
         newer,
-        &std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "HTTP 403: API rate limit exceeded",
-        ),
+        &std::io::Error::other("HTTP 403: API rate limit exceeded"),
     );
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.show_gh_log_dialog();

@@ -41,7 +41,6 @@ use crate::config::{
     RepoConfig, SavedSearchFilterConfig, github_repo_from_remote_url, repo_remote_config_value,
 };
 use crate::dirs::Paths;
-use crate::gh_log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::github::{
     AssigneeAction, CommentFetchResult, ItemDetailsMetadata, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
@@ -64,8 +63,9 @@ use crate::github::{
     update_issue_assignees, update_item_subscription, update_pull_request_branch,
     with_background_github_priority,
 };
+use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
-    ActionHints, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
+    ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
     FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
     ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
     global_search_view_key, mark_all_notifications_read_in_section,
@@ -145,6 +145,7 @@ use tasks::*;
 use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
 
 const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
+const NO_SELECTED_CHECK_RUN_INDEX: usize = usize::MAX;
 
 enum AppMsg {
     RefreshStarted {
@@ -1562,6 +1563,7 @@ struct AppState {
     notification_read_pending: HashSet<String>,
     notification_done_pending: HashSet<String>,
     selected_comment_index: usize,
+    selected_check_run_index: usize,
     expanded_comments: HashSet<String>,
     comment_dialog: Option<CommentDialog>,
     editor_drafts: HashMap<String, EditorDraft>,
@@ -2919,6 +2921,7 @@ impl AppState {
             notification_read_pending: HashSet::new(),
             notification_done_pending: HashSet::new(),
             selected_comment_index: 0,
+            selected_check_run_index: NO_SELECTED_CHECK_RUN_INDEX,
             expanded_comments: ui_state.expanded_comments.iter().cloned().collect(),
             comment_dialog: None,
             editor_drafts: HashMap::new(),
@@ -7460,6 +7463,7 @@ impl AppState {
     fn select_comment(&mut self, index: usize) {
         let previous = self.selected_comment_index;
         self.selected_comment_index = index;
+        self.clear_selected_check_run();
         self.clamp_selected_comment();
         self.status = if self.comment_selection_cleared() {
             "no comment focused".to_string()
@@ -7482,6 +7486,95 @@ impl AppState {
         self.selected_comment_index == NO_SELECTED_COMMENT_INDEX
     }
 
+    fn clear_selected_check_run(&mut self) {
+        self.selected_check_run_index = NO_SELECTED_CHECK_RUN_INDEX;
+    }
+
+    fn check_run_selection_cleared(&self) -> bool {
+        self.selected_check_run_index == NO_SELECTED_CHECK_RUN_INDEX
+    }
+
+    fn current_visible_check_run_indices(&self) -> Vec<usize> {
+        let Some(item) = self.current_item() else {
+            return Vec::new();
+        };
+        let Some(ActionHintState::Loaded(hints)) = self.action_hints.get(&item.id) else {
+            return Vec::new();
+        };
+        visible_check_run_indices(hints)
+    }
+
+    fn current_selected_check_run(&self) -> Option<&CheckRunSummary> {
+        if self.check_run_selection_cleared() {
+            return None;
+        }
+        let item = self.current_item()?;
+        let ActionHintState::Loaded(hints) = self.action_hints.get(&item.id)? else {
+            return None;
+        };
+        let check = hints.check_runs.get(self.selected_check_run_index)?;
+        check_run_visible(check).then_some(check)
+    }
+
+    fn selected_check_run_label(&self) -> Option<String> {
+        self.current_selected_check_run()
+            .map(check_run_display_label)
+    }
+
+    fn select_check_run(&mut self, index: usize, area: Option<Rect>) {
+        self.clear_selected_comment();
+        self.selected_check_run_index = index;
+        let position = self
+            .current_visible_check_run_indices()
+            .iter()
+            .position(|candidate| *candidate == index)
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        let total = self.current_visible_check_run_indices().len();
+        let label = self
+            .selected_check_run_label()
+            .unwrap_or_else(|| "check".to_string());
+        self.status = if total == 0 {
+            format!("check focused: {label}")
+        } else {
+            format!("check {position}/{total} focused: {label}")
+        };
+        self.scroll_selected_check_run_into_view(area);
+        self.remember_current_conversation_details_position();
+    }
+
+    fn scroll_selected_check_run_into_view(&mut self, area: Option<Rect>) {
+        let Some(area) = area else {
+            self.remember_current_conversation_details_position();
+            return;
+        };
+        let details_area = details_area_for(self, area);
+        let inner = block_inner(details_area);
+        if inner.height == 0 {
+            self.remember_current_conversation_details_position();
+            return;
+        }
+        let document = build_details_document(self, inner.width);
+        let Some(region) = document.check_run_region(self.selected_check_run_index) else {
+            self.remember_current_conversation_details_position();
+            return;
+        };
+        let viewport_start = usize::from(self.details_scroll);
+        let viewport_height = usize::from(inner.height);
+        let viewport_end = viewport_start.saturating_add(viewport_height);
+        let line = region.line;
+        if line < viewport_start.saturating_add(1) {
+            self.details_scroll = line.saturating_sub(1).min(usize::from(u16::MAX)) as u16;
+        } else if line >= viewport_end.saturating_sub(2) {
+            let next_scroll = line.saturating_sub(viewport_height / 3);
+            self.details_scroll = next_scroll.min(usize::from(u16::MAX)) as u16;
+        }
+        self.details_scroll = self
+            .details_scroll
+            .min(max_details_scroll(self, details_area));
+        self.remember_current_conversation_details_position();
+    }
+
     fn select_details_body(&mut self) {
         self.details_scroll = 0;
         self.select_details_body_without_scroll();
@@ -7489,6 +7582,7 @@ impl AppState {
 
     fn select_details_body_without_scroll(&mut self) {
         self.clear_selected_comment();
+        self.clear_selected_check_run();
         self.status = self.details_body_focus_status();
         self.remember_current_conversation_details_position();
     }
@@ -7566,6 +7660,9 @@ impl AppState {
         if self.move_hidden_diff_inline_comment(delta, area) {
             return;
         }
+        if self.move_conversation_detail_focus(delta, area) {
+            return;
+        }
         if self.move_rendered_comment(delta, area) {
             return;
         }
@@ -7577,6 +7674,82 @@ impl AppState {
         } else {
             self.scroll_selected_comment_into_view(area);
         }
+    }
+
+    fn move_conversation_detail_focus(&mut self, delta: isize, area: Option<Rect>) -> bool {
+        if self.details_mode != DetailsMode::Conversation {
+            return false;
+        }
+        let check_order = self.current_visible_check_run_indices();
+        if check_order.is_empty() {
+            return false;
+        }
+        let comment_order = if let Some(area) = area {
+            let details_area = details_area_for(self, area);
+            let inner = block_inner(details_area);
+            if inner.height == 0 {
+                Vec::new()
+            } else {
+                build_details_document(self, inner.width)
+                    .comments
+                    .iter()
+                    .map(|comment| comment.index)
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            self.current_comments()
+                .map(|comments| comment_display_entries(comments))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>()
+        };
+        let total = 1 + check_order.len() + comment_order.len();
+        if total <= 1 {
+            return false;
+        }
+
+        let current_position = if let Some(position) = check_order
+            .iter()
+            .position(|index| *index == self.selected_check_run_index)
+        {
+            1 + position
+        } else if let Some(position) = comment_order
+            .iter()
+            .position(|index| *index == self.selected_comment_index)
+        {
+            1 + check_order.len() + position
+        } else {
+            0
+        };
+        let next_position = if delta < 0 {
+            current_position.saturating_sub(1)
+        } else {
+            current_position.saturating_add(1).min(total - 1)
+        };
+        if next_position == current_position {
+            return false;
+        }
+
+        if next_position == 0 {
+            self.select_details_body();
+            return true;
+        }
+        if next_position <= check_order.len() {
+            self.select_check_run(check_order[next_position - 1], area);
+            return true;
+        }
+
+        let comment_position = next_position - 1 - check_order.len();
+        let comment_index = comment_order[comment_position];
+        self.select_comment(comment_index);
+        self.status = format!(
+            "comment {}/{} focused",
+            comment_position + 1,
+            comment_order.len()
+        );
+        self.scroll_selected_comment_into_view(area);
+        true
     }
 
     fn move_hidden_diff_inline_comment(&mut self, delta: isize, area: Option<Rect>) -> bool {
@@ -7856,6 +8029,7 @@ impl AppState {
                 self.start_comment_reaction_dialog(index);
             }
             DetailAction::CopyBlock(text) => self.copy_block_to_clipboard(&text),
+            DetailAction::OpenUrl(url) => self.open_url(&url),
             DetailAction::SubscribeItem => {
                 if let Some(tx) = tx {
                     self.start_item_subscription_action(ItemSubscriptionAction::Subscribe, tx);
@@ -11323,6 +11497,16 @@ impl AppState {
         if self.focus == FocusTarget::Details
             && self.details_mode == DetailsMode::Conversation
             && let Some(url) = self
+                .current_selected_check_run()
+                .and_then(|check| check.link.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some((url.to_string(), "check"));
+        }
+
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
                 .current_selected_comment()
                 .and_then(|comment| comment.url.as_deref())
                 .filter(|url| !url.trim().is_empty())
@@ -11366,6 +11550,16 @@ impl AppState {
     }
 
     fn selected_open_url(&self) -> Option<String> {
+        if self.focus == FocusTarget::Details
+            && self.details_mode == DetailsMode::Conversation
+            && let Some(url) = self
+                .current_selected_check_run()
+                .and_then(|check| check.link.as_deref())
+                .filter(|url| !url.trim().is_empty())
+        {
+            return Some(url.to_string());
+        }
+
         let item = self.current_item()?;
         if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
             return Some(pull_request_changes_url(item));
@@ -11728,6 +11922,7 @@ impl AppState {
         if let Some(state) = state {
             self.details_scroll = state.details_scroll;
             self.selected_comment_index = state.selected_comment_index;
+            self.clear_selected_check_run();
             if self.current_comments().is_some() {
                 self.clamp_selected_comment();
             }
@@ -11737,6 +11932,7 @@ impl AppState {
     fn reset_or_restore_current_conversation_details_state(&mut self) {
         self.details_scroll = 0;
         self.selected_comment_index = 0;
+        self.clear_selected_check_run();
         self.restore_current_conversation_details_state();
     }
 

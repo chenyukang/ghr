@@ -1,7 +1,7 @@
 use super::*;
-use crate::gh_log::{GhLogEntry, recent_gh_log_entries};
+use crate::log::{GhLogEntry, recent_gh_log_entries};
 #[cfg(not(test))]
-use crate::gh_log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
+use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 
 pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<String> {
     let cwd = std::env::current_dir()

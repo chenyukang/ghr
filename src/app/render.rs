@@ -1372,7 +1372,17 @@ pub(super) fn footer_has_selected_comment(app: &AppState) -> bool {
     }
     app.focus == FocusTarget::Details
         && app.comment_selection_cleared()
+        && app.check_run_selection_cleared()
         && app.current_item().is_some_and(item_description_can_reply)
+}
+
+pub(super) fn footer_has_selected_check_run(app: &AppState) -> bool {
+    app.focus == FocusTarget::Details
+        && app.details_mode == DetailsMode::Conversation
+        && app
+            .current_selected_check_run()
+            .and_then(|check| check.link.as_deref())
+            .is_some()
 }
 
 pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static>> {
@@ -1435,13 +1445,20 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 push_footer_pair(&mut spans, "c", "inline", Color::LightBlue);
                 push_footer_pair(&mut spans, "a", "comment", Color::LightBlue);
             } else {
+                let has_check_runs = !app.current_visible_check_run_indices().is_empty();
                 push_footer_pair(&mut spans, "j/k", "scroll", Color::Cyan);
                 push_footer_pair(&mut spans, "tab", "List", Color::Cyan);
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
                 push_footer_pair(&mut spans, "c/a", "comment", Color::LightBlue);
-                if footer_has_selected_comment(app) {
+                if has_check_runs {
+                    push_footer_pair(&mut spans, "n/p", "focus", Color::LightBlue);
+                } else if footer_has_selected_comment(app) {
                     push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
+                }
+                if footer_has_selected_check_run(app) {
+                    push_footer_pair(&mut spans, "enter", "open", Color::Yellow);
+                } else if footer_has_selected_comment(app) {
                     push_footer_pair(&mut spans, "enter", "expand", Color::Yellow);
                 }
                 if footer_has_selected_comment(app) {

@@ -3,7 +3,7 @@ use super::pr_checkout::{
     command_output_text, pr_checkout_command_args, pr_checkout_command_display,
 };
 use super::*;
-use crate::gh_log::{clear_gh_log_entries, fail_gh_request_to_start, start_gh_request};
+use crate::log::{clear_gh_log_entries, fail_gh_request_to_start, start_gh_request};
 use crate::model::CommentPreviewKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -9427,6 +9427,130 @@ fn details_meta_shows_pr_action_hints() {
     assert!(
         action_line > branch_line,
         "action/checks should start on a new line"
+    );
+}
+
+#[test]
+fn pr_details_render_check_runs_as_openable_rows() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.focus_details();
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::Loaded(ActionHints {
+            checks: Some(CheckSummary {
+                passed: 3,
+                failed: 1,
+                pending: 1,
+                skipped: 0,
+                total: 5,
+                incomplete: false,
+            }),
+            check_runs: vec![
+                CheckRunSummary {
+                    name: "test".to_string(),
+                    workflow: Some("CI".to_string()),
+                    state: Some("FAILURE".to_string()),
+                    bucket: Some("fail".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+                    description: Some("failed after 2m".to_string()),
+                },
+                CheckRunSummary {
+                    name: "deploy".to_string(),
+                    workflow: Some("Release".to_string()),
+                    state: Some("PENDING".to_string()),
+                    bucket: Some("pending".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/11".to_string()),
+                    description: None,
+                },
+                CheckRunSummary {
+                    name: "fmt".to_string(),
+                    workflow: Some("CI".to_string()),
+                    state: Some("SUCCESS".to_string()),
+                    bucket: Some("pass".to_string()),
+                    link: Some("https://github.com/rust-lang/rust/actions/runs/12".to_string()),
+                    description: None,
+                },
+            ],
+            ..ActionHints::default()
+        }),
+    );
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Checks"));
+    assert!(rendered.contains("fail     CI / test"));
+    assert!(rendered.contains("failed after 2m"));
+    assert!(rendered.contains("pending  Release / deploy"));
+    assert!(!rendered.contains("CI / fmt"));
+    assert_document_link_for_text(
+        &document,
+        "CI / test",
+        "https://github.com/rust-lang/rust/actions/runs/10",
+    );
+    assert_document_action_for_text_on_line(
+        &document,
+        "CI / test",
+        "open",
+        DetailAction::OpenUrl("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+    );
+}
+
+#[test]
+fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_details();
+    app.select_details_body_without_scroll();
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::Loaded(ActionHints {
+            check_runs: vec![CheckRunSummary {
+                name: "test".to_string(),
+                workflow: Some("CI".to_string()),
+                state: Some("FAILURE".to_string()),
+                bucket: Some("fail".to_string()),
+                link: Some("https://github.com/rust-lang/rust/actions/runs/10".to_string()),
+                description: None,
+            }],
+            ..ActionHints::default()
+        }),
+    );
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('n')),
+        &config,
+        &store,
+        &tx,
+        Some(Rect::new(0, 0, 120, 30))
+    ));
+
+    assert_eq!(app.selected_check_run_index, 0);
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://github.com/rust-lang/rust/actions/runs/10")
+    );
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Enter),
+        &config,
+        &store,
+        &tx,
+        Some(Rect::new(0, 0, 120, 30))
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/rust-lang/rust/actions/runs/10"
     );
 }
 

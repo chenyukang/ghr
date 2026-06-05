@@ -106,7 +106,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `n` / `p` in ghr, Sections, or List | Mirror next/previous movement for focus or list selection; `p` at the first list item returns to Sections |
 | `[` / `]` in List | Load previous/next GitHub result page |
 | `PgDown` / `PgUp` or `d` / `u` | Page current list/details movement |
-| `n` / `p` in Details | Focus next/previous comment in conversation or diff details; `p` from the first conversation comment returns to PR/issue details |
+| `n` / `p` in Details | Focus next/previous check or comment in conversation details, or comments in diff details; `p` moves back toward PR/issue details |
 | `h` / `l` in diff Details | Page down/up through the file diff; at file edges, jump to the next/previous file |
 | `g` / `G` | Jump to top/bottom in list, details, or diff; in conversation details, top clears comment focus and bottom focuses the last comment |
 | `[` / `]` in diff mode | Switch diff files |
@@ -116,7 +116,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `i` | Ignore the selected PR or issue and hide it from future lists |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
-| `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page |
+| `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page; in Details, open the focused check URL when one is selected |
 | `a` | Add a normal issue or PR comment |
 | `L` | Add a label to the selected issue or PR; type a prefix and choose from repo labels |
 | `N` | In a PR list, create a PR from the repo `local_dir` current branch; in an issue list, create an issue |

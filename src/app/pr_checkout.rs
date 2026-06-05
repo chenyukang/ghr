@@ -7,7 +7,7 @@ use tracing::{debug, error};
 
 use super::text::truncate_text;
 use crate::config::{Config, github_repo_from_remote_url};
-use crate::gh_log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
+use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{PullRequestBranch, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

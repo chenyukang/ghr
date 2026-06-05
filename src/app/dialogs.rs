@@ -4611,7 +4611,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("/", "search loaded comments by keyword"),
         help_key_line(
             "n / p",
-            "focus comments; p from first returns to PR/issue details",
+            "focus checks and comments; p returns toward PR/issue details",
         ),
         help_key_line(
             "h / l in diff",
@@ -4619,7 +4619,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         ),
         help_key_line(
             "Enter in conversation",
-            "expand or collapse a long focused comment",
+            "open a focused check, or expand/collapse a long focused comment",
         ),
         help_key_line("PgDown/PgUp or d/u", "scroll details by page"),
         help_key_line(
@@ -4661,7 +4661,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("t", "change issue or PR milestone"),
         help_key_line("P", "request or re-request PR reviewers"),
         help_key_line("Y", "remove pending PR review requests"),
-        help_key_line("o", "open selected item in browser"),
+        help_key_line("o", "open selected item or focused check in browser"),
         Line::from(""),
         help_heading("Editor"),
         help_key_line("Left / Right", "move cursor by character"),

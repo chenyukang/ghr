@@ -3,6 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MouseWheelTargetKind {
     CommentDialog,
+    HelpDialog,
     List,
     Details,
 }
@@ -70,6 +71,10 @@ pub(super) fn flush_pending_mouse_scroll(
             steps.saturating_mul(MOUSE_COMMENT_SCROLL_LINES as i16),
             Some(scroll.target.area),
         ),
+        MouseWheelTargetKind::HelpDialog => app.scroll_help_dialog(
+            steps.saturating_mul(MOUSE_DETAILS_SCROLL_LINES as i16),
+            Some(scroll.target.area),
+        ),
         MouseWheelTargetKind::List => handle_list_scroll(
             app,
             scroll.target.area,
@@ -110,7 +115,6 @@ pub(super) fn mouse_wheel_target(
         || app.project_add_dialog.is_some()
         || app.project_remove_dialog.is_some()
         || app.cache_clear_dialog.is_some()
-        || app.help_dialog
         || app.message_dialog.is_some()
         || app.item_edit_dialog.is_some()
         || app.pr_action_dialog.is_some()
@@ -122,6 +126,13 @@ pub(super) fn mouse_wheel_target(
         || app.reviewer_dialog.is_some()
     {
         return None;
+    }
+
+    if app.help_dialog {
+        return Some(MouseWheelTarget {
+            kind: MouseWheelTargetKind::HelpDialog,
+            area,
+        });
     }
 
     if let Some(dialog) = &app.comment_dialog {
@@ -418,6 +429,16 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q') => {
                 app.dismiss_help_dialog()
             }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+                app.scroll_help_dialog(1, area)
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+                app.scroll_help_dialog(-1, area)
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => app.page_help_dialog(1, area),
+            KeyCode::PageUp | KeyCode::Char('u') => app.page_help_dialog(-1, area),
+            KeyCode::Char('g') => app.scroll_help_dialog_to_top(),
+            KeyCode::Char('G') => app.scroll_help_dialog_to_bottom(area),
             _ => {}
         }
         return false;

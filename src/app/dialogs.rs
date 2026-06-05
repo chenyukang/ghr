@@ -237,17 +237,33 @@ pub(super) fn draw_setup_dialog(frame: &mut Frame<'_>, dialog: SetupDialog, area
     frame.render_widget(paragraph, dialog_area);
 }
 
-pub(super) fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect, command_palette_key: &str) {
+pub(super) fn draw_help_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    command_palette_key: &str,
+    scroll: u16,
+) {
     let width = help_dialog_width(area);
     let lines = help_dialog_content_for_width(width.saturating_sub(2), command_palette_key);
     let height = help_dialog_height(lines.len(), area);
+    let max_scroll = help_dialog_max_scroll_for_lines(lines.len(), area);
+    let scroll = scroll.min(max_scroll);
     let dialog_area = centered_rect_with_size(width, height, area);
+    let title = if max_scroll > 0 {
+        format!(
+            "Help {}/{}",
+            usize::from(scroll) + 1,
+            usize::from(max_scroll) + 1
+        )
+    } else {
+        "Help".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(active_theme().panel().fg(active_theme().action))
         .style(modal_surface_style())
         .title(Span::styled(
-            "Help",
+            title,
             active_theme()
                 .panel()
                 .fg(active_theme().action)
@@ -256,10 +272,17 @@ pub(super) fn draw_help_dialog(frame: &mut Frame<'_>, area: Rect, command_palett
     let paragraph = Paragraph::new(Text::from(lines))
         .block(block)
         .style(modal_text_style())
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    let footer = if max_scroll > 0 {
+        "j/k/n/p or Up/Down: scroll    d/u or PgUp/PgDown: page    g/G: top/bottom    Esc/q: close"
+    } else {
+        "Esc/q: close"
+    };
+    draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
 }
 
 pub(super) fn help_dialog_width(area: Rect) -> u16 {
@@ -4477,6 +4500,17 @@ pub(super) fn help_dialog_height(line_count: usize, area: Rect) -> u16 {
         .min(area.height.saturating_sub(2).max(1))
 }
 
+pub(super) fn help_dialog_visible_height(line_count: usize, area: Rect) -> u16 {
+    help_dialog_height(line_count, area).saturating_sub(2)
+}
+
+pub(super) fn help_dialog_max_scroll_for_lines(line_count: usize, area: Rect) -> u16 {
+    let visible = usize::from(help_dialog_visible_height(line_count, area));
+    line_count
+        .saturating_sub(visible)
+        .min(usize::from(u16::MAX)) as u16
+}
+
 pub(super) fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
     match dialog {
         SetupDialog::MissingGh => (
@@ -4705,7 +4739,10 @@ pub(super) fn help_dialog_content_for_width(
     let lines = help_dialog_content(command_palette_key);
     let content_width = usize::from(content_width);
     if content_width < HELP_TWO_COLUMN_MIN_WIDTH {
-        return lines;
+        return lines
+            .iter()
+            .flat_map(|line| wrapped_help_column_lines(line, content_width))
+            .collect();
     }
     help_dialog_two_column_content(lines, content_width)
 }

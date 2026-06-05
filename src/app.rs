@@ -1611,6 +1611,7 @@ struct AppState {
     dialog_text_drag: Option<DialogTextDrag>,
     dialog_text_selection: Option<DialogTextSelection>,
     help_dialog: bool,
+    help_dialog_scroll: u16,
     diff_return_state: Option<DiffReturnState>,
 }
 
@@ -2969,6 +2970,7 @@ impl AppState {
             dialog_text_drag: None,
             dialog_text_selection: None,
             help_dialog: false,
+            help_dialog_scroll: 0,
             diff_return_state: None,
         };
         state.clamp_positions();
@@ -4948,6 +4950,7 @@ impl AppState {
     fn show_help_dialog(&mut self) {
         self.finish_details_visit(Instant::now());
         self.help_dialog = true;
+        self.help_dialog_scroll = 0;
         self.search_active = false;
         self.comment_search_active = false;
         self.global_search_active = false;
@@ -4965,7 +4968,72 @@ impl AppState {
 
     fn dismiss_help_dialog(&mut self) {
         self.help_dialog = false;
+        self.help_dialog_scroll = 0;
         self.status = "help dismissed".to_string();
+    }
+
+    fn help_dialog_max_scroll(&self, area: Option<Rect>) -> u16 {
+        let Some(area) = area else {
+            return 0;
+        };
+        let width = help_dialog_width(area);
+        let line_count =
+            help_dialog_content_for_width(width.saturating_sub(2), &self.command_palette_key).len();
+        help_dialog_max_scroll_for_lines(line_count, area)
+    }
+
+    fn help_dialog_page_lines(&self, area: Option<Rect>) -> i16 {
+        let Some(area) = area else {
+            return 8;
+        };
+        let width = help_dialog_width(area);
+        let line_count =
+            help_dialog_content_for_width(width.saturating_sub(2), &self.command_palette_key).len();
+        help_dialog_visible_height(line_count, area)
+            .saturating_sub(1)
+            .max(1)
+            .min(i16::MAX as u16) as i16
+    }
+
+    fn scroll_help_dialog(&mut self, delta: i16, area: Option<Rect>) {
+        let max_scroll = self.help_dialog_max_scroll(area);
+        if delta < 0 {
+            self.help_dialog_scroll = self.help_dialog_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.help_dialog_scroll = self.help_dialog_scroll.saturating_add(delta as u16);
+        }
+        self.help_dialog_scroll = self.help_dialog_scroll.min(max_scroll);
+        if max_scroll > 0 {
+            self.status = format!(
+                "help {}/{}",
+                usize::from(self.help_dialog_scroll) + 1,
+                usize::from(max_scroll) + 1
+            );
+        }
+    }
+
+    fn page_help_dialog(&mut self, delta: i16, area: Option<Rect>) {
+        let page = self.help_dialog_page_lines(area);
+        self.scroll_help_dialog(delta.saturating_mul(page), area);
+    }
+
+    fn scroll_help_dialog_to_top(&mut self) {
+        self.help_dialog_scroll = 0;
+        self.status = "help top".to_string();
+    }
+
+    fn scroll_help_dialog_to_bottom(&mut self, area: Option<Rect>) {
+        let max_scroll = self.help_dialog_max_scroll(area);
+        self.help_dialog_scroll = max_scroll;
+        self.status = if max_scroll > 0 {
+            format!(
+                "help bottom {}/{}",
+                usize::from(max_scroll) + 1,
+                usize::from(max_scroll) + 1
+            )
+        } else {
+            "help".to_string()
+        };
     }
 
     fn show_command_palette(&mut self) {

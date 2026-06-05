@@ -4091,6 +4091,7 @@ fn question_mark_opens_and_dismisses_help_dialog() {
     ));
     assert!(app.help_dialog);
     assert_eq!(app.status, "help");
+    app.help_dialog_scroll = 3;
 
     assert!(!handle_key(
         &mut app,
@@ -4100,7 +4101,101 @@ fn question_mark_opens_and_dismisses_help_dialog() {
         &tx
     ));
     assert!(!app.help_dialog);
+    assert_eq!(app.help_dialog_scroll, 0);
     assert_eq!(app.status, "help dismissed");
+}
+
+#[test]
+fn help_dialog_scrolls_with_navigation_keys() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let area = Rect::new(0, 0, 120, 18);
+    app.show_help_dialog();
+    let max_scroll = app.help_dialog_max_scroll(Some(area));
+
+    assert!(max_scroll > 3, "small help dialog should need scrolling");
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('j')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 1);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('n')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 2);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('p')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 1);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('k')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 0);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('d')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert!(app.help_dialog_scroll > 1);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('u')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 0);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('G')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, max_scroll);
+
+    assert!(!handle_key_in_area(
+        &mut app,
+        key(KeyCode::Char('g')),
+        &config,
+        &store,
+        &tx,
+        Some(area)
+    ));
+    assert_eq!(app.help_dialog_scroll, 0);
 }
 
 #[test]

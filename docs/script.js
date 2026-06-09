@@ -41,7 +41,7 @@ const shortcuts = [
   ["Merge Dialog", "m / s / r", "Choose merge, squash, or rebase"],
   ["Merge Dialog", "Tab", "Cycle merge method"],
   ["Dialog", "y / Enter", "Confirm the current action"],
-  ["Editor", "Ctrl+Enter", "Send, update, create, or submit from editor dialogs"],
+  ["Editor", "Ctrl+Enter / Ctrl+O", "Send, update, create, or submit from editor dialogs"],
   ["Editor", "Ctrl+S / Cmd+S", "Save the current comment, issue, or pull request draft"],
   ["Editor", "@", "Search GitHub accounts for mention completion; Up/Down choose and Tab/Enter insert"],
   ["Editor", "Arrows", "Move the cursor by character or rendered line"],

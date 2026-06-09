@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::DEFAULT_COMMAND_PALETTE_KEY;
+use crate::config::{DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct KeyBinding {
@@ -48,6 +48,16 @@ pub(super) fn normalized_command_palette_key(value: &str) -> String {
 pub(super) fn command_palette_key_binding(value: &str) -> KeyBinding {
     parse_key_binding(value).unwrap_or_else(|| {
         parse_key_binding(DEFAULT_COMMAND_PALETTE_KEY).expect("default command palette key parses")
+    })
+}
+
+pub(super) fn normalized_editor_submit_key(value: &str) -> String {
+    editor_submit_key_binding(value).label
+}
+
+pub(super) fn editor_submit_key_binding(value: &str) -> KeyBinding {
+    parse_key_binding(value).unwrap_or_else(|| {
+        parse_key_binding(DEFAULT_EDITOR_SUBMIT_KEY).expect("default editor submit key parses")
     })
 }
 

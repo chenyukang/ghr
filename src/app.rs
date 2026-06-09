@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-#[cfg(all(not(test), unix, not(target_os = "macos")))]
+#[cfg(all(not(test), unix))]
 use std::env;
 use std::io;
 use std::io::IsTerminal;
@@ -37,8 +37,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, warn};
 
 use crate::config::{
-    Config, CurrentRepoRemotePrompt, DEFAULT_COMMAND_PALETTE_KEY, GitHubRemoteCandidate,
-    RepoConfig, SavedSearchFilterConfig, github_repo_from_remote_url, repo_remote_config_value,
+    Config, CurrentRepoRemotePrompt, DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY,
+    GitHubRemoteCandidate, RepoConfig, SavedSearchFilterConfig, github_repo_from_remote_url,
+    repo_remote_config_value,
 };
 use crate::dirs::Paths;
 use crate::github::{
@@ -116,7 +117,10 @@ use drafts::*;
 use editor::*;
 use global_search::*;
 use input::*;
-use keymap::{command_palette_key_binding, normalized_command_palette_key};
+use keymap::{
+    command_palette_key_binding, editor_submit_key_binding, normalized_command_palette_key,
+    normalized_editor_submit_key,
+};
 use layout::{
     block_inner, body_areas_with_ratio, centered_rect, centered_rect_width,
     centered_rect_with_size, details_area_for, page_areas, rect_contains,
@@ -1606,6 +1610,7 @@ struct AppState {
     startup_dialog: Option<StartupDialog>,
     message_dialog: Option<MessageDialog>,
     mouse_capture_enabled: bool,
+    editor_submit_key: String,
     details_text_drag: Option<DetailsTextDrag>,
     details_text_selection: Option<DetailsTextSelection>,
     dialog_text_drag: Option<DialogTextDrag>,
@@ -1857,6 +1862,7 @@ pub async fn run(
     app.load_repo_candidate_cache(repo_candidate_cache);
     app.load_editor_drafts(editor_drafts);
     app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
+    app.editor_submit_key = normalized_editor_submit_key(&config.defaults.editor_submit_key);
     let startup_setup_dialog = startup_setup_dialog();
     if let Some(dialog) = startup_setup_dialog {
         app.show_setup_dialog(dialog);
@@ -1878,6 +1884,9 @@ pub async fn run(
         );
     }
     app.apply_theme_preference(&config);
+
+    #[cfg(all(not(test), unix))]
+    let _tmux_extended_keys_guard = prepare_tmux_extended_keys();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2297,9 +2306,87 @@ const UNIX_CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[
     },
 ];
 
-#[cfg(all(not(test), unix, not(target_os = "macos")))]
+#[cfg(all(not(test), unix))]
 fn env_var_present(name: &str) -> bool {
     env::var_os(name).is_some_and(|value| !value.as_os_str().is_empty())
+}
+
+#[cfg(all(not(test), unix))]
+struct TmuxExtendedKeysGuard {
+    previous: String,
+}
+
+#[cfg(all(not(test), unix))]
+impl Drop for TmuxExtendedKeysGuard {
+    fn drop(&mut self) {
+        if let Err(error) = set_tmux_extended_keys(&self.previous) {
+            debug!(
+                previous = %self.previous,
+                error = %error,
+                "failed to restore tmux extended-keys option"
+            );
+        }
+    }
+}
+
+#[cfg(all(not(test), unix))]
+fn prepare_tmux_extended_keys() -> Option<TmuxExtendedKeysGuard> {
+    if !env_var_present("TMUX") {
+        return None;
+    }
+
+    let previous = match tmux_extended_keys() {
+        Ok(value) => value,
+        Err(error) => {
+            debug!(error = %error, "failed to read tmux extended-keys option");
+            return None;
+        }
+    };
+    if tmux_extended_keys_enabled(&previous) {
+        return None;
+    }
+
+    match set_tmux_extended_keys("on") {
+        Ok(()) => Some(TmuxExtendedKeysGuard { previous }),
+        Err(error) => {
+            debug!(error = %error, "failed to enable tmux extended-keys option");
+            None
+        }
+    }
+}
+
+#[cfg(all(not(test), unix))]
+fn tmux_extended_keys_enabled(value: &str) -> bool {
+    matches!(value.trim(), "on" | "always")
+}
+
+#[cfg(all(not(test), unix))]
+fn tmux_extended_keys() -> io::Result<String> {
+    tmux_output(&["show-options", "-qv", "extended-keys"])
+}
+
+#[cfg(all(not(test), unix))]
+fn set_tmux_extended_keys(value: &str) -> io::Result<()> {
+    tmux_output(&["set-option", "-q", "extended-keys", value]).map(|_| ())
+}
+
+#[cfg(all(not(test), unix))]
+fn tmux_output(args: &[&str]) -> io::Result<String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::other(command_failure_message(
+            "tmux",
+            &output.status.to_string(),
+            &output.stderr,
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(any(test, all(not(test), unix, not(target_os = "macos"))))]
@@ -2555,11 +2642,14 @@ fn clipboard_copy_error(errors: &[String]) -> io::Error {
 }
 
 fn is_comment_submit_key(key: KeyEvent) -> bool {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return false;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('\n' | 'm' | 'M' | 'o' | 'O')
+        );
     }
 
-    matches!(key.code, KeyCode::Enter | KeyCode::Char('\n'))
+    key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Enter)
 }
 
 fn is_ctrl_c_key(key: KeyEvent) -> bool {
@@ -2965,6 +3055,7 @@ impl AppState {
             startup_dialog: None,
             message_dialog: None,
             mouse_capture_enabled: true,
+            editor_submit_key: DEFAULT_EDITOR_SUBMIT_KEY.to_string(),
             details_text_drag: None,
             details_text_selection: None,
             dialog_text_drag: None,
@@ -2996,6 +3087,11 @@ impl AppState {
 
     fn load_saved_search_filters(&mut self, config: &Config) {
         self.global_search_saved_by_repo = saved_search_map_from_config(config);
+    }
+
+    fn is_editor_submit_key(&self, key: KeyEvent) -> bool {
+        is_comment_submit_key(key)
+            || editor_submit_key_binding(&self.editor_submit_key).matches(key)
     }
 
     fn effective_theme(config: &Config) -> ThemeName {
@@ -5250,7 +5346,7 @@ impl AppState {
         else {
             return;
         };
-        let commands = command_palette_commands(&self.command_palette_key);
+        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
         let len = self.command_palette_match_indices(&commands, &query).len();
         if let Some(palette) = &mut self.command_palette {
             palette.selected = move_wrapping(palette.selected, len, delta);
@@ -5292,6 +5388,9 @@ impl AppState {
             PaletteAction::ShowCommandPalette => {
                 self.show_command_palette();
                 false
+            }
+            PaletteAction::SubmitEditor => {
+                self.submit_active_editor_from_command(config, paths, store, tx, area)
             }
             PaletteAction::Refresh => {
                 trigger_refresh(self, config, store, tx);
@@ -5376,9 +5475,41 @@ impl AppState {
         }
     }
 
+    fn submit_active_editor_from_command(
+        &mut self,
+        config: &mut Config,
+        paths: &Paths,
+        store: &SnapshotStore,
+        tx: &UnboundedSender<AppMsg>,
+        area: Option<Rect>,
+    ) -> bool {
+        if !self.editor_dialog_active() {
+            self.status = "no active editor to submit".to_string();
+            return false;
+        }
+
+        handle_key_in_area_mut(
+            self,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            config,
+            paths,
+            store,
+            tx,
+            area,
+        )
+    }
+
+    fn editor_dialog_active(&self) -> bool {
+        self.comment_dialog.is_some()
+            || self.issue_dialog.is_some()
+            || self.pr_create_dialog.is_some()
+            || self.review_submit_dialog.is_some()
+            || self.item_edit_dialog.is_some()
+    }
+
     fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
         let palette = self.command_palette.as_ref()?;
-        let commands = command_palette_commands(&self.command_palette_key);
+        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
         let matches = self.command_palette_match_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
         matches
@@ -8584,7 +8715,7 @@ impl AppState {
             KeyCode::BackTab => self.move_item_edit_field(-1),
             KeyCode::PageDown => self.scroll_item_edit_body(6, area),
             KeyCode::PageUp => self.scroll_item_edit_body(-6, area),
-            _ if is_comment_submit_key(key) => {
+            _ if self.is_editor_submit_key(key) => {
                 if let Some(pending) = self.prepare_item_edit_submit() {
                     submit(pending);
                 }
@@ -9120,7 +9251,7 @@ impl AppState {
             }
             KeyCode::PageDown => self.scroll_review_submit_dialog(6, area),
             KeyCode::PageUp => self.scroll_review_submit_dialog(-6, area),
-            _ if is_comment_submit_key(key) => {
+            _ if self.is_editor_submit_key(key) => {
                 if let Some(pending) = self.prepare_review_submit() {
                     submit(pending);
                 }
@@ -10342,7 +10473,7 @@ impl AppState {
             return;
         }
 
-        if is_comment_submit_key(key) {
+        if self.is_editor_submit_key(key) {
             if let Some(pending) = self.prepare_issue_create() {
                 submit(pending);
             }
@@ -10500,7 +10631,7 @@ impl AppState {
             return;
         }
 
-        if is_comment_submit_key(key) {
+        if self.is_editor_submit_key(key) {
             if let Some(pending) = self.prepare_pr_create() {
                 submit(pending);
             }
@@ -10652,7 +10783,7 @@ impl AppState {
             }
             KeyCode::PageDown => self.scroll_comment_dialog(6, area),
             KeyCode::PageUp => self.scroll_comment_dialog(-6, area),
-            _ if is_comment_submit_key(key) => {
+            _ if self.is_editor_submit_key(key) => {
                 if let Some(pending) = self.prepare_comment_submit() {
                     submit(pending);
                 }

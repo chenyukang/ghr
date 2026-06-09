@@ -302,7 +302,7 @@ pub(super) fn draw_command_palette(
     area: Rect,
     command_palette_key: &str,
 ) {
-    let commands = command_palette_commands(command_palette_key);
+    let commands = command_palette_commands(command_palette_key, &app.editor_submit_key);
     let matches = app.command_palette_match_indices(&commands, &palette.query);
     let dialog_area = command_palette_area(area);
     let inner = block_inner(dialog_area);
@@ -2084,7 +2084,7 @@ pub(super) fn draw_issue_dialog(
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
+        "Tab: field  Ctrl+Enter/Ctrl+O: create  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
     };
 
     let block = Block::default()
@@ -2156,7 +2156,7 @@ pub(super) fn draw_pr_create_dialog(
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: create PR  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
+        "Tab: field  Ctrl+Enter/Ctrl+O: create PR  Ctrl+S/click: save draft  arrows/Home/End edit  Ctrl+W/U/K/X word/line"
     };
 
     let block = Block::default()
@@ -3050,7 +3050,7 @@ pub(super) fn draw_item_edit_dialog(
     let footer = if running {
         "working..."
     } else {
-        "Tab: field  Ctrl+Enter: save  Enter: add/remove candidate  Backspace: remove last when empty  Esc: cancel"
+        "Tab: field  Ctrl+Enter/Ctrl+O: save  Enter: add/remove candidate  Backspace: remove last when empty  Esc: cancel"
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4116,7 +4116,7 @@ pub(super) fn draw_review_submit_dialog(
         area,
         dialog_area,
         modal_footer_line(
-            "Tab/1/2/3: event    Ctrl+Enter: submit    arrows/Home/End/Ctrl+W/U/K/X edit    click cursor",
+            "Tab/1/2/3: event    Ctrl+Enter/Ctrl+O: submit    arrows/Home/End/Ctrl+W/U/K/X edit    click cursor",
         ),
     );
     if let Some(position) = review_submit_cursor_position(
@@ -4192,8 +4192,7 @@ pub(super) fn draw_comment_editor(
         lines.push(Line::from(""));
     }
     apply_dialog_text_selection(app, DialogTextTarget::Comment, scroll, 0, &mut lines);
-    let footer =
-        "Ctrl+Enter: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor";
+    let footer = "Ctrl+Enter/Ctrl+O: send    Ctrl+S/click: save draft    arrows/Home/End edit    click cursor";
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(themed_fg_style(Color::LightMagenta))
@@ -4710,6 +4709,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("Alt+D", "delete next word"),
         help_key_line("Ctrl+U / Ctrl+K", "delete to line start / end"),
         help_key_line("Ctrl+X", "delete current line"),
+        help_key_line("Ctrl+Enter / Ctrl+O", "submit the active editor"),
         help_key_line("Ctrl+S / Cmd+S", "save the active editor draft"),
         help_key_line("Ctrl+Z / Cmd+Z", "undo text edits"),
         help_key_line("Ctrl+R / Cmd+Shift+Z", "redo text edits"),

@@ -228,6 +228,7 @@ pub(super) fn handle_key_in_area_mut(
     area: Option<Rect>,
 ) -> bool {
     app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
+    app.editor_submit_key = normalized_editor_submit_key(&config.defaults.editor_submit_key);
 
     if is_ctrl_c_key(key) {
         return true;

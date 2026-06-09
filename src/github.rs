@@ -561,8 +561,9 @@ struct PullRequestTimelineCommit {
     committed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReviewThreadState {
+    thread_id: Option<String>,
     is_resolved: bool,
     is_outdated: bool,
     viewer_can_update: Option<bool>,
@@ -608,6 +609,7 @@ struct PullRequestReviewThreadConnectionRaw {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequestReviewThreadRaw {
+    id: Option<String>,
     is_resolved: bool,
     is_outdated: bool,
     comments: PullRequestReviewThreadCommentConnectionRaw,
@@ -2310,6 +2312,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           endCursor
         }
         nodes {
+          id
           isResolved
           isOutdated
           comments(first: 100) {
@@ -3218,6 +3221,56 @@ pub async fn edit_pull_request_review_comment(
     Ok(())
 }
 
+pub async fn set_pull_request_review_thread_resolved(
+    thread_id: &str,
+    resolved: bool,
+) -> Result<()> {
+    if thread_id.trim().is_empty() {
+        bail!("review thread id is required");
+    }
+    let (mutation, action) = if resolved {
+        (
+            r#"
+mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+"#,
+            "resolve",
+        )
+    } else {
+        (
+            r#"
+mutation($threadId: ID!) {
+  unresolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+"#,
+            "unresolve",
+        )
+    };
+
+    run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("threadId={thread_id}"),
+    ])
+    .await
+    .with_context(|| format!("failed to {action} review thread {thread_id}"))?;
+    Ok(())
+}
+
 pub async fn edit_item_metadata(
     repository: &str,
     number: u64,
@@ -3989,7 +4042,7 @@ fn parse_pull_request_review_comments_output(
         .map(|comment| {
             let thread_state = comment
                 .id
-                .and_then(|id| thread_states.get(&id).copied())
+                .and_then(|id| thread_states.get(&id).cloned())
                 .unwrap_or_default();
             pull_request_review_comment_preview(comment, viewer_login, thread_state, false)
         })
@@ -4031,6 +4084,7 @@ fn pull_request_review_comment_preview(
             .map(ReactionSummary::from)
             .unwrap_or_default(),
         review: Some(ReviewCommentPreview {
+            thread_id: thread_state.thread_id,
             path: comment.path.unwrap_or_else(|| "-".to_string()),
             line: comment.line,
             original_line: comment.original_line,
@@ -4299,13 +4353,19 @@ fn parse_pull_request_review_thread_states_page(
     let mut states = HashMap::new();
     for thread in threads.nodes.unwrap_or_default() {
         let state = ReviewThreadState {
+            thread_id: thread.id,
             is_resolved: thread.is_resolved,
             is_outdated: thread.is_outdated,
             viewer_can_update: None,
         };
         for comment in thread.comments.nodes.unwrap_or_default() {
             if let Some(id) = comment.database_id {
-                states.insert(id, state.with_viewer_can_update(comment.viewer_can_update));
+                states.insert(
+                    id,
+                    state
+                        .clone()
+                        .with_viewer_can_update(comment.viewer_can_update),
+                );
             }
         }
     }
@@ -7103,6 +7163,7 @@ mod tests {
             &HashMap::from([(
                 10,
                 ReviewThreadState {
+                    thread_id: Some("PRRT_kwDOA1".to_string()),
                     is_resolved: true,
                     is_outdated: false,
                     viewer_can_update: Some(true),
@@ -7130,6 +7191,7 @@ mod tests {
             review.diff_hunk.as_deref(),
             Some("@@ -55,6 +55,7 @@ fn main() {\n line 55\n+line 57\n line 58")
         );
+        assert_eq!(review.thread_id.as_deref(), Some("PRRT_kwDOA1"));
         assert!(review.is_resolved);
         assert!(!review.is_outdated);
     }
@@ -7315,6 +7377,7 @@ mod tests {
                   },
                   "nodes": [
                     {
+                      "id": "PRRT_resolved",
                       "isResolved": true,
                       "isOutdated": false,
                       "comments": {
@@ -7325,6 +7388,7 @@ mod tests {
                       }
                     },
                     {
+                      "id": "PRRT_outdated",
                       "isResolved": false,
                       "isOutdated": true,
                       "comments": {
@@ -7349,6 +7413,7 @@ mod tests {
         assert_eq!(
             states.get(&10),
             Some(&ReviewThreadState {
+                thread_id: Some("PRRT_resolved".to_string()),
                 is_resolved: true,
                 is_outdated: false,
                 viewer_can_update: Some(true),
@@ -7357,6 +7422,7 @@ mod tests {
         assert_eq!(
             states.get(&20),
             Some(&ReviewThreadState {
+                thread_id: Some("PRRT_outdated".to_string()),
                 is_resolved: false,
                 is_outdated: true,
                 viewer_can_update: None,

@@ -672,6 +672,9 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Char('R') if app.details_mode == DetailsMode::Conversation => {
                 app.start_reply_to_selected_comment()
             }
+            KeyCode::Char('z') if key.modifiers.is_empty() => {
+                app.toggle_selected_review_thread_resolution(tx)
+            }
             _ if app.details_mode == DetailsMode::Conversation && is_reaction_key(key) => {
                 app.start_keyboard_reaction_dialog(area)
             }

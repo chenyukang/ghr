@@ -750,6 +750,36 @@ pub(super) fn start_reaction_submit(
     });
 }
 
+pub(super) fn start_review_thread_resolution_update(
+    item: WorkItem,
+    comment_index: usize,
+    thread_id: String,
+    resolved: bool,
+    tx: UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let item_id = item.id.clone();
+        let result = match item.number {
+            Some(number) if item.kind == ItemKind::PullRequest => {
+                match set_pull_request_review_thread_resolved(&thread_id, resolved).await {
+                    Ok(()) => fetch_comments(&item.repo, number, item.kind)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Some(_) => Err("review threads are available for pull requests".to_string()),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::ReviewThreadResolutionUpdated {
+            item_id,
+            comment_index,
+            resolved,
+            result,
+        });
+    });
+}
+
 pub(super) fn start_label_update(item: WorkItem, action: LabelAction, tx: UnboundedSender<AppMsg>) {
     tokio::spawn(async move {
         let item_id = item.id.clone();

@@ -4261,8 +4261,8 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("terminal text selection"));
     assert!(text.contains("@ / -"));
     assert!(text.contains("add a reaction"));
+    assert!(text.contains("Ctrl+Enter / Ctrl+O"));
     assert!(!text.contains("Reaction Dialog"));
-    assert!(!text.contains("Ctrl+Enter"));
 }
 
 #[test]
@@ -4434,7 +4434,7 @@ fn modified_command_palette_key_can_open_over_text_input() {
 #[test]
 fn command_palette_orders_recently_selected_commands_first() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY);
     app.recent_commands = vec![
         RecentCommand {
             id: "Refresh".to_string(),
@@ -4455,7 +4455,7 @@ fn command_palette_orders_recently_selected_commands_first() {
 #[test]
 fn command_palette_recent_ties_fall_back_to_default_order() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY);
     let selected_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     app.recent_commands = vec![
         RecentCommand {
@@ -4561,7 +4561,7 @@ fn command_palette_info_opens_runtime_info_dialog() {
 
 #[test]
 fn command_palette_does_not_include_debug_command() {
-    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+    let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY);
     assert!(commands.iter().any(|command| command.title == "Info"));
     assert!(!commands.iter().any(|command| command.title == "Debug"));
 }
@@ -4605,6 +4605,37 @@ fn command_palette_log_opens_recent_gh_request_dialog() {
     );
     assert_eq!(app.status, "log");
     clear_gh_log_entries();
+}
+
+#[tokio::test]
+async fn command_palette_submit_editor_submits_comment_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_new_comment_dialog();
+    app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+    app.sections[0].items[0].number = None;
+    app.command_palette = Some(CommandPalette {
+        query: "submit editor".to_string(),
+        selected: 0,
+    });
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-submit-editor");
+    let store = SnapshotStore::new(paths.db_path.clone());
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert!(app.command_palette.is_none());
+    assert!(app.comment_dialog.is_none());
+    assert!(app.posting_comment);
+    assert_eq!(app.status, "posting comment");
 }
 
 #[test]
@@ -17611,7 +17642,84 @@ fn ctrl_j_variant_also_submits_comment_dialog_for_terminals_without_enhanced_ent
         KeyCode::Char('\n'),
         crossterm::event::KeyModifiers::CONTROL
     )));
+    assert!(is_comment_submit_key(KeyEvent::new(
+        KeyCode::Char('m'),
+        crossterm::event::KeyModifiers::CONTROL
+    )));
     assert!(!is_comment_submit_key(key(KeyCode::Enter)));
+}
+
+#[test]
+fn alt_enter_variant_also_submits_for_tmux_without_enhanced_enter() {
+    assert!(is_comment_submit_key(alt_key(KeyCode::Enter)));
+    assert!(!is_comment_submit_key(alt_key(KeyCode::Char('m'))));
+}
+
+#[test]
+fn ctrl_o_variant_also_submits_for_tmux_without_enhanced_keys() {
+    assert!(is_comment_submit_key(ctrl_key(KeyCode::Char('o'))));
+    assert!(!is_comment_submit_key(key(KeyCode::Char('o'))));
+}
+
+#[test]
+fn ctrl_m_variant_submits_comment_dialog_instead_of_inserting_newline() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_new_comment_dialog();
+    app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+    let mut submitted = None;
+
+    app.handle_comment_dialog_key_with_submit(ctrl_key(KeyCode::Char('m')), None, |pending| {
+        submitted = Some(pending.body);
+    });
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(submitted.as_deref(), Some("hello"));
+}
+
+#[test]
+fn ctrl_o_variant_submits_comment_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_new_comment_dialog();
+    app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+    let mut submitted = None;
+
+    app.handle_comment_dialog_key_with_submit(ctrl_key(KeyCode::Char('o')), None, |pending| {
+        submitted = Some(pending.body);
+    });
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(submitted.as_deref(), Some("hello"));
+}
+
+#[test]
+fn custom_editor_submit_key_submits_comment_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.editor_submit_key = normalized_editor_submit_key("Ctrl+T");
+    app.start_new_comment_dialog();
+    app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+    let mut submitted = None;
+
+    app.handle_comment_dialog_key_with_submit(ctrl_key(KeyCode::Char('t')), None, |pending| {
+        submitted = Some(pending.body);
+    });
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(submitted.as_deref(), Some("hello"));
+}
+
+#[test]
+fn alt_enter_variant_submits_comment_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.start_new_comment_dialog();
+    app.comment_dialog.as_mut().unwrap().body.set_text("hello");
+    let mut submitted = None;
+
+    app.handle_comment_dialog_key_with_submit(alt_key(KeyCode::Enter), None, |pending| {
+        submitted = Some(pending.body);
+    });
+
+    assert!(app.comment_dialog.is_none());
+    assert_eq!(submitted.as_deref(), Some("hello"));
 }
 
 #[test]
@@ -20052,6 +20160,10 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn ctrl_key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, crossterm::event::KeyModifiers::CONTROL)
+}
+
+fn alt_key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, crossterm::event::KeyModifiers::ALT)
 }
 
 fn cmd_key(code: KeyCode) -> KeyEvent {

@@ -146,10 +146,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `t` | Change or clear the selected issue/PR milestone |
 | `y` / `Enter` | Confirm the current action in the confirmation dialog |
 | `Enter` in Reviewer Action | Submit the reviewer login list |
-| `Ctrl+Enter` | Send a comment or save the active issue/PR editor dialog |
+| `Ctrl+Enter` / `Ctrl+O` | Send a comment or save the active issue/PR editor dialog |
 | `Ctrl+S` / `Cmd+S` in editor dialogs | Save the current comment, issue, or pull request draft |
 | `@` in editor dialogs | Search GitHub accounts for mention completion; `Up`/`Down` choose and `Tab`/`Enter` insert |
-| `Ctrl+Enter` in issue dialog | Create the issue |
+| `Ctrl+Enter` / `Ctrl+O` in issue dialog | Create the issue |
 | `←` / `→` / `↑` / `↓` in editor dialogs | Move the cursor by character or rendered line |
 | `Home` / `End` in editor dialogs | Jump to the start or end of the current line |
 | `Ctrl+W` / `Alt+Backspace` in editor dialogs | Delete the previous word |
@@ -189,7 +189,7 @@ Diff review ranges:
 - Press `m` on a diff line to begin a range, move the highlight, then press `e` to end it.
 - Press `c` after ending a range to post an inline review comment for the selected range.
 - With the mouse, single click selects one diff line. Double click begins a range, then single click the end line to complete it.
-- Press `s` to open the review summary editor, use `Tab` or `1` / `2` / `3` to choose comment, request changes, or approve, then press `Ctrl+Enter` to submit.
+- Press `s` to open the review summary editor, use `Tab` or `1` / `2` / `3` to choose comment, request changes, or approve, then press `Ctrl+Enter` or `Ctrl+O` to submit.
 - Press `Ctrl+P` in the review summary editor to create a pending review draft, then press `s` later to submit it or `D` to discard it.
 
 Local PR checkout:
@@ -269,6 +269,7 @@ issue_labels = ["E-easy"]
 [defaults]
 view = "pull_requests"
 command_palette_key = ":"
+editor_submit_key = "Ctrl+O"
 theme = "auto"
 log_level = "info"
 pr_per_page = 50
@@ -312,7 +313,7 @@ Use `[[saved_search_filters]]` for named PR/issue searches that should be editab
 
 When `ghr` starts inside a Git checkout with a GitHub remote, it adds that repository as a repo tab if it is not already configured and saves it back to `config.toml` with `local_dir` set to the launch directory. If the checkout has more than one GitHub remote, ghr opens a startup modal so you can choose the remote, then stores non-origin choices as `remote = "upstream"` or whichever remote you selected. If the repo already exists in the config but has no `local_dir`, `ghr` fills that field without overwriting an existing value.
 
-Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs.
+Set `command_palette_key` to change the command palette shortcut. Printable keys such as `":"` are treated as text while typing in search, filter, and editor dialogs; use a modified key such as `"Ctrl+L"` if you want the palette to open from those text inputs. Set `editor_submit_key` to add a custom submit shortcut for editor dialogs; `Ctrl+Enter` and `Ctrl+O` are always accepted.
 
 Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 

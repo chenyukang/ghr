@@ -30,6 +30,7 @@ pub(super) enum PaletteAction {
     ShowGhLog,
     ShowHelp,
     ShowCommandPalette,
+    SubmitEditor,
     Refresh,
     RecentItems,
     SetColorTheme,
@@ -119,7 +120,10 @@ pub(super) fn command_palette_result_line(
     ])
 }
 
-pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<PaletteCommand> {
+pub(super) fn command_palette_commands(
+    command_palette_key: &str,
+    editor_submit_key: &str,
+) -> Vec<PaletteCommand> {
     let mut commands = vec![
         palette_command(
             "Show Command Palette",
@@ -675,11 +679,11 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
             palette_key(KeyCode::Char('y')),
         ),
         palette_command(
-            "Submit Comment",
-            "Ctrl+Enter",
-            "Comment Editor",
-            "Send or update the current comment",
-            palette_ctrl_key(KeyCode::Enter),
+            "Submit Editor",
+            editor_submit_key_label(editor_submit_key),
+            "Editor",
+            "Send, update, create, or submit from the active editor dialog",
+            PaletteAction::SubmitEditor,
         ),
         palette_command(
             "Insert Comment Newline",
@@ -788,10 +792,10 @@ pub(super) fn command_palette_commands(command_palette_key: &str) -> Vec<Palette
         ),
         palette_command(
             "Create Issue from Dialog",
-            "Ctrl+Enter",
+            editor_submit_key_label(editor_submit_key),
             "Issue Dialog",
             "Create the issue from the issue dialog",
-            palette_ctrl_key(KeyCode::Enter),
+            PaletteAction::SubmitEditor,
         ),
     ];
 
@@ -833,6 +837,15 @@ fn palette_command(
         detail,
         action,
     }
+}
+
+fn editor_submit_key_label(editor_submit_key: &str) -> String {
+    let mut keys = vec!["Ctrl+Enter".to_string(), "Ctrl+O".to_string()];
+    let configured = editor_submit_key.trim();
+    if !configured.is_empty() && !keys.iter().any(|key| key.eq_ignore_ascii_case(configured)) {
+        keys.push(configured.to_string());
+    }
+    keys.join(" / ")
 }
 
 fn palette_key(code: KeyCode) -> PaletteAction {
@@ -984,13 +997,18 @@ fn command_palette_search_symbol(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_COMMAND_PALETTE_KEY;
+    use crate::config::{DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY};
 
     #[test]
     fn command_palette_lists_and_fuzzy_filters_shortcuts() {
-        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY);
+        let commands =
+            command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY);
         assert!(commands.iter().any(|command| command.keys == ":"));
-        assert!(commands.iter().any(|command| command.keys == "Ctrl+Enter"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.keys == "Ctrl+Enter / Ctrl+O")
+        );
         assert!(
             commands
                 .iter()
@@ -1124,5 +1142,16 @@ mod tests {
                 .iter()
                 .any(|command| command.title == "Copy Content")
         );
+    }
+
+    #[test]
+    fn command_palette_shows_custom_editor_submit_key() {
+        let commands = command_palette_commands(DEFAULT_COMMAND_PALETTE_KEY, "Ctrl+T");
+        let submit = commands
+            .iter()
+            .find(|command| command.title == "Submit Editor")
+            .expect("submit editor command");
+
+        assert_eq!(submit.keys, "Ctrl+Enter / Ctrl+O / Ctrl+T");
     }
 }

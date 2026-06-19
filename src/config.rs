@@ -10,6 +10,7 @@ use crate::state::{GlobalSearchSavedState, GlobalSearchState};
 use crate::theme::{ThemeName, ThemePreference};
 
 pub const DEFAULT_COMMAND_PALETTE_KEY: &str = ":";
+pub const DEFAULT_EDITOR_SUBMIT_KEY: &str = "Ctrl+O";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_REPO_REMOTE: &str = "origin";
 
@@ -31,6 +32,7 @@ pub struct Config {
 pub struct Defaults {
     pub view: SectionKind,
     pub command_palette_key: String,
+    pub editor_submit_key: String,
     pub theme: ThemePreference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme_name: Option<ThemeName>,
@@ -625,6 +627,7 @@ impl Default for Defaults {
         Self {
             view: SectionKind::PullRequests,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
+            editor_submit_key: DEFAULT_EDITOR_SUBMIT_KEY.to_string(),
             theme: ThemePreference::Auto,
             theme_name: None,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
@@ -1123,6 +1126,7 @@ mod tests {
 
         assert_eq!(config.defaults.view, SectionKind::PullRequests);
         assert_eq!(config.defaults.command_palette_key, ":");
+        assert_eq!(config.defaults.editor_submit_key, "Ctrl+O");
         assert_eq!(config.defaults.theme, ThemePreference::Dark);
         assert_eq!(config.defaults.log_level, "debug");
         assert_eq!(config.defaults.pr_per_page, 50);
@@ -1175,6 +1179,19 @@ mod tests {
         .expect("custom command palette key should parse");
 
         assert_eq!(config.defaults.command_palette_key, "Ctrl+L");
+    }
+
+    #[test]
+    fn parses_custom_editor_submit_key() {
+        let config = toml::from_str::<Config>(
+            r#"
+            [defaults]
+            editor_submit_key = "Ctrl+T"
+            "#,
+        )
+        .expect("custom editor submit key should parse");
+
+        assert_eq!(config.defaults.editor_submit_key, "Ctrl+T");
     }
 
     #[test]

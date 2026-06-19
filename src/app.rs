@@ -146,7 +146,9 @@ use status::{
 };
 use switchers::*;
 use tasks::*;
-use text::{display_width, display_width_char, normalize_text, truncate_inline, truncate_text};
+use text::{
+    display_width, display_width_char, expand_tabs, normalize_text, truncate_inline, truncate_text,
+};
 
 const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
 const NO_SELECTED_CHECK_RUN_INDEX: usize = usize::MAX;

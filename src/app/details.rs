@@ -9,6 +9,7 @@ const DESCRIPTION_BODY_PADDING: usize = 2;
 const BLOCK_COPY_BUTTON_LABEL: &str = "copy";
 const INLINE_COMMENT_MARKER: &str = "💬 ";
 const INLINE_COMMENT_MULTIPLE_MARKER: &str = "💬* ";
+const DIFF_TAB_WIDTH: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(super) struct DetailsDocument {
@@ -2068,7 +2069,10 @@ pub(super) fn push_diff_line(
     segments.extend([
         DetailSegment::styled(marker, style),
         DetailSegment::styled(" ", style),
-        DetailSegment::styled(truncate_inline(&line.text, content_width), style),
+        DetailSegment::styled(
+            truncate_inline(&expand_tabs(&line.text, DIFF_TAB_WIDTH), content_width),
+            style,
+        ),
     ]);
     builder.push_line(segments);
 }

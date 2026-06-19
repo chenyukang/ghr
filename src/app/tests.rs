@@ -236,6 +236,45 @@ fn diff_document_renders_lazygit_style_gutter() {
 }
 
 #[test]
+fn diff_document_expands_tabs_in_source_lines() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.show_diff();
+    app.diffs.insert(
+        "1".to_string(),
+        DiffState::Loaded(
+            parse_pull_request_diff(
+                "diff --git a/src/lib.rs b/src/lib.rs\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -0,0 +1,2 @@\n\
++\tif enabled {\n\
++\t\tprintln!(\"ready\");\n",
+            )
+            .expect("parse diff"),
+        ),
+    );
+
+    let rendered_lines = build_details_document(&app, 96)
+        .lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>();
+    let first_added = rendered_lines
+        .iter()
+        .find(|line| line.contains("if enabled"))
+        .expect("first tabbed diff line");
+    let second_added = rendered_lines
+        .iter()
+        .find(|line| line.contains("println!"))
+        .expect("second tabbed diff line");
+
+    assert!(!first_added.contains('\t'));
+    assert!(!second_added.contains('\t'));
+    assert!(first_added.contains("│ +     if enabled {"));
+    assert!(second_added.contains("│ +         println!(\"ready\");"));
+}
+
+#[test]
 fn diff_file_header_links_to_head_branch_near_selected_line() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.show_diff();

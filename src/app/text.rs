@@ -32,6 +32,48 @@ pub(super) fn normalize_text(text: &str) -> String {
         .to_string()
 }
 
+pub(super) fn expand_tabs(text: &str, tab_width: usize) -> String {
+    let tab_width = tab_width.max(1);
+    let mut expanded = String::new();
+    let mut column = 0_usize;
+    let mut last_char_width = None;
+
+    for ch in text.chars() {
+        match ch {
+            '\t' => {
+                let spaces = tab_width - (column % tab_width);
+                for _ in 0..spaces {
+                    expanded.push(' ');
+                }
+                column += spaces;
+                last_char_width = Some(spaces);
+            }
+            '\n' => {
+                expanded.push(ch);
+                column = 0;
+                last_char_width = None;
+            }
+            '\u{fe0f}' => {
+                expanded.push(ch);
+                if let Some(previous_width) = last_char_width
+                    && previous_width < 2
+                {
+                    column += 2 - previous_width;
+                    last_char_width = Some(2);
+                }
+            }
+            _ => {
+                expanded.push(ch);
+                let char_width = display_width_char(ch);
+                column += char_width;
+                last_char_width = Some(char_width);
+            }
+        }
+    }
+
+    expanded
+}
+
 pub(super) fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();

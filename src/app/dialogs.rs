@@ -4597,6 +4597,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
         help_key_line("i", "ignore selected pull request or issue"),
+        help_key_line("x / Delete in Inbox", "mark selected notification done"),
         help_key_line("S", "search PRs and issues in the current repo"),
         help_key_line("f", "filter with state:closed label:bug author:alice"),
         help_key_line("v", "show pull request diff"),

@@ -204,7 +204,7 @@ pub(super) fn command_palette_commands(
         ),
         palette_command(
             "Mark Done",
-            "",
+            "x / Delete",
             "Inbox",
             "Move the selected GitHub notification out of inbox lists",
             PaletteAction::InboxMarkDone,
@@ -1035,7 +1035,11 @@ mod tests {
                 .iter()
                 .any(|command| command.title == "Mark All Read")
         );
-        assert!(commands.iter().any(|command| command.title == "Mark Done"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Mark Done" && command.keys == "x / Delete")
+        );
         assert!(
             commands
                 .iter()

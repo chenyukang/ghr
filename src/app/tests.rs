@@ -6727,6 +6727,25 @@ fn footer_uses_list_shortcuts_and_status() {
 }
 
 #[test]
+fn footer_shows_inbox_mark_done_shortcut_for_notifications() {
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![notification_item(
+            "thread-1", true,
+        )])],
+    );
+    let paths = test_paths();
+
+    app.focus_list();
+    let list = footer_line(&app, &paths).to_string();
+    assert!(list.contains("x/Del done"));
+
+    app.focus_details();
+    let details = footer_line(&app, &paths).to_string();
+    assert!(details.contains("x/Del done"));
+}
+
+#[test]
 fn section_page_loading_overrides_generic_refresh_status() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.refreshing = true;
@@ -19913,6 +19932,34 @@ fn inbox_keyboard_navigation_does_not_mark_notification_read() {
             .iter()
             .all(|item| item.unread == Some(true))
     );
+}
+
+#[test]
+fn x_and_delete_are_inbox_mark_done_shortcuts_only_for_notifications() {
+    let inbox = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![notification_item(
+            "thread-1", true,
+        )])],
+    );
+    assert!(is_inbox_mark_done_key(&inbox, key(KeyCode::Char('x'))));
+    assert!(is_inbox_mark_done_key(&inbox, key(KeyCode::Delete)));
+    assert!(!is_inbox_mark_done_key(&inbox, key(KeyCode::Char('X'))));
+    assert!(!is_inbox_mark_done_key(
+        &inbox,
+        ctrl_key(KeyCode::Char('x'))
+    ));
+    assert!(!is_inbox_mark_done_key(&inbox, ctrl_key(KeyCode::Delete)));
+
+    let pull_requests = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    assert!(!is_inbox_mark_done_key(
+        &pull_requests,
+        key(KeyCode::Char('x'))
+    ));
+    assert!(!is_inbox_mark_done_key(
+        &pull_requests,
+        key(KeyCode::Delete)
+    ));
 }
 
 #[test]

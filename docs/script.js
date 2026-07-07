@@ -12,6 +12,7 @@ const shortcuts = [
   ["General", "o", "Open the selected item, focused check URL, or PR changes page"],
   ["General", "m", "Toggle between TUI mouse controls and terminal text selection"],
   ["General", "i", "Ignore the selected pull request or issue"],
+  ["Inbox", "x / Delete", "Mark the selected GitHub inbox notification done"],
   ["List", "j / k / n / p / Up / Down", "Move list selection; k/p at first item returns to Sections"],
   ["List", "[ / ]", "Load previous or next GitHub result page"],
   ["List", "PgUp / PgDown or u / d", "Move list selection by a visible page"],

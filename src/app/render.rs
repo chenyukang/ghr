@@ -1432,6 +1432,12 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 if app.is_global_search_results_view() {
                     push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 }
+                if app
+                    .current_section()
+                    .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+                {
+                    push_footer_pair(&mut spans, "x/Del", "done", Color::LightRed);
+                }
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "i", "ignore", Color::LightRed);
                 if app.current_item().is_some_and(item_supports_metadata_edit) {
@@ -1455,6 +1461,12 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 push_footer_pair(&mut spans, "tab", "List", Color::Cyan);
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
+                if app
+                    .current_section()
+                    .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+                {
+                    push_footer_pair(&mut spans, "x/Del", "done", Color::LightRed);
+                }
                 push_footer_pair(&mut spans, "c/a", "comment", Color::LightBlue);
                 if has_check_runs {
                     push_footer_pair(&mut spans, "n/p", "focus", Color::LightBlue);

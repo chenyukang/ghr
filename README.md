@@ -114,6 +114,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
 | `S` | Search matching PRs and issues with remembered per-repo fields for title/number, type, status, label, author, assignee, and sort; use `Tab` to switch fields, `↑`/`↓` to move candidates, `Enter` to choose or search, `Ctrl+S` to save reusable conditions, and `Ctrl+U` to clear conditions |
 | `i` | Ignore the selected PR or issue and hide it from future lists |
+| `x` / `Delete` in Inbox | Mark the selected GitHub inbox notification done |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page; in Details, open the focused check URL when one is selected |

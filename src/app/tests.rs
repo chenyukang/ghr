@@ -3053,6 +3053,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         selected_diff_line: HashMap::new(),
         diff_file_details_scroll: HashMap::new(),
         ignored_items: Vec::new(),
+        done_notification_threads: HashMap::new(),
         recent_items: Vec::new(),
         recent_commands: Vec::new(),
         repo_unseen_items: HashMap::new(),
@@ -19784,12 +19785,15 @@ fn notification_read_finished_updates_local_state_and_clears_pending() {
 
 #[test]
 fn notification_done_finished_updates_local_state_and_clears_pending() {
+    let updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(updated_at);
     let sections = vec![SectionSnapshot {
         key: "notifications:all".to_string(),
         kind: SectionKind::Notifications,
         title: "All".to_string(),
         filters: "is:all".to_string(),
-        items: vec![notification_item("thread-1", false)],
+        items: vec![item],
         total_count: None,
         page: 1,
         page_size: 0,
@@ -19801,12 +19805,71 @@ fn notification_done_finished_updates_local_state_and_clears_pending() {
 
     app.handle_msg(AppMsg::NotificationDoneFinished {
         thread_id: "thread-1".to_string(),
+        last_updated_at: Some(updated_at),
         result: Ok(None),
     });
 
     assert!(!app.notification_done_pending.contains("thread-1"));
     assert!(app.sections[0].items.is_empty());
+    assert_eq!(
+        app.done_notification_threads.get("thread-1"),
+        Some(&updated_at)
+    );
     assert_eq!(app.status, "notification marked done");
+}
+
+#[test]
+fn refreshed_notifications_hide_done_threads_until_new_activity() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![])],
+    );
+    app.done_notification_threads
+        .insert("thread-1".to_string(), done_at);
+
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    app.apply_refreshed_section(notification_section(vec![old_item]), None);
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+
+    let mut new_item = notification_item("thread-1", true);
+    new_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    app.apply_refreshed_section(notification_section(vec![new_item]), None);
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-1");
+    assert!(!app.done_notification_threads.contains_key("thread-1"));
+    assert_eq!(
+        app.take_done_notification_threads_to_delete(),
+        vec!["thread-1".to_string()]
+    );
+}
+
+#[test]
+fn done_notification_threads_filter_cached_sections_on_startup() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    let mut revived_item = notification_item("thread-2", true);
+    revived_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    let app = AppState::with_ui_state_and_done_notifications(
+        SectionKind::Notifications,
+        vec![notification_section(vec![old_item, revived_item])],
+        UiState::default(),
+        HashMap::from([
+            ("thread-1".to_string(), done_at),
+            ("thread-2".to_string(), done_at),
+        ]),
+    );
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-2");
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+    assert!(!app.done_notification_threads.contains_key("thread-2"));
+    assert!(app.done_notification_threads_to_delete.contains("thread-2"));
 }
 
 #[test]
@@ -20772,5 +20835,20 @@ fn notification_item(id: &str, unread: bool) -> WorkItem {
         reason: Some("mention".to_string()),
         extra: Some("PullRequest".to_string()),
         viewer_subscription: None,
+    }
+}
+
+fn notification_section(items: Vec<WorkItem>) -> SectionSnapshot {
+    SectionSnapshot {
+        key: "notifications:all".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items,
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
     }
 }

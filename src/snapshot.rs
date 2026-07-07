@@ -56,6 +56,11 @@ impl SnapshotStore {
                 body TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS done_notification_threads (
+                thread_id TEXT PRIMARY KEY,
+                notification_updated_at TEXT NOT NULL,
+                done_at TEXT NOT NULL
+            );
             "#,
         )
         .context("failed to initialize snapshot database")?;
@@ -120,6 +125,60 @@ impl SnapshotStore {
         }
 
         Ok(sections)
+    }
+
+    pub fn load_done_notification_threads(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        let conn = self.connect()?;
+        load_done_notification_threads(&conn)
+    }
+
+    pub fn save_done_notification_thread(
+        &self,
+        thread_id: &str,
+        notification_updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        save_done_notification_thread(&conn, thread_id, notification_updated_at, Utc::now())
+    }
+
+    pub fn migrate_done_notification_threads(
+        &self,
+        threads: &HashMap<String, DateTime<Utc>>,
+    ) -> Result<usize> {
+        if threads.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.connect()?;
+        let done_at = Utc::now();
+        let mut changed = 0;
+        for (thread_id, notification_updated_at) in threads {
+            changed += insert_done_notification_thread_if_missing(
+                &conn,
+                thread_id,
+                *notification_updated_at,
+                done_at,
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub fn delete_done_notification_threads(&self, thread_ids: &[String]) -> Result<usize> {
+        if thread_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.connect()?;
+        let mut changed = 0;
+        for thread_id in thread_ids {
+            changed += conn
+                .execute(
+                    "DELETE FROM done_notification_threads WHERE thread_id = ?1",
+                    params![thread_id],
+                )
+                .with_context(|| format!("failed to delete done notification {thread_id}"))?;
+        }
+        Ok(changed)
     }
 
     pub fn load_editor_drafts(&self) -> Result<HashMap<String, EditorDraft>> {
@@ -360,6 +419,79 @@ impl SnapshotStore {
     }
 }
 
+fn load_done_notification_threads(conn: &Connection) -> Result<HashMap<String, DateTime<Utc>>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT thread_id, notification_updated_at
+            FROM done_notification_threads
+            "#,
+        )
+        .context("failed to prepare done notification load")?;
+
+    let mut rows = stmt
+        .query([])
+        .context("failed to load done notifications")?;
+    let mut threads = HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .context("failed to read done notification row")?
+    {
+        let thread_id: String = row.get(0)?;
+        let updated_at_raw: String = row.get(1)?;
+        let notification_updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+            .map(|value| value.with_timezone(&Utc))
+            .with_context(|| format!("failed to parse done notification {thread_id} timestamp"))?;
+        threads.insert(thread_id, notification_updated_at);
+    }
+    Ok(threads)
+}
+
+fn save_done_notification_thread(
+    conn: &Connection,
+    thread_id: &str,
+    notification_updated_at: DateTime<Utc>,
+    done_at: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO done_notification_threads (thread_id, notification_updated_at, done_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            notification_updated_at = excluded.notification_updated_at,
+            done_at = excluded.done_at
+        "#,
+        params![
+            thread_id,
+            notification_updated_at.to_rfc3339(),
+            done_at.to_rfc3339()
+        ],
+    )
+    .with_context(|| format!("failed to save done notification {thread_id}"))?;
+    Ok(())
+}
+
+fn insert_done_notification_thread_if_missing(
+    conn: &Connection,
+    thread_id: &str,
+    notification_updated_at: DateTime<Utc>,
+    done_at: DateTime<Utc>,
+) -> Result<usize> {
+    conn.execute(
+        r#"
+        INSERT OR IGNORE INTO done_notification_threads
+            (thread_id, notification_updated_at, done_at)
+        VALUES (?1, ?2, ?3)
+        "#,
+        params![
+            thread_id,
+            notification_updated_at.to_rfc3339(),
+            done_at.to_rfc3339()
+        ],
+    )
+    .with_context(|| format!("failed to migrate done notification {thread_id}"))
+}
+
 fn ensure_snapshot_column(conn: &Connection, name: &str, definition: &str) -> Result<()> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(snapshots)")
@@ -557,6 +689,70 @@ mod tests {
     }
 
     #[test]
+    fn done_notification_threads_round_trip_update_delete_and_migrate() {
+        let path = temp_db_path("done-notification-threads");
+        let store = SnapshotStore::new(path.clone());
+        store.init().expect("init snapshot store");
+
+        let first_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let second_updated_at = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+        store
+            .save_done_notification_thread("thread-1", first_updated_at)
+            .expect("save done notification");
+        assert_eq!(
+            store
+                .load_done_notification_threads()
+                .expect("load done notifications")
+                .get("thread-1"),
+            Some(&first_updated_at)
+        );
+
+        store
+            .save_done_notification_thread("thread-1", second_updated_at)
+            .expect("update done notification");
+        assert_eq!(
+            store
+                .load_done_notification_threads()
+                .expect("reload done notifications")
+                .get("thread-1"),
+            Some(&second_updated_at)
+        );
+
+        assert_eq!(
+            store
+                .migrate_done_notification_threads(&HashMap::from([(
+                    "thread-1".to_string(),
+                    first_updated_at,
+                )]))
+                .expect("migrate existing done notification"),
+            0
+        );
+        assert_eq!(
+            store
+                .migrate_done_notification_threads(&HashMap::from([(
+                    "thread-2".to_string(),
+                    first_updated_at,
+                )]))
+                .expect("migrate new done notification"),
+            1
+        );
+
+        assert_eq!(
+            store
+                .delete_done_notification_threads(&["thread-1".to_string()])
+                .expect("delete done notification"),
+            1
+        );
+        let loaded = store
+            .load_done_notification_threads()
+            .expect("load done notifications after delete");
+        assert!(!loaded.contains_key("thread-1"));
+        assert_eq!(loaded.get("thread-2"), Some(&first_updated_at));
+
+        remove_db_files(&path);
+    }
+
+    #[test]
     fn repo_candidate_cache_round_trips_and_updates() {
         let path = temp_db_path("repo-candidate-cache");
         let store = SnapshotStore::new(path.clone());
@@ -693,6 +889,12 @@ mod tests {
         store
             .save_label_candidates("rust-lang/rust", &["T-compiler".to_string()])
             .expect("save candidate cache");
+        store
+            .save_done_notification_thread(
+                "thread-1",
+                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            )
+            .expect("save done notification");
 
         assert_eq!(
             store
@@ -719,6 +921,13 @@ mod tests {
         );
         assert_eq!(store.clear_snapshots().expect("clear all snapshots"), 1);
         assert!(store.load_all().expect("reload snapshots").is_empty());
+        assert_eq!(
+            store
+                .load_done_notification_threads()
+                .expect("load done notifications")
+                .len(),
+            1
+        );
 
         remove_db_files(&path);
     }

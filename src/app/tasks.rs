@@ -241,18 +241,37 @@ pub(super) fn start_notification_read_sync(
 
 pub(super) fn start_notification_done_sync(
     thread_id: String,
+    last_updated_at: Option<DateTime<Utc>>,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
         let result = match mark_notification_thread_done(&thread_id).await {
-            Ok(()) => match store.mark_notification_done(&thread_id) {
-                Ok(_) => Ok(None),
-                Err(error) => Ok(Some(error.to_string())),
-            },
+            Ok(()) => {
+                let mut save_errors = Vec::new();
+                let notification_updated_at = last_updated_at.unwrap_or_else(Utc::now);
+                if let Err(error) =
+                    store.save_done_notification_thread(&thread_id, notification_updated_at)
+                {
+                    save_errors.push(error.to_string());
+                }
+                if let Err(error) = store.mark_notification_done(&thread_id) {
+                    save_errors.push(error.to_string());
+                }
+
+                if save_errors.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(save_errors.join("; ")))
+                }
+            }
             Err(error) => Err(error.to_string()),
         };
-        let _ = tx.send(AppMsg::NotificationDoneFinished { thread_id, result });
+        let _ = tx.send(AppMsg::NotificationDoneFinished {
+            thread_id,
+            last_updated_at,
+            result,
+        });
     });
 }
 

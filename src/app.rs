@@ -292,6 +292,7 @@ enum AppMsg {
     },
     NotificationDoneFinished {
         thread_id: String,
+        last_updated_at: Option<DateTime<Utc>>,
         result: std::result::Result<Option<String>, String>,
     },
     InboxMarkAllReadFinished {
@@ -1542,6 +1543,7 @@ struct AppState {
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
     repo_views_seen_this_session: HashSet<String>,
     details_visit: Option<DetailsVisitState>,
+    done_notification_threads_to_delete: HashSet<String>,
     current_repo_remote_dialog: Option<CurrentRepoRemoteDialog>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
@@ -1564,6 +1566,7 @@ struct AppState {
     selected_diff_line: HashMap<String, usize>,
     diff_file_details_scroll: HashMap<String, u16>,
     ignored_items: HashSet<String>,
+    done_notification_threads: HashMap<String, DateTime<Utc>>,
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
@@ -1870,6 +1873,8 @@ pub async fn run(
     let repo_candidate_cache = store.load_repo_candidate_cache()?;
     let editor_drafts = store.load_editor_drafts()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
+    store.migrate_done_notification_threads(&ui_state.done_notification_threads)?;
+    let done_notification_threads = store.load_done_notification_threads()?;
     let migrated_saved_search_filters =
         saved_search_filters_from_map(&ui_state.global_search_saved_by_repo);
     if config.saved_search_filters.is_empty() && !migrated_saved_search_filters.is_empty() {
@@ -1882,7 +1887,12 @@ pub async fn run(
             );
         }
     }
-    let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    let mut app = AppState::with_ui_state_and_done_notifications(
+        config.defaults.view,
+        sections,
+        ui_state,
+        done_notification_threads,
+    );
     app.load_saved_search_filters(&config);
     app.load_repo_candidate_cache(repo_candidate_cache);
     app.load_editor_drafts(editor_drafts);
@@ -2042,6 +2052,7 @@ async fn run_loop(
         if app.take_recent_items_dirty() {
             save_ui_state(app, paths);
         }
+        delete_revived_done_notification_threads(app, store);
         needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
@@ -2111,6 +2122,20 @@ fn drain_app_messages(app: &mut AppState, rx: &mut UnboundedReceiver<AppMsg>) ->
         handled = true;
     }
     handled
+}
+
+fn delete_revived_done_notification_threads(app: &mut AppState, store: &SnapshotStore) {
+    let thread_ids = app.take_done_notification_threads_to_delete();
+    if thread_ids.is_empty() {
+        return;
+    }
+
+    if let Err(error) = store.delete_done_notification_threads(&thread_ids) {
+        warn!(
+            error = %format!("{error:#}"),
+            "failed to delete revived done notification threads"
+        );
+    }
 }
 
 fn terminal_streams_connected() -> bool {
@@ -2745,6 +2770,35 @@ fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
     values
 }
 
+fn filter_done_notification_threads_in_sections(
+    done_notification_threads: &mut HashMap<String, DateTime<Utc>>,
+    sections: &mut [SectionSnapshot],
+) -> Vec<String> {
+    let mut revived_threads = Vec::new();
+    for section in sections
+        .iter_mut()
+        .filter(|section| matches!(section.kind, SectionKind::Notifications))
+    {
+        section.items.retain(|item| {
+            let Some(done_at) = done_notification_threads.get(&item.id).copied() else {
+                return true;
+            };
+            let item_updated_at = item.updated_at.unwrap_or(done_at);
+            if item_updated_at > done_at {
+                revived_threads.push(item.id.clone());
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    for thread_id in &revived_threads {
+        done_notification_threads.remove(thread_id.as_str());
+    }
+    revived_threads
+}
+
 fn item_supports_details_memory(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
@@ -2895,12 +2949,28 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
 }
 
 impl AppState {
+    #[cfg(test)]
     fn with_ui_state(
         active_view: SectionKind,
         sections: Vec<SectionSnapshot>,
         ui_state: UiState,
     ) -> Self {
+        Self::with_ui_state_and_done_notifications(active_view, sections, ui_state, HashMap::new())
+    }
+
+    fn with_ui_state_and_done_notifications(
+        active_view: SectionKind,
+        mut sections: Vec<SectionSnapshot>,
+        ui_state: UiState,
+        mut done_notification_threads: HashMap<String, DateTime<Utc>>,
+    ) -> Self {
         let ui_state = ui_state.normalized();
+        let done_notification_threads_to_delete = filter_done_notification_threads_in_sections(
+            &mut done_notification_threads,
+            &mut sections,
+        )
+        .into_iter()
+        .collect::<HashSet<_>>();
         let default_view = builtin_view_key(active_view);
         let active_view = if ui_state.active_view.trim().is_empty() {
             default_view
@@ -2988,6 +3058,7 @@ impl AppState {
                 .collect(),
             repo_views_seen_this_session: HashSet::new(),
             details_visit: None,
+            done_notification_threads_to_delete,
             current_repo_remote_dialog: None,
             project_add_dialog: None,
             project_remove_dialog: None,
@@ -3010,6 +3081,7 @@ impl AppState {
             selected_diff_line: ui_state.selected_diff_line.clone(),
             diff_file_details_scroll: ui_state.diff_file_details_scroll.clone(),
             ignored_items: ui_state.ignored_items.iter().cloned().collect(),
+            done_notification_threads,
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
@@ -3278,6 +3350,7 @@ impl AppState {
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
             ignored_items: sorted_strings(&self.ignored_items),
+            done_notification_threads: HashMap::new(),
             recent_items: recent_items_to_saved(&self.recent_items),
             recent_commands: recent_commands_to_saved(&self.recent_commands),
             repo_unseen_items: self
@@ -3598,11 +3671,12 @@ impl AppState {
 
     fn apply_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
         let active_view = self.active_view.clone();
-        let sections = sections
+        let mut sections = sections
             .into_iter()
             .filter(|section| !same_view_key(&section_view_key(section), &active_view))
             .filter(|section| !self.has_active_section_filter(&section.key))
             .collect::<Vec<_>>();
+        self.filter_done_notification_threads(&mut sections);
 
         if sections.is_empty() {
             return;
@@ -3617,7 +3691,11 @@ impl AppState {
         self.sections = merge_refreshed_sections(current, sections);
     }
 
-    fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
+    fn apply_refreshed_section(
+        &mut self,
+        mut section: SectionSnapshot,
+        save_error: Option<String>,
+    ) {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
         let previous_comment_index = self.selected_comment_index;
@@ -3651,6 +3729,7 @@ impl AppState {
             return;
         }
 
+        self.filter_done_notification_threads(std::slice::from_mut(&mut section));
         self.record_unseen_repo_items_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
@@ -3731,11 +3810,12 @@ impl AppState {
                 for section in &sections {
                     self.remember_base_filters(section);
                 }
-                let sections = sections
+                let mut sections = sections
                     .into_iter()
                     .filter(|section| !self.has_active_section_filter(&section.key))
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
+                self.filter_done_notification_threads(&mut sections);
                 self.record_unseen_repo_items_for_sections(&sections);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
@@ -4841,14 +4921,19 @@ impl AppState {
                     }
                 }
             }
-            AppMsg::NotificationDoneFinished { thread_id, result } => {
+            AppMsg::NotificationDoneFinished {
+                thread_id,
+                last_updated_at,
+                result,
+            } => {
                 self.notification_done_pending.remove(&thread_id);
                 match result {
                     Ok(save_error) => {
+                        self.remember_done_notification_thread(&thread_id, last_updated_at);
                         let changed = self.apply_notification_done_local(&thread_id);
                         self.status = match (changed, save_error) {
                             (_, Some(error)) => {
-                                format!("notification marked done; snapshot save failed: {error}")
+                                format!("notification marked done; local save failed: {error}")
                             }
                             (true, None) => "notification marked done".to_string(),
                             (false, None) => "notification done synced".to_string(),
@@ -5900,17 +5985,27 @@ impl AppState {
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        let Some(thread_id) = self.current_inbox_thread_id() else {
+        if self
+            .current_section()
+            .is_none_or(|section| !matches!(section.kind, SectionKind::Notifications))
+        {
+            self.status = "select an inbox item to mark done".to_string();
+            return;
+        }
+        let Some(item) = self.current_item() else {
             self.status = "select an inbox item to mark done".to_string();
             return;
         };
+        let thread_id = item.id.clone();
+        let last_updated_at = item.updated_at;
 
-        self.mark_notification_done(thread_id, store, tx);
+        self.mark_notification_done(thread_id, last_updated_at, store, tx);
     }
 
     fn mark_notification_done(
         &mut self,
         thread_id: String,
+        last_updated_at: Option<DateTime<Utc>>,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
@@ -5919,7 +6014,7 @@ impl AppState {
         }
 
         self.status = "marking notification done".to_string();
-        start_notification_done_sync(thread_id, store.clone(), tx.clone());
+        start_notification_done_sync(thread_id, last_updated_at, store.clone(), tx.clone());
     }
 
     fn mark_all_inbox_read(&mut self, store: &SnapshotStore, tx: &UnboundedSender<AppMsg>) {
@@ -6009,6 +6104,26 @@ impl AppState {
             self.clamp_positions();
         }
         changed
+    }
+
+    fn remember_done_notification_thread(
+        &mut self,
+        thread_id: &str,
+        updated_at: Option<DateTime<Utc>>,
+    ) {
+        let done_at = updated_at.unwrap_or_else(Utc::now);
+        self.done_notification_threads
+            .insert(thread_id.to_string(), done_at);
+        self.done_notification_threads_to_delete.remove(thread_id);
+    }
+
+    fn filter_done_notification_threads(&mut self, sections: &mut [SectionSnapshot]) {
+        self.done_notification_threads_to_delete.extend(
+            filter_done_notification_threads_in_sections(
+                &mut self.done_notification_threads,
+                sections,
+            ),
+        );
     }
 
     fn update_item_reactions(&mut self, item_id: &str, reactions: ReactionSummary) {
@@ -12125,6 +12240,15 @@ impl AppState {
         let dirty = self.recent_items_dirty;
         self.recent_items_dirty = false;
         dirty
+    }
+
+    fn take_done_notification_threads_to_delete(&mut self) -> Vec<String> {
+        let mut thread_ids = self
+            .done_notification_threads_to_delete
+            .drain()
+            .collect::<Vec<_>>();
+        thread_ids.sort();
+        thread_ids
     }
 
     fn jump_to_recent_item(&mut self, item: &RecentItem) -> bool {

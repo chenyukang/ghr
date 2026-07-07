@@ -34,6 +34,8 @@ pub struct UiState {
     pub selected_diff_line: HashMap<String, usize>,
     pub diff_file_details_scroll: HashMap<String, u16>,
     pub ignored_items: Vec<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub done_notification_threads: HashMap<String, DateTime<Utc>>,
     pub recent_items: Vec<RecentItemState>,
     pub recent_commands: Vec<RecentCommandState>,
     pub repo_unseen_items: HashMap<String, RepoUnseenItemsState>,
@@ -257,6 +259,8 @@ impl UiState {
         self.ignored_items
             .retain(|key| !key.trim().is_empty() && seen_ignored.insert(key.clone()));
         self.ignored_items.sort();
+        self.done_notification_threads
+            .retain(|key, _| !key.trim().is_empty());
         self.recent_items = normalized_recent_items(self.recent_items);
         self.recent_commands = normalized_recent_commands(self.recent_commands);
         self.repo_unseen_items = normalized_repo_unseen_items(self.repo_unseen_items);
@@ -287,6 +291,7 @@ impl Default for UiState {
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
             ignored_items: Vec::new(),
+            done_notification_threads: HashMap::new(),
             recent_items: Vec::new(),
             recent_commands: Vec::new(),
             repo_unseen_items: HashMap::new(),
@@ -492,6 +497,16 @@ mod tests {
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
             diff_file_details_scroll: HashMap::from([("issue-3::src/lib.rs".to_string(), 17)]),
             ignored_items: vec!["issue-2".to_string(), "issue-2".to_string(), String::new()],
+            done_notification_threads: HashMap::from([
+                (
+                    "thread-1".to_string(),
+                    DateTime::from_timestamp(1_700_000_040, 0).unwrap(),
+                ),
+                (
+                    String::new(),
+                    DateTime::from_timestamp(1_700_000_050, 0).unwrap(),
+                ),
+            ]),
             recent_items: vec![
                 RecentItemState {
                     id: "pr-1".to_string(),
@@ -622,6 +637,11 @@ mod tests {
             Some(&17)
         );
         assert_eq!(state.ignored_items, vec!["issue-2"]);
+        assert_eq!(
+            state.done_notification_threads.get("thread-1"),
+            Some(&DateTime::from_timestamp(1_700_000_040, 0).unwrap())
+        );
+        assert!(!state.done_notification_threads.contains_key(""));
         assert_eq!(
             state.recent_items,
             vec![RecentItemState {

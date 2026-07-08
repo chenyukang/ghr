@@ -57,12 +57,13 @@ use crate::github::{
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
-    refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
-    reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
-    search_github_users, search_global, set_pull_request_review_thread_resolved,
-    submit_pending_pull_request_review, submit_pull_request_review, subscribe_notification_thread,
-    unsubscribe_notification_thread, update_issue_assignees, update_item_subscription,
-    update_pull_request_branch, with_background_github_priority,
+    refresh_notification_section_page, refresh_section_page, remove_issue_label,
+    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_github_users,
+    search_global, set_pull_request_review_thread_resolved, submit_pending_pull_request_review,
+    submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
+    update_issue_assignees, update_item_subscription, update_pull_request_branch,
+    with_background_github_priority,
 };
 use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
@@ -135,7 +136,7 @@ use pr_checkout::{
 };
 use render::*;
 use runtime::*;
-use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
+use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query_for_section};
 use status::{
     comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
     persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
@@ -947,16 +948,32 @@ enum GlobalSearchField {
     Author,
     Assignee,
     Sort,
+    Reason,
+    Repo,
 }
 
 impl GlobalSearchField {
-    const FIELDS: [GlobalSearchField; 6] = [
+    const SEARCH_FIELDS: [GlobalSearchField; 6] = [
         GlobalSearchField::Title,
         GlobalSearchField::Status,
         GlobalSearchField::Label,
         GlobalSearchField::Author,
         GlobalSearchField::Assignee,
         GlobalSearchField::Sort,
+    ];
+    const GLOBAL_SEARCH_FIELDS: [GlobalSearchField; 7] = [
+        GlobalSearchField::Title,
+        GlobalSearchField::Repo,
+        GlobalSearchField::Status,
+        GlobalSearchField::Label,
+        GlobalSearchField::Author,
+        GlobalSearchField::Assignee,
+        GlobalSearchField::Sort,
+    ];
+    const NOTIFICATION_FIELDS: [GlobalSearchField; 3] = [
+        GlobalSearchField::Status,
+        GlobalSearchField::Reason,
+        GlobalSearchField::Repo,
     ];
 
     fn label(self) -> &'static str {
@@ -967,6 +984,15 @@ impl GlobalSearchField {
             Self::Author => "Author",
             Self::Assignee => "Assignee",
             Self::Sort => "Sort",
+            Self::Reason => "Reason",
+            Self::Repo => "Repo",
+        }
+    }
+
+    fn dialog_label(self, kind: GlobalSearchDialogKind) -> &'static str {
+        match (kind, self) {
+            (GlobalSearchDialogKind::Notifications, Self::Status) => "State",
+            _ => self.label(),
         }
     }
 
@@ -978,6 +1004,8 @@ impl GlobalSearchField {
             Self::Author => "author",
             Self::Assignee => "assignee",
             Self::Sort => "sort",
+            Self::Reason => "reason",
+            Self::Repo => "repo",
         }
     }
 
@@ -988,12 +1016,13 @@ impl GlobalSearchField {
             "author" => Self::Author,
             "assignee" => Self::Assignee,
             "sort" => Self::Sort,
+            "reason" => Self::Reason,
+            "repo" => Self::Repo,
             _ => Self::Title,
         }
     }
 
-    fn next(self, delta: isize) -> Self {
-        let fields = Self::FIELDS;
+    fn next(self, delta: isize, fields: &[GlobalSearchField]) -> Self {
         let index = fields
             .iter()
             .position(|field| *field == self)
@@ -1001,6 +1030,12 @@ impl GlobalSearchField {
         let next = (index as isize + delta).rem_euclid(fields.len() as isize) as usize;
         fields[next]
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalSearchDialogKind {
+    Search,
+    Notifications,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1011,6 +1046,7 @@ struct GlobalSearchSuggestionFilter {
 
 #[derive(Debug, Clone)]
 struct GlobalSearchDialog {
+    kind: GlobalSearchDialogKind,
     repo: Option<String>,
     title: EditorText,
     status: EditorText,
@@ -1018,10 +1054,13 @@ struct GlobalSearchDialog {
     author: EditorText,
     assignee: EditorText,
     sort: EditorText,
+    reason: EditorText,
+    repo_filter: EditorText,
     field: GlobalSearchField,
     labels: Vec<String>,
     labels_loading: bool,
     labels_error: Option<String>,
+    repo_candidates: Vec<String>,
     author_candidates: Vec<String>,
     assignee_candidates: Vec<String>,
     assignees_loading: bool,
@@ -1033,6 +1072,7 @@ struct GlobalSearchDialog {
 impl Default for GlobalSearchDialog {
     fn default() -> Self {
         Self {
+            kind: GlobalSearchDialogKind::Search,
             repo: None,
             title: EditorText::from_text(""),
             status: EditorText::from_text(""),
@@ -1040,10 +1080,13 @@ impl Default for GlobalSearchDialog {
             author: EditorText::from_text(""),
             assignee: EditorText::from_text(""),
             sort: EditorText::from_text("created_at"),
+            reason: EditorText::from_text(""),
+            repo_filter: EditorText::from_text(""),
             field: GlobalSearchField::Title,
             labels: Vec::new(),
             labels_loading: false,
             labels_error: None,
+            repo_candidates: Vec::new(),
             author_candidates: Vec::new(),
             assignee_candidates: Vec::new(),
             assignees_loading: false,
@@ -1063,18 +1106,40 @@ impl GlobalSearchDialog {
             GlobalSearchField::Author => &mut self.author,
             GlobalSearchField::Assignee => &mut self.assignee,
             GlobalSearchField::Sort => &mut self.sort,
+            GlobalSearchField::Reason => &mut self.reason,
+            GlobalSearchField::Repo => &mut self.repo_filter,
         }
     }
 
     fn active_editor(&self) -> &EditorText {
-        match self.field {
+        self.editor_for_field(self.field)
+    }
+
+    fn editor_for_field(&self, field: GlobalSearchField) -> &EditorText {
+        match field {
             GlobalSearchField::Title => &self.title,
             GlobalSearchField::Status => &self.status,
             GlobalSearchField::Label => &self.label,
             GlobalSearchField::Author => &self.author,
             GlobalSearchField::Assignee => &self.assignee,
             GlobalSearchField::Sort => &self.sort,
+            GlobalSearchField::Reason => &self.reason,
+            GlobalSearchField::Repo => &self.repo_filter,
         }
+    }
+
+    fn fields(&self) -> &'static [GlobalSearchField] {
+        match self.kind {
+            GlobalSearchDialogKind::Notifications => &GlobalSearchField::NOTIFICATION_FIELDS,
+            GlobalSearchDialogKind::Search if self.repo.is_none() => {
+                &GlobalSearchField::GLOBAL_SEARCH_FIELDS
+            }
+            GlobalSearchDialogKind::Search => &GlobalSearchField::SEARCH_FIELDS,
+        }
+    }
+
+    fn next_field(&self, delta: isize) -> GlobalSearchField {
+        self.field.next(delta, self.fields())
     }
 }
 
@@ -2799,6 +2864,35 @@ fn filter_done_notification_threads_in_sections(
     revived_threads
 }
 
+fn filter_only_done_notification_threads_in_sections(
+    done_notification_threads: &mut HashMap<String, DateTime<Utc>>,
+    sections: &mut [SectionSnapshot],
+) -> Vec<String> {
+    let mut revived_threads = Vec::new();
+    for section in sections
+        .iter_mut()
+        .filter(|section| matches!(section.kind, SectionKind::Notifications))
+    {
+        section.items.retain(|item| {
+            let Some(done_at) = done_notification_threads.get(&item.id).copied() else {
+                return false;
+            };
+            let item_updated_at = item.updated_at.unwrap_or(done_at);
+            if item_updated_at > done_at {
+                revived_threads.push(item.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    for thread_id in &revived_threads {
+        done_notification_threads.remove(thread_id.as_str());
+    }
+    revived_threads
+}
+
 fn item_supports_details_memory(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
@@ -2946,6 +3040,27 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
         return true;
     }
     !recent.id.is_empty() && item.id == recent.id
+}
+
+fn repo_candidates_from_sections(
+    sections: &[SectionSnapshot],
+    kind: Option<SectionKind>,
+) -> Vec<String> {
+    let mut repos = sections
+        .iter()
+        .filter(|section| kind.is_none_or(|kind| section.kind == kind))
+        .flat_map(|section| {
+            section
+                .items
+                .iter()
+                .map(|item| item.repo.clone())
+                .chain(section_repo_scope(section))
+        })
+        .filter(|repo| !repo.trim().is_empty())
+        .collect::<Vec<_>>();
+    repos.sort_by_key(|repo| repo.to_ascii_lowercase());
+    repos.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    repos
 }
 
 impl AppState {
@@ -5038,13 +5153,14 @@ impl AppState {
             }
             AppMsg::FilterSectionLoaded {
                 section_key,
-                section,
+                mut section,
             } => {
                 let error = section.error.clone();
                 let filter_label = self.section_filter_label_for_key(&section_key);
                 if self.setup_dialog.is_none() {
                     self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
                 }
+                self.filter_done_notification_threads_for_filter(&section_key, &mut section);
                 self.replace_section_page(&section_key, section);
                 self.refreshing = false;
                 self.section_page_loading = None;
@@ -6126,6 +6242,27 @@ impl AppState {
         );
     }
 
+    fn filter_done_notification_threads_for_filter(
+        &mut self,
+        section_key: &str,
+        section: &mut SectionSnapshot,
+    ) {
+        if self
+            .quick_filters
+            .get(section_key)
+            .is_some_and(QuickFilter::matches_done_notifications)
+        {
+            self.done_notification_threads_to_delete.extend(
+                filter_only_done_notification_threads_in_sections(
+                    &mut self.done_notification_threads,
+                    std::slice::from_mut(section),
+                ),
+            );
+        } else {
+            self.filter_done_notification_threads(std::slice::from_mut(section));
+        }
+    }
+
     fn update_item_reactions(&mut self, item_id: &str, reactions: ReactionSummary) {
         for section in &mut self.sections {
             for item in &mut section.items {
@@ -6393,7 +6530,7 @@ impl AppState {
         let base_filters = self.base_filters_for_section(section);
         self.quick_filters
             .get(&section.key)
-            .map(|filter| quick_filter_query(&base_filters, filter))
+            .map(|filter| quick_filter_query_for_section(&base_filters, filter, section.kind))
             .unwrap_or(base_filters)
     }
 
@@ -11125,6 +11262,14 @@ impl AppState {
         store: Option<&SnapshotStore>,
         tx: Option<&UnboundedSender<AppMsg>>,
     ) {
+        if self
+            .current_section()
+            .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+        {
+            self.start_notification_search_input();
+            return;
+        }
+
         self.save_current_conversation_details_state();
         if !self.is_global_search_results_view() {
             self.global_search_return_view = Some(self.active_view.clone());
@@ -11136,8 +11281,9 @@ impl AppState {
             )
             .then_some(section.kind)
         });
-        let repo_scope = self.current_repo_scope();
-        let mut dialog = self.global_search_dialog_for_repo(repo_scope.clone());
+        let repo_scope = self.current_global_search_repo_scope();
+        let mut dialog = self
+            .global_search_dialog_for_repo(repo_scope.clone(), self.global_search_preferred_kind);
         let labels_refreshing = repo_scope
             .as_ref()
             .and_then(|repo| {
@@ -11170,13 +11316,60 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.reviewer_dialog = None;
-        self.status = match self.current_repo_scope() {
+        self.status = match repo_scope {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
         };
     }
 
-    fn global_search_dialog_for_repo(&self, repo: Option<String>) -> GlobalSearchDialog {
+    fn start_notification_search_input(&mut self) {
+        let Some(section) = self.current_section() else {
+            self.status = "no section selected".to_string();
+            return;
+        };
+        let section_key = section.key.clone();
+        let mut dialog = GlobalSearchDialog {
+            kind: GlobalSearchDialogKind::Notifications,
+            field: GlobalSearchField::Status,
+            sort: EditorText::from_text(""),
+            repo_filter: EditorText::from_text(""),
+            ..GlobalSearchDialog::default()
+        };
+        if let Some(filter) = self.quick_filters.get(&section_key) {
+            let (state, reasons, repos) = filter.notification_dialog_values();
+            dialog.status.set_text(state);
+            dialog.reason.set_text(reasons);
+            dialog.repo_filter.set_text(repos);
+        }
+        dialog.repo_candidates =
+            repo_candidates_from_sections(&self.sections, Some(SectionKind::Notifications));
+
+        self.save_current_conversation_details_state();
+        self.focus = FocusTarget::List;
+        self.global_search_active = true;
+        self.global_search_scope = None;
+        self.global_search_preferred_kind = Some(SectionKind::Notifications);
+        self.global_search_query.clear();
+        self.global_search_dialog = Some(dialog);
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.reviewer_dialog = None;
+        self.status = "inbox search mode".to_string();
+    }
+
+    fn global_search_dialog_for_repo(
+        &self,
+        repo: Option<String>,
+        kind: Option<SectionKind>,
+    ) -> GlobalSearchDialog {
         let mut dialog = GlobalSearchDialog {
             repo: repo.clone(),
             ..GlobalSearchDialog::default()
@@ -11199,6 +11392,7 @@ impl AppState {
         } else {
             dialog.author_candidates =
                 global_search_author_candidates_from_sections(&self.sections, None);
+            dialog.repo_candidates = repo_candidates_from_sections(&self.sections, kind);
         }
         let state_key = global_search_repo_state_key(repo.as_deref());
         if let Some(state) = self.global_search_by_repo.get(&state_key) {
@@ -11216,9 +11410,10 @@ impl AppState {
         let section_kind = section.kind;
         if !matches!(
             section_kind,
-            SectionKind::PullRequests | SectionKind::Issues
+            SectionKind::PullRequests | SectionKind::Issues | SectionKind::Notifications
         ) {
-            self.status = "quick filters are available for PR and issue sections".to_string();
+            self.status =
+                "quick filters are available for PR, issue, and inbox sections".to_string();
             return;
         }
 
@@ -11235,7 +11430,14 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
-        self.status = "filter mode: state:closed label:bug author:alice".to_string();
+        self.status = match section_kind {
+            SectionKind::Notifications => {
+                "filter mode: done unread reason:mention repo:owner/repo".to_string()
+            }
+            SectionKind::PullRequests | SectionKind::Issues => {
+                "filter mode: state:closed label:bug author:alice".to_string()
+            }
+        };
     }
 
     fn handle_filter_input_key(
@@ -11249,7 +11451,12 @@ impl AppState {
                 self.filter_input_active = false;
                 self.status = "filter cancelled".to_string();
             }
-            KeyCode::Enter => match QuickFilter::parse(&self.filter_input_query) {
+            KeyCode::Enter => match self
+                .current_section()
+                .map(|section| section.kind)
+                .ok_or_else(|| "no section selected".to_string())
+                .and_then(|kind| QuickFilter::parse_for_section(&self.filter_input_query, kind))
+            {
                 Ok(filter) => {
                     self.filter_input_active = false;
                     self.filter_input_query.clear();
@@ -11275,7 +11482,19 @@ impl AppState {
         config: &Config,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        let repo_scope = self.current_repo_scope();
+        if self
+            .global_search_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.kind == GlobalSearchDialogKind::Notifications)
+        {
+            self.handle_notification_search_key(key, config, tx);
+            return;
+        }
+
+        let repo_scope = self
+            .global_search_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.repo.clone());
         self.handle_global_search_key_with_submit(key, |query, display_query| {
             start_global_search(
                 query,
@@ -11285,6 +11504,72 @@ impl AppState {
                 tx.clone(),
             );
         });
+    }
+
+    fn handle_notification_search_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.global_search_active = false;
+                self.global_search_dialog = None;
+                self.global_search_preferred_kind = None;
+                self.status = "search cancelled".to_string();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_notification_search_dialog_conditions();
+            }
+            KeyCode::Enter => {
+                if self.accept_global_search_suggestion() {
+                    return;
+                }
+                let Some(dialog) = &self.global_search_dialog else {
+                    self.status = "notification filter is empty".to_string();
+                    return;
+                };
+                let filter = match notification_search_dialog_filter(dialog) {
+                    Ok(filter) => filter,
+                    Err(message) => {
+                        self.status = message;
+                        return;
+                    }
+                };
+                self.global_search_active = false;
+                self.global_search_dialog = None;
+                self.global_search_preferred_kind = None;
+                self.global_search_scope = None;
+                self.global_search_query.clear();
+                self.search_active = false;
+                self.search_query.clear();
+                self.comment_search_active = false;
+                self.filter_input_active = false;
+                start_filtered_section_load(self, config, tx, filter);
+            }
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.global_search_dialog {
+                    dialog.field = dialog.next_field(1);
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(dialog) = &mut self.global_search_dialog {
+                    dialog.field = dialog.next_field(-1);
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+            KeyCode::Down => self.move_global_search_suggestion(1),
+            KeyCode::Up => self.move_global_search_suggestion(-1),
+            _ => {
+                if let Some(dialog) = &mut self.global_search_dialog
+                    && dialog.active_editor_mut().input_key(key, false)
+                {
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+        }
     }
 
     fn handle_global_search_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
@@ -11320,12 +11605,12 @@ impl AppState {
                         return;
                     }
                 };
+                let repo_scope = dialog.repo.clone();
                 if self.global_search_running {
                     self.status = "search already running".to_string();
                     return;
                 }
                 self.remember_current_global_search_dialog();
-                let repo_scope = self.current_repo_scope();
                 self.global_search_active = false;
                 self.global_search_dialog = None;
                 self.global_search_running = true;
@@ -11346,14 +11631,14 @@ impl AppState {
             }
             KeyCode::Tab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
-                    dialog.field = dialog.field.next(1);
+                    dialog.field = dialog.next_field(1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
                 self.remember_current_global_search_dialog();
             }
             KeyCode::BackTab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
-                    dialog.field = dialog.field.next(-1);
+                    dialog.field = dialog.next_field(-1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
                 self.remember_current_global_search_dialog();
@@ -11375,12 +11660,27 @@ impl AppState {
         let Some(dialog) = &self.global_search_dialog else {
             return;
         };
+        if dialog.kind == GlobalSearchDialogKind::Notifications {
+            return;
+        }
         let key = global_search_repo_state_key(dialog.repo.as_deref());
         if let Some(state) = global_search_dialog_state(dialog) {
             self.global_search_by_repo.insert(key, state);
         } else {
             self.global_search_by_repo.remove(&key);
         }
+    }
+
+    fn clear_notification_search_dialog_conditions(&mut self) {
+        let Some(dialog) = &mut self.global_search_dialog else {
+            return;
+        };
+        dialog.status.set_text("");
+        dialog.reason.set_text("");
+        dialog.repo_filter.set_text("");
+        dialog.field = GlobalSearchField::Status;
+        reset_global_search_dialog_suggestions(dialog);
+        self.status = "notification search cleared".to_string();
     }
 
     fn clear_current_global_search_dialog_conditions(&mut self) {
@@ -12049,6 +12349,10 @@ impl AppState {
         self.current_item()
             .map(|item| item.repo.clone())
             .or_else(|| self.current_section().and_then(section_repo_scope))
+    }
+
+    fn current_global_search_repo_scope(&self) -> Option<String> {
+        self.current_section().and_then(section_repo_scope)
     }
 
     fn current_item_supports_comments(&self) -> bool {

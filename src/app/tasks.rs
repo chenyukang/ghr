@@ -149,14 +149,6 @@ pub(super) fn start_filtered_section_load(
         app.status = "no section selected".to_string();
         return;
     };
-    if !matches!(
-        section.kind,
-        SectionKind::PullRequests | SectionKind::Issues
-    ) {
-        app.status = "quick filters are available for PR and issue sections".to_string();
-        return;
-    }
-
     let section_key = section.key.clone();
     let view = section_view_key(section);
     let kind = section.kind;
@@ -164,7 +156,7 @@ pub(super) fn start_filtered_section_load(
     let base_filters = app.base_filters_for_section(section);
     let page_size = section_page_size(section, config);
     let effective_filters = match &filter {
-        Some(filter) => quick_filter_query(&base_filters, filter),
+        Some(filter) => quick_filter_query_for_section(&base_filters, filter, kind),
         None => base_filters.clone(),
     };
     let status_filter = filter.as_ref().map(QuickFilter::display);
@@ -197,8 +189,22 @@ pub(super) fn start_filtered_section_load(
     let config = config.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let section =
-            refresh_section_page(view, kind, title, effective_filters, 1, page_size, &config).await;
+        let section = match kind {
+            SectionKind::Notifications => {
+                refresh_notification_section_page(
+                    view,
+                    title,
+                    effective_filters,
+                    page_size,
+                    &config,
+                )
+                .await
+            }
+            SectionKind::PullRequests | SectionKind::Issues => {
+                refresh_section_page(view, kind, title, effective_filters, 1, page_size, &config)
+                    .await
+            }
+        };
         let _ = tx.send(AppMsg::FilterSectionLoaded {
             section_key,
             section,

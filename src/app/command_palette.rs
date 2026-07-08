@@ -252,10 +252,10 @@ pub(super) fn command_palette_commands(
             PaletteAction::ItemSubscriptionAction(ItemSubscriptionAction::Unsubscribe),
         ),
         palette_command(
-            "Search Current Repo",
+            "Search Current List",
             "S",
             "General",
-            "Search the current PR or issue list with structured fields",
+            "Search the current PR/issue list or Inbox notifications with structured fields",
             PaletteAction::SearchCurrentRepo,
         ),
         palette_command(

@@ -253,21 +253,10 @@ pub(super) fn start_notification_done_sync(
 ) {
     tokio::spawn(async move {
         let result = match mark_notification_thread_done(&thread_id).await {
-            Ok(()) => {
-                let mut save_errors = Vec::new();
-                if let Err(error) = store.save_done_notification_thread(&thread_id, done_cutoff) {
-                    save_errors.push(error.to_string());
-                }
-                if let Err(error) = store.mark_notification_done(&thread_id) {
-                    save_errors.push(error.to_string());
-                }
-
-                if save_errors.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(save_errors.join("; ")))
-                }
-            }
+            Ok(()) => match store.mark_notification_done_persisted(&thread_id, done_cutoff) {
+                Ok(_) => Ok(None),
+                Err(error) => Ok(Some(error.to_string())),
+            },
             Err(error) => Err(error.to_string()),
         };
         let _ = tx.send(AppMsg::NotificationDoneFinished {

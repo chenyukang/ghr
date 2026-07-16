@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Error as SqliteError, ErrorCode, Transaction, params};
 
 use crate::model::{
     EditorDraft, SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
@@ -13,6 +14,11 @@ use crate::model::{
 };
 
 const SNAPSHOT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_DB_WRITE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(300),
+    Duration::from_millis(700),
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoCandidateCache {
@@ -24,110 +30,63 @@ pub struct RepoCandidateCache {
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl SnapshotStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn init(&self) -> Result<()> {
-        let conn = self.connect()?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS snapshots (
-                key TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                title TEXT NOT NULL,
-                filters TEXT NOT NULL,
-                items_json TEXT NOT NULL,
-                total_count INTEGER,
-                page INTEGER NOT NULL DEFAULT 1,
-                page_size INTEGER NOT NULL DEFAULT 0,
-                refreshed_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS repo_candidate_cache (
-                repo TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                values_json TEXT NOT NULL,
-                refreshed_at TEXT NOT NULL,
-                PRIMARY KEY (repo, kind)
-            );
-            CREATE TABLE IF NOT EXISTS editor_drafts (
-                key TEXT PRIMARY KEY,
-                body TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS done_notification_threads (
-                thread_id TEXT PRIMARY KEY,
-                notification_updated_at TEXT NOT NULL,
-                done_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .context("failed to initialize snapshot database")?;
-        ensure_snapshot_column(&conn, "total_count", "INTEGER")?;
-        ensure_snapshot_column(&conn, "page", "INTEGER NOT NULL DEFAULT 1")?;
-        ensure_snapshot_column(&conn, "page_size", "INTEGER NOT NULL DEFAULT 0")?;
-        Ok(())
+        self.with_write_conn("initialize snapshot database", |conn| {
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    filters TEXT NOT NULL,
+                    items_json TEXT NOT NULL,
+                    total_count INTEGER,
+                    page INTEGER NOT NULL DEFAULT 1,
+                    page_size INTEGER NOT NULL DEFAULT 0,
+                    refreshed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS repo_candidate_cache (
+                    repo TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    values_json TEXT NOT NULL,
+                    refreshed_at TEXT NOT NULL,
+                    PRIMARY KEY (repo, kind)
+                );
+                CREATE TABLE IF NOT EXISTS editor_drafts (
+                    key TEXT PRIMARY KEY,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS done_notification_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    notification_updated_at TEXT NOT NULL,
+                    done_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .context("failed to initialize snapshot database")?;
+            ensure_snapshot_column(conn, "total_count", "INTEGER")?;
+            ensure_snapshot_column(conn, "page", "INTEGER NOT NULL DEFAULT 1")?;
+            ensure_snapshot_column(conn, "page_size", "INTEGER NOT NULL DEFAULT 0")?;
+            Ok(())
+        })
     }
 
     pub fn load_all(&self) -> Result<HashMap<String, SectionSnapshot>> {
         let conn = self.connect()?;
-        let mut stmt = conn
-            .prepare(
-                r#"
-                SELECT key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at
-                FROM snapshots
-                "#,
-            )
-            .context("failed to prepare snapshot load")?;
-
-        let mut rows = stmt.query([]).context("failed to load snapshots")?;
-        let mut sections = HashMap::new();
-        while let Some(row) = rows.next().context("failed to read snapshot row")? {
-            let key: String = row.get(0)?;
-            let kind_raw: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let filters: String = row.get(3)?;
-            let items_json: String = row.get(4)?;
-            let total_count_raw: Option<i64> = row.get(5)?;
-            let total_count = total_count_raw.and_then(|value| usize::try_from(value).ok());
-            let page_raw: i64 = row.get(6)?;
-            let page = usize::try_from(page_raw)
-                .ok()
-                .filter(|page| *page > 0)
-                .unwrap_or(1);
-            let page_size_raw: i64 = row.get(7)?;
-            let page_size = usize::try_from(page_size_raw).unwrap_or(0);
-            let refreshed_at_raw: String = row.get(8)?;
-
-            let kind = SectionKind::from_str(&kind_raw).map_err(anyhow::Error::msg)?;
-            let items = serde_json::from_str(&items_json)
-                .with_context(|| format!("failed to parse cached items for {key}"))?;
-            let refreshed_at = DateTime::parse_from_rfc3339(&refreshed_at_raw)
-                .map(|value| value.with_timezone(&Utc))
-                .with_context(|| format!("failed to parse refreshed_at for {key}"))?;
-
-            sections.insert(
-                key.clone(),
-                SectionSnapshot {
-                    key,
-                    kind,
-                    title,
-                    filters,
-                    items,
-                    total_count,
-                    page,
-                    page_size,
-                    refreshed_at: Some(refreshed_at),
-                    error: None,
-                },
-            );
-        }
-
-        Ok(sections)
+        load_all_sections(&conn)
     }
 
     pub fn load_done_notification_threads(&self) -> Result<HashMap<String, DateTime<Utc>>> {
@@ -135,13 +94,26 @@ impl SnapshotStore {
         load_done_notification_threads(&conn)
     }
 
+    #[cfg(test)]
     pub fn save_done_notification_thread(
         &self,
         thread_id: &str,
         notification_updated_at: DateTime<Utc>,
     ) -> Result<()> {
-        let conn = self.connect()?;
-        save_done_notification_thread(&conn, thread_id, notification_updated_at, Utc::now())
+        self.with_write_conn("save done notification", |conn| {
+            save_done_notification_thread(conn, thread_id, notification_updated_at, Utc::now())
+        })
+    }
+
+    pub fn mark_notification_done_persisted(
+        &self,
+        thread_id: &str,
+        notification_updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.with_write_transaction("mark notification done", |tx| {
+            save_done_notification_thread(tx, thread_id, notification_updated_at, Utc::now())?;
+            mark_notification_done_in_cached_sections(tx, thread_id)
+        })
     }
 
     pub fn migrate_done_notification_threads(
@@ -152,18 +124,19 @@ impl SnapshotStore {
             return Ok(0);
         }
 
-        let conn = self.connect()?;
-        let done_at = Utc::now();
-        let mut changed = 0;
-        for (thread_id, notification_updated_at) in threads {
-            changed += insert_done_notification_thread_if_missing(
-                &conn,
-                thread_id,
-                *notification_updated_at,
-                done_at,
-            )?;
-        }
-        Ok(changed)
+        self.with_write_transaction("migrate done notifications", |tx| {
+            let done_at = Utc::now();
+            let mut changed = 0;
+            for (thread_id, notification_updated_at) in threads {
+                changed += insert_done_notification_thread_if_missing(
+                    tx,
+                    thread_id,
+                    *notification_updated_at,
+                    done_at,
+                )?;
+            }
+            Ok(changed)
+        })
     }
 
     pub fn delete_done_notification_threads(&self, thread_ids: &[String]) -> Result<usize> {
@@ -171,17 +144,18 @@ impl SnapshotStore {
             return Ok(0);
         }
 
-        let conn = self.connect()?;
-        let mut changed = 0;
-        for thread_id in thread_ids {
-            changed += conn
-                .execute(
-                    "DELETE FROM done_notification_threads WHERE thread_id = ?1",
-                    params![thread_id],
-                )
-                .with_context(|| format!("failed to delete done notification {thread_id}"))?;
-        }
-        Ok(changed)
+        self.with_write_transaction("delete done notifications", |tx| {
+            let mut changed = 0;
+            for thread_id in thread_ids {
+                changed += tx
+                    .execute(
+                        "DELETE FROM done_notification_threads WHERE thread_id = ?1",
+                        params![thread_id],
+                    )
+                    .with_context(|| format!("failed to delete done notification {thread_id}"))?;
+            }
+            Ok(changed)
+        })
     }
 
     pub fn load_editor_drafts(&self) -> Result<HashMap<String, EditorDraft>> {
@@ -256,33 +230,35 @@ impl SnapshotStore {
     }
 
     pub fn save_editor_draft(&self, key: &str, body: &str) -> Result<EditorDraft> {
-        let conn = self.connect()?;
         let draft = EditorDraft {
             key: key.to_string(),
             body: body.to_string(),
             updated_at: Utc::now(),
         };
-        conn.execute(
-            r#"
-            INSERT INTO editor_drafts (key, body, updated_at)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(key) DO UPDATE SET
-                body = excluded.body,
-                updated_at = excluded.updated_at
-            "#,
-            params![&draft.key, &draft.body, draft.updated_at.to_rfc3339()],
-        )
-        .with_context(|| format!("failed to save editor draft {}", draft.key))?;
+        self.with_write_conn("save editor draft", |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO editor_drafts (key, body, updated_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(key) DO UPDATE SET
+                    body = excluded.body,
+                    updated_at = excluded.updated_at
+                "#,
+                params![&draft.key, &draft.body, draft.updated_at.to_rfc3339()],
+            )
+            .with_context(|| format!("failed to save editor draft {}", draft.key))?;
 
-        Ok(draft)
+            Ok(draft.clone())
+        })
     }
 
     pub fn delete_editor_draft(&self, key: &str) -> Result<bool> {
-        let conn = self.connect()?;
-        let changed = conn
-            .execute("DELETE FROM editor_drafts WHERE key = ?1", params![key])
-            .with_context(|| format!("failed to delete editor draft {key}"))?;
-        Ok(changed > 0)
+        self.with_write_conn("delete editor draft", |conn| {
+            let changed = conn
+                .execute("DELETE FROM editor_drafts WHERE key = ?1", params![key])
+                .with_context(|| format!("failed to delete editor draft {key}"))?;
+            Ok(changed > 0)
+        })
     }
 
     pub fn save_label_candidates(&self, repo: &str, labels: &[String]) -> Result<()> {
@@ -302,118 +278,121 @@ impl SnapshotStore {
             return Ok(());
         };
 
-        let conn = self.connect()?;
-        let items_json = serde_json::to_string(&section.items)
-            .with_context(|| format!("failed to encode snapshot {}", section.key))?;
-
-        conn.execute(
-            r#"
-            INSERT INTO snapshots (key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(key) DO UPDATE SET
-                kind = excluded.kind,
-                title = excluded.title,
-                filters = excluded.filters,
-                items_json = excluded.items_json,
-                total_count = excluded.total_count,
-                page = excluded.page,
-                page_size = excluded.page_size,
-                refreshed_at = excluded.refreshed_at
-            "#,
-            params![
-                &section.key,
-                section.kind.as_str(),
-                &section.title,
-                &section.filters,
-                items_json,
-                section.total_count.map(|value| value as i64),
-                section.page as i64,
-                section.page_size as i64,
-                refreshed_at.to_rfc3339(),
-            ],
-        )
-        .with_context(|| format!("failed to save snapshot {}", section.key))?;
-
-        Ok(())
+        self.with_write_conn("save snapshot", |conn| {
+            save_section(conn, section, refreshed_at)
+        })
     }
 
     pub fn mark_notification_read(&self, thread_id: &str) -> Result<bool> {
-        let mut changed = false;
-        for mut section in self.load_all()?.into_values() {
-            if mark_notification_read_in_section(&mut section, thread_id) {
-                self.save_section(&section)?;
-                changed = true;
-            }
-        }
-        Ok(changed)
+        self.with_write_transaction("mark notification read", |tx| {
+            mark_notification_read_in_cached_sections(tx, thread_id)
+        })
     }
 
+    #[cfg(test)]
     pub fn mark_notification_done(&self, thread_id: &str) -> Result<bool> {
-        let mut changed = false;
-        for mut section in self.load_all()?.into_values() {
-            if mark_notification_done_in_section(&mut section, thread_id) {
-                self.save_section(&section)?;
-                changed = true;
-            }
-        }
-        Ok(changed)
+        self.with_write_transaction("mark notification done", |tx| {
+            mark_notification_done_in_cached_sections(tx, thread_id)
+        })
     }
 
     pub fn mark_all_notifications_read(&self) -> Result<bool> {
-        let mut changed = false;
-        let last_read_at = Utc::now();
-        for mut section in self.load_all()?.into_values() {
-            if mark_all_notifications_read_in_section(&mut section, last_read_at) {
-                self.save_section(&section)?;
-                changed = true;
+        self.with_write_transaction("mark all notifications read", |tx| {
+            let mut changed = false;
+            let last_read_at = Utc::now();
+            for mut section in load_all_sections(tx)?.into_values() {
+                if mark_all_notifications_read_in_section(&mut section, last_read_at) {
+                    save_section_if_refreshed(tx, &section)?;
+                    changed = true;
+                }
             }
-        }
-        Ok(changed)
+            Ok(changed)
+        })
     }
 
     pub fn clear_snapshots(&self) -> Result<usize> {
-        let conn = self.connect()?;
-        conn.execute("DELETE FROM snapshots", [])
-            .context("failed to clear snapshot cache")
+        self.with_write_conn("clear snapshot cache", |conn| {
+            conn.execute("DELETE FROM snapshots", [])
+                .context("failed to clear snapshot cache")
+        })
     }
 
     pub fn clear_snapshots_by_keys(&self, keys: &[String]) -> Result<usize> {
-        let conn = self.connect()?;
         let mut keys = keys.to_vec();
         keys.sort();
         keys.dedup();
-        let mut changed = 0;
-        for key in keys {
-            changed += conn
-                .execute("DELETE FROM snapshots WHERE key = ?1", params![key])
-                .with_context(|| format!("failed to clear snapshot {key}"))?;
-        }
-        Ok(changed)
+        self.with_write_transaction("clear selected snapshots", |tx| {
+            let mut changed = 0;
+            for key in &keys {
+                changed += tx
+                    .execute("DELETE FROM snapshots WHERE key = ?1", params![key])
+                    .with_context(|| format!("failed to clear snapshot {key}"))?;
+            }
+            Ok(changed)
+        })
     }
 
     pub fn clear_repo_candidate_cache(&self) -> Result<usize> {
-        let conn = self.connect()?;
-        conn.execute("DELETE FROM repo_candidate_cache", [])
-            .context("failed to clear repo candidate cache")
+        self.with_write_conn("clear repo candidate cache", |conn| {
+            conn.execute("DELETE FROM repo_candidate_cache", [])
+                .context("failed to clear repo candidate cache")
+        })
     }
 
     fn save_repo_candidates(&self, repo: &str, kind: &str, values: &[String]) -> Result<()> {
-        let conn = self.connect()?;
         let values_json = serde_json::to_string(values)
             .with_context(|| format!("failed to encode cached {kind} candidates for {repo}"))?;
-        conn.execute(
-            r#"
-            INSERT INTO repo_candidate_cache (repo, kind, values_json, refreshed_at)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(repo, kind) DO UPDATE SET
-                values_json = excluded.values_json,
-                refreshed_at = excluded.refreshed_at
-            "#,
-            params![repo, kind, values_json, Utc::now().to_rfc3339()],
-        )
-        .with_context(|| format!("failed to save cached {kind} candidates for {repo}"))?;
+        self.with_write_conn("save repo candidate cache", |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO repo_candidate_cache (repo, kind, values_json, refreshed_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(repo, kind) DO UPDATE SET
+                    values_json = excluded.values_json,
+                    refreshed_at = excluded.refreshed_at
+                "#,
+                params![repo, kind, values_json, Utc::now().to_rfc3339()],
+            )
+            .with_context(|| format!("failed to save cached {kind} candidates for {repo}"))?;
 
-        Ok(())
+            Ok(())
+        })
+    }
+
+    fn lock_writes(&self, operation: &str) -> Result<MutexGuard<'_, ()>> {
+        self.write_lock
+            .lock()
+            .map_err(|_| anyhow!("snapshot write lock poisoned while trying to {operation}"))
+    }
+
+    fn with_write_conn<T>(
+        &self,
+        operation: &str,
+        mut f: impl FnMut(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self.lock_writes(operation)?;
+        retry_snapshot_write(operation, || {
+            let conn = self.connect()?;
+            f(&conn)
+        })
+    }
+
+    fn with_write_transaction<T>(
+        &self,
+        operation: &str,
+        mut f: impl FnMut(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self.lock_writes(operation)?;
+        retry_snapshot_write(operation, || {
+            let mut conn = self.connect()?;
+            let tx = conn
+                .transaction()
+                .with_context(|| format!("failed to start transaction to {operation}"))?;
+            let result = f(&tx)?;
+            tx.commit()
+                .with_context(|| format!("failed to commit transaction to {operation}"))?;
+            Ok(result)
+        })
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -453,6 +432,130 @@ fn load_done_notification_threads(conn: &Connection) -> Result<HashMap<String, D
     Ok(threads)
 }
 
+fn load_all_sections(conn: &Connection) -> Result<HashMap<String, SectionSnapshot>> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at
+            FROM snapshots
+            "#,
+        )
+        .context("failed to prepare snapshot load")?;
+
+    let mut rows = stmt.query([]).context("failed to load snapshots")?;
+    let mut sections = HashMap::new();
+    while let Some(row) = rows.next().context("failed to read snapshot row")? {
+        let key: String = row.get(0)?;
+        let kind_raw: String = row.get(1)?;
+        let title: String = row.get(2)?;
+        let filters: String = row.get(3)?;
+        let items_json: String = row.get(4)?;
+        let total_count_raw: Option<i64> = row.get(5)?;
+        let total_count = total_count_raw.and_then(|value| usize::try_from(value).ok());
+        let page_raw: i64 = row.get(6)?;
+        let page = usize::try_from(page_raw)
+            .ok()
+            .filter(|page| *page > 0)
+            .unwrap_or(1);
+        let page_size_raw: i64 = row.get(7)?;
+        let page_size = usize::try_from(page_size_raw).unwrap_or(0);
+        let refreshed_at_raw: String = row.get(8)?;
+
+        let kind = SectionKind::from_str(&kind_raw).map_err(anyhow::Error::msg)?;
+        let items = serde_json::from_str(&items_json)
+            .with_context(|| format!("failed to parse cached items for {key}"))?;
+        let refreshed_at = DateTime::parse_from_rfc3339(&refreshed_at_raw)
+            .map(|value| value.with_timezone(&Utc))
+            .with_context(|| format!("failed to parse refreshed_at for {key}"))?;
+
+        sections.insert(
+            key.clone(),
+            SectionSnapshot {
+                key,
+                kind,
+                title,
+                filters,
+                items,
+                total_count,
+                page,
+                page_size,
+                refreshed_at: Some(refreshed_at),
+                error: None,
+            },
+        );
+    }
+
+    Ok(sections)
+}
+
+fn save_section_if_refreshed(conn: &Connection, section: &SectionSnapshot) -> Result<()> {
+    let Some(refreshed_at) = section.refreshed_at else {
+        return Ok(());
+    };
+    save_section(conn, section, refreshed_at)
+}
+
+fn save_section(
+    conn: &Connection,
+    section: &SectionSnapshot,
+    refreshed_at: DateTime<Utc>,
+) -> Result<()> {
+    let items_json = serde_json::to_string(&section.items)
+        .with_context(|| format!("failed to encode snapshot {}", section.key))?;
+
+    conn.execute(
+        r#"
+        INSERT INTO snapshots (key, kind, title, filters, items_json, total_count, page, page_size, refreshed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(key) DO UPDATE SET
+            kind = excluded.kind,
+            title = excluded.title,
+            filters = excluded.filters,
+            items_json = excluded.items_json,
+            total_count = excluded.total_count,
+            page = excluded.page,
+            page_size = excluded.page_size,
+            refreshed_at = excluded.refreshed_at
+        "#,
+        params![
+            &section.key,
+            section.kind.as_str(),
+            &section.title,
+            &section.filters,
+            items_json,
+            section.total_count.map(|value| value as i64),
+            section.page as i64,
+            section.page_size as i64,
+            refreshed_at.to_rfc3339(),
+        ],
+    )
+    .with_context(|| format!("failed to save snapshot {}", section.key))?;
+
+    Ok(())
+}
+
+fn mark_notification_read_in_cached_sections(conn: &Connection, thread_id: &str) -> Result<bool> {
+    let mut changed = false;
+    for mut section in load_all_sections(conn)?.into_values() {
+        if mark_notification_read_in_section(&mut section, thread_id) {
+            save_section_if_refreshed(conn, &section)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn mark_notification_done_in_cached_sections(conn: &Connection, thread_id: &str) -> Result<bool> {
+    let mut changed = false;
+    for mut section in load_all_sections(conn)?.into_values() {
+        if mark_notification_done_in_section(&mut section, thread_id) {
+            save_section_if_refreshed(conn, &section)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn save_done_notification_thread(
     conn: &Connection,
     thread_id: &str,
@@ -475,6 +578,33 @@ fn save_done_notification_thread(
     )
     .with_context(|| format!("failed to save done notification {thread_id}"))?;
     Ok(())
+}
+
+fn retry_snapshot_write<T>(_operation: &str, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut retry_delays = SNAPSHOT_DB_WRITE_RETRY_DELAYS.iter().copied();
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if is_retryable_snapshot_write_error(&error)
+                    && let Some(delay) = retry_delays.next()
+                {
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn is_retryable_snapshot_write_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SqliteError>()
+            .and_then(SqliteError::sqlite_error_code)
+            .is_some_and(|code| matches!(code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
+    })
 }
 
 fn insert_done_notification_thread_if_missing(
@@ -519,6 +649,7 @@ fn ensure_snapshot_column(conn: &Connection, name: &str, definition: &str) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -936,6 +1067,37 @@ mod tests {
         );
 
         remove_db_files(&path);
+    }
+
+    #[test]
+    fn cloned_snapshot_stores_share_write_lock() {
+        let path = temp_db_path("shared-write-lock");
+        let store = SnapshotStore::new(path);
+        let cloned = store.clone();
+        let _guard = store.write_lock.lock().expect("lock original store");
+
+        assert!(cloned.write_lock.try_lock().is_err());
+    }
+
+    #[test]
+    fn snapshot_write_retries_busy_errors() {
+        let attempts = Cell::new(0);
+
+        let result = retry_snapshot_write("test retry", || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                return Err(anyhow::Error::new(SqliteError::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )));
+            }
+            Ok("ok")
+        })
+        .expect("retry succeeds");
+
+        assert_eq!(result, "ok");
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]

@@ -247,7 +247,7 @@ pub(super) fn start_notification_read_sync(
 
 pub(super) fn start_notification_done_sync(
     thread_id: String,
-    last_updated_at: Option<DateTime<Utc>>,
+    done_cutoff: DateTime<Utc>,
     store: SnapshotStore,
     tx: UnboundedSender<AppMsg>,
 ) {
@@ -255,10 +255,7 @@ pub(super) fn start_notification_done_sync(
         let result = match mark_notification_thread_done(&thread_id).await {
             Ok(()) => {
                 let mut save_errors = Vec::new();
-                let notification_updated_at = last_updated_at.unwrap_or_else(Utc::now);
-                if let Err(error) =
-                    store.save_done_notification_thread(&thread_id, notification_updated_at)
-                {
+                if let Err(error) = store.save_done_notification_thread(&thread_id, done_cutoff) {
                     save_errors.push(error.to_string());
                 }
                 if let Err(error) = store.mark_notification_done(&thread_id) {
@@ -275,7 +272,7 @@ pub(super) fn start_notification_done_sync(
         };
         let _ = tx.send(AppMsg::NotificationDoneFinished {
             thread_id,
-            last_updated_at,
+            done_cutoff,
             result,
         });
     });

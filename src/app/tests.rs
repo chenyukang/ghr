@@ -20006,7 +20006,7 @@ fn notification_done_finished_updates_local_state_and_clears_pending() {
 
     app.handle_msg(AppMsg::NotificationDoneFinished {
         thread_id: "thread-1".to_string(),
-        last_updated_at: Some(updated_at),
+        done_cutoff: updated_at,
         result: Ok(None),
     });
 
@@ -20017,6 +20017,42 @@ fn notification_done_finished_updates_local_state_and_clears_pending() {
         Some(&updated_at)
     );
     assert_eq!(app.status, "notification marked done");
+}
+
+#[test]
+fn notification_done_cutoff_uses_dismiss_time_after_stale_notification_timestamp() {
+    let item_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let dismissed_at = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(item_updated_at);
+    let app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![item])],
+    );
+
+    assert_eq!(
+        app.notification_done_cutoff("thread-1", Some(item_updated_at), dismissed_at),
+        dismissed_at
+    );
+}
+
+#[test]
+fn refreshed_notifications_stay_hidden_for_api_timestamp_before_dismiss_time() {
+    let dismissed_at = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![])],
+    );
+    app.done_notification_threads
+        .insert("thread-1".to_string(), dismissed_at);
+
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(DateTime::from_timestamp(1_700_000_050, 0).unwrap());
+    app.apply_refreshed_section(notification_section(vec![item]), None);
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+    assert!(app.take_done_notification_threads_to_delete().is_empty());
 }
 
 #[test]

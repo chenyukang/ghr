@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -10,6 +11,8 @@ use crate::model::{
     EditorDraft, SectionKind, SectionSnapshot, mark_all_notifications_read_in_section,
     mark_notification_done_in_section, mark_notification_read_in_section,
 };
+
+const SNAPSHOT_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoCandidateCache {
@@ -414,8 +417,11 @@ impl SnapshotStore {
     }
 
     fn connect(&self) -> Result<Connection> {
-        Connection::open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))
+        let conn = Connection::open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        conn.busy_timeout(SNAPSHOT_DB_BUSY_TIMEOUT)
+            .with_context(|| format!("failed to configure {}", self.path.display()))?;
+        Ok(conn)
     }
 }
 
@@ -927,6 +933,21 @@ mod tests {
                 .expect("load done notifications")
                 .len(),
             1
+        );
+
+        remove_db_files(&path);
+    }
+
+    #[test]
+    fn snapshot_connections_wait_for_short_write_locks() {
+        let path = temp_db_path("busy-timeout");
+        let store = SnapshotStore::new(path.clone());
+        let conn = store.connect().expect("connect");
+
+        assert_eq!(
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .expect("read busy timeout"),
+            SNAPSHOT_DB_BUSY_TIMEOUT.as_millis() as i64
         );
 
         remove_db_files(&path);

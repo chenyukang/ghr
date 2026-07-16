@@ -293,7 +293,7 @@ enum AppMsg {
     },
     NotificationDoneFinished {
         thread_id: String,
-        last_updated_at: Option<DateTime<Utc>>,
+        done_cutoff: DateTime<Utc>,
         result: std::result::Result<Option<String>, String>,
     },
     InboxMarkAllReadFinished {
@@ -5038,13 +5038,13 @@ impl AppState {
             }
             AppMsg::NotificationDoneFinished {
                 thread_id,
-                last_updated_at,
+                done_cutoff,
                 result,
             } => {
                 self.notification_done_pending.remove(&thread_id);
                 match result {
                     Ok(save_error) => {
-                        self.remember_done_notification_thread(&thread_id, last_updated_at);
+                        self.remember_done_notification_thread(&thread_id, done_cutoff);
                         let changed = self.apply_notification_done_local(&thread_id);
                         self.status = match (changed, save_error) {
                             (_, Some(error)) => {
@@ -6113,15 +6113,17 @@ impl AppState {
             return;
         };
         let thread_id = item.id.clone();
-        let last_updated_at = item.updated_at;
+        let selected_updated_at = item.updated_at;
+        let done_cutoff =
+            self.notification_done_cutoff(&thread_id, selected_updated_at, Utc::now());
 
-        self.mark_notification_done(thread_id, last_updated_at, store, tx);
+        self.mark_notification_done(thread_id, done_cutoff, store, tx);
     }
 
     fn mark_notification_done(
         &mut self,
         thread_id: String,
-        last_updated_at: Option<DateTime<Utc>>,
+        done_cutoff: DateTime<Utc>,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
@@ -6130,7 +6132,7 @@ impl AppState {
         }
 
         self.status = "marking notification done".to_string();
-        start_notification_done_sync(thread_id, last_updated_at, store.clone(), tx.clone());
+        start_notification_done_sync(thread_id, done_cutoff, store.clone(), tx.clone());
     }
 
     fn mark_all_inbox_read(&mut self, store: &SnapshotStore, tx: &UnboundedSender<AppMsg>) {
@@ -6222,15 +6224,28 @@ impl AppState {
         changed
     }
 
-    fn remember_done_notification_thread(
-        &mut self,
-        thread_id: &str,
-        updated_at: Option<DateTime<Utc>>,
-    ) {
-        let done_at = updated_at.unwrap_or_else(Utc::now);
+    fn remember_done_notification_thread(&mut self, thread_id: &str, done_cutoff: DateTime<Utc>) {
         self.done_notification_threads
-            .insert(thread_id.to_string(), done_at);
+            .insert(thread_id.to_string(), done_cutoff);
         self.done_notification_threads_to_delete.remove(thread_id);
+    }
+
+    fn notification_done_cutoff(
+        &self,
+        thread_id: &str,
+        selected_updated_at: Option<DateTime<Utc>>,
+        dismissed_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        self.sections
+            .iter()
+            .filter(|section| matches!(section.kind, SectionKind::Notifications))
+            .flat_map(|section| section.items.iter())
+            .filter(|item| item.id == thread_id)
+            .filter_map(|item| item.updated_at)
+            .chain(selected_updated_at)
+            .chain(std::iter::once(dismissed_at))
+            .max()
+            .unwrap_or(dismissed_at)
     }
 
     fn filter_done_notification_threads(&mut self, sections: &mut [SectionSnapshot]) {

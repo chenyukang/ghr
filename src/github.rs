@@ -902,6 +902,35 @@ struct PullRequestHeadRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct PullRequestNodeRaw {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestRestStatusRaw {
+    node_id: String,
+    state: Option<String>,
+    draft: Option<bool>,
+    auto_merge: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedPullRequestRaw {
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergePullRequestRaw {
+    merged: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryDefaultBranchRaw {
+    default_branch: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PullRequestHeadRefRaw {
     sha: String,
 }
@@ -1474,6 +1503,10 @@ async fn fetch_search_items_for_query(
     limit: usize,
     exclude_repos: &[String],
 ) -> Result<Vec<WorkItem>> {
+    if crate::github_api::token_available() {
+        return fetch_search_items_with_pat(kind, &filters, limit, exclude_repos).await;
+    }
+
     let subcommand = match kind {
         SectionKind::PullRequests => "prs",
         SectionKind::Issues => "issues",
@@ -1493,6 +1526,31 @@ async fn fetch_search_items_for_query(
         .filter(|item| !is_excluded_repo(&item.repository.name_with_owner, exclude_repos))
         .map(|item| search_item_to_work_item(kind, item))
         .collect())
+}
+
+async fn fetch_search_items_with_pat(
+    kind: SectionKind,
+    filters: &str,
+    limit: usize,
+    exclude_repos: &[String],
+) -> Result<Vec<WorkItem>> {
+    let limit = search_command_limit(limit);
+    let page_size = search_api_page_size(limit);
+    let mut page = 1;
+    let mut items = Vec::new();
+
+    loop {
+        let result = fetch_search_page(kind, filters, page, page_size, exclude_repos).await?;
+        let total_count = result.total_count.unwrap_or(result.items.len());
+        items.extend(result.items);
+        if items.len() >= limit || page.saturating_mul(page_size) >= total_count {
+            break;
+        }
+        page += 1;
+    }
+
+    items.truncate(limit);
+    Ok(items)
 }
 
 fn search_args(subcommand: &str, fields: &str, filters: &str, limit: usize) -> Vec<String> {
@@ -2225,6 +2283,9 @@ async fn fetch_paginated_api_array_output_without_slurp(
 }
 
 async fn gh_api_slurp_supported() -> bool {
+    if crate::github_api::token_available() {
+        return false;
+    }
     *GH_API_SLURP_SUPPORTED
         .get_or_init(detect_gh_api_slurp_support)
         .await
@@ -2482,6 +2543,9 @@ query($owner: String!, $name: String!, $number: Int!) {
         .and_then(|repository| repository.pull_request)
         .ok_or_else(|| anyhow!("pull request {repository}#{number} was not found"))?;
     let mut hints = pull_request_action_hints(&pr);
+    if crate::github_api::token_available() {
+        return Ok(hints);
+    }
     match fetch_failed_check_runs_from_pr_checks(repository, number).await {
         Ok(discovery) => {
             if !discovery.check_runs.is_empty() {
@@ -2502,6 +2566,26 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 
 pub async fn rerun_failed_pull_request_checks(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        let hints = fetch_pull_request_action_hints(repository, number).await?;
+        if hints.failed_check_runs.is_empty() {
+            bail!("no failed GitHub Actions checks found for {repository}#{number}");
+        }
+        for run in hints.failed_check_runs {
+            run_gh_json(&[
+                "api".to_string(),
+                "-X".to_string(),
+                "POST".to_string(),
+                format!(
+                    "repos/{repository}/actions/runs/{}/rerun-failed-jobs",
+                    run.run_id
+                ),
+            ])
+            .await?;
+        }
+        return Ok(());
+    }
+
     let discovery = fetch_failed_check_runs_from_pr_checks(repository, number).await?;
     if discovery.runs.is_empty() {
         if discovery.unmapped_failed_checks.is_empty() {
@@ -2722,12 +2806,42 @@ pub async fn create_pull_request(
     body: &str,
 ) -> Result<WorkItem> {
     push_pull_request_head(repository, local_dir, head).await?;
+    if crate::github_api::token_available() {
+        let repository_output =
+            run_gh_json(&["api".to_string(), format!("repos/{repository}")]).await?;
+        let repository_raw = serde_json::from_str::<RepositoryDefaultBranchRaw>(&repository_output)
+            .with_context(|| format!("failed to parse default branch for {repository}"))?;
+        let output = run_gh_json(&[
+            "api".to_string(),
+            "-X".to_string(),
+            "POST".to_string(),
+            format!("repos/{repository}/pulls"),
+            "-f".to_string(),
+            format!("head={head}"),
+            "-f".to_string(),
+            format!("base={}", repository_raw.default_branch),
+            "-f".to_string(),
+            format!("title={title}"),
+            "-f".to_string(),
+            format!("body={body}"),
+        ])
+        .await
+        .with_context(|| format!("failed to create pull request in {repository}"))?;
+        let created = serde_json::from_str::<CreatedPullRequestRaw>(&output)
+            .with_context(|| format!("failed to parse created pull request in {repository}"))?;
+        return fetch_created_pull_request(repository, created.number).await;
+    }
+
     let args = create_pull_request_args(repository, head, title, body);
     let output = run_gh_text_in_dir(&args, local_dir)
         .await
         .with_context(|| format!("failed to create pull request in {repository}"))?;
     let number = pull_request_number_from_create_output(&output)
         .ok_or_else(|| anyhow!("gh pr create did not return a pull request URL"))?;
+    fetch_created_pull_request(repository, number).await
+}
+
+async fn fetch_created_pull_request(repository: &str, number: u64) -> Result<WorkItem> {
     let issue_path = format!("repos/{repository}/issues/{number}");
     let issue_output = run_gh_json(&["api".to_string(), issue_path])
         .await
@@ -3310,6 +3424,29 @@ pub async fn edit_item_metadata(
 }
 
 pub async fn merge_pull_request(repository: &str, number: u64, method: MergeMethod) -> Result<()> {
+    if crate::github_api::token_available() {
+        let output = run_gh_json(&[
+            "api".to_string(),
+            "-X".to_string(),
+            "PUT".to_string(),
+            format!("repos/{repository}/pulls/{number}/merge"),
+            "-f".to_string(),
+            format!("merge_method={}", method.label()),
+        ])
+        .await?;
+        let result = serde_json::from_str::<MergePullRequestRaw>(&output)
+            .with_context(|| format!("failed to parse merge response for {repository}#{number}"))?;
+        if !result.merged {
+            bail!(
+                "failed to merge {repository}#{number}: {}",
+                result
+                    .message
+                    .unwrap_or_else(|| "GitHub rejected the merge".to_string())
+            );
+        }
+        return Ok(());
+    }
+
     ensure_pull_request_can_merge(repository, number).await?;
     run_gh_json(&merge_pull_request_args(repository, number, method)).await?;
     Ok(())
@@ -3346,6 +3483,9 @@ async fn ensure_pull_request_can_merge(repository: &str, number: u64) -> Result<
 }
 
 pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_issue_state(repository, number, "closed").await;
+    }
     run_gh_json(&[
         "pr".to_string(),
         "close".to_string(),
@@ -3358,6 +3498,9 @@ pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
 }
 
 pub async fn reopen_pull_request(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_issue_state(repository, number, "open").await;
+    }
     run_gh_json(&[
         "pr".to_string(),
         "reopen".to_string(),
@@ -3370,6 +3513,9 @@ pub async fn reopen_pull_request(repository: &str, number: u64) -> Result<()> {
 }
 
 pub async fn close_issue(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_issue_state(repository, number, "closed").await;
+    }
     run_gh_json(&[
         "issue".to_string(),
         "close".to_string(),
@@ -3382,6 +3528,9 @@ pub async fn close_issue(repository: &str, number: u64) -> Result<()> {
 }
 
 pub async fn reopen_issue(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_issue_state(repository, number, "open").await;
+    }
     run_gh_json(&[
         "issue".to_string(),
         "reopen".to_string(),
@@ -3394,7 +3543,30 @@ pub async fn reopen_issue(repository: &str, number: u64) -> Result<()> {
 }
 
 pub async fn update_pull_request_branch(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        run_gh_json(&[
+            "api".to_string(),
+            "-X".to_string(),
+            "PUT".to_string(),
+            format!("repos/{repository}/pulls/{number}/update-branch"),
+        ])
+        .await?;
+        return Ok(());
+    }
     run_gh_json(&update_pull_request_branch_args(repository, number)).await?;
+    Ok(())
+}
+
+async fn set_issue_state(repository: &str, number: u64, state: &str) -> Result<()> {
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{repository}/issues/{number}"),
+        "-f".to_string(),
+        format!("state={state}"),
+    ])
+    .await?;
     Ok(())
 }
 
@@ -3411,6 +3583,9 @@ fn update_pull_request_branch_args(repository: &str, number: u64) -> Vec<String>
 pub async fn enable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_auto_merge_can_enable(repository, number).await?;
     let method = auto_merge_method_flag(repository).await?;
+    if crate::github_api::token_available() {
+        return update_pull_request_auto_merge(repository, number, Some(method)).await;
+    }
     run_gh_json(&enable_pull_request_auto_merge_args(
         repository, number, method,
     ))
@@ -3469,6 +3644,9 @@ fn repository_merge_method_flag(
 
 pub async fn disable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_auto_merge_can_disable(repository, number).await?;
+    if crate::github_api::token_available() {
+        return update_pull_request_auto_merge(repository, number, None).await;
+    }
     run_gh_json(&disable_pull_request_auto_merge_args(repository, number)).await?;
     Ok(())
 }
@@ -3504,9 +3682,61 @@ async fn fetch_pull_request_auto_merge_status(
     repository: &str,
     number: u64,
 ) -> Result<PullRequestAutoMergeStatusRaw> {
+    if crate::github_api::token_available() {
+        let output = run_gh_json(&[
+            "api".to_string(),
+            format!("repos/{repository}/pulls/{number}"),
+        ])
+        .await?;
+        let raw = serde_json::from_str::<PullRequestRestStatusRaw>(&output).with_context(|| {
+            format!("failed to parse auto-merge status for {repository}#{number}")
+        })?;
+        return Ok(PullRequestAutoMergeStatusRaw {
+            auto_merge_request: raw.auto_merge,
+            is_draft: raw.draft,
+            state: raw.state,
+        });
+    }
     let output = run_gh_json(&pull_request_auto_merge_status_args(repository, number)).await?;
     serde_json::from_str::<PullRequestAutoMergeStatusRaw>(&output)
         .with_context(|| format!("failed to parse auto-merge status for {repository}#{number}"))
+}
+
+async fn update_pull_request_auto_merge(
+    repository: &str,
+    number: u64,
+    method: Option<&str>,
+) -> Result<()> {
+    let output = run_gh_json(&[
+        "api".to_string(),
+        format!("repos/{repository}/pulls/{number}"),
+    ])
+    .await?;
+    let pull_request = serde_json::from_str::<PullRequestRestStatusRaw>(&output)
+        .with_context(|| format!("failed to parse pull request id for {repository}#{number}"))?;
+    let (mutation, mut args) = if let Some(method) = method {
+        let merge_method = method.trim_start_matches("--").to_ascii_uppercase();
+        (
+            "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { pullRequest { id } } }",
+            vec!["-F".to_string(), format!("method={merge_method}")],
+        )
+    } else {
+        (
+            "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { id } } }",
+            Vec::new(),
+        )
+    };
+    let mut request = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("id={}", pull_request.node_id),
+    ];
+    request.append(&mut args);
+    run_gh_json(&request).await?;
+    Ok(())
 }
 
 fn pull_request_auto_merge_status_args(repository: &str, number: u64) -> Vec<String> {
@@ -3629,12 +3859,43 @@ fn assignee_api_args(
 }
 
 pub async fn convert_pull_request_to_draft(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_pull_request_draft_state(repository, number, true).await;
+    }
     run_gh_json(&pull_request_ready_args(repository, number, true)).await?;
     Ok(())
 }
 
 pub async fn mark_pull_request_ready_for_review(repository: &str, number: u64) -> Result<()> {
+    if crate::github_api::token_available() {
+        return set_pull_request_draft_state(repository, number, false).await;
+    }
     run_gh_json(&pull_request_ready_args(repository, number, false)).await?;
+    Ok(())
+}
+
+async fn set_pull_request_draft_state(repository: &str, number: u64, draft: bool) -> Result<()> {
+    let output = run_gh_json(&[
+        "api".to_string(),
+        format!("repos/{repository}/pulls/{number}"),
+    ])
+    .await?;
+    let pull_request = serde_json::from_str::<PullRequestNodeRaw>(&output)
+        .with_context(|| format!("failed to parse pull request id for {repository}#{number}"))?;
+    let mutation = if draft {
+        "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { id } } }"
+    } else {
+        "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }"
+    };
+    run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("id={}", pull_request.node_id),
+    ])
+    .await?;
     Ok(())
 }
 
@@ -4641,6 +4902,10 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
 }
 
 async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
+    if crate::github_api::token_available() && args.first().is_some_and(|arg| arg == "api") {
+        return crate::github_api::run_api_args(args).await;
+    }
+
     let gh_request = debug_log_gh_request_started(args, None);
     let output = Command::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
@@ -4817,8 +5082,14 @@ async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String
 }
 
 fn gh_missing_message(args: &[String]) -> String {
+    if let Some(token_env) = crate::github_api::token_env_name() {
+        return format!(
+            "This operation is not yet supported by the PAT backend selected through {token_env}, and GitHub CLI `gh` was not found. Tried: gh {}",
+            args.join(" ")
+        );
+    }
     format!(
-        "GitHub CLI `gh` is required but was not found. Install it for your OS from https://cli.github.com/: macOS `brew install gh`, Fedora `sudo dnf install gh`, Arch `sudo pacman -S github-cli`, Debian/Ubuntu official apt setup at https://github.com/cli/cli/blob/trunk/docs/install_linux.md. Then run `gh auth login`. Tried: gh {}",
+        "No GitHub authentication backend is available: set GHR_GITHUB_TOKEN (GH_TOKEN and GITHUB_TOKEN are also supported), or install GitHub CLI from https://cli.github.com/ and run `gh auth login`. Tried: gh {}",
         args.join(" ")
     )
 }
@@ -7463,14 +7734,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_gh_message_explains_install_and_login() {
+    fn missing_backend_message_explains_token_and_cli_options() {
         let message = gh_missing_message(&["api".to_string(), "user".to_string()]);
 
-        assert!(message.contains("GitHub CLI `gh` is required"));
-        assert!(message.contains("brew install gh"));
-        assert!(message.contains("sudo dnf install gh"));
-        assert!(message.contains("sudo pacman -S github-cli"));
-        assert!(message.contains("official apt setup"));
+        assert!(message.contains("No GitHub authentication backend is available"));
+        assert!(message.contains("GHR_GITHUB_TOKEN"));
+        assert!(message.contains("https://cli.github.com/"));
         assert!(message.contains("gh auth login"));
     }
 

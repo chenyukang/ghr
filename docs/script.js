@@ -29,7 +29,7 @@ const shortcuts = [
   ["Issue/PR", "t", "Change or clear milestone"],
   ["Pull Request", "M", "Open merge confirmation"],
   ["Pull Request", "C", "Close or reopen"],
-  ["Pull Request", "X", "Checkout PR locally with gh pr checkout"],
+  ["Pull Request", "X", "Checkout PR locally with git or gh"],
   ["Pull Request", "F", "Rerun failed checks"],
   ["Pull Request", "U", "Update PR branch"],
   ["Pull Request", "D", "Toggle draft or ready for review"],

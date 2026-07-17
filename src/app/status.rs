@@ -11,12 +11,12 @@ pub(super) fn refresh_error_status(count: usize, first_error: Option<&str>) -> S
         return format!("refresh complete with {count} failed section(s)");
     };
 
-    if first_error.contains("GitHub CLI `gh` is required") {
-        return "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string();
+    if missing_github_auth_backend(first_error) {
+        return "GitHub auth required: set GHR_GITHUB_TOKEN or install `gh`".to_string();
     }
 
-    if first_error.contains("Run `gh auth login`") {
-        return "GitHub CLI auth required: run `gh auth login`".to_string();
+    if github_auth_failed(first_error) {
+        return "GitHub authentication failed: check the token or run `gh auth login`".to_string();
     }
 
     if is_github_search_rate_limit(first_error) {
@@ -29,12 +29,12 @@ pub(super) fn refresh_error_status(count: usize, first_error: Option<&str>) -> S
 }
 
 pub(super) fn compact_error_label(error: &str) -> String {
-    if error.contains("GitHub CLI `gh` is required") {
-        return "GitHub CLI missing".to_string();
+    if missing_github_auth_backend(error) {
+        return "GitHub authentication missing".to_string();
     }
 
-    if error.contains("Run `gh auth login`") {
-        return "GitHub CLI auth required".to_string();
+    if github_auth_failed(error) {
+        return "GitHub authentication failed".to_string();
     }
 
     if is_github_search_rate_limit(error) {
@@ -50,15 +50,26 @@ pub(super) fn compact_error_label(error: &str) -> String {
 }
 
 pub(super) fn setup_dialog_from_error(error: &str) -> Option<SetupDialog> {
-    if error.contains("GitHub CLI `gh` is required") {
+    if missing_github_auth_backend(error) {
         return Some(SetupDialog::MissingGh);
     }
 
-    if error.contains("Run `gh auth login`") {
+    if github_auth_failed(error) {
         return Some(SetupDialog::AuthRequired);
     }
 
     None
+}
+
+fn missing_github_auth_backend(error: &str) -> bool {
+    error.contains("No GitHub authentication backend is available")
+        || error.contains("GitHub CLI `gh` is required")
+}
+
+fn github_auth_failed(error: &str) -> bool {
+    error.contains("Run `gh auth login`")
+        || error.contains("HTTP 401")
+        || error.to_ascii_lowercase().contains("bad credentials")
 }
 
 pub(super) fn message_dialog(title: impl Into<String>, body: impl Into<String>) -> MessageDialog {
@@ -145,7 +156,7 @@ pub(super) fn pr_action_success_body(action: PrAction, _item_kind: ItemKind) -> 
         PrAction::Approve => "GitHub accepted the approval. Refreshing details.",
         PrAction::EnableAutoMerge => "GitHub enabled auto-merge. Refreshing details.",
         PrAction::DisableAutoMerge => "GitHub disabled auto-merge. Refreshing details.",
-        PrAction::Checkout => "GitHub CLI checked out the pull request locally.",
+        PrAction::Checkout => "The pull request was checked out locally.",
         PrAction::RerunFailedChecks => {
             "GitHub accepted the failed-check rerun request. Refreshing details."
         }

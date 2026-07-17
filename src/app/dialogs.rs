@@ -4513,11 +4513,15 @@ pub(super) fn help_dialog_max_scroll_for_lines(line_count: usize, area: Rect) ->
 pub(super) fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Line<'static>>) {
     match dialog {
         SetupDialog::MissingGh => (
-            "GitHub CLI Required",
+            "GitHub Authentication Required",
             vec![
-                Line::from("ghr uses GitHub CLI for authentication and GitHub API access."),
+                Line::from("ghr needs either a GitHub token or an authenticated GitHub CLI."),
                 Line::from(""),
-                Line::from("Install GitHub CLI: https://cli.github.com/"),
+                Line::from("Use a personal access token without installing gh:"),
+                command_line("export GHR_GITHUB_TOKEN=github_pat_..."),
+                Line::from("GH_TOKEN and GITHUB_TOKEN are also supported."),
+                Line::from(""),
+                Line::from("Or install GitHub CLI: https://cli.github.com/"),
                 command_line("macOS: brew install gh"),
                 command_line("Debian/Ubuntu: sudo apt install gh"),
                 Line::from("Linux package details:"),
@@ -4531,14 +4535,13 @@ pub(super) fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Li
             ],
         ),
         SetupDialog::AuthRequired => (
-            "GitHub Login Required",
+            "GitHub Authentication Failed",
             vec![
-                Line::from("GitHub CLI is installed, but it is not authenticated."),
+                Line::from("The configured token or GitHub CLI login was rejected."),
                 Line::from(""),
-                Line::from("Run this in your terminal:"),
+                Line::from("Check GHR_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN."),
+                Line::from("Or authenticate GitHub CLI:"),
                 command_line("gh auth login"),
-                Line::from(""),
-                Line::from("You can also launch ghr with GH_TOKEN set."),
                 Line::from("After setup, press Esc and then r to refresh."),
                 Line::from("Esc: close and use cached data    q: quit"),
             ],

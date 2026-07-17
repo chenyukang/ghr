@@ -20,7 +20,7 @@ pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<
         .iter()
         .map(|section| section.items.len())
         .sum::<usize>();
-    let gh_version = github_cli_version_summary();
+    let github_auth = github_auth_summary();
     let gh_log_entries = recent_gh_log_entries();
 
     vec![
@@ -33,7 +33,7 @@ pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<
         ),
         format!("pid: {}", std::process::id()),
         format!("process memory: {}", process_memory_summary()),
-        format!("gh: {gh_version}"),
+        format!("GitHub auth: {github_auth}"),
         String::new(),
         "terminal".to_string(),
         format!("TERM: {}", env_summary("TERM")),
@@ -349,12 +349,16 @@ fn format_kib(kib: u64) -> String {
 }
 
 #[cfg(test)]
-fn github_cli_version_summary() -> String {
+fn github_auth_summary() -> String {
     "not checked in tests".to_string()
 }
 
 #[cfg(not(test))]
-fn github_cli_version_summary() -> String {
+fn github_auth_summary() -> String {
+    if let Some(name) = crate::github_api::token_env_name() {
+        return format!("PAT via {name}");
+    }
+
     let gh_request = start_gh_request("gh", "gh --version", None);
     debug!(command = "gh --version", "gh request started");
     let output = Command::new("gh")

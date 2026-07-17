@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod dirs;
 mod github;
+mod github_api;
 mod log;
 mod model;
 mod snapshot;

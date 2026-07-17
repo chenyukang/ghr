@@ -105,14 +105,21 @@ fn fuzzy_score_matches_ordered_subsequence() {
 fn refresh_error_status_guides_missing_gh_and_auth() {
     assert_eq!(
         refresh_error_status(3, Some("GitHub CLI `gh` is required but was not found.")),
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set GHR_GITHUB_TOKEN or install `gh`"
     );
     assert_eq!(
         refresh_error_status(
             3,
             Some("GitHub CLI is installed but not authenticated. Run `gh auth login`.")
         ),
-        "GitHub CLI auth required: run `gh auth login`"
+        "GitHub authentication failed: check the token or run `gh auth login`"
+    );
+    assert_eq!(
+        refresh_error_status(
+            3,
+            Some("GitHub API request failed: HTTP 401: Bad credentials")
+        ),
+        "GitHub authentication failed: check the token or run `gh auth login`"
     );
     assert_eq!(
         refresh_error_status(3, Some("HTTP 403: API rate limit exceeded")),
@@ -2470,6 +2477,10 @@ fn setup_dialog_from_error_classifies_gh_setup_failures() {
         Some(SetupDialog::AuthRequired)
     );
     assert_eq!(setup_dialog_from_error("HTTP 500"), None);
+    assert_eq!(
+        setup_dialog_from_error("GitHub API request failed: HTTP 401: Bad credentials"),
+        Some(SetupDialog::AuthRequired)
+    );
 }
 
 #[test]
@@ -2526,7 +2537,7 @@ fn startup_setup_dialog_sets_status_without_initializing_dialog() {
     assert_eq!(app.startup_dialog, None);
     assert_eq!(
         app.status,
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set a token or install `gh`"
     );
 }
 
@@ -2547,7 +2558,7 @@ fn refresh_failure_opens_setup_dialog() {
     assert_eq!(app.startup_dialog, None);
     assert_eq!(
         app.status,
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set GHR_GITHUB_TOKEN or install `gh`"
     );
 }
 
@@ -7116,6 +7127,7 @@ fn setup_dialog_content_contains_actionable_commands() {
     assert!(missing_text.contains("brew install gh"));
     assert!(missing_text.contains("sudo apt install gh"));
     assert!(missing_text.contains("gh auth login"));
+    assert!(missing_text.contains("GHR_GITHUB_TOKEN"));
 
     let (_title, auth_lines) = setup_dialog_content(SetupDialog::AuthRequired);
     let auth_text = auth_lines
@@ -7125,6 +7137,7 @@ fn setup_dialog_content_contains_actionable_commands() {
         .join("\n");
     assert!(auth_text.contains("gh auth login"));
     assert!(auth_text.contains("GH_TOKEN"));
+    assert!(auth_text.contains("GHR_GITHUB_TOKEN"));
 }
 
 #[test]
@@ -13084,6 +13097,21 @@ fn configured_repo_remote_is_used_when_validating_local_dir() {
 }
 
 #[test]
+fn checkout_remote_uses_matching_base_repo_remote() {
+    let local_dir = checkout_test_fork_repo_dir_on_branch(
+        "feature/upstream-base",
+        "Officeyutong/tentacle",
+        "nervosnetwork/tentacle",
+    );
+
+    assert_eq!(
+        resolve_pr_checkout_remote(&Config::default(), &local_dir, "nervosnetwork/tentacle")
+            .expect("matching remote"),
+        "upstream"
+    );
+}
+
+#[test]
 fn capital_n_in_pr_repo_without_local_dir_shows_hint() {
     let section = SectionSnapshot {
         key: "repo:ghr:pull_requests:Pull Requests".to_string(),
@@ -14009,6 +14037,96 @@ fn pr_checkout_command_construction_uses_repo_and_number() {
     assert_eq!(
         pr_checkout_command_display(&args),
         "gh pr checkout 123 --repo rust-lang/rust"
+    );
+}
+
+#[tokio::test]
+async fn pat_checkout_fetches_pull_ref_and_fast_forwards_local_branch() {
+    let directory = checkout_test_repo_dir();
+    let remote_dir = directory.with_extension("bare.git");
+    std::fs::create_dir_all(&remote_dir).expect("create bare remote directory");
+    run_checkout_test_git(&remote_dir, &["init", "--bare", "-q"]);
+
+    run_checkout_test_git(&directory, &["config", "user.email", "ghr@example.com"]);
+    run_checkout_test_git(&directory, &["config", "user.name", "ghr test"]);
+    run_checkout_test_git(&directory, &["checkout", "-q", "-b", "main"]);
+    std::fs::write(directory.join("README.md"), "base\n").expect("write base file");
+    run_checkout_test_git(&directory, &["add", "README.md"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "base"]);
+    run_checkout_test_git(&directory, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(directory.join("feature.txt"), "first\n").expect("write feature file");
+    run_checkout_test_git(&directory, &["add", "feature.txt"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "feature one"]);
+    run_checkout_test_git(
+        &directory,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &remote_dir.display().to_string(),
+        ],
+    );
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "main:refs/heads/main"],
+    );
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "feature:refs/pull/19/head"],
+    );
+    run_checkout_test_git(&directory, &["checkout", "-q", "main"]);
+
+    let first = run_git_pr_checkout_ref(
+        "chenyukang/ghr",
+        19,
+        directory.clone(),
+        "origin".to_string(),
+    )
+    .await
+    .expect("initial PAT checkout");
+
+    assert_eq!(
+        current_git_branch_for_directory(&directory).expect("current branch"),
+        "pr/19"
+    );
+    assert!(
+        first
+            .command
+            .contains("git fetch --no-tags origin +refs/pull/19/head:refs/ghr/pull/19/head")
+    );
+
+    run_checkout_test_git(&directory, &["checkout", "-q", "feature"]);
+    std::fs::write(directory.join("feature.txt"), "second\n").expect("update feature file");
+    run_checkout_test_git(&directory, &["add", "feature.txt"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "feature two"]);
+    let updated_head = checkout_test_git_text(&directory, &["rev-parse", "HEAD"]);
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "feature:refs/pull/19/head"],
+    );
+    run_checkout_test_git(&directory, &["checkout", "-q", "main"]);
+
+    let second = run_git_pr_checkout_ref(
+        "chenyukang/ghr",
+        19,
+        directory.clone(),
+        "origin".to_string(),
+    )
+    .await
+    .expect("fast-forward PAT checkout");
+
+    assert_eq!(
+        current_git_branch_for_directory(&directory).expect("current branch"),
+        "pr/19"
+    );
+    assert_eq!(
+        checkout_test_git_text(&directory, &["rev-parse", "HEAD"]),
+        updated_head
+    );
+    assert!(
+        second
+            .command
+            .contains("git merge --ff-only refs/ghr/pull/19/head")
     );
 }
 
@@ -20561,6 +20679,25 @@ fn run_checkout_test_git(dir: &std::path::Path, args: &[&str]) {
         args.join(" "),
         command_output_text(&output.stdout, &output.stderr)
     );
+}
+
+fn checkout_test_git_text(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        command_output_text(&output.stdout, &output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output utf-8")
+        .trim()
+        .to_string()
 }
 
 fn many_items_section(count: u64) -> SectionSnapshot {

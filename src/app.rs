@@ -127,11 +127,13 @@ use layout::{
     split_percent_from_column, splitter_contains,
 };
 use participants::*;
+#[cfg(test)]
+use pr_checkout::run_git_pr_checkout_ref;
 use pr_checkout::{
     PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
     current_git_branch_for_directory, ensure_directory_tracks_configured_repo,
-    resolve_pr_checkout_directory, resolve_pull_request_head_ref, run_pr_checkout,
-    validate_pr_create_preflight,
+    resolve_pr_checkout_directory, resolve_pr_checkout_remote, resolve_pull_request_head_ref,
+    run_pr_checkout, validate_pr_create_preflight,
 };
 use render::*;
 use runtime::*;
@@ -1956,6 +1958,10 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
+    if crate::github_api::token_available() {
+        return None;
+    }
+
     let gh_request = start_gh_request("gh", "gh --version", None);
     debug!(command = "gh --version", "gh request started");
     let result = Command::new("gh")
@@ -3467,10 +3473,10 @@ impl AppState {
         self.startup_dialog = None;
         self.status = match dialog {
             SetupDialog::MissingGh => {
-                "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string()
+                "GitHub auth required: set a token or install `gh`".to_string()
             }
             SetupDialog::AuthRequired => {
-                "GitHub CLI auth required: run `gh auth login`".to_string()
+                "GitHub authentication failed: check the token or `gh auth login`".to_string()
             }
         };
     }
@@ -8624,6 +8630,14 @@ impl AppState {
                 return;
             }
         };
+        let remote = match resolve_pr_checkout_remote(config, &directory, &item.repo) {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.message_dialog = Some(message_dialog("Checkout Unavailable", error));
+                self.status = "pull request checkout unavailable".to_string();
+                return;
+            }
+        };
         let branch = self
             .action_hints
             .get(&item.id)
@@ -8648,7 +8662,11 @@ impl AppState {
         self.pr_action_dialog = Some(PrActionDialog {
             item,
             action: PrAction::Checkout,
-            checkout: Some(PrCheckoutPlan { directory, branch }),
+            checkout: Some(PrCheckoutPlan {
+                directory,
+                branch,
+                remote,
+            }),
             summary: Vec::new(),
             merge_method: MergeMethod::default(),
         });

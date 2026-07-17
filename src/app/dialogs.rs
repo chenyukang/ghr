@@ -4518,7 +4518,7 @@ pub(super) fn setup_dialog_content(dialog: SetupDialog) -> (&'static str, Vec<Li
                 Line::from("ghr needs either a GitHub token or an authenticated GitHub CLI."),
                 Line::from(""),
                 Line::from("Use a personal access token without installing gh:"),
-                command_line("export GHR_GITHUB_TOKEN=github_pat_..."),
+                command_line("export GHR_GITHUB_TOKEN=ghp_..."),
                 Line::from("GH_TOKEN and GITHUB_TOKEN are also supported."),
                 Line::from(""),
                 Line::from("Or install GitHub CLI: https://cli.github.com/"),

@@ -1,7 +1,5 @@
 use super::layout::{body_area, body_areas};
-use super::pr_checkout::{
-    command_output_text, pr_checkout_command_args, pr_checkout_command_display,
-};
+use super::pr_checkout::command_output_text;
 use super::*;
 use crate::log::{clear_gh_log_entries, fail_gh_request_to_start, start_gh_request};
 use crate::model::CommentPreviewKind;
@@ -128,26 +126,25 @@ fn refresh_error_status_guides_missing_gh_and_auth() {
 }
 
 #[test]
-fn compact_error_label_hides_long_gh_command_context() {
-    let error = "gh search prs --json number,title,body,repository,author,createdAt,updatedAt,url,state,isDraft,labels,commentsCount --limit 500 -- repo:rust-lang/rust is:open failed: HTTP 403: API rate limit exceeded for user ID 230646";
+fn compact_error_label_hides_long_github_request_context() {
+    let error = "gh api --method GET search/issues -f q=is:pr repo:rust-lang/rust is:open -f per_page=100 failed: HTTP 403: API rate limit exceeded for user ID 230646";
 
     assert_eq!(compact_error_label(error), "GitHub search rate limited");
-    assert!(!compact_error_label(error).contains("--json"));
+    assert!(!compact_error_label(error).contains("--method"));
 }
 
 #[test]
 fn error_chain_message_keeps_gh_failure_detail() {
-    let error = anyhow::anyhow!(
-        "gh pr create --repo owner/repo --head feature failed: a pull request already exists"
-    )
-    .context("failed to create pull request in owner/repo");
+    let error =
+        anyhow::anyhow!("GitHub API request failed: HTTP 422: a pull request already exists")
+            .context("failed to create pull request in owner/repo");
     let message = error_chain_message(error);
 
     assert!(message.contains("failed to create pull request in owner/repo"));
     assert!(message.contains("a pull request already exists"));
     assert_eq!(
         operation_error_body(&message),
-        "a pull request already exists"
+        "HTTP 422: a pull request already exists"
     );
 }
 
@@ -13462,7 +13459,7 @@ fn issue_create_failure_restores_dialog_for_retry() {
 }
 
 #[test]
-fn pull_request_create_failure_shows_gh_detail_and_restores_dialog() {
+fn pull_request_create_failure_shows_api_detail_and_restores_dialog() {
     let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let dialog = PrCreateDialog {
@@ -13487,7 +13484,7 @@ fn pull_request_create_failure_shows_gh_detail_and_restores_dialog() {
     });
 
     app.handle_msg(AppMsg::PullRequestCreated {
-            result: Err("failed to create pull request in chenyukang/ghr: gh pr create --repo chenyukang/ghr --head feature/pr-body failed: a pull request for branch \"feature/pr-body\" already exists: https://github.com/chenyukang/ghr/pull/42".to_string()),
+            result: Err("failed to create pull request in chenyukang/ghr: GitHub API request failed: HTTP 422: a pull request for branch \"feature/pr-body\" already exists: https://github.com/chenyukang/ghr/pull/42".to_string()),
         });
 
     assert!(!app.pr_creating);
@@ -14020,28 +14017,8 @@ fn checkout_confirmation_submits_selected_action() {
     ));
 }
 
-#[test]
-fn pr_checkout_command_construction_uses_repo_and_number() {
-    let args = pr_checkout_command_args("rust-lang/rust", 123);
-
-    assert_eq!(
-        args,
-        vec![
-            "pr".to_string(),
-            "checkout".to_string(),
-            "123".to_string(),
-            "--repo".to_string(),
-            "rust-lang/rust".to_string(),
-        ]
-    );
-    assert_eq!(
-        pr_checkout_command_display(&args),
-        "gh pr checkout 123 --repo rust-lang/rust"
-    );
-}
-
 #[tokio::test]
-async fn pat_checkout_fetches_pull_ref_and_fast_forwards_local_branch() {
+async fn git_checkout_fetches_pull_ref_and_fast_forwards_local_branch() {
     let directory = checkout_test_repo_dir();
     let remote_dir = directory.with_extension("bare.git");
     std::fs::create_dir_all(&remote_dir).expect("create bare remote directory");
@@ -15871,7 +15848,7 @@ fn pr_checkout_finished_shows_success_output() {
 
     app.handle_msg(AppMsg::PrCheckoutFinished {
         result: Ok(PrCheckoutResult {
-            command: "gh pr checkout 1 --repo rust-lang/rust".to_string(),
+            command: "git fetch --no-tags origin +refs/pull/1/head:refs/ghr/pull/1/head\ngit switch --create pr/1 refs/ghr/pull/1/head".to_string(),
             directory: PathBuf::from("/tmp/rust"),
             output: "Switched to branch 'diagnostics'".to_string(),
         }),
@@ -15885,8 +15862,9 @@ fn pr_checkout_finished_shows_success_output() {
     assert!(
         dialog
             .body
-            .contains("gh pr checkout 1 --repo rust-lang/rust")
+            .contains("git fetch --no-tags origin +refs/pull/1/head")
     );
+    assert!(dialog.body.contains("git switch --create pr/1"));
     assert!(dialog.body.contains("Checkout runs from /tmp/rust."));
     assert!(dialog.body.contains("Switched to branch"));
     assert_eq!(dialog.kind, MessageDialogKind::Success);
@@ -15902,7 +15880,7 @@ fn pr_checkout_failure_opens_message_dialog() {
 
     app.handle_msg(AppMsg::PrCheckoutFinished {
             result: Err(
-                "gh pr checkout 1 --repo rust-lang/rust failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
+                "git fetch --no-tags origin +refs/pull/1/head:refs/ghr/pull/1/head failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
                     .to_string(),
             ),
         });

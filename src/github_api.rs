@@ -8,8 +8,20 @@ const TOKEN_ENV_VARS: [&str; 3] = ["GHR_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN
 
 static CLIENT: OnceLock<std::result::Result<Octocrab, String>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubBackend {
+    DirectApi,
+    GitHubCli,
+}
+
+impl GitHubBackend {
+    pub fn supports_cli_commands(self) -> bool {
+        matches!(self, Self::GitHubCli)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-struct ApiRequest {
+pub struct ApiRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
@@ -17,18 +29,26 @@ struct ApiRequest {
     graphql: bool,
 }
 
-pub fn token_available() -> bool {
-    token_from_env().is_some()
+pub fn selected_backend() -> GitHubBackend {
+    if token_from_env().is_some() {
+        GitHubBackend::DirectApi
+    } else {
+        GitHubBackend::GitHubCli
+    }
 }
 
+#[cfg(not(test))]
 pub fn token_env_name() -> Option<&'static str> {
     TOKEN_ENV_VARS
         .into_iter()
         .find(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
-pub async fn run_api_args(args: &[String]) -> Result<String> {
-    let request = parse_api_args(args)?;
+pub fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
+    parse_api_args_impl(args)
+}
+
+pub async fn run_direct_request(request: &ApiRequest) -> Result<String> {
     let graphql = request.graphql;
     let client = client()?;
     let path = normalized_path(&request.path);
@@ -39,16 +59,16 @@ pub async fn run_api_args(args: &[String]) -> Result<String> {
         client._get_with_headers(path, Some(headers)).await?
     } else {
         let body = if request.graphql {
-            graphql_body(request.fields)?
+            graphql_body(request.fields.clone())?
         } else {
-            Value::Object(request.fields)
+            Value::Object(request.fields.clone())
         };
         match request.method.as_str() {
             "POST" => client._post(path, Some(&body)).await?,
             "PATCH" => client._patch(path, Some(&body)).await?,
             "PUT" => client._put(path, Some(&body)).await?,
             "DELETE" => client._delete(path, Some(&body)).await?,
-            method => bail!("PAT backend does not support GitHub API method {method}"),
+            method => bail!("direct GitHub API backend does not support method {method}"),
         }
     };
 
@@ -74,7 +94,8 @@ fn client() -> Result<&'static Octocrab> {
     CLIENT
         .get_or_init(|| {
             let token = token_from_env().ok_or_else(|| {
-                "set GHR_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN to use the PAT backend".to_string()
+                "set GHR_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN to use direct GitHub API access"
+                    .to_string()
             })?;
             let mut builder = Octocrab::builder().personal_token(token);
             if let Some(api_url) = github_api_url() {
@@ -100,9 +121,9 @@ fn github_api_url() -> Option<String> {
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
 }
 
-fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
+fn parse_api_args_impl(args: &[String]) -> Result<ApiRequest> {
     if args.first().map(String::as_str) != Some("api") {
-        bail!("PAT backend expected a `gh api` request");
+        bail!("direct GitHub API backend expected a `gh api` request");
     }
 
     let mut method = None;
@@ -138,21 +159,21 @@ fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
                 let _ = required_arg(args, index, "output selector")?;
             }
             "--paginate" | "--slurp" => {
-                bail!("PAT backend pagination must be handled by the caller");
+                bail!("direct GitHub API pagination must be handled by the caller");
             }
             arg if arg.starts_with('-') => {
-                bail!("PAT backend does not support gh api argument `{arg}`");
+                bail!("direct GitHub API backend does not support gh api argument `{arg}`");
             }
             arg => {
                 if path.replace(arg.to_string()).is_some() {
-                    bail!("PAT backend received more than one GitHub API path");
+                    bail!("direct GitHub API backend received more than one API path");
                 }
             }
         }
         index += 1;
     }
 
-    let path = path.ok_or_else(|| anyhow!("PAT backend GitHub API path is missing"))?;
+    let path = path.ok_or_else(|| anyhow!("direct GitHub API path is missing"))?;
     let method = method.unwrap_or_else(|| {
         if graphql || !fields.is_empty() {
             "POST".to_string()
@@ -172,7 +193,7 @@ fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
 fn required_arg<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a str> {
     args.get(index)
         .map(String::as_str)
-        .ok_or_else(|| anyhow!("PAT backend GitHub API {name} is missing"))
+        .ok_or_else(|| anyhow!("direct GitHub API {name} is missing"))
 }
 
 fn parse_header(input: &str) -> Result<(String, String)> {
@@ -270,7 +291,7 @@ fn graphql_body(mut fields: Map<String, Value>) -> Result<Value> {
     let query = fields
         .remove("query")
         .and_then(|value| value.as_str().map(str::to_string))
-        .ok_or_else(|| anyhow!("PAT backend GraphQL query is missing"))?;
+        .ok_or_else(|| anyhow!("direct GitHub API GraphQL query is missing"))?;
     Ok(serde_json::json!({
         "query": query,
         "variables": fields,

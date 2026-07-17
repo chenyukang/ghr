@@ -1958,7 +1958,7 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
-    if crate::github_api::token_available() {
+    if !crate::github_api::selected_backend().supports_cli_commands() {
         return None;
     }
 

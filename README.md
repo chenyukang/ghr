@@ -151,7 +151,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close or reopen confirmation for the selected issue or PR |
-| `X` | Open a local PR checkout confirmation; PAT mode uses `git`, while GitHub CLI mode uses `gh pr checkout` |
+| `X` | Open a local PR checkout confirmation using ordinary `git` commands |
 | `F` | Rerun failed checks for the selected PR |
 | `U` | Open an update-branch confirmation for the selected PR |
 | `m` / `s` / `r` in merge confirmation | Choose merge, squash, or rebase before confirming |
@@ -217,7 +217,7 @@ Local PR checkout:
 
 - Press `X` on a pull request in the list or Details pane, then confirm with `y` or `Enter`.
 - Pull request Details show the remote branch as a clickable link when GitHub provides it.
-- In PAT mode, ghr fetches `refs/pull/<number>/head` from the matching Git remote and checks out `pr/<number>`; GitHub CLI is not required.
+- ghr fetches `refs/pull/<number>/head` from the matching Git remote and checks out `pr/<number>`; GitHub CLI is not required for checkout.
 - An existing `pr/<number>` branch is only fast-forwarded. If it has diverged, ghr leaves it untouched and reports the conflict.
 - Checkout runs from the matching local repository directory. Set `local_dir` on a repo entry to make the target explicit:
 
@@ -233,7 +233,7 @@ show_issues = true
 ```
 
 - If `local_dir` is not set, `ghr` tries the directory where it was launched when that directory has a GitHub remote for the pull request repository. If neither path matches, `ghr` shows a hint instead of running checkout.
-- Creating a pull request from `local_dir` runs a local preflight before pushing or calling `gh pr create`. It blocks with a dialog when the title is empty, the checkout has moved branches, the worktree is dirty, the head has no commit, no matching GitHub push remote exists, or the branch has no commits ahead of the local base branch.
+- Creating a pull request from `local_dir` runs a local preflight before pushing and calling the GitHub API. It blocks with a dialog when the title is empty, the checkout has moved branches, the worktree is dirty, the head has no commit, no matching GitHub push remote exists, or the branch has no commits ahead of the local base branch.
 
 Mouse behavior:
 

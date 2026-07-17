@@ -1,4 +1,3 @@
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -7,7 +6,6 @@ use tracing::{debug, error};
 
 use super::text::truncate_text;
 use crate::config::{Config, github_repo_from_remote_url};
-use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{PullRequestBranch, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,104 +27,7 @@ pub(super) async fn run_pr_checkout(
     directory: PathBuf,
     remote: String,
 ) -> std::result::Result<PrCheckoutResult, String> {
-    if crate::github_api::token_available() {
-        return run_git_pr_checkout(item, directory, remote).await;
-    }
-    run_gh_pr_checkout(item, directory).await
-}
-
-async fn run_gh_pr_checkout(
-    item: WorkItem,
-    directory: PathBuf,
-) -> std::result::Result<PrCheckoutResult, String> {
-    let number = item
-        .number
-        .ok_or_else(|| "selected item has no pull request number".to_string())?;
-    let args = pr_checkout_command_args(&item.repo, number);
-    let command = pr_checkout_command_display(&args);
-    let gh_request = start_gh_request("gh", command.clone(), Some(&directory));
-    debug!(
-        command = %command,
-        cwd = %directory.display(),
-        "gh request started"
-    );
-    let output = TokioCommand::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .current_dir(&directory)
-        .args(&args)
-        .output()
-        .await
-        .map_err(|error| {
-            fail_gh_request_to_start(gh_request.clone(), &error);
-            debug!(
-                command = %command,
-                cwd = %directory.display(),
-                error = %error,
-                "gh request failed to start"
-            );
-            error!(
-                command = %command,
-                cwd = %directory.display(),
-                error = %error,
-                "gh request failed to start"
-            );
-            if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
-                    checkout_directory_notice(&directory),
-                )
-            } else {
-                format!(
-                    "failed to run {command}: {error}\n\n{}",
-                    checkout_directory_notice(&directory),
-                )
-            }
-        })?;
-    finish_gh_request(gh_request, &output);
-    debug!(
-        command = %command,
-        cwd = %directory.display(),
-        status = %output.status,
-        success = output.status.success(),
-        stdout_bytes = output.stdout.len(),
-        stderr_bytes = output.stderr.len(),
-        "gh request finished"
-    );
-
-    let output_text = command_output_text(&output.stdout, &output.stderr);
-    if !output.status.success() {
-        let detail = if output_text.is_empty() {
-            "gh did not return any output".to_string()
-        } else {
-            output_text
-        };
-        error!(
-            command = %command,
-            cwd = %directory.display(),
-            status = %output.status,
-            message = %truncate_text(&detail, 900),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
-        );
-        return Err(format!(
-            "{} failed.\n\n{}\n\n{}",
-            command,
-            checkout_directory_notice(&directory),
-            truncate_text(&detail, 900),
-        ));
-    }
-
-    let output = if output_text.is_empty() {
-        "gh pr checkout completed successfully.".to_string()
-    } else {
-        truncate_text(&output_text, 900)
-    };
-    Ok(PrCheckoutResult {
-        command,
-        directory,
-        output,
-    })
+    run_git_pr_checkout(item, directory, remote).await
 }
 
 async fn run_git_pr_checkout(
@@ -305,20 +206,6 @@ fn git_is_ancestor(
             command_output_text(&output.stdout, &output.stderr)
         )),
     }
-}
-
-pub(super) fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "checkout".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ]
-}
-
-pub(super) fn pr_checkout_command_display(args: &[String]) -> String {
-    format!("gh {}", args.join(" "))
 }
 
 pub(super) fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {

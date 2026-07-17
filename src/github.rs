@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -14,10 +13,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
-use crate::log::{
-    GhLogRequest, fail_gh_request_to_start as record_gh_request_failed_to_start,
-    finish_gh_request as record_gh_request_finished, start_gh_request as record_gh_request_started,
-};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
     FailedCheckRunSummary, ItemKind, MergeQueueInfo, Milestone, PullRequestBranch,
@@ -27,7 +22,6 @@ use crate::model::{
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
-static GH_API_SLURP_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
 static USER_GH_REQUESTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
@@ -132,159 +126,6 @@ async fn wait_for_user_gh_requests() {
     while USER_GH_REQUESTS_IN_FLIGHT.load(Ordering::Acquire) > 0 {
         sleep(BACKGROUND_GH_YIELD_INTERVAL).await;
     }
-}
-
-fn gh_request_kind(args: &[String]) -> &'static str {
-    if args.first().is_some_and(|arg| arg == "api") {
-        "gh api"
-    } else {
-        "gh"
-    }
-}
-
-fn gh_command_display(args: &[String]) -> String {
-    format!("gh {}", args.join(" "))
-}
-
-fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) -> GhLogRequest {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            "gh request started"
-        );
-    } else {
-        debug!(kind, command = %command, "gh request started");
-    }
-    record_gh_request_started(kind, command, directory)
-}
-
-fn debug_log_gh_request_finished(
-    request: GhLogRequest,
-    args: &[String],
-    directory: Option<&Path>,
-    output: &std::process::Output,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        );
-    } else {
-        debug!(
-            kind,
-            command = %command,
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        );
-    }
-    record_gh_request_finished(request, output);
-}
-
-fn log_gh_request_failed_to_start(
-    request: GhLogRequest,
-    args: &[String],
-    directory: Option<&Path>,
-    error: &std::io::Error,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            error = %error,
-            "gh request failed to start"
-        );
-        error!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            error = %error,
-            "gh request failed to start"
-        );
-    } else {
-        debug!(
-            kind,
-            command = %command,
-            error = %error,
-            "gh request failed to start"
-        );
-        error!(
-            kind,
-            command = %command,
-            error = %error,
-            "gh request failed to start"
-        );
-    }
-    record_gh_request_failed_to_start(request, error);
-}
-
-fn log_gh_request_failed_result(
-    args: &[String],
-    directory: Option<&Path>,
-    output: &std::process::Output,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        error!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            status = %output.status,
-            message = %gh_output_message(output),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
-        );
-    } else {
-        error!(
-            kind,
-            command = %command,
-            status = %output.status,
-            message = %gh_output_message(output),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
-        );
-    }
-}
-
-fn gh_output_message(output: &std::process::Output) -> String {
-    gh_output_message_from_parts(&output.stdout, &output.stderr)
-}
-
-fn gh_output_message_from_parts(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    truncate_gh_output_message(&message)
-}
-
-fn truncate_gh_output_message(message: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    if message.chars().count() <= MAX_CHARS {
-        return message.to_string();
-    }
-    let mut truncated = message.chars().take(MAX_CHARS).collect::<String>();
-    truncated.push_str("...");
-    truncated
 }
 
 #[derive(Debug, Deserialize)]
@@ -1507,7 +1348,7 @@ async fn fetch_number_lookup_item(
     ];
     let output = match run_gh_json(&args).await {
         Ok(output) => output,
-        Err(error) if is_gh_not_found_error(&error) => return Ok(None),
+        Err(error) if is_github_not_found_error(&error) => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to fetch {repo}#{number} by number"));
@@ -2185,49 +2026,7 @@ async fn gh_api_slurp_supported() -> bool {
     if !crate::github_api::selected_backend().supports_cli_commands() {
         return false;
     }
-    *GH_API_SLURP_SUPPORTED
-        .get_or_init(detect_gh_api_slurp_support)
-        .await
-}
-
-async fn detect_gh_api_slurp_support() -> bool {
-    let args = vec!["api".to_string(), "--help".to_string()];
-    let gh_request = debug_log_gh_request_started(&args, None);
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(&args)
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => {
-            debug_log_gh_request_finished(gh_request, &args, None, &output);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            gh_api_help_has_flag(&stdout, "--slurp") || gh_api_help_has_flag(&stderr, "--slurp")
-        }
-        Ok(output) => {
-            debug_log_gh_request_finished(gh_request, &args, None, &output);
-            debug!(
-                status = %output.status,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
-        Err(error) => {
-            log_gh_request_failed_to_start(gh_request, &args, None, &error);
-            debug!(
-                error = %error,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
-    }
-}
-
-fn gh_api_help_has_flag(help: &str, flag: &str) -> bool {
-    help.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '[' | ']' | '(' | ')' | '`'))
-        .any(|token| token == flag)
+    crate::github_gh::api_slurp_supported().await
 }
 
 fn paginated_api_slurp_args(path: &str, accept_header: Option<&str>) -> Vec<String> {
@@ -4512,7 +4311,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
                     attempt = attempt + 1,
                     retry_in_ms = delay.as_millis(),
                     error = %error,
-                    command = %gh_command_display(args),
+                    command = %crate::github_gh::command_display(args),
                     "retrying transient gh request failure"
                 );
                 sleep(delay).await;
@@ -4528,39 +4327,13 @@ async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
     if args.first().map(String::as_str) != Some("api") {
         bail!("GitHub backend expected a `gh api` request");
     }
-    if matches!(
-        crate::github_api::selected_backend(),
-        crate::github_api::GitHubBackend::DirectApi
-    ) {
-        let request = crate::github_api::parse_api_args(args)?;
-        return crate::github_api::run_direct_request(&request).await;
+    match crate::github_api::selected_backend() {
+        crate::github_api::GitHubBackend::DirectApi => {
+            let request = crate::github_api::parse_api_args(args)?;
+            crate::github_api::run_direct_request(&request).await
+        }
+        crate::github_api::GitHubBackend::GitHubCli => crate::github_gh::run_api(args).await,
     }
-
-    let gh_request = debug_log_gh_request_started(args, None);
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| {
-            log_gh_request_failed_to_start(gh_request.clone(), args, None, &error);
-            if error.kind() == ErrorKind::NotFound {
-                anyhow!("{}", gh_missing_message(args))
-            } else {
-                anyhow!("failed to run gh {}: {error}", args.join(" "))
-            }
-        })?;
-    debug_log_gh_request_finished(gh_request, args, None, &output);
-
-    if !output.status.success() {
-        log_gh_request_failed_result(args, None, &output);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!("{}", gh_failure_message(args, &message));
-    }
-
-    String::from_utf8(output.stdout).context("gh output was not UTF-8")
 }
 
 fn is_retryable_gh_json_request(args: &[String]) -> bool {
@@ -4676,26 +4449,7 @@ async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String
     String::from_utf8(output.stdout).context("git output was not UTF-8")
 }
 
-fn gh_missing_message(args: &[String]) -> String {
-    format!(
-        "No GitHub authentication backend is available: set GHR_GITHUB_TOKEN (GH_TOKEN and GITHUB_TOKEN are also supported), or install GitHub CLI from https://cli.github.com/ and run `gh auth login`. Tried: gh {}",
-        args.join(" ")
-    )
-}
-
-fn gh_failure_message(args: &[String], message: &str) -> String {
-    if is_gh_auth_error(message) {
-        return format!(
-            "GitHub CLI is installed but not authenticated. Run `gh auth login`, then restart ghr. Original error from `gh {}`: {}",
-            args.join(" "),
-            message
-        );
-    }
-
-    format!("gh {} failed: {message}", args.join(" "))
-}
-
-fn is_gh_not_found_error(error: &anyhow::Error) -> bool {
+fn is_github_not_found_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
         message.contains("HTTP 404") || message.contains("Not Found (HTTP 404)")
@@ -5333,22 +5087,6 @@ fn split_repository(repository: &str) -> Result<(&str, &str)> {
     Ok((owner, name))
 }
 
-fn is_gh_auth_error(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    [
-        "gh auth login",
-        "not authenticated",
-        "not logged in",
-        "authentication required",
-        "requires authentication",
-        "must authenticate",
-        "bad credentials",
-        "no oauth token",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
 fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> WorkItem {
     let item_kind = match kind {
         SectionKind::PullRequests => ItemKind::PullRequest,
@@ -5794,22 +5532,6 @@ mod tests {
 
         assert_eq!(priority, GhRequestPriority::Background);
         assert_eq!(current_gh_request_priority(), GhRequestPriority::User);
-    }
-
-    #[test]
-    fn gh_output_message_prefers_stderr() {
-        assert_eq!(
-            gh_output_message_from_parts(b"{\"state\":\"failure\"}", b"HTTP 403\n"),
-            "HTTP 403"
-        );
-    }
-
-    #[test]
-    fn gh_output_message_uses_stdout_when_stderr_is_empty() {
-        assert_eq!(
-            gh_output_message_from_parts(b"{\"state\":\"failure\"}\n", b""),
-            "{\"state\":\"failure\"}"
-        );
     }
 
     #[test]
@@ -6318,14 +6040,6 @@ mod tests {
                 "repos/owner/repo/milestones?state=open&per_page=100"
             ]
         );
-        assert!(gh_api_help_has_flag(
-            "      --slurp               Use an array of arrays for paginated responses",
-            "--slurp"
-        ));
-        assert!(!gh_api_help_has_flag(
-            "      --paginate            Fetch all pages",
-            "--slurp"
-        ));
         assert_eq!(
             paginated_api_slurp_args(
                 "repos/owner/repo/issues/1/comments?per_page=100",
@@ -7186,27 +6900,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_backend_message_explains_token_and_cli_options() {
-        let message = gh_missing_message(&["api".to_string(), "user".to_string()]);
-
-        assert!(message.contains("No GitHub authentication backend is available"));
-        assert!(message.contains("GHR_GITHUB_TOKEN"));
-        assert!(message.contains("https://cli.github.com/"));
-        assert!(message.contains("gh auth login"));
-    }
-
-    #[test]
-    fn auth_errors_are_rewritten_with_login_hint() {
-        let message = gh_failure_message(
-            &["api".to_string(), "user".to_string()],
-            "To get started with GitHub CLI, please run: gh auth login",
-        );
-
-        assert!(message.contains("not authenticated"));
-        assert!(message.contains("Run `gh auth login`"));
-    }
-
-    #[test]
     fn merge_pull_request_uses_rest_api() {
         assert_eq!(
             merge_pull_request_api_args("owner/repo", 42, MergeMethod::default()),
@@ -7840,16 +7533,6 @@ mod tests {
                 "HEAD:refs/heads/feature/new-pr".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn non_auth_gh_errors_keep_original_command_context() {
-        let message = gh_failure_message(
-            &["api".to_string(), "search/issues".to_string()],
-            "HTTP 500",
-        );
-
-        assert_eq!(message, "gh api search/issues failed: HTTP 500");
     }
 
     #[test]

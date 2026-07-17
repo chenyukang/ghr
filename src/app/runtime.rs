@@ -1,7 +1,5 @@
 use super::*;
 use crate::log::{GhLogEntry, recent_gh_log_entries};
-#[cfg(not(test))]
-use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 
 pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<String> {
     let cwd = std::env::current_dir()
@@ -359,23 +357,8 @@ fn github_auth_summary() -> String {
         return format!("PAT via {name}");
     }
 
-    let gh_request = start_gh_request("gh", "gh --version", None);
-    debug!(command = "gh --version", "gh request started");
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .arg("--version")
-        .output();
-    match output {
+    match crate::github_gh::version_output() {
         Ok(output) => {
-            finish_gh_request(gh_request, &output);
-            debug!(
-                command = "gh --version",
-                status = %output.status,
-                success = output.status.success(),
-                stdout_bytes = output.stdout.len(),
-                stderr_bytes = output.stderr.len(),
-                "gh request finished"
-            );
             if output.status.success() {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -385,14 +368,6 @@ fn github_auth_summary() -> String {
                     .unwrap_or("installed")
                     .to_string()
             } else {
-                error!(
-                    command = "gh --version",
-                    status = %output.status,
-                    message = %gh_version_output_message(&output),
-                    stdout_bytes = output.stdout.len(),
-                    stderr_bytes = output.stderr.len(),
-                    "gh request returned failure"
-                );
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 stderr
                     .lines()
@@ -403,26 +378,6 @@ fn github_auth_summary() -> String {
                     .to_string()
             }
         }
-        Err(error) => {
-            fail_gh_request_to_start(gh_request, &error);
-            debug!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-            error!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-            format!("unavailable ({error})")
-        }
+        Err(error) => format!("unavailable ({error})"),
     }
-}
-
-#[cfg(not(test))]
-fn gh_version_output_message(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stderr.is_empty() { stdout } else { stderr }
 }

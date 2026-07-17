@@ -3,6 +3,7 @@ mod config;
 mod dirs;
 mod github;
 mod github_api;
+mod github_gh;
 mod log;
 mod model;
 mod snapshot;

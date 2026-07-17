@@ -34,7 +34,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::config::{
     Config, CurrentRepoRemotePrompt, DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY,
@@ -64,7 +64,6 @@ use crate::github::{
     unsubscribe_notification_thread, update_issue_assignees, update_item_subscription,
     update_pull_request_branch, with_background_github_priority,
 };
-use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
     FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
@@ -1962,55 +1961,8 @@ fn startup_setup_dialog() -> Option<SetupDialog> {
         return None;
     }
 
-    let gh_request = start_gh_request("gh", "gh --version", None);
-    debug!(command = "gh --version", "gh request started");
-    let result = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .arg("--version")
-        .output();
-    match &result {
-        Ok(output) => {
-            finish_gh_request(gh_request, output);
-            debug!(
-                command = "gh --version",
-                status = %output.status,
-                success = output.status.success(),
-                stdout_bytes = output.stdout.len(),
-                stderr_bytes = output.stderr.len(),
-                "gh request finished"
-            );
-            if !output.status.success() {
-                error!(
-                    command = "gh --version",
-                    status = %output.status,
-                    message = %gh_version_output_message(output),
-                    stdout_bytes = output.stdout.len(),
-                    stderr_bytes = output.stderr.len(),
-                    "gh request returned failure"
-                );
-            }
-        }
-        Err(error) => {
-            fail_gh_request_to_start(gh_request, error);
-            debug!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-            error!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-        }
-    }
+    let result = crate::github_gh::version_output();
     startup_setup_dialog_from_gh_probe(result.map(|_| ()))
-}
-
-fn gh_version_output_message(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stderr.is_empty() { stdout } else { stderr }
 }
 
 fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {

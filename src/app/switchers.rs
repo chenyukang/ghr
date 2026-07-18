@@ -523,16 +523,14 @@ impl AppState {
             .repo_name_for_repo(&candidate.repo)
             .map(str::to_string)
             .unwrap_or_else(|| candidate.repo.clone());
+        let view = repo_view_key(&name);
         self.add_project_view_from_config(config, &name);
-        self.switch_project_view(repo_view_key(&name));
+        self.switch_project_view(view.clone());
         self.status = format!(
             "current repo remote: {} -> {}",
             candidate.remote, candidate.repo
         );
-        #[cfg(not(test))]
-        trigger_refresh(self, config, store, tx);
-        #[cfg(test)]
-        let _ = (store, tx);
+        trigger_refresh_scope(self, config, store, tx, RefreshScope::View(view));
     }
 
     pub(super) fn dismiss_project_add_dialog(&mut self) {
@@ -656,14 +654,12 @@ impl AppState {
             return;
         }
 
+        let view = repo_view_key(&name);
         self.add_project_view_from_config(config, &name);
-        self.switch_project_view(repo_view_key(&name));
+        self.switch_project_view(view.clone());
         self.project_add_dialog = None;
         self.status = format!("project added: {name}");
-        #[cfg(not(test))]
-        trigger_refresh(self, config, store, tx);
-        #[cfg(test)]
-        let _ = (store, tx);
+        trigger_refresh_scope(self, config, store, tx, RefreshScope::View(view));
     }
 
     pub(super) fn add_project_view_from_config(&mut self, config: &Config, name: &str) {

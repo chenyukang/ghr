@@ -5831,7 +5831,7 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
     let mut config = Config::default();
     config.save(&paths.config_path).expect("save config");
     let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.show_project_add_dialog();
@@ -5867,6 +5867,13 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
         vec!["Issues", "Pull Requests"]
     );
     assert_eq!(app.status, "project added: ghr");
+    let refresh = rx.try_recv().expect("project add should start a refresh");
+    match refresh {
+        AppMsg::RefreshStarted { scope } => {
+            assert_eq!(scope, RefreshScope::View("repo:ghr".to_string()));
+        }
+        _ => panic!("expected refresh start after project add"),
+    }
 
     let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
     assert_eq!(saved.repos.len(), 1);

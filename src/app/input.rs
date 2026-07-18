@@ -888,15 +888,31 @@ pub(super) fn trigger_refresh(
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) {
+    trigger_refresh_scope(app, config, store, tx, RefreshScope::Full);
+}
+
+pub(super) fn trigger_refresh_scope(
+    app: &mut AppState,
+    config: &Config,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+    scope: RefreshScope,
+) {
     if app.refreshing {
         app.status = "refresh already running".to_string();
     } else {
+        #[cfg(test)]
+        {
+            let _ = (config, store, RefreshPriority::User);
+            let _ = tx.send(AppMsg::RefreshStarted { scope });
+        }
+        #[cfg(not(test))]
         start_refresh(
             config.clone(),
             store.clone(),
             tx.clone(),
             RefreshPriority::User,
-            RefreshScope::Full,
+            scope,
         );
     }
 }

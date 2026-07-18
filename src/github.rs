@@ -769,7 +769,11 @@ where
     if !searches.is_empty() {
         pace_search_refresh().await;
     }
-    let mut notifications = refresh_notification_sections(config).await;
+    let mut notifications = if refresh_scope_includes_notifications(&scope) {
+        refresh_notification_sections(config).await
+    } else {
+        Vec::new()
+    };
     for section in &notifications {
         on_section(section);
     }
@@ -837,6 +841,13 @@ fn refresh_scope_view(scope: &RefreshScope) -> Option<&str> {
     match scope {
         RefreshScope::Full => None,
         RefreshScope::View(view) => Some(view.as_str()),
+    }
+}
+
+fn refresh_scope_includes_notifications(scope: &RefreshScope) -> bool {
+    match scope {
+        RefreshScope::Full => true,
+        RefreshScope::View(view) => same_refresh_view_key(view, "notifications"),
     }
 }
 
@@ -5717,6 +5728,17 @@ mod tests {
         assert!(jobs.iter().all(|job| job.view == "repo:Fiber"));
         assert_eq!(jobs[0].kind, SectionKind::Issues);
         assert_eq!(jobs[1].kind, SectionKind::PullRequests);
+    }
+
+    #[test]
+    fn scoped_repo_refresh_does_not_include_notifications() {
+        assert!(refresh_scope_includes_notifications(&RefreshScope::Full));
+        assert!(refresh_scope_includes_notifications(&RefreshScope::View(
+            "notifications".to_string()
+        )));
+        assert!(!refresh_scope_includes_notifications(&RefreshScope::View(
+            "repo:Fiber".to_string()
+        )));
     }
 
     #[test]

@@ -1446,7 +1446,7 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
         }
         FocusTarget::List => {
             if app.details_mode == DetailsMode::Diff {
-                push_footer_pair(&mut spans, "j/k", "file", Color::Cyan);
+                push_footer_pair(&mut spans, "j/k/n/p", "file", Color::Cyan);
                 push_footer_pair(&mut spans, "tab", "diff", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "diff", Color::Cyan);
                 push_footer_pair(&mut spans, "esc", "back", Color::Cyan);

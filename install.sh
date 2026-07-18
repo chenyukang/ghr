@@ -207,5 +207,5 @@ case ":$PATH:" in
 esac
 
 echo "ghr install: installed $tag to $install_dir/$bin_name"
-echo "Next: gh auth login"
+echo "Next: set GHR_GITHUB_TOKEN, or run: gh auth login"
 echo "Run:  ghr"

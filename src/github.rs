@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -14,10 +13,6 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
-use crate::log::{
-    GhLogRequest, fail_gh_request_to_start as record_gh_request_failed_to_start,
-    finish_gh_request as record_gh_request_finished, start_gh_request as record_gh_request_started,
-};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
     FailedCheckRunSummary, ItemKind, MergeQueueInfo, Milestone, PullRequestBranch,
@@ -27,7 +22,6 @@ use crate::model::{
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
-static GH_API_SLURP_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
 static USER_GH_REQUESTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
@@ -54,14 +48,6 @@ impl MergeMethod {
             Self::Merge => "merge",
             Self::Squash => "squash",
             Self::Rebase => "rebase",
-        }
-    }
-
-    pub fn gh_flag(self) -> &'static str {
-        match self {
-            Self::Merge => "--merge",
-            Self::Squash => "--squash",
-            Self::Rebase => "--rebase",
         }
     }
 
@@ -142,177 +128,6 @@ async fn wait_for_user_gh_requests() {
     }
 }
 
-fn gh_request_kind(args: &[String]) -> &'static str {
-    if args.first().is_some_and(|arg| arg == "api") {
-        "gh api"
-    } else {
-        "gh"
-    }
-}
-
-fn gh_command_display(args: &[String]) -> String {
-    format!("gh {}", args.join(" "))
-}
-
-fn debug_log_gh_request_started(args: &[String], directory: Option<&Path>) -> GhLogRequest {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            "gh request started"
-        );
-    } else {
-        debug!(kind, command = %command, "gh request started");
-    }
-    record_gh_request_started(kind, command, directory)
-}
-
-fn debug_log_gh_request_finished(
-    request: GhLogRequest,
-    args: &[String],
-    directory: Option<&Path>,
-    output: &std::process::Output,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        );
-    } else {
-        debug!(
-            kind,
-            command = %command,
-            status = %output.status,
-            success = output.status.success(),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request finished"
-        );
-    }
-    record_gh_request_finished(request, output);
-}
-
-fn log_gh_request_failed_to_start(
-    request: GhLogRequest,
-    args: &[String],
-    directory: Option<&Path>,
-    error: &std::io::Error,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        debug!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            error = %error,
-            "gh request failed to start"
-        );
-        error!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            error = %error,
-            "gh request failed to start"
-        );
-    } else {
-        debug!(
-            kind,
-            command = %command,
-            error = %error,
-            "gh request failed to start"
-        );
-        error!(
-            kind,
-            command = %command,
-            error = %error,
-            "gh request failed to start"
-        );
-    }
-    record_gh_request_failed_to_start(request, error);
-}
-
-fn log_gh_request_failed_result(
-    args: &[String],
-    directory: Option<&Path>,
-    output: &std::process::Output,
-) {
-    let kind = gh_request_kind(args);
-    let command = gh_command_display(args);
-    if let Some(directory) = directory {
-        error!(
-            kind,
-            command = %command,
-            cwd = %directory.display(),
-            status = %output.status,
-            message = %gh_output_message(output),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
-        );
-    } else {
-        error!(
-            kind,
-            command = %command,
-            status = %output.status,
-            message = %gh_output_message(output),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
-        );
-    }
-}
-
-fn gh_output_message(output: &std::process::Output) -> String {
-    gh_output_message_from_parts(&output.stdout, &output.stderr)
-}
-
-fn gh_output_message_from_parts(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    truncate_gh_output_message(&message)
-}
-
-fn truncate_gh_output_message(message: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    if message.chars().count() <= MAX_CHARS {
-        return message.to_string();
-    }
-    let mut truncated = message.chars().take(MAX_CHARS).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchItemRaw {
-    author: Option<SearchAuthorRaw>,
-    assignees: Option<Vec<SearchAuthorRaw>>,
-    body: Option<String>,
-    comments_count: Option<u64>,
-    created_at: Option<DateTime<Utc>>,
-    is_draft: Option<bool>,
-    labels: Option<Vec<SearchLabelRaw>>,
-    number: u64,
-    repository: SearchRepositoryRaw,
-    state: Option<String>,
-    title: String,
-    updated_at: Option<DateTime<Utc>>,
-    url: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct SearchAuthorRaw {
     login: String,
@@ -336,12 +151,6 @@ struct RepositoryAssigneeRaw {
 #[derive(Debug, Deserialize)]
 struct UserSearchRaw {
     items: Vec<SearchAuthorRaw>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchRepositoryRaw {
-    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -880,25 +689,37 @@ struct PullRequestViewerReviewRaw {
 }
 
 #[derive(Debug, Deserialize)]
-struct PullRequestCheckStatusRaw {
-    bucket: Option<String>,
-    description: Option<String>,
-    link: Option<String>,
-    name: Option<String>,
-    state: Option<String>,
-    workflow: Option<String>,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct FailedCheckRunDiscovery {
-    runs: Vec<FailedCheckRunSummary>,
-    check_runs: Vec<CheckRunSummary>,
-    unmapped_failed_checks: Vec<String>,
+struct PullRequestHeadRaw {
+    head: PullRequestHeadRefRaw,
 }
 
 #[derive(Debug, Deserialize)]
-struct PullRequestHeadRaw {
-    head: PullRequestHeadRefRaw,
+struct PullRequestNodeRaw {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestRestStatusRaw {
+    node_id: String,
+    state: Option<String>,
+    draft: Option<bool>,
+    auto_merge: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedPullRequestRaw {
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergePullRequestRaw {
+    merged: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryDefaultBranchRaw {
+    default_branch: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,7 +769,11 @@ where
     if !searches.is_empty() {
         pace_search_refresh().await;
     }
-    let mut notifications = refresh_notification_sections(config).await;
+    let mut notifications = if refresh_scope_includes_notifications(&scope) {
+        refresh_notification_sections(config).await
+    } else {
+        Vec::new()
+    };
     for section in &notifications {
         on_section(section);
     }
@@ -1016,6 +841,13 @@ fn refresh_scope_view(scope: &RefreshScope) -> Option<&str> {
     match scope {
         RefreshScope::Full => None,
         RefreshScope::View(view) => Some(view.as_str()),
+    }
+}
+
+fn refresh_scope_includes_notifications(scope: &RefreshScope) -> bool {
+    match scope {
+        RefreshScope::Full => true,
+        RefreshScope::View(view) => same_refresh_view_key(view, "notifications"),
     }
 }
 
@@ -1474,43 +1306,32 @@ async fn fetch_search_items_for_query(
     limit: usize,
     exclude_repos: &[String],
 ) -> Result<Vec<WorkItem>> {
-    let subcommand = match kind {
-        SectionKind::PullRequests => "prs",
-        SectionKind::Issues => "issues",
-        SectionKind::Notifications => bail!("notifications are not fetched via search"),
-    };
-
-    let fields = search_fields(kind);
-
-    let args = search_args(subcommand, fields, &filters, limit);
-
-    let output = run_gh_json(&args).await?;
-    let items = serde_json::from_str::<Vec<SearchItemRaw>>(&output)
-        .with_context(|| format!("failed to parse gh search {subcommand} output"))?;
-
-    Ok(items
-        .into_iter()
-        .filter(|item| !is_excluded_repo(&item.repository.name_with_owner, exclude_repos))
-        .map(|item| search_item_to_work_item(kind, item))
-        .collect())
+    fetch_search_items_with_api(kind, &filters, limit, exclude_repos).await
 }
 
-fn search_args(subcommand: &str, fields: &str, filters: &str, limit: usize) -> Vec<String> {
+async fn fetch_search_items_with_api(
+    kind: SectionKind,
+    filters: &str,
+    limit: usize,
+    exclude_repos: &[String],
+) -> Result<Vec<WorkItem>> {
     let limit = search_command_limit(limit);
-    let mut args = vec![
-        "search".to_string(),
-        subcommand.to_string(),
-        "--json".to_string(),
-        fields.to_string(),
-        "--limit".to_string(),
-        limit.to_string(),
-    ];
-    let query_tokens = search_filter_tokens(filters);
-    if !query_tokens.is_empty() {
-        args.push("--".to_string());
-        args.extend(query_tokens);
+    let page_size = search_api_page_size(limit);
+    let mut page = 1;
+    let mut items = Vec::new();
+
+    loop {
+        let result = fetch_search_page(kind, filters, page, page_size, exclude_repos).await?;
+        let total_count = result.total_count.unwrap_or(result.items.len());
+        items.extend(result.items);
+        if items.len() >= limit || page.saturating_mul(page_size) >= total_count {
+            break;
+        }
+        page += 1;
     }
-    args
+
+    items.truncate(limit);
+    Ok(items)
 }
 
 fn search_command_limit(limit: usize) -> usize {
@@ -1538,7 +1359,7 @@ async fn fetch_number_lookup_item(
     ];
     let output = match run_gh_json(&args).await {
         Ok(output) => output,
-        Err(error) if is_gh_not_found_error(&error) => return Ok(None),
+        Err(error) if is_github_not_found_error(&error) => return Ok(None),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to fetch {repo}#{number} by number"));
@@ -1765,18 +1586,6 @@ fn is_plain_search_term(token: &str) -> bool {
     }
     let token = token.strip_prefix('-').unwrap_or(token);
     !token.contains(':')
-}
-
-fn search_fields(kind: SectionKind) -> &'static str {
-    match kind {
-        SectionKind::PullRequests => {
-            "number,title,body,repository,author,assignees,createdAt,updatedAt,url,state,isDraft,labels,commentsCount"
-        }
-        SectionKind::Issues => {
-            "number,title,body,repository,author,assignees,createdAt,updatedAt,url,state,labels,commentsCount"
-        }
-        SectionKind::Notifications => unreachable!("notifications are not fetched via search"),
-    }
 }
 
 pub async fn fetch_comments(
@@ -2225,49 +2034,10 @@ async fn fetch_paginated_api_array_output_without_slurp(
 }
 
 async fn gh_api_slurp_supported() -> bool {
-    *GH_API_SLURP_SUPPORTED
-        .get_or_init(detect_gh_api_slurp_support)
-        .await
-}
-
-async fn detect_gh_api_slurp_support() -> bool {
-    let args = vec!["api".to_string(), "--help".to_string()];
-    let gh_request = debug_log_gh_request_started(&args, None);
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(&args)
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => {
-            debug_log_gh_request_finished(gh_request, &args, None, &output);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            gh_api_help_has_flag(&stdout, "--slurp") || gh_api_help_has_flag(&stderr, "--slurp")
-        }
-        Ok(output) => {
-            debug_log_gh_request_finished(gh_request, &args, None, &output);
-            debug!(
-                status = %output.status,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
-        Err(error) => {
-            log_gh_request_failed_to_start(gh_request, &args, None, &error);
-            debug!(
-                error = %error,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
+    if !crate::github_api::selected_backend().supports_cli_commands() {
+        return false;
     }
-}
-
-fn gh_api_help_has_flag(help: &str, flag: &str) -> bool {
-    help.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '[' | ']' | '(' | ')' | '`'))
-        .any(|token| token == flag)
+    crate::github_gh::api_slurp_supported().await
 }
 
 fn paginated_api_slurp_args(path: &str, accept_header: Option<&str>) -> Vec<String> {
@@ -2375,6 +2145,11 @@ async fn comment_viewer_login(context: &'static str) -> Option<String> {
 }
 
 pub async fn fetch_pull_request_action_hints(repository: &str, number: u64) -> Result<ActionHints> {
+    let pr = fetch_pull_request_action(repository, number).await?;
+    Ok(pull_request_action_hints(&pr))
+}
+
+async fn fetch_pull_request_action(repository: &str, number: u64) -> Result<PullRequestActionRaw> {
     let (owner, name) = split_repository(repository)?;
     let query = r#"
 query($owner: String!, $name: String!, $number: Int!) {
@@ -2481,106 +2256,28 @@ query($owner: String!, $name: String!, $number: Int!) {
         .repository
         .and_then(|repository| repository.pull_request)
         .ok_or_else(|| anyhow!("pull request {repository}#{number} was not found"))?;
-    let mut hints = pull_request_action_hints(&pr);
-    match fetch_failed_check_runs_from_pr_checks(repository, number).await {
-        Ok(discovery) => {
-            if !discovery.check_runs.is_empty() {
-                hints.check_runs = discovery.check_runs;
-            }
-            merge_failed_check_runs(&mut hints.failed_check_runs, discovery.runs);
-        }
-        Err(error) => {
-            debug!(
-                repository,
-                number,
-                error = %error,
-                "failed to enrich pull request check hints from gh pr checks"
-            );
-        }
-    }
-    Ok(hints)
+    Ok(pr)
 }
 
 pub async fn rerun_failed_pull_request_checks(repository: &str, number: u64) -> Result<()> {
-    let discovery = fetch_failed_check_runs_from_pr_checks(repository, number).await?;
-    if discovery.runs.is_empty() {
-        if discovery.unmapped_failed_checks.is_empty() {
-            bail!("no failed checks found for {repository}#{number}");
-        }
-        bail!(
-            "failed checks were found, but none linked to GitHub Actions workflow runs: {}",
-            discovery.unmapped_failed_checks.join(", ")
-        );
+    let hints = fetch_pull_request_action_hints(repository, number).await?;
+    if hints.failed_check_runs.is_empty() {
+        bail!("no failed GitHub Actions checks found for {repository}#{number}");
     }
-
-    for run in &discovery.runs {
+    for run in hints.failed_check_runs {
         run_gh_json(&rerun_failed_check_run_args(repository, run.run_id)).await?;
     }
 
     Ok(())
 }
 
-async fn fetch_failed_check_runs_from_pr_checks(
-    repository: &str,
-    number: u64,
-) -> Result<FailedCheckRunDiscovery> {
-    let output = run_gh_pr_checks_json(&pr_checks_args(repository, number)).await?;
-    failed_check_runs_from_pr_checks_json(&output)
-        .with_context(|| format!("failed to parse PR checks for {repository}#{number}"))
-}
-
-fn pr_checks_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "checks".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--json".to_string(),
-        "name,state,bucket,workflow,link,description".to_string(),
-    ]
-}
-
 fn rerun_failed_check_run_args(repository: &str, run_id: u64) -> Vec<String> {
     vec![
-        "run".to_string(),
-        "rerun".to_string(),
-        run_id.to_string(),
-        "--failed".to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        format!("repos/{repository}/actions/runs/{run_id}/rerun-failed-jobs"),
     ]
-}
-
-async fn run_gh_pr_checks_json(args: &[String]) -> Result<String> {
-    let gh_request = debug_log_gh_request_started(args, None);
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| {
-            log_gh_request_failed_to_start(gh_request.clone(), args, None, &error);
-            if error.kind() == ErrorKind::NotFound {
-                anyhow!("{}", gh_missing_message(args))
-            } else {
-                anyhow!("failed to run gh {}: {error}", args.join(" "))
-            }
-        })?;
-    debug_log_gh_request_finished(gh_request, args, None, &output);
-
-    if !output.status.success() {
-        log_gh_request_failed_result(args, None, &output);
-    }
-
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!("{}", gh_failure_message(args, &message));
-    }
-
-    String::from_utf8(output.stdout).context("gh output was not UTF-8")
 }
 
 pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<String> {
@@ -2722,12 +2419,48 @@ pub async fn create_pull_request(
     body: &str,
 ) -> Result<WorkItem> {
     push_pull_request_head(repository, local_dir, head).await?;
-    let args = create_pull_request_args(repository, head, title, body);
-    let output = run_gh_text_in_dir(&args, local_dir)
-        .await
-        .with_context(|| format!("failed to create pull request in {repository}"))?;
-    let number = pull_request_number_from_create_output(&output)
-        .ok_or_else(|| anyhow!("gh pr create did not return a pull request URL"))?;
+    let repository_output =
+        run_gh_json(&["api".to_string(), format!("repos/{repository}")]).await?;
+    let repository_raw = serde_json::from_str::<RepositoryDefaultBranchRaw>(&repository_output)
+        .with_context(|| format!("failed to parse default branch for {repository}"))?;
+    let output = run_gh_json(&create_pull_request_api_args(
+        repository,
+        head,
+        &repository_raw.default_branch,
+        title,
+        body,
+    ))
+    .await
+    .with_context(|| format!("failed to create pull request in {repository}"))?;
+    let created = serde_json::from_str::<CreatedPullRequestRaw>(&output)
+        .with_context(|| format!("failed to parse created pull request in {repository}"))?;
+    fetch_created_pull_request(repository, created.number).await
+}
+
+fn create_pull_request_api_args(
+    repository: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        format!("repos/{repository}/pulls"),
+        "-f".to_string(),
+        format!("head={head}"),
+        "-f".to_string(),
+        format!("base={base}"),
+        "-f".to_string(),
+        format!("title={title}"),
+        "-f".to_string(),
+        format!("body={body}"),
+    ]
+}
+
+async fn fetch_created_pull_request(repository: &str, number: u64) -> Result<WorkItem> {
     let issue_path = format!("repos/{repository}/issues/{number}");
     let issue_output = run_gh_json(&["api".to_string(), issue_path])
         .await
@@ -2735,21 +2468,6 @@ pub async fn create_pull_request(
     let raw = serde_json::from_str::<SearchApiIssueRaw>(&issue_output)
         .with_context(|| format!("failed to parse created pull request {repository}#{number}"))?;
     Ok(search_api_item_to_work_item(SectionKind::PullRequests, raw))
-}
-
-fn create_pull_request_args(repository: &str, head: &str, title: &str, body: &str) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "create".to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--head".to_string(),
-        head.to_string(),
-        "--title".to_string(),
-        title.to_string(),
-        "--body".to_string(),
-        body.to_string(),
-    ]
 }
 
 async fn push_pull_request_head(repository: &str, local_dir: &Path, head: &str) -> Result<()> {
@@ -2848,21 +2566,6 @@ fn git_push_pull_request_head_args(remote: &str, branch: &str) -> Vec<String> {
         remote.to_string(),
         format!("HEAD:refs/heads/{branch}"),
     ]
-}
-
-fn pull_request_number_from_create_output(output: &str) -> Option<u64> {
-    output.split_whitespace().find_map(|token| {
-        let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | '(' | ',' | '.'));
-        let marker = "/pull/";
-        let start = token.find(marker)?.saturating_add(marker.len());
-        let number = token[start..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        (!number.is_empty())
-            .then(|| number.parse::<u64>().ok())
-            .flatten()
-    })
 }
 
 pub async fn fetch_open_milestones(repository: &str) -> Result<Vec<Milestone>> {
@@ -3311,34 +3014,34 @@ pub async fn edit_item_metadata(
 
 pub async fn merge_pull_request(repository: &str, number: u64, method: MergeMethod) -> Result<()> {
     ensure_pull_request_can_merge(repository, number).await?;
-    run_gh_json(&merge_pull_request_args(repository, number, method)).await?;
+    let output = run_gh_json(&merge_pull_request_api_args(repository, number, method)).await?;
+    let result = serde_json::from_str::<MergePullRequestRaw>(&output)
+        .with_context(|| format!("failed to parse merge response for {repository}#{number}"))?;
+    if !result.merged {
+        bail!(
+            "failed to merge {repository}#{number}: {}",
+            result
+                .message
+                .unwrap_or_else(|| "GitHub rejected the merge".to_string())
+        );
+    }
     Ok(())
 }
 
-fn merge_pull_request_args(repository: &str, number: u64, method: MergeMethod) -> Vec<String> {
+fn merge_pull_request_api_args(repository: &str, number: u64, method: MergeMethod) -> Vec<String> {
     vec![
-        "pr".to_string(),
-        "merge".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        method.gh_flag().to_string(),
+        "api".to_string(),
+        "-X".to_string(),
+        "PUT".to_string(),
+        format!("repos/{repository}/pulls/{number}/merge"),
+        "-f".to_string(),
+        format!("merge_method={}", method.label()),
     ]
 }
 
 async fn ensure_pull_request_can_merge(repository: &str, number: u64) -> Result<()> {
-    let output = run_gh_json(&[
-        "pr".to_string(),
-        "view".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--json".to_string(),
-        "state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup".to_string(),
-    ])
-    .await?;
-    let status = serde_json::from_str::<PullRequestMergeStatusRaw>(&output)
-        .with_context(|| format!("failed to parse merge status for {repository}#{number}"))?;
+    let action = fetch_pull_request_action(repository, number).await?;
+    let status = pull_request_merge_status_from_action(&action);
     if let Some(message) = pull_request_merge_blocker_message(repository, number, &status) {
         bail!("{message}");
     }
@@ -3346,92 +3049,52 @@ async fn ensure_pull_request_can_merge(repository: &str, number: u64) -> Result<
 }
 
 pub async fn close_pull_request(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&[
-        "pr".to_string(),
-        "close".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ])
-    .await?;
-    Ok(())
+    set_issue_state(repository, number, "closed").await
 }
 
 pub async fn reopen_pull_request(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&[
-        "pr".to_string(),
-        "reopen".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ])
-    .await?;
-    Ok(())
+    set_issue_state(repository, number, "open").await
 }
 
 pub async fn close_issue(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&[
-        "issue".to_string(),
-        "close".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ])
-    .await?;
-    Ok(())
+    set_issue_state(repository, number, "closed").await
 }
 
 pub async fn reopen_issue(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&[
-        "issue".to_string(),
-        "reopen".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ])
-    .await?;
-    Ok(())
+    set_issue_state(repository, number, "open").await
 }
 
 pub async fn update_pull_request_branch(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&update_pull_request_branch_args(repository, number)).await?;
+    run_gh_json(&update_pull_request_branch_api_args(repository, number)).await?;
     Ok(())
 }
 
-fn update_pull_request_branch_args(repository: &str, number: u64) -> Vec<String> {
+fn update_pull_request_branch_api_args(repository: &str, number: u64) -> Vec<String> {
     vec![
-        "pr".to_string(),
-        "update-branch".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
+        "api".to_string(),
+        "-X".to_string(),
+        "PUT".to_string(),
+        format!("repos/{repository}/pulls/{number}/update-branch"),
     ]
+}
+
+async fn set_issue_state(repository: &str, number: u64, state: &str) -> Result<()> {
+    run_gh_json(&[
+        "api".to_string(),
+        "-X".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{repository}/issues/{number}"),
+        "-f".to_string(),
+        format!("state={state}"),
+    ])
+    .await?;
+    Ok(())
 }
 
 pub async fn enable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_auto_merge_can_enable(repository, number).await?;
     let method = auto_merge_method_flag(repository).await?;
-    run_gh_json(&enable_pull_request_auto_merge_args(
-        repository, number, method,
-    ))
-    .await?;
-    Ok(())
-}
-
-fn enable_pull_request_auto_merge_args(
-    repository: &str,
-    number: u64,
-    method: &'static str,
-) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "merge".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        method.to_string(),
-        "--auto".to_string(),
-    ]
+    update_pull_request_auto_merge(repository, number, Some(method)).await
 }
 
 async fn auto_merge_method_flag(repository: &str) -> Result<&'static str> {
@@ -3469,19 +3132,7 @@ fn repository_merge_method_flag(
 
 pub async fn disable_pull_request_auto_merge(repository: &str, number: u64) -> Result<()> {
     ensure_pull_request_auto_merge_can_disable(repository, number).await?;
-    run_gh_json(&disable_pull_request_auto_merge_args(repository, number)).await?;
-    Ok(())
-}
-
-fn disable_pull_request_auto_merge_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "merge".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--disable-auto".to_string(),
-    ]
+    update_pull_request_auto_merge(repository, number, None).await
 }
 
 async fn ensure_pull_request_auto_merge_can_enable(repository: &str, number: u64) -> Result<()> {
@@ -3504,21 +3155,55 @@ async fn fetch_pull_request_auto_merge_status(
     repository: &str,
     number: u64,
 ) -> Result<PullRequestAutoMergeStatusRaw> {
-    let output = run_gh_json(&pull_request_auto_merge_status_args(repository, number)).await?;
-    serde_json::from_str::<PullRequestAutoMergeStatusRaw>(&output)
-        .with_context(|| format!("failed to parse auto-merge status for {repository}#{number}"))
+    let output = run_gh_json(&[
+        "api".to_string(),
+        format!("repos/{repository}/pulls/{number}"),
+    ])
+    .await?;
+    let raw = serde_json::from_str::<PullRequestRestStatusRaw>(&output)
+        .with_context(|| format!("failed to parse auto-merge status for {repository}#{number}"))?;
+    Ok(PullRequestAutoMergeStatusRaw {
+        auto_merge_request: raw.auto_merge,
+        is_draft: raw.draft,
+        state: raw.state,
+    })
 }
 
-fn pull_request_auto_merge_status_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "view".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-        "--json".to_string(),
-        "state,isDraft,autoMergeRequest".to_string(),
-    ]
+async fn update_pull_request_auto_merge(
+    repository: &str,
+    number: u64,
+    method: Option<&str>,
+) -> Result<()> {
+    let output = run_gh_json(&[
+        "api".to_string(),
+        format!("repos/{repository}/pulls/{number}"),
+    ])
+    .await?;
+    let pull_request = serde_json::from_str::<PullRequestRestStatusRaw>(&output)
+        .with_context(|| format!("failed to parse pull request id for {repository}#{number}"))?;
+    let (mutation, mut args) = if let Some(method) = method {
+        let merge_method = method.trim_start_matches("--").to_ascii_uppercase();
+        (
+            "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { pullRequest { id } } }",
+            vec!["-F".to_string(), format!("method={merge_method}")],
+        )
+    } else {
+        (
+            "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { id } } }",
+            Vec::new(),
+        )
+    };
+    let mut request = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("id={}", pull_request.node_id),
+    ];
+    request.append(&mut args);
+    run_gh_json(&request).await?;
+    Ok(())
 }
 
 fn pull_request_auto_merge_enable_blocker(
@@ -3629,12 +3314,35 @@ fn assignee_api_args(
 }
 
 pub async fn convert_pull_request_to_draft(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&pull_request_ready_args(repository, number, true)).await?;
-    Ok(())
+    set_pull_request_draft_state(repository, number, true).await
 }
 
 pub async fn mark_pull_request_ready_for_review(repository: &str, number: u64) -> Result<()> {
-    run_gh_json(&pull_request_ready_args(repository, number, false)).await?;
+    set_pull_request_draft_state(repository, number, false).await
+}
+
+async fn set_pull_request_draft_state(repository: &str, number: u64, draft: bool) -> Result<()> {
+    let output = run_gh_json(&[
+        "api".to_string(),
+        format!("repos/{repository}/pulls/{number}"),
+    ])
+    .await?;
+    let pull_request = serde_json::from_str::<PullRequestNodeRaw>(&output)
+        .with_context(|| format!("failed to parse pull request id for {repository}#{number}"))?;
+    let mutation = if draft {
+        "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { id } } }"
+    } else {
+        "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }"
+    };
+    run_gh_json(&[
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("id={}", pull_request.node_id),
+    ])
+    .await?;
     Ok(())
 }
 
@@ -3833,20 +3541,6 @@ fn parse_subscribable_viewer_subscription(
     }
     .ok_or_else(|| anyhow!("subscription target {repository}#{number} was not found"))?;
     Ok(node.viewer_subscription)
-}
-
-fn pull_request_ready_args(repository: &str, number: u64, undo: bool) -> Vec<String> {
-    let mut args = vec![
-        "pr".to_string(),
-        "ready".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ];
-    if undo {
-        args.push("--undo".to_string());
-    }
-    args
 }
 
 fn parse_issue_item_output(
@@ -4698,7 +4392,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
                     attempt = attempt + 1,
                     retry_in_ms = delay.as_millis(),
                     error = %error,
-                    command = %gh_command_display(args),
+                    command = %crate::github_gh::command_display(args),
                     "retrying transient gh request failure"
                 );
                 sleep(delay).await;
@@ -4711,36 +4405,20 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
 }
 
 async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
-    let gh_request = debug_log_gh_request_started(args, None);
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| {
-            log_gh_request_failed_to_start(gh_request.clone(), args, None, &error);
-            if error.kind() == ErrorKind::NotFound {
-                anyhow!("{}", gh_missing_message(args))
-            } else {
-                anyhow!("failed to run gh {}: {error}", args.join(" "))
-            }
-        })?;
-    debug_log_gh_request_finished(gh_request, args, None, &output);
-
-    if !output.status.success() {
-        log_gh_request_failed_result(args, None, &output);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!("{}", gh_failure_message(args, &message));
+    if args.first().map(String::as_str) != Some("api") {
+        bail!("GitHub backend expected a `gh api` request");
     }
-
-    String::from_utf8(output.stdout).context("gh output was not UTF-8")
+    match crate::github_api::selected_backend() {
+        crate::github_api::GitHubBackend::DirectApi => {
+            let request = crate::github_api::parse_api_args(args)?;
+            crate::github_api::run_direct_request(&request).await
+        }
+        crate::github_api::GitHubBackend::GitHubCli => crate::github_gh::run_api(args).await,
+    }
 }
 
 fn is_retryable_gh_json_request(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("search") => true,
         Some("api") if args.get(1).is_some_and(|arg| arg == "graphql") => !args.iter().any(|arg| {
             arg.trim_start_matches("query=")
                 .trim_start()
@@ -4803,40 +4481,6 @@ fn is_retryable_gh_json_error(error: &str) -> bool {
     .any(|needle| error.contains(needle))
 }
 
-async fn run_gh_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
-    let _guard = UserGhRequestGuard::new();
-    let gh_request = debug_log_gh_request_started(args, Some(directory));
-    let output = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .current_dir(directory)
-        .args(args)
-        .output()
-        .await
-        .map_err(|error| {
-            log_gh_request_failed_to_start(gh_request.clone(), args, Some(directory), &error);
-            if error.kind() == ErrorKind::NotFound {
-                anyhow!("{}", gh_missing_message(args))
-            } else {
-                anyhow!(
-                    "failed to run gh {} in {}: {error}",
-                    args.join(" "),
-                    directory.display()
-                )
-            }
-        })?;
-    debug_log_gh_request_finished(gh_request, args, Some(directory), &output);
-
-    if !output.status.success() {
-        log_gh_request_failed_result(args, Some(directory), &output);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        bail!("{}", gh_failure_message(args, &message));
-    }
-
-    String::from_utf8(output.stdout).context("gh output was not UTF-8")
-}
-
 async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
     let command = format!("git {}", args.join(" "));
     debug!(command = %command, cwd = %directory.display(), "git request started");
@@ -4886,30 +4530,55 @@ async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String
     String::from_utf8(output.stdout).context("git output was not UTF-8")
 }
 
-fn gh_missing_message(args: &[String]) -> String {
-    format!(
-        "GitHub CLI `gh` is required but was not found. Install it for your OS from https://cli.github.com/: macOS `brew install gh`, Fedora `sudo dnf install gh`, Arch `sudo pacman -S github-cli`, Debian/Ubuntu official apt setup at https://github.com/cli/cli/blob/trunk/docs/install_linux.md. Then run `gh auth login`. Tried: gh {}",
-        args.join(" ")
-    )
-}
-
-fn gh_failure_message(args: &[String], message: &str) -> String {
-    if is_gh_auth_error(message) {
-        return format!(
-            "GitHub CLI is installed but not authenticated. Run `gh auth login`, then restart ghr. Original error from `gh {}`: {}",
-            args.join(" "),
-            message
-        );
-    }
-
-    format!("gh {} failed: {message}", args.join(" "))
-}
-
-fn is_gh_not_found_error(error: &anyhow::Error) -> bool {
+fn is_github_not_found_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
         message.contains("HTTP 404") || message.contains("Not Found (HTTP 404)")
     })
+}
+
+fn pull_request_merge_status_from_action(
+    action: &PullRequestActionRaw,
+) -> PullRequestMergeStatusRaw {
+    let status_check_rollup = action
+        .status_check_rollup
+        .as_ref()
+        .and_then(|rollup| rollup.contexts.as_ref())
+        .and_then(|contexts| contexts.nodes.as_ref())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| match node {
+                    PullRequestCheckContextRaw::CheckRun {
+                        conclusion, status, ..
+                    } => Some(PullRequestCheckRaw {
+                        conclusion: conclusion.clone(),
+                        status: status.clone(),
+                    }),
+                    PullRequestCheckContextRaw::StatusContext { state } => {
+                        let state = state.clone();
+                        let completed =
+                            matches!(state.as_deref(), Some("SUCCESS" | "FAILURE" | "ERROR"));
+                        Some(PullRequestCheckRaw {
+                            conclusion: completed.then_some(state.clone()).flatten(),
+                            status: Some(if completed {
+                                "COMPLETED".to_string()
+                            } else {
+                                state.unwrap_or_else(|| "PENDING".to_string())
+                            }),
+                        })
+                    }
+                    PullRequestCheckContextRaw::Other => None,
+                })
+                .collect()
+        });
+    PullRequestMergeStatusRaw {
+        is_draft: action.is_draft,
+        merge_state_status: action.merge_state_status.clone(),
+        review_decision: action.review_decision.clone(),
+        state: action.state.clone(),
+        status_check_rollup,
+    }
 }
 
 fn pull_request_merge_blocker_message(
@@ -4980,9 +4649,10 @@ fn check_rollup_counts(status: &PullRequestMergeStatusRaw) -> (usize, usize) {
     let mut pending = 0;
     for check in status.status_check_rollup.as_deref().unwrap_or(&[]) {
         match check.conclusion.as_deref() {
-            Some("FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE") => {
-                failing += 1
-            }
+            Some(
+                "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+                | "STARTUP_FAILURE",
+            ) => failing += 1,
             Some(_) => {}
             None => {
                 if !matches!(check.status.as_deref(), Some("COMPLETED")) {
@@ -5400,65 +5070,6 @@ fn failed_check_runs_from_rollup(
     runs
 }
 
-fn failed_check_runs_from_pr_checks_json(output: &str) -> Result<FailedCheckRunDiscovery> {
-    let checks = serde_json::from_str::<Vec<PullRequestCheckStatusRaw>>(output)?;
-    let mut discovery = FailedCheckRunDiscovery::default();
-
-    for check in checks {
-        let name = check
-            .name
-            .as_deref()
-            .and_then(non_empty_string)
-            .unwrap_or_else(|| "unknown check".to_string());
-        if pr_check_should_show(&check) {
-            discovery.check_runs.push(CheckRunSummary {
-                name: name.clone(),
-                workflow: check.workflow.as_deref().and_then(non_empty_string),
-                state: check.state.as_deref().and_then(non_empty_string),
-                bucket: check.bucket.as_deref().and_then(non_empty_string),
-                link: check.link.as_deref().and_then(non_empty_string),
-                description: check.description.as_deref().and_then(non_empty_string),
-            });
-        }
-        if !pr_check_failed(&check) {
-            continue;
-        }
-        let Some(run_id) = check.link.as_deref().and_then(actions_run_id_from_url) else {
-            push_unique_string(&mut discovery.unmapped_failed_checks, name);
-            continue;
-        };
-        add_failed_check_run(&mut discovery.runs, run_id, check.workflow, name);
-    }
-
-    Ok(discovery)
-}
-
-fn pr_check_should_show(check: &PullRequestCheckStatusRaw) -> bool {
-    if let Some(bucket) = check.bucket.as_deref().and_then(non_empty_string) {
-        return !matches_normalized(Some(&bucket), &["pass"]);
-    }
-    check.state.as_deref().and_then(non_empty_string).is_some()
-        && !matches_normalized(check.state.as_deref(), &["pass", "success"])
-}
-
-fn pr_check_failed(check: &PullRequestCheckStatusRaw) -> bool {
-    matches_normalized(check.bucket.as_deref(), &["fail", "cancel"])
-        || matches_normalized(
-            check.state.as_deref(),
-            &[
-                "fail",
-                "failure",
-                "error",
-                "cancel",
-                "cancelled",
-                "canceled",
-                "timed_out",
-                "action_required",
-                "startup_failure",
-            ],
-        )
-}
-
 fn check_run_should_show(conclusion: Option<&str>, status: Option<&str>) -> bool {
     match conclusion {
         Some(value) => !value.eq_ignore_ascii_case("SUCCESS"),
@@ -5520,17 +5131,6 @@ fn actions_run_id_from_url(url: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn merge_failed_check_runs(
-    target: &mut Vec<FailedCheckRunSummary>,
-    source: Vec<FailedCheckRunSummary>,
-) {
-    for run in source {
-        for check in run.checks {
-            add_failed_check_run(target, run.run_id, run.workflow.clone(), check);
-        }
-    }
-}
-
 fn add_failed_check_run(
     runs: &mut Vec<FailedCheckRunSummary>,
     run_id: u64,
@@ -5566,65 +5166,6 @@ fn split_repository(repository: &str) -> Result<(&str, &str)> {
         bail!("repository should be in owner/name form: {repository}");
     }
     Ok((owner, name))
-}
-
-fn is_gh_auth_error(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    [
-        "gh auth login",
-        "not authenticated",
-        "not logged in",
-        "authentication required",
-        "requires authentication",
-        "must authenticate",
-        "bad credentials",
-        "no oauth token",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn search_item_to_work_item(kind: SectionKind, item: SearchItemRaw) -> WorkItem {
-    let item_kind = match kind {
-        SectionKind::PullRequests => ItemKind::PullRequest,
-        SectionKind::Issues => ItemKind::Issue,
-        SectionKind::Notifications => ItemKind::Notification,
-    };
-    let repo = item.repository.name_with_owner;
-    let labels = item
-        .labels
-        .unwrap_or_default()
-        .into_iter()
-        .map(|label| label.name)
-        .collect::<Vec<_>>();
-    let assignees = assignees_from_raw(item.assignees);
-
-    WorkItem {
-        id: format!("{repo}#{}", item.number),
-        kind: item_kind,
-        repo,
-        number: Some(item.number),
-        title: item.title,
-        body: item.body.filter(|body| !body.trim().is_empty()),
-        author: item.author.map(|author| author.login),
-        state: item.state,
-        url: item.url,
-        created_at: item.created_at,
-        updated_at: item.updated_at,
-        last_read_at: None,
-        labels,
-        reactions: ReactionSummary::default(),
-        milestone: None,
-        assignees,
-        comments: item.comments_count,
-        unread: None,
-        reason: None,
-        extra: item
-            .is_draft
-            .filter(|is_draft| *is_draft)
-            .map(|_| "draft".to_string()),
-        viewer_subscription: None,
-    }
 }
 
 fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> WorkItem {
@@ -6076,22 +5617,6 @@ mod tests {
     }
 
     #[test]
-    fn gh_output_message_prefers_stderr() {
-        assert_eq!(
-            gh_output_message_from_parts(b"{\"state\":\"failure\"}", b"HTTP 403\n"),
-            "HTTP 403"
-        );
-    }
-
-    #[test]
-    fn gh_output_message_uses_stdout_when_stderr_is_empty() {
-        assert_eq!(
-            gh_output_message_from_parts(b"{\"state\":\"failure\"}\n", b""),
-            "{\"state\":\"failure\"}"
-        );
-    }
-
-    #[test]
     fn retryable_gh_json_error_detects_transient_network_failures() {
         assert!(is_retryable_gh_json_error(
             r#"gh api repos/owner/repo/issues/1/comments failed: Get "https://api.github.com": net/http: TLS handshake timeout"#
@@ -6133,13 +5658,6 @@ mod tests {
             "-f".to_string(),
             "query=query { viewer { login } }".to_string(),
         ]));
-        assert!(is_retryable_gh_json_request(&[
-            "search".to_string(),
-            "prs".to_string(),
-            "--json".to_string(),
-            "number,title".to_string(),
-        ]));
-
         assert!(!is_retryable_gh_json_request(&[
             "api".to_string(),
             "-X".to_string(),
@@ -6169,49 +5687,7 @@ mod tests {
     }
 
     #[test]
-    fn search_args_put_flags_before_query_separator() {
-        let args = search_args(
-            "prs",
-            "number,title",
-            "reviewed-by:chenyukang -author:chenyukang sort:created-desc",
-            50,
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "search",
-                "prs",
-                "--json",
-                "number,title",
-                "--limit",
-                "50",
-                "--",
-                "reviewed-by:chenyukang",
-                "-author:chenyukang",
-                "sort:created-desc"
-            ]
-        );
-    }
-
-    #[test]
-    fn search_args_cap_limit_to_github_search_result_window() {
-        let args = search_args("issues", "number,title", "repo:rust-lang/rust is:open", 500);
-
-        assert_eq!(
-            args,
-            vec![
-                "search",
-                "issues",
-                "--json",
-                "number,title",
-                "--limit",
-                "500",
-                "--",
-                "repo:rust-lang/rust",
-                "is:open"
-            ]
-        );
+    fn search_limit_is_clamped_to_github_search_result_window() {
         assert_eq!(search_command_limit(0), 1);
         assert_eq!(search_command_limit(50), 50);
         assert_eq!(search_command_limit(101), 101);
@@ -6326,6 +5802,17 @@ mod tests {
     }
 
     #[test]
+    fn scoped_repo_refresh_does_not_include_notifications() {
+        assert!(refresh_scope_includes_notifications(&RefreshScope::Full));
+        assert!(refresh_scope_includes_notifications(&RefreshScope::View(
+            "notifications".to_string()
+        )));
+        assert!(!refresh_scope_includes_notifications(&RefreshScope::View(
+            "repo:Fiber".to_string()
+        )));
+    }
+
+    #[test]
     fn idle_refresh_jobs_skip_active_view_and_advance_cursor() {
         let mut config = Config::default();
         config.repos.push(RepoConfig {
@@ -6373,18 +5860,6 @@ mod tests {
 
         assert!(jobs.is_empty());
         assert_eq!(next_cursor, 5);
-    }
-
-    #[test]
-    fn pull_request_ready_args_toggle_ready_and_draft() {
-        assert_eq!(
-            pull_request_ready_args("owner/repo", 42, false),
-            vec!["pr", "ready", "42", "--repo", "owner/repo"]
-        );
-        assert_eq!(
-            pull_request_ready_args("owner/repo", 42, true),
-            vec!["pr", "ready", "42", "--repo", "owner/repo", "--undo"]
-        );
     }
 
     #[test]
@@ -6658,14 +6133,6 @@ mod tests {
                 "repos/owner/repo/milestones?state=open&per_page=100"
             ]
         );
-        assert!(gh_api_help_has_flag(
-            "      --slurp               Use an array of arrays for paginated responses",
-            "--slurp"
-        ));
-        assert!(!gh_api_help_has_flag(
-            "      --paginate            Fetch all pages",
-            "--slurp"
-        ));
         assert_eq!(
             paginated_api_slurp_args(
                 "repos/owner/repo/issues/1/comments?per_page=100",
@@ -7116,14 +6583,6 @@ mod tests {
     }
 
     #[test]
-    fn search_fields_include_body_for_preview() {
-        assert!(search_fields(SectionKind::PullRequests).contains("body"));
-        assert!(search_fields(SectionKind::Issues).contains("body"));
-        assert!(search_fields(SectionKind::PullRequests).contains("createdAt"));
-        assert!(search_fields(SectionKind::Issues).contains("createdAt"));
-    }
-
-    #[test]
     fn paginated_comments_are_flattened_sorted_oldest_first_and_not_truncated() {
         let output = r##"
         [
@@ -7534,92 +6993,68 @@ mod tests {
     }
 
     #[test]
-    fn missing_gh_message_explains_install_and_login() {
-        let message = gh_missing_message(&["api".to_string(), "user".to_string()]);
-
-        assert!(message.contains("GitHub CLI `gh` is required"));
-        assert!(message.contains("brew install gh"));
-        assert!(message.contains("sudo dnf install gh"));
-        assert!(message.contains("sudo pacman -S github-cli"));
-        assert!(message.contains("official apt setup"));
-        assert!(message.contains("gh auth login"));
-    }
-
-    #[test]
-    fn auth_errors_are_rewritten_with_login_hint() {
-        let message = gh_failure_message(
-            &["search".to_string(), "prs".to_string()],
-            "To get started with GitHub CLI, please run: gh auth login",
-        );
-
-        assert!(message.contains("not authenticated"));
-        assert!(message.contains("Run `gh auth login`"));
-    }
-
-    #[test]
-    fn merge_pull_request_args_default_to_merge_flag() {
+    fn merge_pull_request_uses_rest_api() {
         assert_eq!(
-            merge_pull_request_args("owner/repo", 42, MergeMethod::default()),
+            merge_pull_request_api_args("owner/repo", 42, MergeMethod::default()),
             vec![
-                "pr".to_string(),
-                "merge".to_string(),
-                "42".to_string(),
-                "--repo".to_string(),
-                "owner/repo".to_string(),
-                "--merge".to_string(),
+                "api".to_string(),
+                "-X".to_string(),
+                "PUT".to_string(),
+                "repos/owner/repo/pulls/42/merge".to_string(),
+                "-f".to_string(),
+                "merge_method=merge".to_string(),
             ]
+        );
+        assert_eq!(
+            merge_pull_request_api_args("owner/repo", 42, MergeMethod::Squash).last(),
+            Some(&"merge_method=squash".to_string())
+        );
+        assert_eq!(
+            merge_pull_request_api_args("owner/repo", 42, MergeMethod::Rebase).last(),
+            Some(&"merge_method=rebase".to_string())
         );
     }
 
     #[test]
-    fn merge_pull_request_args_use_selected_method_flag() {
-        assert_eq!(
-            merge_pull_request_args("owner/repo", 42, MergeMethod::Squash).last(),
-            Some(&"--squash".to_string())
-        );
-        assert_eq!(
-            merge_pull_request_args("owner/repo", 42, MergeMethod::Rebase).last(),
-            Some(&"--rebase".to_string())
-        );
+    fn merge_preflight_maps_graphql_check_contexts() {
+        let action = serde_json::from_value::<PullRequestActionRaw>(serde_json::json!({
+            "state": "OPEN",
+            "isDraft": false,
+            "mergeStateStatus": "BLOCKED",
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": {
+                "contexts": {
+                    "totalCount": 3,
+                    "nodes": [
+                        {
+                            "__typename": "CheckRun",
+                            "conclusion": "FAILURE",
+                            "status": "COMPLETED"
+                        },
+                        {
+                            "__typename": "StatusContext",
+                            "state": "ERROR"
+                        },
+                        {
+                            "__typename": "StatusContext",
+                            "state": "PENDING"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("valid pull request action");
+
+        let status = pull_request_merge_status_from_action(&action);
+        assert_eq!(check_rollup_counts(&status), (2, 1));
+        let message = pull_request_merge_blocker_message("owner/repo", 42, &status)
+            .expect("blocked pull request");
+        assert!(message.contains("2 check(s) failing"));
+        assert!(message.contains("1 check(s) pending"));
     }
 
     #[test]
-    fn auto_merge_commands_use_non_interactive_gh_pr_merge_flags() {
-        assert_eq!(
-            enable_pull_request_auto_merge_args("owner/repo", 42, "--merge"),
-            vec![
-                "pr",
-                "merge",
-                "42",
-                "--repo",
-                "owner/repo",
-                "--merge",
-                "--auto"
-            ]
-        );
-        assert_eq!(
-            disable_pull_request_auto_merge_args("owner/repo", 42),
-            vec![
-                "pr",
-                "merge",
-                "42",
-                "--repo",
-                "owner/repo",
-                "--disable-auto"
-            ]
-        );
-        assert_eq!(
-            pull_request_auto_merge_status_args("owner/repo", 42),
-            vec![
-                "pr",
-                "view",
-                "42",
-                "--repo",
-                "owner/repo",
-                "--json",
-                "state,isDraft,autoMergeRequest"
-            ]
-        );
+    fn repository_merge_methods_use_rest_api() {
         assert_eq!(
             repository_merge_methods_args("owner/repo"),
             vec![
@@ -8093,136 +7528,54 @@ mod tests {
     }
 
     #[test]
-    fn pr_checks_json_groups_failed_checks_by_actions_run() {
-        let output = r#"
-[
-  {
-    "bucket": "fail",
-    "description": "failed after 2m",
-    "link": "https://github.com/owner/repo/actions/runs/1001/job/1?pr=2",
-    "name": "test",
-    "state": "FAILURE",
-    "workflow": "CI"
-  },
-  {
-    "bucket": "fail",
-    "link": "https://github.com/owner/repo/actions/runs/1001/job/2?pr=2",
-    "name": "lint",
-    "state": "FAILURE",
-    "workflow": "CI"
-  },
-  {
-    "bucket": "pass",
-    "link": "https://github.com/owner/repo/actions/runs/1002/job/3?pr=2",
-    "name": "fmt",
-    "state": "SUCCESS",
-    "workflow": "CI"
-  },
-  {
-    "bucket": "fail",
-    "link": "https://example.com/checks/9",
-    "name": "external",
-    "state": "ERROR",
-    "workflow": null
-  }
-]
-"#;
-
-        let discovery = failed_check_runs_from_pr_checks_json(output).expect("valid checks");
-
-        assert_eq!(
-            discovery.runs,
-            vec![FailedCheckRunSummary {
-                run_id: 1001,
-                workflow: Some("CI".to_string()),
-                checks: vec!["test".to_string(), "lint".to_string()],
-            }]
-        );
-        assert_eq!(
-            discovery.check_runs,
-            vec![
-                CheckRunSummary {
-                    name: "test".to_string(),
-                    workflow: Some("CI".to_string()),
-                    state: Some("FAILURE".to_string()),
-                    bucket: Some("fail".to_string()),
-                    link: Some(
-                        "https://github.com/owner/repo/actions/runs/1001/job/1?pr=2".to_string()
-                    ),
-                    description: Some("failed after 2m".to_string()),
-                },
-                CheckRunSummary {
-                    name: "lint".to_string(),
-                    workflow: Some("CI".to_string()),
-                    state: Some("FAILURE".to_string()),
-                    bucket: Some("fail".to_string()),
-                    link: Some(
-                        "https://github.com/owner/repo/actions/runs/1001/job/2?pr=2".to_string()
-                    ),
-                    description: None,
-                },
-                CheckRunSummary {
-                    name: "external".to_string(),
-                    workflow: None,
-                    state: Some("ERROR".to_string()),
-                    bucket: Some("fail".to_string()),
-                    link: Some("https://example.com/checks/9".to_string()),
-                    description: None,
-                },
-            ]
-        );
-        assert_eq!(discovery.unmapped_failed_checks, vec!["external"]);
-    }
-
-    #[test]
-    fn rerun_failed_checks_commands_are_constructed_for_pr_and_run() {
-        assert_eq!(
-            pr_checks_args("owner/repo", 42),
-            vec![
-                "pr",
-                "checks",
-                "42",
-                "--repo",
-                "owner/repo",
-                "--json",
-                "name,state,bucket,workflow,link,description",
-            ]
-        );
+    fn rerun_failed_checks_uses_rest_api() {
         assert_eq!(
             rerun_failed_check_run_args("owner/repo", 1001),
-            vec!["run", "rerun", "1001", "--failed", "--repo", "owner/repo"]
-        );
-    }
-
-    #[test]
-    fn update_pull_request_branch_uses_gh_update_branch_command() {
-        assert_eq!(
-            update_pull_request_branch_args("owner/repo", 42),
             vec![
-                "pr".to_string(),
-                "update-branch".to_string(),
-                "42".to_string(),
-                "--repo".to_string(),
-                "owner/repo".to_string(),
+                "api",
+                "-X",
+                "POST",
+                "repos/owner/repo/actions/runs/1001/rerun-failed-jobs"
             ]
         );
     }
 
     #[test]
-    fn create_pull_request_args_use_repo_head_title_and_body() {
+    fn update_pull_request_branch_uses_rest_api() {
         assert_eq!(
-            create_pull_request_args("owner/repo", "feature/new-pr", "Add feature", "Body text"),
+            update_pull_request_branch_api_args("owner/repo", 42),
             vec![
-                "pr".to_string(),
-                "create".to_string(),
-                "--repo".to_string(),
-                "owner/repo".to_string(),
-                "--head".to_string(),
-                "feature/new-pr".to_string(),
-                "--title".to_string(),
-                "Add feature".to_string(),
-                "--body".to_string(),
-                "Body text".to_string(),
+                "api".to_string(),
+                "-X".to_string(),
+                "PUT".to_string(),
+                "repos/owner/repo/pulls/42/update-branch".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_pull_request_uses_rest_api() {
+        assert_eq!(
+            create_pull_request_api_args(
+                "owner/repo",
+                "feature/new-pr",
+                "main",
+                "Add feature",
+                "Body text"
+            ),
+            vec![
+                "api".to_string(),
+                "-X".to_string(),
+                "POST".to_string(),
+                "repos/owner/repo/pulls".to_string(),
+                "-f".to_string(),
+                "head=feature/new-pr".to_string(),
+                "-f".to_string(),
+                "base=main".to_string(),
+                "-f".to_string(),
+                "title=Add feature".to_string(),
+                "-f".to_string(),
+                "body=Body text".to_string(),
             ]
         );
     }
@@ -8273,27 +7626,6 @@ mod tests {
                 "HEAD:refs/heads/feature/new-pr".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn pull_request_number_parses_from_create_output_url() {
-        assert_eq!(
-            pull_request_number_from_create_output("https://github.com/owner/repo/pull/42\n"),
-            Some(42)
-        );
-        assert_eq!(
-            pull_request_number_from_create_output(
-                "created https://github.com/owner/repo/pull/77."
-            ),
-            Some(77)
-        );
-    }
-
-    #[test]
-    fn non_auth_gh_errors_keep_original_command_context() {
-        let message = gh_failure_message(&["search".to_string(), "issues".to_string()], "HTTP 500");
-
-        assert_eq!(message, "gh search issues failed: HTTP 500");
     }
 
     #[test]

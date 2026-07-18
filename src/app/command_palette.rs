@@ -178,7 +178,7 @@ pub(super) fn command_palette_commands(
             "Refresh",
             "r",
             "General",
-            "Refresh dashboard data from GitHub",
+            "Refresh the active tab first, then run a full background refresh",
             PaletteAction::Refresh,
         ),
         palette_command(

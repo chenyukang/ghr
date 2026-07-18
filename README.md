@@ -32,16 +32,32 @@
 - Built-in `auto` plus named light and dark color themes configured through `defaults.theme` / `defaults.theme_name`; `auto` follows the macOS appearance when available.
 - UI state persistence under `~/.ghr`, including focus, selected item, scroll position, split ratio, and diff mode.
 - Local state under `~/.ghr`: config, SQLite snapshot database, logs, and UI state.
-- Uses the GitHub CLI for authentication, API access, and browser opening behavior.
+- Supports direct GitHub API access with a personal access token, or the GitHub CLI as a compatible fallback.
 
-## Requirements
+## Authentication
 
-- GitHub CLI [gh](https://cli.github.com/)
-- An authenticated GitHub CLI session:
+Choose either authentication method:
+
+1. Set a [personal access token (classic)](https://github.com/settings/tokens):
+
+```bash
+export GHR_GITHUB_TOKEN=ghp_...
+ghr
+```
+
+   For full access to private repositories, select the classic `repo` scope. For public repositories only, use `public_repo` together with `notifications`. The `workflow` scope is not required because ghr does not modify workflow files. GitHub's notification endpoints accept the `notifications` or `repo` scope, and linked private issues, pull requests, and commits require `repo`.
+
+   `GH_TOKEN` and `GITHUB_TOKEN` are also recognized. `GHR_GITHUB_TOKEN` takes precedence. Tokens are read from the environment and are never written to `~/.ghr/config.toml`. Treat the token like a password and give it an expiration date.
+
+   Fine-grained PATs (`github_pat_...`) provide partial repository access, but are not recommended for the complete ghr experience. GitHub's Notifications API does not support fine-grained PATs, so Inbox loading and read/done/mute actions will fail. Fine-grained PATs are also limited to one resource owner, cannot access multiple organizations at once, may not support every Checks API operation, and can require organization approval or a shorter lifetime. See GitHub's documentation for [notification authentication](https://docs.github.com/en/rest/activity/notifications) and [fine-grained PAT limitations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations).
+
+2. Install [GitHub CLI](https://cli.github.com/) and authenticate it:
 
 ```bash
 gh auth login
 ```
+
+GitHub CLI is not required in PAT mode. Local checkout uses the matching repository remote with ordinary `git` commands.
 
 ## Installation
 
@@ -69,9 +85,14 @@ Install the latest release binary on Windows PowerShell:
 irm https://raw.githubusercontent.com/chenyukang/ghr/main/install.ps1 | iex
 ```
 
-Then authenticate GitHub CLI and run ghr:
+Then set a token or authenticate GitHub CLI and run ghr:
 
 ```bash
+# PAT mode, without GitHub CLI
+export GHR_GITHUB_TOKEN=ghp_...
+ghr
+
+# Or GitHub CLI mode
 gh auth login
 ghr
 
@@ -88,7 +109,7 @@ curl -fsSL https://raw.githubusercontent.com/chenyukang/ghr/main/install.sh | GH
 
 ## Usage
 
-Run `ghr` from any terminal after `gh auth login`. When started inside a Git checkout with a GitHub remote, ghr adds that repository as a local project tab automatically.
+Run `ghr` after setting a token or completing `gh auth login`. When started inside a Git checkout with a GitHub remote, ghr adds that repository as a local project tab automatically.
 
 ## Keybindings
 
@@ -131,7 +152,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `m` | Toggle terminal text selection mode; in diff details, begin a review range |
 | `M` | Open a merge confirmation for the selected PR, defaulting to merge commits |
 | `C` | Open a close or reopen confirmation for the selected issue or PR |
-| `X` | Open a confirmation to run `gh pr checkout <number> --repo <owner/repo>` from the matching local checkout |
+| `X` | Open a local PR checkout confirmation using ordinary `git` commands |
 | `F` | Rerun failed checks for the selected PR |
 | `U` | Open an update-branch confirmation for the selected PR |
 | `m` / `s` / `r` in merge confirmation | Choose merge, squash, or rebase before confirming |
@@ -159,7 +180,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Ctrl+X` in editor dialogs | Delete the current line |
 | `Ctrl+Z` / `Cmd+Z` in editor dialogs | Undo text edits |
 | `Ctrl+R` / `Cmd+Shift+Z` in editor dialogs | Redo text edits |
-| `r` | Refresh from GitHub |
+| `r` | Refresh the active tab first, then run a full background refresh |
 | `q` / `Ctrl+C` | Save UI state and quit |
 
 ## Commands
@@ -197,6 +218,8 @@ Local PR checkout:
 
 - Press `X` on a pull request in the list or Details pane, then confirm with `y` or `Enter`.
 - Pull request Details show the remote branch as a clickable link when GitHub provides it.
+- ghr fetches `refs/pull/<number>/head` from the matching Git remote and checks out `pr/<number>`; GitHub CLI is not required for checkout.
+- An existing `pr/<number>` branch is only fast-forwarded. If it has diverged, ghr leaves it untouched and reports the conflict.
 - Checkout runs from the matching local repository directory. Set `local_dir` on a repo entry to make the target explicit:
 
 ```toml
@@ -211,7 +234,7 @@ show_issues = true
 ```
 
 - If `local_dir` is not set, `ghr` tries the directory where it was launched when that directory has a GitHub remote for the pull request repository. If neither path matches, `ghr` shows a hint instead of running checkout.
-- Creating a pull request from `local_dir` runs a local preflight before pushing or calling `gh pr create`. It blocks with a dialog when the title is empty, the checkout has moved branches, the worktree is dirty, the head has no commit, no matching GitHub push remote exists, or the branch has no commits ahead of the local base branch.
+- Creating a pull request from `local_dir` runs a local preflight before pushing and calling the GitHub API. It blocks with a dialog when the title is empty, the checkout has moved branches, the worktree is dirty, the head has no commit, no matching GitHub push remote exists, or the branch has no commits ahead of the local base branch.
 
 Mouse behavior:
 

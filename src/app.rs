@@ -34,7 +34,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::config::{
     Config, CurrentRepoRemotePrompt, DEFAULT_COMMAND_PALETTE_KEY, DEFAULT_EDITOR_SUBMIT_KEY,
@@ -65,7 +65,6 @@ use crate::github::{
     update_issue_assignees, update_item_subscription, update_pull_request_branch,
     with_background_github_priority,
 };
-use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
     FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
@@ -128,11 +127,13 @@ use layout::{
     split_percent_from_column, splitter_contains,
 };
 use participants::*;
+#[cfg(test)]
+use pr_checkout::run_git_pr_checkout_ref;
 use pr_checkout::{
     PrCheckoutPlan, PrCheckoutResult, checkout_directory_notice, configured_local_dir_for_repo,
     current_git_branch_for_directory, ensure_directory_tracks_configured_repo,
-    resolve_pr_checkout_directory, resolve_pull_request_head_ref, run_pr_checkout,
-    validate_pr_create_preflight,
+    resolve_pr_checkout_directory, resolve_pr_checkout_remote, resolve_pull_request_head_ref,
+    run_pr_checkout, validate_pr_create_preflight,
 };
 use render::*;
 use runtime::*;
@@ -1617,6 +1618,7 @@ struct AppState {
     status: String,
     refreshing: bool,
     current_refresh_scope: RefreshScope,
+    pending_full_refresh_after_view: bool,
     section_page_loading: Option<SectionPageLoading>,
     last_refresh_request: Instant,
     idle_sweep_refreshing: bool,
@@ -2031,55 +2033,12 @@ fn should_show_startup_dialog(cached: &HashMap<String, SectionSnapshot>) -> bool
 }
 
 fn startup_setup_dialog() -> Option<SetupDialog> {
-    let gh_request = start_gh_request("gh", "gh --version", None);
-    debug!(command = "gh --version", "gh request started");
-    let result = Command::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .arg("--version")
-        .output();
-    match &result {
-        Ok(output) => {
-            finish_gh_request(gh_request, output);
-            debug!(
-                command = "gh --version",
-                status = %output.status,
-                success = output.status.success(),
-                stdout_bytes = output.stdout.len(),
-                stderr_bytes = output.stderr.len(),
-                "gh request finished"
-            );
-            if !output.status.success() {
-                error!(
-                    command = "gh --version",
-                    status = %output.status,
-                    message = %gh_version_output_message(output),
-                    stdout_bytes = output.stdout.len(),
-                    stderr_bytes = output.stderr.len(),
-                    "gh request returned failure"
-                );
-            }
-        }
-        Err(error) => {
-            fail_gh_request_to_start(gh_request, error);
-            debug!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-            error!(
-                command = "gh --version",
-                error = %error,
-                "gh request failed to start"
-            );
-        }
+    if !crate::github_api::selected_backend().supports_cli_commands() {
+        return None;
     }
-    startup_setup_dialog_from_gh_probe(result.map(|_| ()))
-}
 
-fn gh_version_output_message(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stderr.is_empty() { stdout } else { stderr }
+    let result = crate::github_gh::version_output();
+    startup_setup_dialog_from_gh_probe(result.map(|_| ()))
 }
 
 fn startup_setup_dialog_from_gh_probe(result: io::Result<()>) -> Option<SetupDialog> {
@@ -2110,6 +2069,19 @@ async fn run_loop(
         }
 
         needs_draw |= drain_app_messages(app, rx);
+        let started_pending_full_refresh = if app.take_pending_full_refresh_after_view() {
+            start_refresh(
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+                RefreshPriority::Background,
+                RefreshScope::Full,
+            );
+            needs_draw = true;
+            true
+        } else {
+            false
+        };
         needs_draw |= app.ensure_current_details_loading(tx);
         needs_draw |= app.ensure_current_comments_auto_refresh(tx);
         needs_draw |= app.ensure_current_diff_loading(tx);
@@ -2122,7 +2094,8 @@ async fn run_loop(
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
 
-        if !app.refreshing
+        if !started_pending_full_refresh
+            && !app.refreshing
             && config.defaults.refetch_interval_seconds > 0
             && app.last_refresh_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
@@ -2134,7 +2107,7 @@ async fn run_loop(
                 RefreshPriority::Background,
                 RefreshScope::View(app.active_view.clone()),
             );
-        } else if app.should_start_idle_sweep(config) {
+        } else if !started_pending_full_refresh && app.should_start_idle_sweep(config) {
             start_idle_sweep(
                 config.clone(),
                 store.clone(),
@@ -3182,6 +3155,7 @@ impl AppState {
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             current_refresh_scope: RefreshScope::Full,
+            pending_full_refresh_after_view: false,
             section_page_loading: None,
             last_refresh_request: Instant::now(),
             idle_sweep_refreshing: false,
@@ -3655,10 +3629,10 @@ impl AppState {
         self.startup_dialog = None;
         self.status = match dialog {
             SetupDialog::MissingGh => {
-                "GitHub CLI missing: install `gh`, then run `gh auth login`".to_string()
+                "GitHub auth required: set a token or install `gh`".to_string()
             }
             SetupDialog::AuthRequired => {
-                "GitHub CLI auth required: run `gh auth login`".to_string()
+                "GitHub authentication failed: check the token or `gh auth login`".to_string()
             }
         };
     }
@@ -3874,6 +3848,18 @@ impl AppState {
             (Some(error), None) => refresh_error_status(1, Some(error)),
             (_, Some(error)) => format!("snapshot save failed: {error}"),
         };
+    }
+
+    fn queue_full_refresh_after_view(&mut self) {
+        self.pending_full_refresh_after_view = true;
+    }
+
+    fn take_pending_full_refresh_after_view(&mut self) -> bool {
+        if self.refreshing {
+            return false;
+        }
+
+        std::mem::take(&mut self.pending_full_refresh_after_view)
     }
 
     fn handle_msg(&mut self, message: AppMsg) {
@@ -8891,6 +8877,14 @@ impl AppState {
                 return;
             }
         };
+        let remote = match resolve_pr_checkout_remote(config, &directory, &item.repo) {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.message_dialog = Some(message_dialog("Checkout Unavailable", error));
+                self.status = "pull request checkout unavailable".to_string();
+                return;
+            }
+        };
         let branch = self
             .action_hints
             .get(&item.id)
@@ -8915,7 +8909,11 @@ impl AppState {
         self.pr_action_dialog = Some(PrActionDialog {
             item,
             action: PrAction::Checkout,
-            checkout: Some(PrCheckoutPlan { directory, branch }),
+            checkout: Some(PrCheckoutPlan {
+                directory,
+                branch,
+                remote,
+            }),
             summary: Vec::new(),
             merge_method: MergeMethod::default(),
         });

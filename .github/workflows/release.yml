@@ -23,7 +23,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -94,7 +94,7 @@ jobs:
             exe_suffix: ".exe"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
     environment: crates-io
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -236,7 +236,7 @@ jobs:
       - publish
     steps:
       - name: Checkout release source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download release artifacts
         uses: actions/download-artifact@v8
@@ -261,7 +261,7 @@ jobs:
           fi
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: chenyukang/homebrew-tap
           path: homebrew-tap
@@ -288,7 +288,7 @@ jobs:
           fi
 
       - name: Checkout source main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: main
           path: ghr-main

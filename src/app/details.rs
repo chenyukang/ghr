@@ -1451,6 +1451,13 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
             3,
         );
     }
+    if matches!(item.kind, ItemKind::PullRequest) && !item.linked_issues.is_empty() {
+        builder.push_styled_key_value_limited(
+            "linked issues",
+            linked_issue_segments(&item.linked_issues, &item.repo),
+            3,
+        );
+    }
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -1772,13 +1779,13 @@ pub(super) fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
     }
     segments.push(DetailSegment::raw("  "));
     segments.push(DetailSegment::action(
-        "@ assign",
+        "@assign",
         DetailAction::AssignAssignee,
     ));
     if !item.assignees.is_empty() {
         segments.push(DetailSegment::raw("  "));
         segments.push(DetailSegment::action(
-            "- unassign",
+            "-unassign",
             DetailAction::UnassignAssignee,
         ));
     }
@@ -1803,45 +1810,108 @@ pub(super) fn linked_pull_request_segments(
     pull_requests: &[LinkedPullRequest],
     current_repo: &str,
 ) -> Vec<DetailSegment> {
+    linked_item_segments(pull_requests, current_repo)
+}
+
+pub(super) fn linked_issue_segments(
+    issues: &[LinkedIssue],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
+    linked_item_segments(issues, current_repo)
+}
+
+trait LinkedDetailItem {
+    fn repository(&self) -> &str;
+    fn number(&self) -> u64;
+    fn title(&self) -> &str;
+    fn state(&self) -> Option<&str>;
+    fn url(&self) -> &str;
+}
+
+impl LinkedDetailItem for LinkedPullRequest {
+    fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    fn number(&self) -> u64 {
+        self.number
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl LinkedDetailItem for LinkedIssue {
+    fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    fn number(&self) -> u64 {
+        self.number
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+fn linked_item_segments<T: LinkedDetailItem>(
+    items: &[T],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
     let mut segments = Vec::new();
-    for pull_request in pull_requests {
+    for item in items {
         if !segments.is_empty() {
             segments.push(DetailSegment::raw("; "));
         }
         segments.push(DetailSegment::link(
-            linked_pull_request_label(pull_request, current_repo),
-            pull_request.url.clone(),
+            linked_item_label(item, current_repo),
+            item.url().to_string(),
         ));
-        if !pull_request.title.trim().is_empty() {
-            segments.push(DetailSegment::raw(format!(
-                " {}",
-                pull_request.title.trim()
-            )));
+        if !item.title().trim().is_empty() {
+            segments.push(DetailSegment::raw(format!(" {}", item.title().trim())));
         }
-        if let Some(state) = useful_meta_value(pull_request.state.as_deref()) {
+        if let Some(state) = useful_meta_value(item.state()) {
             segments.push(DetailSegment::raw(" "));
             segments.push(DetailSegment::styled(
-                linked_pull_request_state_label(state),
-                linked_pull_request_state_style(state),
+                linked_item_state_label(state),
+                linked_item_state_style(state),
             ));
         }
     }
     segments
 }
 
-fn linked_pull_request_label(pull_request: &LinkedPullRequest, current_repo: &str) -> String {
-    if pull_request.repository.is_empty() || pull_request.repository == current_repo {
-        format!("#{}", pull_request.number)
+fn linked_item_label<T: LinkedDetailItem>(item: &T, current_repo: &str) -> String {
+    if item.repository().is_empty() || item.repository() == current_repo {
+        format!("#{}", item.number())
     } else {
-        format!("{}#{}", pull_request.repository, pull_request.number)
+        format!("{}#{}", item.repository(), item.number())
     }
 }
 
-fn linked_pull_request_state_label(state: &str) -> String {
+fn linked_item_state_label(state: &str) -> String {
     state.to_ascii_lowercase()
 }
 
-fn linked_pull_request_state_style(state: &str) -> Style {
+fn linked_item_state_style(state: &str) -> Style {
     match state.to_ascii_lowercase().as_str() {
         "open" => active_theme()
             .panel()
@@ -2246,7 +2316,7 @@ pub(super) fn push_diff_inline_comment(
     if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            "+ react",
+            "+react",
             DetailAction::ReactComment(index),
         ));
     }
@@ -2902,7 +2972,7 @@ pub(super) fn push_reactions_line(
         } else {
             "  "
         }));
-        segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+        segments.push(DetailSegment::action("+react", DetailAction::ReactItem));
     }
     if can_reply {
         segments.push(DetailSegment::raw(if reactions.is_empty() && !can_react {
@@ -3035,7 +3105,7 @@ pub(super) fn push_comment(
     if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            "+ react",
+            "+react",
             DetailAction::ReactComment(index),
         ));
     }

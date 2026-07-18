@@ -52,6 +52,8 @@ pub struct WorkItem {
     pub assignees: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_pull_requests: Vec<LinkedPullRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_issues: Vec<LinkedIssue>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,
@@ -62,6 +64,15 @@ pub struct WorkItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedPullRequest {
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub state: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedIssue {
     pub repository: String,
     pub number: u64,
     pub title: String,
@@ -615,11 +626,22 @@ fn preserve_lazy_item_details(current: &WorkItem, refreshed: &mut WorkItem) {
 }
 
 fn preserve_detail_only_fields(current: &WorkItem, refreshed: &mut WorkItem) {
-    if current.kind != refreshed.kind || !matches!(refreshed.kind, ItemKind::Issue) {
+    if current.kind != refreshed.kind {
         return;
     }
-    if refreshed.linked_pull_requests.is_empty() && !current.linked_pull_requests.is_empty() {
-        refreshed.linked_pull_requests = current.linked_pull_requests.clone();
+    match refreshed.kind {
+        ItemKind::Issue => {
+            if refreshed.linked_pull_requests.is_empty() && !current.linked_pull_requests.is_empty()
+            {
+                refreshed.linked_pull_requests = current.linked_pull_requests.clone();
+            }
+        }
+        ItemKind::PullRequest => {
+            if refreshed.linked_issues.is_empty() && !current.linked_issues.is_empty() {
+                refreshed.linked_issues = current.linked_issues.clone();
+            }
+        }
+        ItemKind::Notification => {}
     }
 }
 
@@ -848,6 +870,37 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_pull_request_sections_preserve_loaded_linked_issues() {
+        let mut current_item = test_work_item("owner/repo#7", ItemKind::PullRequest);
+        current_item.body = Some("Old description".to_string());
+        current_item.labels = vec!["old-label".to_string()];
+        let linked_issues = vec![LinkedIssue {
+            repository: "owner/repo".to_string(),
+            number: 42,
+            title: "Bug example".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/owner/repo/issues/42".to_string(),
+        }];
+        current_item.linked_issues = linked_issues.clone();
+
+        let mut refreshed_item = test_work_item("owner/repo#7", ItemKind::PullRequest);
+        refreshed_item.title = "Updated PR title".to_string();
+        let merged = merge_refreshed_sections(
+            vec![test_section(SectionKind::PullRequests, vec![current_item])],
+            vec![test_section(
+                SectionKind::PullRequests,
+                vec![refreshed_item],
+            )],
+        );
+
+        let item = &merged[0].items[0];
+        assert_eq!(item.title, "Updated PR title");
+        assert!(item.body.is_none());
+        assert!(item.labels.is_empty());
+        assert_eq!(item.linked_issues, linked_issues);
+    }
+
+    #[test]
     fn configured_repo_sections_use_repo_view_and_generic_titles() {
         let mut config = Config::default();
         config.repos.push(crate::config::RepoConfig {
@@ -1001,6 +1054,7 @@ mod tests {
             milestone: None,
             assignees: Vec::new(),
             linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
             comments: None,
             unread: None,
             reason: None,

@@ -66,7 +66,7 @@ use crate::github::{
 };
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
-    FailedCheckRunSummary, ItemKind, LinkedPullRequest, Milestone, PullRequestBranch,
+    FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest, Milestone, PullRequestBranch,
     PullRequestReviewActor, ReactionSummary, SectionKind, SectionSnapshot, WorkItem,
     builtin_view_key, configured_sections, global_search_view_key,
     mark_all_notifications_read_in_section, mark_notification_done_in_section,
@@ -5499,8 +5499,8 @@ impl AppState {
                 self.open_selected();
                 false
             }
-            PaletteAction::OpenLinkedPullRequest => {
-                self.open_linked_pull_request();
+            PaletteAction::OpenLinkedItem => {
+                self.open_linked_item();
                 false
             }
             PaletteAction::ShowDiff => {
@@ -5709,6 +5709,9 @@ impl AppState {
                 }
                 if let Some(linked_pull_requests) = &metadata.linked_pull_requests {
                     item.linked_pull_requests = linked_pull_requests.clone();
+                }
+                if let Some(linked_issues) = &metadata.linked_issues {
+                    item.linked_issues = linked_issues.clone();
                 }
                 if metadata.comments.is_some() {
                     item.comments = metadata.comments;
@@ -11779,9 +11782,9 @@ impl AppState {
         self.open_url(&url);
     }
 
-    fn open_linked_pull_request(&mut self) {
-        let Some(url) = self.linked_pull_request_open_url() else {
-            self.status = "no linked pull request".to_string();
+    fn open_linked_item(&mut self) {
+        let Some(url) = self.linked_item_open_url() else {
+            self.status = self.missing_linked_item_status();
             return;
         };
 
@@ -11905,15 +11908,27 @@ impl AppState {
         Some(item.url.clone())
     }
 
-    fn linked_pull_request_open_url(&self) -> Option<String> {
+    fn linked_item_open_url(&self) -> Option<String> {
         let item = self.current_item()?;
-        if !matches!(item.kind, ItemKind::Issue) {
-            return None;
+        match item.kind {
+            ItemKind::Issue => item.linked_pull_requests.iter().find_map(|pull_request| {
+                let url = pull_request.url.trim();
+                (!url.is_empty()).then(|| url.to_string())
+            }),
+            ItemKind::PullRequest => item.linked_issues.iter().find_map(|issue| {
+                let url = issue.url.trim();
+                (!url.is_empty()).then(|| url.to_string())
+            }),
+            ItemKind::Notification => None,
         }
-        item.linked_pull_requests.iter().find_map(|pull_request| {
-            let url = pull_request.url.trim();
-            (!url.is_empty()).then(|| url.to_string())
-        })
+    }
+
+    fn missing_linked_item_status(&self) -> String {
+        match self.current_item().map(|item| item.kind) {
+            Some(ItemKind::Issue) => "no linked pull request".to_string(),
+            Some(ItemKind::PullRequest) => "no linked issue".to_string(),
+            _ => "no linked pull request or issue".to_string(),
+        }
     }
 
     fn open_url(&mut self, url: &str) {

@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
-    FailedCheckRunSummary, ItemKind, LinkedPullRequest, MergeQueueInfo, Milestone,
+    FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest, MergeQueueInfo, Milestone,
     PullRequestBranch, PullRequestReviewActor, PullRequestReviewActorState,
     PullRequestReviewSummary, ReactionSummary, ReviewCommentPreview, SectionKind, SectionSnapshot,
     WorkItem, builtin_view_key, global_search_view_key, repo_section_filters_with_labels,
@@ -82,6 +82,7 @@ pub struct ItemDetailsMetadata {
     pub comments: Option<u64>,
     pub viewer_subscription: Option<String>,
     pub linked_pull_requests: Option<Vec<LinkedPullRequest>>,
+    pub linked_issues: Option<Vec<LinkedIssue>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +255,52 @@ struct IssueLinkedPullRequestRaw {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssueLinkedPullRequestRepositoryRaw {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesGraphQlRaw {
+    data: PullRequestLinkedIssuesDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestLinkedIssuesDataRaw {
+    repository: Option<PullRequestLinkedIssuesRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesRepositoryRaw {
+    pull_request: Option<PullRequestLinkedIssuesPullRequestRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesPullRequestRaw {
+    closing_issues_references: PullRequestLinkedIssueConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueConnectionRaw {
+    nodes: Option<Vec<PullRequestLinkedIssueRaw>>,
+    page_info: GraphQlPageInfoRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueRaw {
+    repository: Option<PullRequestLinkedIssueRepositoryRaw>,
+    number: u64,
+    title: String,
+    state: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueRepositoryRaw {
     name_with_owner: String,
 }
 
@@ -1822,6 +1869,71 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
     Ok(pull_requests)
 }
 
+async fn fetch_pull_request_linked_issues(
+    repository: &str,
+    number: u64,
+) -> Result<Vec<LinkedIssue>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          repository {
+            nameWithOwner
+          }
+          number
+          title
+          state
+          url
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut cursor = None;
+    let mut issues = Vec::new();
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+
+        let output = run_gh_json(&args).await?;
+        let (mut page, has_next_page, end_cursor) =
+            parse_pull_request_linked_issues_page(&output, repository, number)?;
+        issues.append(&mut page);
+        if !has_next_page {
+            break;
+        }
+        let Some(next_cursor) = end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(issues)
+}
+
 async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/issues/{number}/comments?per_page=100");
     fetch_paginated_api_array_output(
@@ -1904,6 +2016,7 @@ pub async fn fetch_pull_request_comments(
     number: u64,
 ) -> Result<CommentFetchResult> {
     let issue_details = fetch_issue_details_output(repository, number);
+    let linked_issues = fetch_pull_request_linked_issues(repository, number);
     let issue_comments = fetch_issue_comments_output(repository, number);
     let issue_comment_permissions =
         fetch_issue_comment_permissions(repository, number, ItemKind::PullRequest);
@@ -1915,6 +2028,7 @@ pub async fn fetch_pull_request_comments(
         fetch_item_subscription_state_optional(repository, number, ItemKind::PullRequest);
     let (
         issue_details,
+        linked_issues,
         issue_output,
         issue_comment_permissions,
         review_output,
@@ -1924,6 +2038,7 @@ pub async fn fetch_pull_request_comments(
         viewer_subscription,
     ) = tokio::join!(
         issue_details,
+        linked_issues,
         issue_comments,
         issue_comment_permissions,
         review_comments,
@@ -1965,6 +2080,18 @@ pub async fn fetch_pull_request_comments(
                 repository,
                 number,
                 "failed to load pull request details while loading comments"
+            );
+            None
+        }
+    };
+    let linked_issues = match linked_issues {
+        Ok(linked_issues) => Some(linked_issues),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load linked issues while loading pull request comments"
             );
             None
         }
@@ -2020,6 +2147,9 @@ pub async fn fetch_pull_request_comments(
         .and_then(|details| details.item_metadata.as_mut())
     {
         metadata.viewer_subscription = viewer_subscription;
+        if let Some(linked_issues) = linked_issues {
+            metadata.linked_issues = Some(linked_issues);
+        }
     }
     let (item_metadata, item_reactions, item_milestone) = match issue_details {
         Some(details) => (
@@ -3873,6 +4003,48 @@ fn linked_pull_request_state(
     state.map(|state| state.to_ascii_lowercase())
 }
 
+fn parse_pull_request_linked_issues_page(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<(Vec<LinkedIssue>, bool, Option<String>)> {
+    let raw = serde_json::from_str::<PullRequestLinkedIssuesGraphQlRaw>(output)
+        .with_context(|| format!("failed to parse linked issues for {repository}#{number}"))?;
+    let Some(pull_request) = raw
+        .data
+        .repository
+        .and_then(|repository| repository.pull_request)
+    else {
+        return Ok((Vec::new(), false, None));
+    };
+    let connection = pull_request.closing_issues_references;
+    let issues = connection
+        .nodes
+        .unwrap_or_default()
+        .into_iter()
+        .map(linked_issue_from_raw)
+        .collect::<Vec<_>>();
+
+    Ok((
+        issues,
+        connection.page_info.has_next_page,
+        connection.page_info.end_cursor,
+    ))
+}
+
+fn linked_issue_from_raw(raw: PullRequestLinkedIssueRaw) -> LinkedIssue {
+    LinkedIssue {
+        repository: raw
+            .repository
+            .map(|repository| repository.name_with_owner)
+            .unwrap_or_default(),
+        number: raw.number,
+        title: raw.title,
+        state: raw.state.map(|state| state.to_ascii_lowercase()),
+        url: raw.url,
+    }
+}
+
 impl IssueDetailsRaw {
     fn item_metadata(&mut self) -> Option<ItemDetailsMetadata> {
         let has_metadata = self.title.is_some()
@@ -3912,6 +4084,7 @@ impl IssueDetailsRaw {
             comments: self.comments,
             viewer_subscription: None,
             linked_pull_requests: None,
+            linked_issues: None,
         })
     }
 }
@@ -5333,6 +5506,7 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
         }),
         assignees,
         linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -5452,6 +5626,7 @@ fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
         milestone: None,
         assignees,
         linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -5568,6 +5743,7 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         milestone: None,
         assignees: Vec::new(),
         linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: None,
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
@@ -6529,6 +6705,53 @@ mod tests {
         assert_eq!(pull_requests[0].title, "Fix linked issue");
         assert_eq!(pull_requests[0].state.as_deref(), Some("open"));
         assert_eq!(pull_requests[1].state.as_deref(), Some("merged"));
+    }
+
+    #[test]
+    fn pull_request_linked_issues_parse_graphql_page() {
+        let output = r#"{
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "closingIssuesReferences": {
+                  "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "cursor-2"
+                  },
+                  "nodes": [
+                    {
+                      "repository": { "nameWithOwner": "owner/repo" },
+                      "number": 77,
+                      "title": "Notifications reappear in inbox",
+                      "state": "OPEN",
+                      "url": "https://github.com/owner/repo/issues/77"
+                    },
+                    {
+                      "repository": { "nameWithOwner": "other/repo" },
+                      "number": 91,
+                      "title": "Another linked issue",
+                      "state": "CLOSED",
+                      "url": "https://github.com/other/repo/issues/91"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let (issues, has_next_page, end_cursor) =
+            parse_pull_request_linked_issues_page(output, "owner/repo", 78).unwrap();
+
+        assert!(has_next_page);
+        assert_eq!(end_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].repository, "owner/repo");
+        assert_eq!(issues[0].number, 77);
+        assert_eq!(issues[0].title, "Notifications reappear in inbox");
+        assert_eq!(issues[0].state.as_deref(), Some("open"));
+        assert_eq!(issues[1].repository, "other/repo");
+        assert_eq!(issues[1].state.as_deref(), Some("closed"));
     }
 
     #[test]

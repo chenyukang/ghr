@@ -759,6 +759,7 @@ mod tests {
             milestone: None,
             assignees: Vec::new(),
             linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

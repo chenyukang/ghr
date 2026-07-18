@@ -3636,6 +3636,7 @@ fn comments_loaded_records_item_updated_at_for_cache_freshness() {
                 comments: Some(1),
                 viewer_subscription: None,
                 linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3689,6 +3690,7 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
                 comments: Some(3),
                 viewer_subscription: None,
                 linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3733,6 +3735,7 @@ fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
                 comments: Some(3),
                 viewer_subscription: None,
                 linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -5052,7 +5055,7 @@ fn command_palette_recent_items_opens_recent_picker() {
 }
 
 #[test]
-fn command_palette_open_linked_pr_opens_current_issue_linked_pull_request() {
+fn command_palette_open_linked_item_opens_current_issue_linked_pull_request() {
     let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
     item.kind = ItemKind::Issue;
     item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
@@ -5103,7 +5106,7 @@ fn command_palette_open_linked_pr_opens_current_issue_linked_pull_request() {
 }
 
 #[test]
-fn command_palette_open_linked_pr_reports_missing_linked_pull_request() {
+fn command_palette_open_linked_item_reports_missing_linked_pull_request() {
     let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
     item.kind = ItemKind::Issue;
     item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
@@ -5140,6 +5143,105 @@ fn command_palette_open_linked_pr_reports_missing_linked_pull_request() {
     ));
 
     assert_eq!(app.status, "no linked pull request");
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_item_opens_current_pull_request_linked_issue() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.linked_issues = vec![LinkedIssue {
+        repository: "chenyukang/ghr".to_string(),
+        number: 77,
+        title: "Notifications reappear in inbox".to_string(),
+        state: Some("open".to_string()),
+        url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+    }];
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-issue");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked issue".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/chenyukang/ghr/issues/77"
+    );
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_item_reports_missing_linked_issue() {
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![work_item(
+            "pr-78",
+            "chenyukang/ghr",
+            78,
+            "Fix notification handling",
+            Some("alice"),
+        )],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-issue-missing");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked issue".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(app.status, "no linked issue");
     assert!(app.command_palette.is_none());
 }
 
@@ -6707,7 +6809,7 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
         .iter()
         .position(|line| {
             let text = line.to_string();
-            text.contains("+ react") && text.contains("reply")
+            text.contains("+react") && text.contains("reply")
         })
         .expect("comment header");
     let paths = test_paths();
@@ -6726,7 +6828,7 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
 
     let top_details_line = &buffer_lines(terminal.backend().buffer())[inner.y as usize];
     assert!(
-        !top_details_line.contains("+ react") && !top_details_line.contains("reply"),
+        !top_details_line.contains("+react") && !top_details_line.contains("reply"),
         "stale comment header cells leaked after scroll: {top_details_line:?}"
     );
 }
@@ -9395,6 +9497,7 @@ fn comments_loaded_updates_issue_linked_pull_requests_metadata() {
                     state: Some("merged".to_string()),
                     url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
                 }]),
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -9409,6 +9512,69 @@ fn comments_loaded_updates_issue_linked_pull_requests_metadata() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+}
+
+#[test]
+fn comments_loaded_updates_pull_request_linked_issues_metadata() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.url = "https://github.com/chenyukang/ghr/pull/78".to_string();
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "pr-78".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: Some(ItemDetailsMetadata {
+                title: Some("Fix notification handling".to_string()),
+                body: Some("Pull request body".to_string()),
+                author: Some("alice".to_string()),
+                state: Some("open".to_string()),
+                url: Some("https://github.com/chenyukang/ghr/pull/78".to_string()),
+                created_at: None,
+                updated_at: None,
+                labels: Some(Vec::new()),
+                assignees: Some(Vec::new()),
+                comments: Some(0),
+                viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: Some(vec![LinkedIssue {
+                    repository: "chenyukang/ghr".to_string(),
+                    number: 77,
+                    title: "Notifications reappear in inbox".to_string(),
+                    state: Some("open".to_string()),
+                    url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+                }]),
+            }),
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
+            comments: Vec::new(),
+        }),
+    });
+
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked issues: #77 Notifications reappear in inbox open"));
 }
 
 #[test]
@@ -9474,6 +9640,7 @@ fn comments_loaded_updates_inbox_notification_description_from_lazy_metadata() {
                 comments: Some(3),
                 viewer_subscription: None,
                 linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -9724,6 +9891,67 @@ fn issue_details_shows_linked_pull_requests() {
 }
 
 #[test]
+fn pull_request_details_shows_linked_issues() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.url = "https://github.com/chenyukang/ghr/pull/78".to_string();
+    item.linked_issues = vec![
+        LinkedIssue {
+            repository: "chenyukang/ghr".to_string(),
+            number: 77,
+            title: "Notifications reappear in inbox".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+        },
+        LinkedIssue {
+            repository: "rust-lang/rust".to_string(),
+            number: 159309,
+            title: "Move tests batch 18".to_string(),
+            state: Some("closed".to_string()),
+            url: "https://github.com/rust-lang/rust/issues/159309".to_string(),
+        },
+    ];
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let document = build_details_document(&app, 140);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("linked issues: #77 Notifications reappear in inbox open"));
+    assert!(rendered.contains("rust-lang/rust#159309 Move tests batch 18 closed"));
+    assert_document_link_for_text(
+        &document,
+        "#77",
+        "https://github.com/chenyukang/ghr/issues/77",
+    );
+    assert_document_link_for_text(
+        &document,
+        "rust-lang/rust#159309",
+        "https://github.com/rust-lang/rust/issues/159309",
+    );
+}
+
+#[test]
 fn issue_details_show_empty_labels_as_actionable() {
     let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
     item.kind = ItemKind::Issue;
@@ -9753,7 +9981,7 @@ fn issue_details_show_empty_labels_as_actionable() {
     assert!(rendered.contains("labels:  +"));
     assert!(!rendered.contains("labels: none"));
     assert!(rendered.contains("subscription: subscribe"));
-    assert!(rendered.contains("  reactions:  + react"));
+    assert!(rendered.contains("  reactions:  +react"));
     assert!(!rendered.contains("reactions: none"));
     assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     assert_document_action_for_text_on_line(
@@ -9771,7 +9999,7 @@ fn issue_details_show_empty_labels_as_actionable() {
     assert_document_action_for_text_on_line(
         &document,
         "reactions:",
-        "+ react",
+        "+react",
         DetailAction::ReactItem,
     );
 }
@@ -9894,7 +10122,7 @@ fn notification_details_hide_unavailable_item_reaction_action() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(!rendered.contains("+ react"));
+    assert!(!rendered.contains("+react"));
     assert!(!rendered.contains("reactions:"));
     assert!(!rendered.contains("subscription:"));
     assert!(
@@ -9944,7 +10172,7 @@ fn notification_details_show_reaction_counts_without_unavailable_action() {
         .join("\n");
 
     assert!(rendered.contains("reactions: 👀 1"));
-    assert!(!rendered.contains("+ react"));
+    assert!(!rendered.contains("+react"));
     assert!(
         !document
             .actions
@@ -11392,7 +11620,7 @@ fn details_activity_hides_comment_actions() {
         .find(|line| line.contains("doitian"))
         .expect("activity header");
     assert!(activity_header.contains("activity:"));
-    assert!(!activity_header.contains("+ react"));
+    assert!(!activity_header.contains("+react"));
     assert!(!activity_header.contains("reply"));
     assert!(document.comments.is_empty());
 }
@@ -11585,7 +11813,7 @@ fn details_render_description_and_comment_reactions() {
         .collect::<Vec<_>>();
     let rendered = rendered_lines.join("\n");
 
-    assert!(rendered.contains("  reactions: ❤️ 1  👀 1  + react"));
+    assert!(rendered.contains("  reactions: ❤️ 1  👀 1  +react"));
     assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     let header_index = rendered_lines
         .iter()
@@ -11619,7 +11847,7 @@ fn details_renderer_marks_terminal_wide_symbols_as_skip_cells() {
         Span::raw("Zhangcy0x3 - 16d open "),
         Span::raw("❤️"),
         Span::raw(" 1  "),
-        Span::styled("+ react", active_theme().action),
+        Span::styled("+react", active_theme().action),
     ]);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 3));
 
@@ -11911,7 +12139,7 @@ fn details_comments_show_inline_review_location() {
         .find(|line| line.contains("inline src/github.rs:876 right"))
         .expect("inline review metadata line");
     assert!(
-        !metadata_line.contains("+ react") && !metadata_line.contains("reply"),
+        !metadata_line.contains("+react") && !metadata_line.contains("reply"),
         "review metadata line should not carry comment actions: {rendered}"
     );
     assert!(rendered.contains("GH_NO_UPDATE_NOTIFIER"));
@@ -11954,7 +12182,7 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         .collect::<Vec<_>>();
     let header_index = rendered
         .iter()
-        .position(|line| line.contains("mejrs") && line.contains("+ react"))
+        .position(|line| line.contains("mejrs") && line.contains("+react"))
         .expect("comment action header");
     let metadata_index = rendered
         .iter()
@@ -11977,8 +12205,7 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         "long review metadata should not share the author/action header: {rendered:?}"
     );
     assert!(
-        !rendered[metadata_index].contains("+ react")
-            && !rendered[metadata_index].contains("reply"),
+        !rendered[metadata_index].contains("+react") && !rendered[metadata_index].contains("reply"),
         "comment actions should stay on the header: {rendered:?}"
     );
 }
@@ -12138,7 +12365,7 @@ fn comment_gap_lines_are_padded_to_clear_stale_header_cells() {
         .collect::<Vec<_>>();
     let header_index = rendered
         .iter()
-        .position(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+        .position(|line| line.contains("Zhangcy0x3") && line.contains("+react"))
         .expect("comment header");
     let gap = rendered
         .get(header_index + 1)
@@ -12179,7 +12406,7 @@ fn selected_comment_right_border_stays_aligned_with_reactions() {
         .expect("selected comment top border");
     let header = rendered
         .iter()
-        .find(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+        .find(|line| line.contains("Zhangcy0x3") && line.contains("+react"))
         .expect("selected comment header");
     let body = rendered
         .iter()
@@ -12475,7 +12702,7 @@ fn review_summary_details_show_reply_without_reaction_action() {
         .expect("review summary header");
 
     assert!(rendered[header_line].contains("reply"));
-    assert!(!rendered[header_line].contains("+ react"));
+    assert!(!rendered[header_line].contains("+react"));
     let reply_column = rendered[header_line].find("reply").expect("reply action") as u16;
     assert_eq!(
         document.action_at(header_line, reply_column),
@@ -12494,8 +12721,8 @@ fn assignee_actions_are_rendered_in_details() {
         .position(|line| line.to_string().contains("assignees: -"))
         .expect("empty assignee row");
     let empty_line = document.lines[assignee_line].to_string();
-    let assign_column = empty_line.find("@ assign").expect("assign action") as u16;
-    assert!(!empty_line.contains("- unassign"));
+    let assign_column = empty_line.find("@assign").expect("assign action") as u16;
+    assert!(!empty_line.contains("-unassign"));
     assert_eq!(
         document.action_at(assignee_line, assign_column),
         Some(DetailAction::AssignAssignee)
@@ -12511,11 +12738,11 @@ fn assignee_actions_are_rendered_in_details() {
         .expect("assignee row");
     let assign_column = document.lines[assignee_line]
         .to_string()
-        .find("@ assign")
+        .find("@assign")
         .expect("assign action") as u16;
     let unassign_column = document.lines[assignee_line]
         .to_string()
-        .find("- unassign")
+        .find("-unassign")
         .expect("unassign action") as u16;
 
     assert_eq!(
@@ -15946,6 +16173,7 @@ fn item_edit_rejects_non_issue_or_pull_request_items() {
             milestone: None,
             assignees: Vec::new(),
             linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
             comments: None,
             unread: Some(true),
             reason: Some("mention".to_string()),
@@ -21287,6 +21515,7 @@ fn work_item(id: &str, repo: &str, number: u64, title: &str, author: Option<&str
         milestone: None,
         assignees: Vec::new(),
         linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: Some(0),
         unread: None,
         reason: None,
@@ -21337,6 +21566,7 @@ fn notification_item(id: &str, unread: bool) -> WorkItem {
         milestone: None,
         assignees: Vec::new(),
         linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: None,
         unread: Some(unread),
         reason: Some("mention".to_string()),

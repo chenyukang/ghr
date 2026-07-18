@@ -101,6 +101,7 @@ const commands = [
   ["Inbox", "Unsubscribe Thread", "Unsubscribe from the selected inbox thread"],
   ["Details", "Subscribe Item", "Subscribe to the selected issue or pull request conversation"],
   ["Details", "Unsubscribe Item", "Unsubscribe from the selected issue or pull request conversation"],
+  ["Details", "Open Linked PR", "Open the first pull request linked from the current issue"],
   ["Clipboard", "Copy GitHub Link", "Copy selected comment link or issue/PR URL"],
   ["Clipboard", "Copy Content", "Copy selected comment body or issue/PR description"],
   ["Info", "Info", "Show version, paths, ghr process memory, UI state, and ignored/recent counts"],

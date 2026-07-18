@@ -66,11 +66,12 @@ use crate::github::{
 };
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
-    FailedCheckRunSummary, ItemKind, Milestone, PullRequestBranch, PullRequestReviewActor,
-    ReactionSummary, SectionKind, SectionSnapshot, WorkItem, builtin_view_key, configured_sections,
-    global_search_view_key, mark_all_notifications_read_in_section,
-    mark_notification_done_in_section, mark_notification_read_in_section, merge_cached_sections,
-    merge_refreshed_sections, repo_view_key, section_view_key,
+    FailedCheckRunSummary, ItemKind, LinkedPullRequest, Milestone, PullRequestBranch,
+    PullRequestReviewActor, ReactionSummary, SectionKind, SectionSnapshot, WorkItem,
+    builtin_view_key, configured_sections, global_search_view_key,
+    mark_all_notifications_read_in_section, mark_notification_done_in_section,
+    mark_notification_read_in_section, merge_cached_sections, merge_refreshed_sections,
+    repo_view_key, section_view_key,
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
@@ -5498,6 +5499,10 @@ impl AppState {
                 self.open_selected();
                 false
             }
+            PaletteAction::OpenLinkedPullRequest => {
+                self.open_linked_pull_request();
+                false
+            }
             PaletteAction::ShowDiff => {
                 self.show_diff();
                 false
@@ -5701,6 +5706,9 @@ impl AppState {
                 }
                 if let Some(assignees) = &metadata.assignees {
                     item.assignees = assignees.clone();
+                }
+                if let Some(linked_pull_requests) = &metadata.linked_pull_requests {
+                    item.linked_pull_requests = linked_pull_requests.clone();
                 }
                 if metadata.comments.is_some() {
                     item.comments = metadata.comments;
@@ -11771,6 +11779,15 @@ impl AppState {
         self.open_url(&url);
     }
 
+    fn open_linked_pull_request(&mut self) {
+        let Some(url) = self.linked_pull_request_open_url() else {
+            self.status = "no linked pull request".to_string();
+            return;
+        };
+
+        self.open_url(&url);
+    }
+
     fn copy_github_link(&mut self) {
         let Some((url, label)) = self.selected_github_link() else {
             self.status = "no GitHub link selected".to_string();
@@ -11886,6 +11903,17 @@ impl AppState {
             return Some(pull_request_changes_url(item));
         }
         Some(item.url.clone())
+    }
+
+    fn linked_pull_request_open_url(&self) -> Option<String> {
+        let item = self.current_item()?;
+        if !matches!(item.kind, ItemKind::Issue) {
+            return None;
+        }
+        item.linked_pull_requests.iter().find_map(|pull_request| {
+            let url = pull_request.url.trim();
+            (!url.is_empty()).then(|| url.to_string())
+        })
     }
 
     fn open_url(&mut self, url: &str) {

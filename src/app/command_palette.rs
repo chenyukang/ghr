@@ -44,6 +44,7 @@ pub(super) enum PaletteAction {
     CopyContent,
     ToggleMouseCapture,
     OpenSelected,
+    OpenLinkedPullRequest,
     ShowDiff,
     ClearIgnoredItems,
     ClearCache,
@@ -313,6 +314,13 @@ pub(super) fn command_palette_commands(
             "General",
             "Open the selected item or PR changes page",
             PaletteAction::OpenSelected,
+        ),
+        palette_command(
+            "Open Linked PR",
+            "",
+            "Details",
+            "Open the first pull request linked from the current issue",
+            PaletteAction::OpenLinkedPullRequest,
         ),
         palette_command(
             "Show Pull Request Diff",
@@ -1141,6 +1149,17 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.title == "Copy Content")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Open Linked PR")
+        );
+        let linked_pr_matches = command_palette_filtered_indices(&commands, "linked pr");
+        assert!(
+            linked_pr_matches
+                .iter()
+                .any(|index| commands[*index].title == "Open Linked PR")
         );
     }
 

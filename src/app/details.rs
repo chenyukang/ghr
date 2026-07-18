@@ -249,6 +249,37 @@ pub(super) struct DiffInlineCommentSummary {
     pub(super) has_outdated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DiffGutterWidths {
+    old: usize,
+    new: usize,
+}
+
+impl Default for DiffGutterWidths {
+    fn default() -> Self {
+        Self { old: 4, new: 4 }
+    }
+}
+
+impl DiffGutterWidths {
+    fn for_file(file: &DiffFile) -> Self {
+        Self::for_lines(file.hunks.iter().flat_map(|hunk| hunk.lines.iter()))
+    }
+
+    fn for_lines<'a>(lines: impl IntoIterator<Item = &'a DiffLine>) -> Self {
+        let mut widths = Self::default();
+        for line in lines {
+            if let Some(old_line) = line.old_line {
+                widths.old = widths.old.max(diff_line_number_width(old_line));
+            }
+            if let Some(new_line) = line.new_line {
+                widths.new = widths.new.max(diff_line_number_width(new_line));
+            }
+        }
+        widths
+    }
+}
+
 impl From<&DiffReviewTarget> for DiffInlineCommentKey {
     fn from(target: &DiffReviewTarget) -> Self {
         Self {
@@ -1413,6 +1444,13 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_styled_key_value_limited("reviewers", reviewer_segments, 2);
     }
     builder.push_link_value("url", &item.url);
+    if matches!(item.kind, ItemKind::Issue) && !item.linked_pull_requests.is_empty() {
+        builder.push_styled_key_value_limited(
+            "linked PRs",
+            linked_pull_request_segments(&item.linked_pull_requests, &item.repo),
+            3,
+        );
+    }
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -1761,6 +1799,70 @@ pub(super) fn subscription_detail_segments(item: &WorkItem) -> Vec<DetailSegment
     }
 }
 
+pub(super) fn linked_pull_request_segments(
+    pull_requests: &[LinkedPullRequest],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for pull_request in pull_requests {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw("; "));
+        }
+        segments.push(DetailSegment::link(
+            linked_pull_request_label(pull_request, current_repo),
+            pull_request.url.clone(),
+        ));
+        if !pull_request.title.trim().is_empty() {
+            segments.push(DetailSegment::raw(format!(
+                " {}",
+                pull_request.title.trim()
+            )));
+        }
+        if let Some(state) = useful_meta_value(pull_request.state.as_deref()) {
+            segments.push(DetailSegment::raw(" "));
+            segments.push(DetailSegment::styled(
+                linked_pull_request_state_label(state),
+                linked_pull_request_state_style(state),
+            ));
+        }
+    }
+    segments
+}
+
+fn linked_pull_request_label(pull_request: &LinkedPullRequest, current_repo: &str) -> String {
+    if pull_request.repository.is_empty() || pull_request.repository == current_repo {
+        format!("#{}", pull_request.number)
+    } else {
+        format!("{}#{}", pull_request.repository, pull_request.number)
+    }
+}
+
+fn linked_pull_request_state_label(state: &str) -> String {
+    state.to_ascii_lowercase()
+}
+
+fn linked_pull_request_state_style(state: &str) -> Style {
+    match state.to_ascii_lowercase().as_str() {
+        "open" => active_theme()
+            .panel()
+            .fg(active_theme().success)
+            .add_modifier(Modifier::BOLD),
+        "draft" => active_theme()
+            .panel()
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD),
+        "merged" => active_theme()
+            .panel()
+            .fg(active_theme().link)
+            .add_modifier(Modifier::BOLD),
+        "closed" => active_theme()
+            .panel()
+            .fg(active_theme().error)
+            .add_modifier(Modifier::BOLD),
+        _ => active_theme().muted(),
+    }
+}
+
 pub(super) fn push_diff(
     builder: &mut DetailsBuilder,
     diff: &PullRequestDiff,
@@ -1803,6 +1905,7 @@ pub(super) fn push_diff(
         context.file_link_base.as_ref(),
         context.selected_line,
     );
+    let gutter_widths = DiffGutterWidths::for_file(file);
     for metadata in &file.metadata {
         builder.push_line(vec![DetailSegment::styled(
             truncate_inline(metadata, builder.width),
@@ -1843,6 +1946,7 @@ pub(super) fn push_diff(
                     index == context.selected_line || index_in_range(index, context.selected_range)
                 }),
                 inline_summary,
+                gutter_widths,
             );
             if context.comments.is_some() {
                 if context.diff_inline_comments_visible {
@@ -2026,11 +2130,12 @@ pub(super) fn push_diff_line(
     review_index: Option<usize>,
     selected: bool,
     inline_comment_summary: DiffInlineCommentSummary,
+    gutter_widths: DiffGutterWidths,
 ) {
     if let Some(review_index) = review_index {
         builder.mark_diff_line(review_index, selected);
     }
-    let gutter = diff_gutter(line.old_line, line.new_line);
+    let gutter = diff_gutter(line.old_line, line.new_line, gutter_widths);
     let (marker, mut style) = match line.kind {
         DiffLineKind::Context => (" ", diff_context_style()),
         DiffLineKind::Added => ("+", diff_added_style()),
@@ -2680,13 +2785,21 @@ pub(super) fn diff_review_side_from_label(label: &str) -> Option<DiffReviewSide>
     }
 }
 
-pub(super) fn diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
+fn diff_line_number_width(line: usize) -> usize {
+    line.to_string().len().max(4)
+}
+
+pub(super) fn diff_gutter(
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    widths: DiffGutterWidths,
+) -> String {
     let old = old_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
+        .map(|line| format!("{line:>width$}", width = widths.old))
+        .unwrap_or_else(|| " ".repeat(widths.old));
     let new = new_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
+        .map(|line| format!("{line:>width$}", width = widths.new))
+        .unwrap_or_else(|| " ".repeat(widths.new));
     format!("{old} {new} │ ")
 }
 
@@ -3233,6 +3346,7 @@ pub(super) fn push_inline_review_context(
 
     let focus_span = inline_diff_focus_span(&hunk.lines, review);
     let (start, end) = inline_diff_context_range(hunk.lines.len(), focus_span);
+    let gutter_widths = DiffGutterWidths::for_lines(hunk.lines.iter());
     let prefix = comment_line_prefix(selected, depth);
     let right_padding = comment_right_padding(selected);
     let original_width = builder.width;
@@ -3256,7 +3370,7 @@ pub(super) fn push_inline_review_context(
     for (offset, line) in hunk.lines[start..end].iter().enumerate() {
         let index = start + offset;
         let focused = focus_span.is_some_and(|(start, end)| (start..=end).contains(&index));
-        push_inline_diff_line(builder, line, prefix.as_slice(), focused);
+        push_inline_diff_line(builder, line, prefix.as_slice(), focused, gutter_widths);
     }
     if end < hunk.lines.len() {
         push_inline_diff_ellipsis(builder, prefix.as_slice());
@@ -3477,6 +3591,7 @@ pub(super) fn push_inline_diff_line(
     line: &DiffLine,
     prefix: &[DetailSegment],
     focused: bool,
+    gutter_widths: DiffGutterWidths,
 ) {
     let marker = match line.kind {
         DiffLineKind::Context => " ",
@@ -3506,7 +3621,7 @@ pub(super) fn push_inline_diff_line(
     let focus_marker = if focused { ">" } else { " " };
     let gutter = format!(
         "{focus_marker}{}",
-        compact_diff_gutter(line.old_line, line.new_line)
+        compact_diff_gutter(line.old_line, line.new_line, gutter_widths)
     );
     let prefix_width = prefix
         .iter()
@@ -3527,14 +3642,12 @@ pub(super) fn push_inline_diff_line(
     builder.push_line(segments);
 }
 
-pub(super) fn compact_diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
-    let old = old_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
-    let new = new_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
-    format!("{old} {new} │ ")
+pub(super) fn compact_diff_gutter(
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    widths: DiffGutterWidths,
+) -> String {
+    diff_gutter(old_line, new_line, widths)
 }
 
 pub(super) fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {

@@ -240,6 +240,70 @@ fn diff_document_renders_lazygit_style_gutter() {
 }
 
 #[test]
+fn diff_document_aligns_gutter_for_wide_line_numbers() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.show_diff();
+    app.diffs.insert(
+        "1".to_string(),
+        DiffState::Loaded(
+            parse_pull_request_diff(
+                r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11099,4 +11423,5 @@
+ context before
+-old
++new
++extra
+ context after
+"#,
+            )
+            .expect("parse diff"),
+        ),
+    );
+
+    let rendered_lines = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>();
+    let diff_lines = rendered_lines
+        .iter()
+        .filter(|line| {
+            line.contains("│")
+                && ["context before", "old", "new", "extra", "context after"]
+                    .iter()
+                    .any(|text| line.contains(text))
+        })
+        .collect::<Vec<_>>();
+    let separator_columns = diff_lines
+        .iter()
+        .map(|line| {
+            let separator = line.find('│').expect("diff gutter separator");
+            display_width(&line[..separator])
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        separator_columns.len(),
+        1,
+        "diff gutter separators should stay aligned: {diff_lines:?}"
+    );
+    assert!(
+        rendered_lines
+            .iter()
+            .any(|line| line.contains("11100       │ - old")),
+        "removed line should reserve the 5-wide new-line column: {rendered_lines:?}"
+    );
+    assert!(
+        rendered_lines
+            .iter()
+            .any(|line| line.contains("      11424 │ + new")),
+        "added line should reserve the 5-wide old-line column: {rendered_lines:?}"
+    );
+}
+
+#[test]
 fn diff_document_expands_tabs_in_source_lines() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.show_diff();
@@ -2888,6 +2952,83 @@ fn progressive_refresh_does_not_force_current_details_reload() {
 }
 
 #[test]
+fn progressive_issue_refresh_keeps_linked_pull_requests_visible() {
+    let mut item = work_item(
+        "issue-1",
+        "chenyukang/ghr",
+        77,
+        "Notifications reappear",
+        Some("alice"),
+    );
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/77".to_string();
+    let linked_pull_requests = vec![LinkedPullRequest {
+        repository: "chenyukang/ghr".to_string(),
+        number: 78,
+        title: "Fix notification handling".to_string(),
+        state: Some("merged".to_string()),
+        url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+    }];
+    item.linked_pull_requests = linked_pull_requests.clone();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    app.refreshing = true;
+    app.focus_details();
+    app.details
+        .insert("issue-1".to_string(), DetailState::Loaded(Vec::new()));
+
+    let mut refreshed_item = work_item(
+        "issue-1",
+        "chenyukang/ghr",
+        77,
+        "Notifications reappear in inbox",
+        Some("alice"),
+    );
+    refreshed_item.kind = ItemKind::Issue;
+    refreshed_item.url = "https://github.com/chenyukang/ghr/issues/77".to_string();
+    refreshed_item.linked_pull_requests = Vec::new();
+    let refreshed_section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![refreshed_item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+
+    app.handle_msg(AppMsg::RefreshSectionLoaded {
+        section: refreshed_section,
+        save_error: None,
+    });
+
+    let item = app.current_item().expect("current issue");
+    assert_eq!(item.title, "Notifications reappear in inbox");
+    assert_eq!(item.linked_pull_requests, linked_pull_requests);
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+}
+
+#[test]
 fn progressive_refresh_does_not_overwrite_active_user_page_load() {
     let mut current = many_items_section(1);
     current.total_count = Some(120);
@@ -3494,6 +3635,7 @@ fn comments_loaded_records_item_updated_at_for_cache_freshness() {
                 assignees: None,
                 comments: Some(1),
                 viewer_subscription: None,
+                linked_pull_requests: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3546,6 +3688,7 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
                 assignees: None,
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3589,6 +3732,7 @@ fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
                 assignees: None,
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -4905,6 +5049,98 @@ fn command_palette_recent_items_opens_recent_picker() {
     assert!(app.command_palette.is_none());
     assert_eq!(app.recent_items_dialog, Some(RecentItemsDialog::default()));
     assert_eq!(app.status, "recent items");
+}
+
+#[test]
+fn command_palette_open_linked_pr_opens_current_issue_linked_pull_request() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    item.linked_pull_requests = vec![LinkedPullRequest {
+        repository: "chenyukang/ghr".to_string(),
+        number: 78,
+        title: "Fix notification handling".to_string(),
+        state: Some("merged".to_string()),
+        url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+    }];
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-pr");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked pr".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/chenyukang/ghr/pull/78"
+    );
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_pr_reports_missing_linked_pull_request() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-pr-missing");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked pr".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(app.status, "no linked pull request");
+    assert!(app.command_palette.is_none());
 }
 
 #[test]
@@ -9119,6 +9355,63 @@ fn comments_loaded_updates_details_milestone_metadata() {
 }
 
 #[test]
+fn comments_loaded_updates_issue_linked_pull_requests_metadata() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "issue-1".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: Some(ItemDetailsMetadata {
+                title: Some("Bug report".to_string()),
+                body: Some("Issue body".to_string()),
+                author: Some("alice".to_string()),
+                state: Some("open".to_string()),
+                url: Some("https://github.com/chenyukang/ghr/issues/1".to_string()),
+                created_at: None,
+                updated_at: None,
+                labels: Some(Vec::new()),
+                assignees: Some(Vec::new()),
+                comments: Some(0),
+                viewer_subscription: None,
+                linked_pull_requests: Some(vec![LinkedPullRequest {
+                    repository: "chenyukang/ghr".to_string(),
+                    number: 78,
+                    title: "Fix notification handling".to_string(),
+                    state: Some("merged".to_string()),
+                    url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+                }]),
+            }),
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
+            comments: Vec::new(),
+        }),
+    });
+
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+}
+
+#[test]
 fn comments_loaded_preserves_item_reactions_and_milestone_when_details_are_unknown() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let cached_reactions = ReactionSummary {
@@ -9180,6 +9473,7 @@ fn comments_loaded_updates_inbox_notification_description_from_lazy_metadata() {
                 assignees: Some(vec!["alice".to_string()]),
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -9371,6 +9665,62 @@ fn issue_details_meta_links_author() {
 
     assert_document_link_for_text(&document, "alice", "https://github.com/alice");
     assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
+}
+
+#[test]
+fn issue_details_shows_linked_pull_requests() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    item.linked_pull_requests = vec![
+        LinkedPullRequest {
+            repository: "chenyukang/ghr".to_string(),
+            number: 78,
+            title: "Fix notification handling".to_string(),
+            state: Some("merged".to_string()),
+            url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+        },
+        LinkedPullRequest {
+            repository: "rust-lang/rust".to_string(),
+            number: 159309,
+            title: "Move tests batch 18".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/rust-lang/rust/pull/159309".to_string(),
+        },
+    ];
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let app = AppState::new(SectionKind::Issues, vec![section]);
+    let document = build_details_document(&app, 140);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+    assert!(rendered.contains("rust-lang/rust#159309 Move tests batch 18 open"));
+    assert_document_link_for_text(
+        &document,
+        "#78",
+        "https://github.com/chenyukang/ghr/pull/78",
+    );
+    assert_document_link_for_text(
+        &document,
+        "rust-lang/rust#159309",
+        "https://github.com/rust-lang/rust/pull/159309",
+    );
 }
 
 #[test]
@@ -15595,6 +15945,7 @@ fn item_edit_rejects_non_issue_or_pull_request_items() {
             reactions: ReactionSummary::default(),
             milestone: None,
             assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
             comments: None,
             unread: Some(true),
             reason: Some("mention".to_string()),
@@ -20935,6 +21286,7 @@ fn work_item(id: &str, repo: &str, number: u64, title: &str, author: Option<&str
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees: Vec::new(),
+        linked_pull_requests: Vec::new(),
         comments: Some(0),
         unread: None,
         reason: None,
@@ -20984,6 +21336,7 @@ fn notification_item(id: &str, unread: bool) -> WorkItem {
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees: Vec::new(),
+        linked_pull_requests: Vec::new(),
         comments: None,
         unread: Some(unread),
         reason: Some("mention".to_string()),

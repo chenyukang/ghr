@@ -758,6 +758,7 @@ mod tests {
             reactions: Default::default(),
             milestone: None,
             assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
             comments: None,
             unread: Some(unread),
             reason: Some("mention".to_string()),

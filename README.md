@@ -196,6 +196,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `Open Linked PR` | Open the first pull request linked from the current issue |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
 | `Mark Done` | Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless the thread is muted |
 | `Mark All Read` | Mark every GitHub inbox notification as read |

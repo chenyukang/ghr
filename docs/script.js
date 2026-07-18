@@ -1,7 +1,7 @@
 const shortcuts = [
   ["General", ":", "Open the command palette and fuzzy-search commands; recently run commands appear first"],
   ["General", "?", "Open the live help reference"],
-  ["General", "r", "Refresh dashboard data from GitHub"],
+  ["General", "r", "Refresh the active tab first, then run a full background refresh"],
   ["General", "q / Ctrl+C", "Save UI state and quit"],
   ["General", "1 / 2 / 3 / 4", "Focus ghr, Sections, List, or Details"],
   ["General", "Tab / Shift+Tab", "Switch list/details focus, or move within focused ghr/Sections tabs"],

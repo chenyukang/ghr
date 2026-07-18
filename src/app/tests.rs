@@ -2595,6 +2595,64 @@ fn refresh_finished_resets_background_refresh_interval() {
 }
 
 #[test]
+fn manual_refresh_starts_with_active_view_scope() {
+    let inbox = SectionSnapshot::empty(SectionKind::Notifications, "All", "is:unread");
+    assert_manual_refresh_scope(
+        AppState::new(SectionKind::Notifications, vec![inbox]),
+        "notifications",
+    );
+
+    assert_manual_refresh_scope(
+        AppState::new(SectionKind::PullRequests, vec![test_section()]),
+        "pull_requests",
+    );
+
+    let issues = SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open");
+    assert_manual_refresh_scope(AppState::new(SectionKind::Issues, vec![issues]), "issues");
+
+    let repo_view = repo_view_key("Fiber");
+    let repo_section = SectionSnapshot::empty_for_view(
+        repo_view.clone(),
+        SectionKind::PullRequests,
+        "Pull Requests",
+        "repo:nervosnetwork/fiber is:open",
+    );
+    let mut app = AppState::new(SectionKind::PullRequests, vec![repo_section]);
+    app.switch_view(repo_view);
+    assert_manual_refresh_scope(app, "repo:Fiber");
+}
+
+#[test]
+fn manual_refresh_queues_full_refresh_after_active_view_finishes() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    trigger_refresh(&mut app, &config, &store, &tx);
+    let AppMsg::RefreshStarted { scope } = rx
+        .try_recv()
+        .expect("manual refresh should start current view")
+    else {
+        panic!("expected refresh start after manual refresh");
+    };
+    assert_eq!(scope, RefreshScope::View("pull_requests".to_string()));
+
+    app.handle_msg(AppMsg::RefreshStarted { scope });
+    assert!(app.refreshing);
+    assert!(!app.take_pending_full_refresh_after_view());
+
+    app.handle_msg(AppMsg::RefreshFinished {
+        sections: Vec::new(),
+        save_error: None,
+    });
+
+    assert!(!app.refreshing);
+    assert!(app.take_pending_full_refresh_after_view());
+    assert!(!app.take_pending_full_refresh_after_view());
+}
+
+#[test]
 fn idle_sweep_merges_non_active_sections_without_changing_status() {
     let pull_requests = test_section();
     let mut issue_item = work_item("issue-1", "rust-lang/rust", 1, "old issue", None);
@@ -20472,6 +20530,22 @@ fn test_section() -> SectionSnapshot {
         refreshed_at: None,
         error: None,
     }
+}
+
+fn assert_manual_refresh_scope(mut app: AppState, expected_view: &str) {
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    trigger_refresh(&mut app, &config, &store, &tx);
+    let AppMsg::RefreshStarted { scope } = rx
+        .try_recv()
+        .expect("manual refresh should start current view")
+    else {
+        panic!("expected refresh start after manual refresh");
+    };
+
+    assert_eq!(scope, RefreshScope::View(expected_view.to_string()));
 }
 
 fn test_diff_file(path: &str, additions: usize, deletions: usize) -> DiffFile {

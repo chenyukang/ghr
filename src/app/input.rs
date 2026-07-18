@@ -888,7 +888,16 @@ pub(super) fn trigger_refresh(
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) {
-    trigger_refresh_scope(app, config, store, tx, RefreshScope::Full);
+    if !app.refreshing {
+        app.queue_full_refresh_after_view();
+    }
+    trigger_refresh_scope(
+        app,
+        config,
+        store,
+        tx,
+        RefreshScope::View(app.active_view.clone()),
+    );
 }
 
 pub(super) fn trigger_refresh_scope(

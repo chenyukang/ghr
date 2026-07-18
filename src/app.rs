@@ -1551,6 +1551,7 @@ struct AppState {
     status: String,
     refreshing: bool,
     current_refresh_scope: RefreshScope,
+    pending_full_refresh_after_view: bool,
     section_page_loading: Option<SectionPageLoading>,
     last_refresh_request: Instant,
     idle_sweep_refreshing: bool,
@@ -1993,6 +1994,19 @@ async fn run_loop(
         }
 
         needs_draw |= drain_app_messages(app, rx);
+        let started_pending_full_refresh = if app.take_pending_full_refresh_after_view() {
+            start_refresh(
+                config.clone(),
+                store.clone(),
+                tx.clone(),
+                RefreshPriority::Background,
+                RefreshScope::Full,
+            );
+            needs_draw = true;
+            true
+        } else {
+            false
+        };
         needs_draw |= app.ensure_current_details_loading(tx);
         needs_draw |= app.ensure_current_comments_auto_refresh(tx);
         needs_draw |= app.ensure_current_diff_loading(tx);
@@ -2004,7 +2018,8 @@ async fn run_loop(
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
 
-        if !app.refreshing
+        if !started_pending_full_refresh
+            && !app.refreshing
             && config.defaults.refetch_interval_seconds > 0
             && app.last_refresh_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
@@ -2016,7 +2031,7 @@ async fn run_loop(
                 RefreshPriority::Background,
                 RefreshScope::View(app.active_view.clone()),
             );
-        } else if app.should_start_idle_sweep(config) {
+        } else if !started_pending_full_refresh && app.should_start_idle_sweep(config) {
             start_idle_sweep(
                 config.clone(),
                 store.clone(),
@@ -2954,6 +2969,7 @@ impl AppState {
             status: "loading snapshot; background refresh started".to_string(),
             refreshing: false,
             current_refresh_scope: RefreshScope::Full,
+            pending_full_refresh_after_view: false,
             section_page_loading: None,
             last_refresh_request: Instant::now(),
             idle_sweep_refreshing: false,
@@ -3638,6 +3654,18 @@ impl AppState {
             (Some(error), None) => refresh_error_status(1, Some(error)),
             (_, Some(error)) => format!("snapshot save failed: {error}"),
         };
+    }
+
+    fn queue_full_refresh_after_view(&mut self) {
+        self.pending_full_refresh_after_view = true;
+    }
+
+    fn take_pending_full_refresh_after_view(&mut self) -> bool {
+        if self.refreshing {
+            return false;
+        }
+
+        std::mem::take(&mut self.pending_full_refresh_after_view)
     }
 
     fn handle_msg(&mut self, message: AppMsg) {

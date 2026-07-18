@@ -179,7 +179,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `Ctrl+X` in editor dialogs | Delete the current line |
 | `Ctrl+Z` / `Cmd+Z` in editor dialogs | Undo text edits |
 | `Ctrl+R` / `Cmd+Shift+Z` in editor dialogs | Redo text edits |
-| `r` | Refresh from GitHub |
+| `r` | Refresh the active tab first, then run a full background refresh |
 | `q` / `Ctrl+C` | Save UI state and quit |
 
 ## Commands

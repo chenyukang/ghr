@@ -825,8 +825,8 @@ pub(super) fn handle_diff_file_list_key(
         KeyCode::Char('Y') => {
             app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
         }
-        KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => app.move_diff_file(1),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
             app.move_diff_file(diff_file_page_delta(app, area, 1));
         }

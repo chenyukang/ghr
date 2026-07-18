@@ -65,7 +65,7 @@ const shortcuts = [
   ["Details", "c / a", "Add a comment in conversation mode"],
   ["Diff", "q / Esc", "Return to the state before opening diff mode"],
   ["Diff", "Tab / Shift+Tab", "Switch focus between changed files and the file diff"],
-  ["Diff Files", "j / k / Up / Down", "Choose a changed file"],
+  ["Diff Files", "j / k / n / p / Up / Down", "Choose a changed file"],
   ["Diff Files", "PgUp / PgDown or u / d", "Move by a visible file page"],
   ["Diff Files", "[ / ]", "Previous or next changed file"],
   ["Diff Files", "Enter / 4", "Focus the file diff"],

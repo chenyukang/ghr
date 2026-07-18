@@ -2322,6 +2322,26 @@ diff --git a/src/github.rs b/src/github.rs
 
     assert!(!handle_key(
         &mut app,
+        key(KeyCode::Char('n')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('p')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
         key(KeyCode::Char('j')),
         &config,
         &store,
@@ -4309,6 +4329,7 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("@ / -"));
     assert!(text.contains("add a reaction"));
     assert!(text.contains("Ctrl+Enter / Ctrl+O"));
+    assert!(text.contains("j/k/n/p or Up/Down"));
     assert!(!text.contains("Reaction Dialog"));
 }
 
@@ -6913,7 +6934,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
 
     app.focus_list();
     let diff_list = footer_line(&app, &paths).to_string();
-    assert!(diff_list.contains("j/k file  tab diff  enter diff"));
+    assert!(diff_list.contains("j/k/n/p file  tab diff  enter diff"));
     assert!(!diff_list.contains("m text-select"));
 }
 

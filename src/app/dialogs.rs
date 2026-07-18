@@ -4624,7 +4624,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_heading("Diff Files"),
         help_key_line("3", "focus the changed-file list"),
         help_key_line("Tab / Shift+Tab", "focus the file diff"),
-        help_key_line("j/k or Up/Down", "choose a changed file"),
+        help_key_line("j/k/n/p or Up/Down", "choose a changed file"),
         help_key_line("PgDown/PgUp", "move by visible file page"),
         help_key_line("h / l", "page diff down/up across files"),
         help_key_line("[ / ]", "previous / next changed file"),

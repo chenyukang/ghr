@@ -1,7 +1,5 @@
 use super::layout::{body_area, body_areas};
-use super::pr_checkout::{
-    command_output_text, pr_checkout_command_args, pr_checkout_command_display,
-};
+use super::pr_checkout::command_output_text;
 use super::*;
 use crate::log::{clear_gh_log_entries, fail_gh_request_to_start, start_gh_request};
 use crate::model::CommentPreviewKind;
@@ -105,14 +103,21 @@ fn fuzzy_score_matches_ordered_subsequence() {
 fn refresh_error_status_guides_missing_gh_and_auth() {
     assert_eq!(
         refresh_error_status(3, Some("GitHub CLI `gh` is required but was not found.")),
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set GHR_GITHUB_TOKEN or install `gh`"
     );
     assert_eq!(
         refresh_error_status(
             3,
             Some("GitHub CLI is installed but not authenticated. Run `gh auth login`.")
         ),
-        "GitHub CLI auth required: run `gh auth login`"
+        "GitHub authentication failed: check the token or run `gh auth login`"
+    );
+    assert_eq!(
+        refresh_error_status(
+            3,
+            Some("GitHub API request failed: HTTP 401: Bad credentials")
+        ),
+        "GitHub authentication failed: check the token or run `gh auth login`"
     );
     assert_eq!(
         refresh_error_status(3, Some("HTTP 403: API rate limit exceeded")),
@@ -121,26 +126,25 @@ fn refresh_error_status_guides_missing_gh_and_auth() {
 }
 
 #[test]
-fn compact_error_label_hides_long_gh_command_context() {
-    let error = "gh search prs --json number,title,body,repository,author,createdAt,updatedAt,url,state,isDraft,labels,commentsCount --limit 500 -- repo:rust-lang/rust is:open failed: HTTP 403: API rate limit exceeded for user ID 230646";
+fn compact_error_label_hides_long_github_request_context() {
+    let error = "gh api --method GET search/issues -f q=is:pr repo:rust-lang/rust is:open -f per_page=100 failed: HTTP 403: API rate limit exceeded for user ID 230646";
 
     assert_eq!(compact_error_label(error), "GitHub search rate limited");
-    assert!(!compact_error_label(error).contains("--json"));
+    assert!(!compact_error_label(error).contains("--method"));
 }
 
 #[test]
 fn error_chain_message_keeps_gh_failure_detail() {
-    let error = anyhow::anyhow!(
-        "gh pr create --repo owner/repo --head feature failed: a pull request already exists"
-    )
-    .context("failed to create pull request in owner/repo");
+    let error =
+        anyhow::anyhow!("GitHub API request failed: HTTP 422: a pull request already exists")
+            .context("failed to create pull request in owner/repo");
     let message = error_chain_message(error);
 
     assert!(message.contains("failed to create pull request in owner/repo"));
     assert!(message.contains("a pull request already exists"));
     assert_eq!(
         operation_error_body(&message),
-        "a pull request already exists"
+        "HTTP 422: a pull request already exists"
     );
 }
 
@@ -2318,6 +2322,26 @@ diff --git a/src/github.rs b/src/github.rs
 
     assert!(!handle_key(
         &mut app,
+        key(KeyCode::Char('n')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.selected_diff_file.get("1"), Some(&1));
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('p')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.selected_diff_file.get("1"), Some(&0));
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
         key(KeyCode::Char('j')),
         &config,
         &store,
@@ -2470,6 +2494,10 @@ fn setup_dialog_from_error_classifies_gh_setup_failures() {
         Some(SetupDialog::AuthRequired)
     );
     assert_eq!(setup_dialog_from_error("HTTP 500"), None);
+    assert_eq!(
+        setup_dialog_from_error("GitHub API request failed: HTTP 401: Bad credentials"),
+        Some(SetupDialog::AuthRequired)
+    );
 }
 
 #[test]
@@ -2526,7 +2554,7 @@ fn startup_setup_dialog_sets_status_without_initializing_dialog() {
     assert_eq!(app.startup_dialog, None);
     assert_eq!(
         app.status,
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set a token or install `gh`"
     );
 }
 
@@ -2547,7 +2575,7 @@ fn refresh_failure_opens_setup_dialog() {
     assert_eq!(app.startup_dialog, None);
     assert_eq!(
         app.status,
-        "GitHub CLI missing: install `gh`, then run `gh auth login`"
+        "GitHub auth required: set GHR_GITHUB_TOKEN or install `gh`"
     );
 }
 
@@ -2564,6 +2592,64 @@ fn refresh_finished_resets_background_refresh_interval() {
 
     assert!(!app.refreshing);
     assert!(app.last_refresh_request.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn manual_refresh_starts_with_active_view_scope() {
+    let inbox = SectionSnapshot::empty(SectionKind::Notifications, "All", "is:unread");
+    assert_manual_refresh_scope(
+        AppState::new(SectionKind::Notifications, vec![inbox]),
+        "notifications",
+    );
+
+    assert_manual_refresh_scope(
+        AppState::new(SectionKind::PullRequests, vec![test_section()]),
+        "pull_requests",
+    );
+
+    let issues = SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open");
+    assert_manual_refresh_scope(AppState::new(SectionKind::Issues, vec![issues]), "issues");
+
+    let repo_view = repo_view_key("Fiber");
+    let repo_section = SectionSnapshot::empty_for_view(
+        repo_view.clone(),
+        SectionKind::PullRequests,
+        "Pull Requests",
+        "repo:nervosnetwork/fiber is:open",
+    );
+    let mut app = AppState::new(SectionKind::PullRequests, vec![repo_section]);
+    app.switch_view(repo_view);
+    assert_manual_refresh_scope(app, "repo:Fiber");
+}
+
+#[test]
+fn manual_refresh_queues_full_refresh_after_active_view_finishes() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    trigger_refresh(&mut app, &config, &store, &tx);
+    let AppMsg::RefreshStarted { scope } = rx
+        .try_recv()
+        .expect("manual refresh should start current view")
+    else {
+        panic!("expected refresh start after manual refresh");
+    };
+    assert_eq!(scope, RefreshScope::View("pull_requests".to_string()));
+
+    app.handle_msg(AppMsg::RefreshStarted { scope });
+    assert!(app.refreshing);
+    assert!(!app.take_pending_full_refresh_after_view());
+
+    app.handle_msg(AppMsg::RefreshFinished {
+        sections: Vec::new(),
+        save_error: None,
+    });
+
+    assert!(!app.refreshing);
+    assert!(app.take_pending_full_refresh_after_view());
+    assert!(!app.take_pending_full_refresh_after_view());
 }
 
 #[test]
@@ -4301,6 +4387,7 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("@ / -"));
     assert!(text.contains("add a reaction"));
     assert!(text.contains("Ctrl+Enter / Ctrl+O"));
+    assert!(text.contains("j/k/n/p or Up/Down"));
     assert!(!text.contains("Reaction Dialog"));
 }
 
@@ -5802,7 +5889,7 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
     let mut config = Config::default();
     config.save(&paths.config_path).expect("save config");
     let mut app = AppState::new(SectionKind::PullRequests, configured_sections(&config));
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.show_project_add_dialog();
@@ -5838,6 +5925,13 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
         vec!["Issues", "Pull Requests"]
     );
     assert_eq!(app.status, "project added: ghr");
+    let refresh = rx.try_recv().expect("project add should start a refresh");
+    match refresh {
+        AppMsg::RefreshStarted { scope } => {
+            assert_eq!(scope, RefreshScope::View("repo:ghr".to_string()));
+        }
+        _ => panic!("expected refresh start after project add"),
+    }
 
     let saved = Config::load_or_create(&paths.config_path).expect("load saved config");
     assert_eq!(saved.repos.len(), 1);
@@ -6905,7 +6999,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
 
     app.focus_list();
     let diff_list = footer_line(&app, &paths).to_string();
-    assert!(diff_list.contains("j/k file  tab diff  enter diff"));
+    assert!(diff_list.contains("j/k/n/p file  tab diff  enter diff"));
     assert!(!diff_list.contains("m text-select"));
 }
 
@@ -7116,6 +7210,7 @@ fn setup_dialog_content_contains_actionable_commands() {
     assert!(missing_text.contains("brew install gh"));
     assert!(missing_text.contains("sudo apt install gh"));
     assert!(missing_text.contains("gh auth login"));
+    assert!(missing_text.contains("GHR_GITHUB_TOKEN"));
 
     let (_title, auth_lines) = setup_dialog_content(SetupDialog::AuthRequired);
     let auth_text = auth_lines
@@ -7125,6 +7220,7 @@ fn setup_dialog_content_contains_actionable_commands() {
         .join("\n");
     assert!(auth_text.contains("gh auth login"));
     assert!(auth_text.contains("GH_TOKEN"));
+    assert!(auth_text.contains("GHR_GITHUB_TOKEN"));
 }
 
 #[test]
@@ -13084,6 +13180,21 @@ fn configured_repo_remote_is_used_when_validating_local_dir() {
 }
 
 #[test]
+fn checkout_remote_uses_matching_base_repo_remote() {
+    let local_dir = checkout_test_fork_repo_dir_on_branch(
+        "feature/upstream-base",
+        "Officeyutong/tentacle",
+        "nervosnetwork/tentacle",
+    );
+
+    assert_eq!(
+        resolve_pr_checkout_remote(&Config::default(), &local_dir, "nervosnetwork/tentacle")
+            .expect("matching remote"),
+        "upstream"
+    );
+}
+
+#[test]
 fn capital_n_in_pr_repo_without_local_dir_shows_hint() {
     let section = SectionSnapshot {
         key: "repo:ghr:pull_requests:Pull Requests".to_string(),
@@ -13434,7 +13545,7 @@ fn issue_create_failure_restores_dialog_for_retry() {
 }
 
 #[test]
-fn pull_request_create_failure_shows_gh_detail_and_restores_dialog() {
+fn pull_request_create_failure_shows_api_detail_and_restores_dialog() {
     let local_dir = checkout_test_repo_dir_on_branch("feature/pr-body");
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let dialog = PrCreateDialog {
@@ -13459,7 +13570,7 @@ fn pull_request_create_failure_shows_gh_detail_and_restores_dialog() {
     });
 
     app.handle_msg(AppMsg::PullRequestCreated {
-            result: Err("failed to create pull request in chenyukang/ghr: gh pr create --repo chenyukang/ghr --head feature/pr-body failed: a pull request for branch \"feature/pr-body\" already exists: https://github.com/chenyukang/ghr/pull/42".to_string()),
+            result: Err("failed to create pull request in chenyukang/ghr: GitHub API request failed: HTTP 422: a pull request for branch \"feature/pr-body\" already exists: https://github.com/chenyukang/ghr/pull/42".to_string()),
         });
 
     assert!(!app.pr_creating);
@@ -13992,23 +14103,93 @@ fn checkout_confirmation_submits_selected_action() {
     ));
 }
 
-#[test]
-fn pr_checkout_command_construction_uses_repo_and_number() {
-    let args = pr_checkout_command_args("rust-lang/rust", 123);
+#[tokio::test]
+async fn git_checkout_fetches_pull_ref_and_fast_forwards_local_branch() {
+    let directory = checkout_test_repo_dir();
+    let remote_dir = directory.with_extension("bare.git");
+    std::fs::create_dir_all(&remote_dir).expect("create bare remote directory");
+    run_checkout_test_git(&remote_dir, &["init", "--bare", "-q"]);
+
+    run_checkout_test_git(&directory, &["config", "user.email", "ghr@example.com"]);
+    run_checkout_test_git(&directory, &["config", "user.name", "ghr test"]);
+    run_checkout_test_git(&directory, &["checkout", "-q", "-b", "main"]);
+    std::fs::write(directory.join("README.md"), "base\n").expect("write base file");
+    run_checkout_test_git(&directory, &["add", "README.md"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "base"]);
+    run_checkout_test_git(&directory, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(directory.join("feature.txt"), "first\n").expect("write feature file");
+    run_checkout_test_git(&directory, &["add", "feature.txt"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "feature one"]);
+    run_checkout_test_git(
+        &directory,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &remote_dir.display().to_string(),
+        ],
+    );
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "main:refs/heads/main"],
+    );
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "feature:refs/pull/19/head"],
+    );
+    run_checkout_test_git(&directory, &["checkout", "-q", "main"]);
+
+    let first = run_git_pr_checkout_ref(
+        "chenyukang/ghr",
+        19,
+        directory.clone(),
+        "origin".to_string(),
+    )
+    .await
+    .expect("initial PAT checkout");
 
     assert_eq!(
-        args,
-        vec![
-            "pr".to_string(),
-            "checkout".to_string(),
-            "123".to_string(),
-            "--repo".to_string(),
-            "rust-lang/rust".to_string(),
-        ]
+        current_git_branch_for_directory(&directory).expect("current branch"),
+        "pr/19"
+    );
+    assert!(
+        first
+            .command
+            .contains("git fetch --no-tags origin +refs/pull/19/head:refs/ghr/pull/19/head")
+    );
+
+    run_checkout_test_git(&directory, &["checkout", "-q", "feature"]);
+    std::fs::write(directory.join("feature.txt"), "second\n").expect("update feature file");
+    run_checkout_test_git(&directory, &["add", "feature.txt"]);
+    run_checkout_test_git(&directory, &["commit", "-q", "-m", "feature two"]);
+    let updated_head = checkout_test_git_text(&directory, &["rev-parse", "HEAD"]);
+    run_checkout_test_git(
+        &directory,
+        &["push", "-q", "origin", "feature:refs/pull/19/head"],
+    );
+    run_checkout_test_git(&directory, &["checkout", "-q", "main"]);
+
+    let second = run_git_pr_checkout_ref(
+        "chenyukang/ghr",
+        19,
+        directory.clone(),
+        "origin".to_string(),
+    )
+    .await
+    .expect("fast-forward PAT checkout");
+
+    assert_eq!(
+        current_git_branch_for_directory(&directory).expect("current branch"),
+        "pr/19"
     );
     assert_eq!(
-        pr_checkout_command_display(&args),
-        "gh pr checkout 123 --repo rust-lang/rust"
+        checkout_test_git_text(&directory, &["rev-parse", "HEAD"]),
+        updated_head
+    );
+    assert!(
+        second
+            .command
+            .contains("git merge --ff-only refs/ghr/pull/19/head")
     );
 }
 
@@ -15753,7 +15934,7 @@ fn pr_checkout_finished_shows_success_output() {
 
     app.handle_msg(AppMsg::PrCheckoutFinished {
         result: Ok(PrCheckoutResult {
-            command: "gh pr checkout 1 --repo rust-lang/rust".to_string(),
+            command: "git fetch --no-tags origin +refs/pull/1/head:refs/ghr/pull/1/head\ngit switch --create pr/1 refs/ghr/pull/1/head".to_string(),
             directory: PathBuf::from("/tmp/rust"),
             output: "Switched to branch 'diagnostics'".to_string(),
         }),
@@ -15767,8 +15948,9 @@ fn pr_checkout_finished_shows_success_output() {
     assert!(
         dialog
             .body
-            .contains("gh pr checkout 1 --repo rust-lang/rust")
+            .contains("git fetch --no-tags origin +refs/pull/1/head")
     );
+    assert!(dialog.body.contains("git switch --create pr/1"));
     assert!(dialog.body.contains("Checkout runs from /tmp/rust."));
     assert!(dialog.body.contains("Switched to branch"));
     assert_eq!(dialog.kind, MessageDialogKind::Success);
@@ -15784,7 +15966,7 @@ fn pr_checkout_failure_opens_message_dialog() {
 
     app.handle_msg(AppMsg::PrCheckoutFinished {
             result: Err(
-                "gh pr checkout 1 --repo rust-lang/rust failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
+                "git fetch --no-tags origin +refs/pull/1/head:refs/ghr/pull/1/head failed.\n\nCheckout runs from /tmp.\n\nfatal: not a git repository"
                     .to_string(),
             ),
         });
@@ -20350,6 +20532,22 @@ fn test_section() -> SectionSnapshot {
     }
 }
 
+fn assert_manual_refresh_scope(mut app: AppState, expected_view: &str) {
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    trigger_refresh(&mut app, &config, &store, &tx);
+    let AppMsg::RefreshStarted { scope } = rx
+        .try_recv()
+        .expect("manual refresh should start current view")
+    else {
+        panic!("expected refresh start after manual refresh");
+    };
+
+    assert_eq!(scope, RefreshScope::View(expected_view.to_string()));
+}
+
 fn test_diff_file(path: &str, additions: usize, deletions: usize) -> DiffFile {
     DiffFile {
         old_path: path.to_string(),
@@ -20561,6 +20759,25 @@ fn run_checkout_test_git(dir: &std::path::Path, args: &[&str]) {
         args.join(" "),
         command_output_text(&output.stdout, &output.stderr)
     );
+}
+
+fn checkout_test_git_text(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        command_output_text(&output.stdout, &output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output utf-8")
+        .trim()
+        .to_string()
 }
 
 fn many_items_section(count: u64) -> SectionSnapshot {

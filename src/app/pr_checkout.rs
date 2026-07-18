@@ -1,4 +1,3 @@
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -7,7 +6,6 @@ use tracing::{debug, error};
 
 use super::text::truncate_text;
 use crate::config::{Config, github_repo_from_remote_url};
-use crate::log::{fail_gh_request_to_start, finish_gh_request, start_gh_request};
 use crate::model::{PullRequestBranch, WorkItem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,56 +19,141 @@ pub(super) struct PrCheckoutResult {
 pub(super) struct PrCheckoutPlan {
     pub(super) directory: PathBuf,
     pub(super) branch: Option<PullRequestBranch>,
+    pub(super) remote: String,
 }
 
 pub(super) async fn run_pr_checkout(
     item: WorkItem,
     directory: PathBuf,
+    remote: String,
+) -> std::result::Result<PrCheckoutResult, String> {
+    run_git_pr_checkout(item, directory, remote).await
+}
+
+async fn run_git_pr_checkout(
+    item: WorkItem,
+    directory: PathBuf,
+    remote: String,
 ) -> std::result::Result<PrCheckoutResult, String> {
     let number = item
         .number
         .ok_or_else(|| "selected item has no pull request number".to_string())?;
-    let args = pr_checkout_command_args(&item.repo, number);
-    let command = pr_checkout_command_display(&args);
-    let gh_request = start_gh_request("gh", command.clone(), Some(&directory));
+    run_git_pr_checkout_ref(&item.repo, number, directory, remote).await
+}
+
+pub(super) async fn run_git_pr_checkout_ref(
+    repository: &str,
+    number: u64,
+    directory: PathBuf,
+    remote: String,
+) -> std::result::Result<PrCheckoutResult, String> {
+    ensure_clean_worktree(&directory).map_err(|error| {
+        format!(
+            "Cannot checkout {}/pull/{number} with git.\n\n{}\n\n{error}",
+            repository,
+            checkout_directory_notice(&directory)
+        )
+    })?;
+
+    let fetched_ref = format!("refs/ghr/pull/{number}/head");
+    let local_branch = format!("pr/{number}");
+    let local_ref = format!("refs/heads/{local_branch}");
+    let refspec = format!("+refs/pull/{number}/head:{fetched_ref}");
+    let mut commands = Vec::new();
+    let mut output = Vec::new();
+
+    run_checkout_git_command(
+        &directory,
+        &["fetch", "--no-tags", &remote, &refspec],
+        &mut commands,
+        &mut output,
+    )
+    .await?;
+
+    if !git_ref_exists(&directory, &local_ref) {
+        run_checkout_git_command(
+            &directory,
+            &["switch", "--create", &local_branch, &fetched_ref],
+            &mut commands,
+            &mut output,
+        )
+        .await?;
+    } else if git_is_ancestor(&directory, &local_ref, &fetched_ref)? {
+        run_checkout_git_command(
+            &directory,
+            &["switch", &local_branch],
+            &mut commands,
+            &mut output,
+        )
+        .await?;
+        run_checkout_git_command(
+            &directory,
+            &["merge", "--ff-only", &fetched_ref],
+            &mut commands,
+            &mut output,
+        )
+        .await?;
+    } else if git_is_ancestor(&directory, &fetched_ref, &local_ref)? {
+        run_checkout_git_command(
+            &directory,
+            &["switch", &local_branch],
+            &mut commands,
+            &mut output,
+        )
+        .await?;
+        output.push(format!(
+            "Local branch {local_branch} already contains the fetched PR head."
+        ));
+    } else {
+        return Err(format!(
+            "Local branch {local_branch} has diverged from {}/pull/{number}. Rename or delete that local branch, then retry.\n\n{}",
+            repository,
+            checkout_directory_notice(&directory)
+        ));
+    }
+
+    Ok(PrCheckoutResult {
+        command: commands.join("\n"),
+        directory,
+        output: if output.is_empty() {
+            format!("Checked out pull request #{number} as {local_branch}.")
+        } else {
+            truncate_text(&output.join("\n"), 900)
+        },
+    })
+}
+
+async fn run_checkout_git_command(
+    directory: &Path,
+    args: &[&str],
+    commands: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    let command = format!("git {}", args.join(" "));
     debug!(
         command = %command,
         cwd = %directory.display(),
-        "gh request started"
+        "git checkout command started"
     );
-    let output = TokioCommand::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .current_dir(&directory)
-        .args(&args)
+    let output = TokioCommand::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(directory)
+        .args(args)
         .output()
         .await
         .map_err(|error| {
-            fail_gh_request_to_start(gh_request.clone(), &error);
-            debug!(
-                command = %command,
-                cwd = %directory.display(),
-                error = %error,
-                "gh request failed to start"
-            );
             error!(
                 command = %command,
                 cwd = %directory.display(),
                 error = %error,
-                "gh request failed to start"
+                "git checkout command failed to start"
             );
-            if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "GitHub CLI `gh` is required for local checkout. Install it, run `gh auth login`, then retry.\n\n{}\n\nTried: {command}",
-                    checkout_directory_notice(&directory),
-                )
-            } else {
-                format!(
-                    "failed to run {command}: {error}\n\n{}",
-                    checkout_directory_notice(&directory),
-                )
-            }
+            format!(
+                "failed to run {command}: {error}\n\n{}",
+                checkout_directory_notice(directory)
+            )
         })?;
-    finish_gh_request(gh_request, &output);
+    let message = command_output_text(&output.stdout, &output.stderr);
     debug!(
         command = %command,
         cwd = %directory.display(),
@@ -78,57 +161,51 @@ pub(super) async fn run_pr_checkout(
         success = output.status.success(),
         stdout_bytes = output.stdout.len(),
         stderr_bytes = output.stderr.len(),
-        "gh request finished"
+        "git checkout command finished"
     );
-
-    let output_text = command_output_text(&output.stdout, &output.stderr);
     if !output.status.success() {
-        let detail = if output_text.is_empty() {
-            "gh did not return any output".to_string()
+        let detail = if message.is_empty() {
+            "git did not return any output".to_string()
         } else {
-            output_text
+            truncate_text(&message, 900)
         };
         error!(
             command = %command,
             cwd = %directory.display(),
             status = %output.status,
-            message = %truncate_text(&detail, 900),
-            stdout_bytes = output.stdout.len(),
-            stderr_bytes = output.stderr.len(),
-            "gh request returned failure"
+            message = %detail,
+            "git checkout command returned failure"
         );
         return Err(format!(
-            "{} failed.\n\n{}\n\n{}",
-            command,
-            checkout_directory_notice(&directory),
-            truncate_text(&detail, 900),
+            "{command} failed.\n\n{}\n\n{detail}",
+            checkout_directory_notice(directory)
         ));
     }
+    commands.push(command);
+    if !message.is_empty() {
+        messages.push(message);
+    }
+    Ok(())
+}
 
-    let output = if output_text.is_empty() {
-        "gh pr checkout completed successfully.".to_string()
-    } else {
-        truncate_text(&output_text, 900)
-    };
-    Ok(PrCheckoutResult {
-        command,
+fn git_is_ancestor(
+    directory: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> std::result::Result<bool, String> {
+    let output = git_output(
         directory,
-        output,
-    })
-}
-
-pub(super) fn pr_checkout_command_args(repository: &str, number: u64) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "checkout".to_string(),
-        number.to_string(),
-        "--repo".to_string(),
-        repository.to_string(),
-    ]
-}
-
-pub(super) fn pr_checkout_command_display(args: &[String]) -> String {
-    format!("gh {}", args.join(" "))
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed in {}: {}",
+            directory.display(),
+            command_output_text(&output.stdout, &output.stderr)
+        )),
+    }
 }
 
 pub(super) fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
@@ -177,6 +254,44 @@ pub(super) fn resolve_pr_checkout_directory(
         )
     })?;
     Ok(cwd)
+}
+
+pub(super) fn resolve_pr_checkout_remote(
+    config: &Config,
+    directory: &Path,
+    repository: &str,
+) -> std::result::Result<String, String> {
+    if let Some(remote) = config
+        .repos
+        .iter()
+        .find(|repo| repo.repo.eq_ignore_ascii_case(repository))
+        .and_then(|repo| repo.remote.as_deref())
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+    {
+        return match git_remote_repo(directory, remote) {
+            Some(repo) if repo.eq_ignore_ascii_case(repository) => Ok(remote.to_string()),
+            Some(repo) => Err(format!(
+                "{} remote {remote} points at {repo}, expected {repository}.",
+                directory.display()
+            )),
+            None => Err(format!(
+                "{} has no GitHub remote named {remote}.",
+                directory.display()
+            )),
+        };
+    }
+
+    git_remotes_for_directory(directory)?
+        .into_iter()
+        .find(|(_, repo)| repo.eq_ignore_ascii_case(repository))
+        .map(|(remote, _)| remote)
+        .ok_or_else(|| {
+            format!(
+                "{} has no Git remote for {repository}.",
+                directory.display()
+            )
+        })
 }
 
 pub(super) fn configured_local_dir_for_repo(config: &Config, repository: &str) -> Option<PathBuf> {

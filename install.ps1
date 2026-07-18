@@ -118,7 +118,7 @@ try {
     }
 
     Write-Host "ghr install: installed $Tag to $Destination"
-    Write-Host "Next: gh auth login"
+    Write-Host "Next: set GHR_GITHUB_TOKEN, or run: gh auth login"
     Write-Host "Run:  ghr"
 } finally {
     Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue

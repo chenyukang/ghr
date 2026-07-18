@@ -946,7 +946,7 @@ pub(super) fn start_pr_action(
                 });
                 return;
             };
-            let result = run_pr_checkout(item, checkout.directory).await;
+            let result = run_pr_checkout(item, checkout.directory, checkout.remote).await;
             let _ = tx.send(AppMsg::PrCheckoutFinished { result });
             return;
         }

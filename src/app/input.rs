@@ -825,8 +825,8 @@ pub(super) fn handle_diff_file_list_key(
         KeyCode::Char('Y') => {
             app.start_reviewer_dialog_with_store(ReviewerAction::Remove, Some(store), Some(tx))
         }
-        KeyCode::Down | KeyCode::Char('j') => app.move_diff_file(1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_diff_file(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => app.move_diff_file(1),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => app.move_diff_file(-1),
         KeyCode::PageDown | KeyCode::Char('d') => {
             app.move_diff_file(diff_file_page_delta(app, area, 1));
         }
@@ -888,15 +888,40 @@ pub(super) fn trigger_refresh(
     store: &SnapshotStore,
     tx: &UnboundedSender<AppMsg>,
 ) {
+    if !app.refreshing {
+        app.queue_full_refresh_after_view();
+    }
+    trigger_refresh_scope(
+        app,
+        config,
+        store,
+        tx,
+        RefreshScope::View(app.active_view.clone()),
+    );
+}
+
+pub(super) fn trigger_refresh_scope(
+    app: &mut AppState,
+    config: &Config,
+    store: &SnapshotStore,
+    tx: &UnboundedSender<AppMsg>,
+    scope: RefreshScope,
+) {
     if app.refreshing {
         app.status = "refresh already running".to_string();
     } else {
+        #[cfg(test)]
+        {
+            let _ = (config, store, RefreshPriority::User);
+            let _ = tx.send(AppMsg::RefreshStarted { scope });
+        }
+        #[cfg(not(test))]
         start_refresh(
             config.clone(),
             store.clone(),
             tx.clone(),
             RefreshPriority::User,
-            RefreshScope::Full,
+            scope,
         );
     }
 }

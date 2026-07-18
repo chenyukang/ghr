@@ -77,7 +77,7 @@ class GhrCli < Formula
   end
 
   def caveats
-    "Run \`gh auth login\` before starting ghr."
+    "Set GHR_GITHUB_TOKEN environment variable, or run \`gh auth login\`, before starting ghr."
   end
 
   test do

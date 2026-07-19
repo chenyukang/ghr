@@ -195,6 +195,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
 | `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
+| `Copy PR/Issue Link` | Copy the current PR/issue link to the clipboard, ignoring selected comments |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
 | `Open Linked PR/Issue` | Open the first linked pull request or issue from the current item |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
@@ -305,18 +306,18 @@ include_read_notifications = true
 [[pr_sections]]
 title = "Needs Attention"
 queries = [
-  "is:open review-requested:@me archived:false sort:updated-desc",
-  "is:open assignee:@me archived:false sort:updated-desc",
-  "is:open mentions:@me archived:false sort:updated-desc",
+  "is:open review-requested:@me archived:false sort:created-desc",
+  "is:open assignee:@me archived:false sort:created-desc",
+  "is:open mentions:@me archived:false sort:created-desc",
 ]
 
 [[pr_sections]]
 title = "My Pull Requests"
-filters = "is:open author:@me archived:false sort:updated-desc"
+filters = "is:open author:@me archived:false sort:created-desc"
 
 [[pr_sections]]
 title = "Reviewed"
-filters = "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
+filters = "is:open reviewed-by:@me -author:@me archived:false sort:created-desc"
 
 [[saved_search_filters]]
 name = "my rust prs"
@@ -329,7 +330,7 @@ sort = "created_at"
 exclude_repos = ["some-org/archive-*"]
 ```
 
-Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:updated-desc"` or `label:"good first issue"` for labels with spaces.
+Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:created-desc"` or `label:"good first issue"` for labels with spaces.
 
 Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_issues` and `show_prs` control whether the sections are shown as `Issues` and `Pull Requests`. Repo tabs default to open issues and open PRs, with `Issues` shown first. Set `labels` to filter both repo issue and PR lists, or use `issue_labels` / `pr_labels` for kind-specific filters.
 

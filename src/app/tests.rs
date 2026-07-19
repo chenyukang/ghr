@@ -13315,6 +13315,64 @@ fn copy_github_link_uses_item_link_without_selected_comment() {
 }
 
 #[test]
+fn copy_pr_issue_link_ignores_selected_comment_when_details_focused() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment(
+            "alice",
+            "looks good",
+            Some("https://github.com/rust-lang/rust/pull/1#issuecomment-1"),
+        )]),
+    );
+    app.focus_details();
+
+    assert_eq!(
+        app.selected_pr_issue_link(),
+        Some((
+            "https://github.com/rust-lang/rust/pull/1".to_string(),
+            "pull request"
+        ))
+    );
+
+    app.copy_pr_issue_link();
+
+    assert_eq!(app.status, "copied pull request link");
+}
+
+#[test]
+fn copy_pr_issue_link_uses_selected_issue_link() {
+    let mut item = work_item("issue-159537", "rust-lang/rust", 159537, "Borrowck", None);
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/rust-lang/rust/issues/159537".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+
+    assert_eq!(
+        app.selected_pr_issue_link(),
+        Some((
+            "https://github.com/rust-lang/rust/issues/159537".to_string(),
+            "issue"
+        ))
+    );
+
+    app.copy_pr_issue_link();
+
+    assert_eq!(app.status, "copied issue link");
+}
+
+#[test]
 fn copy_content_prefers_selected_comment_when_details_focused() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details.insert(
@@ -13433,6 +13491,29 @@ fn command_palette_copy_github_link_copies_current_item_link() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.command_palette = Some(CommandPalette {
         query: "copy github".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Enter),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert_eq!(app.status, "copied pull request link");
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_copy_pr_issue_link_copies_current_item_link() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.command_palette = Some(CommandPalette {
+        query: "copy pr issue".to_string(),
         selected: 0,
     });
 

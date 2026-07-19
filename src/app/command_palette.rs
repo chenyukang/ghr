@@ -41,6 +41,7 @@ pub(super) enum PaletteAction {
     ProjectAdd,
     ProjectRemove,
     CopyGithubLink,
+    CopyPrIssueLink,
     CopyContent,
     ToggleMouseCapture,
     OpenSelected,
@@ -293,6 +294,13 @@ pub(super) fn command_palette_commands(
             "General",
             "Copy the selected comment or issue/PR link to the clipboard",
             PaletteAction::CopyGithubLink,
+        ),
+        palette_command(
+            "Copy PR/Issue Link",
+            "",
+            "General",
+            "Copy the current pull request or issue link to the clipboard",
+            PaletteAction::CopyPrIssueLink,
         ),
         palette_command(
             "Copy Content",
@@ -1144,6 +1152,17 @@ mod tests {
             commands
                 .iter()
                 .any(|command| command.title == "Copy GitHub Link")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Copy PR/Issue Link")
+        );
+        let pr_issue_link_matches = command_palette_filtered_indices(&commands, "copy pr issue");
+        assert!(
+            pr_issue_link_matches
+                .iter()
+                .any(|index| commands[*index].title == "Copy PR/Issue Link")
         );
         assert!(
             commands

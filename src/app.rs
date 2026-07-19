@@ -5487,6 +5487,10 @@ impl AppState {
                 self.copy_github_link();
                 false
             }
+            PaletteAction::CopyPrIssueLink => {
+                self.copy_pr_issue_link();
+                false
+            }
             PaletteAction::CopyContent => {
                 self.copy_content();
                 false
@@ -11807,6 +11811,22 @@ impl AppState {
         }
     }
 
+    fn copy_pr_issue_link(&mut self) {
+        let Some((url, label)) = self.selected_pr_issue_link() else {
+            self.status = "no pull request or issue selected".to_string();
+            return;
+        };
+
+        match copy_text_to_clipboard(&url) {
+            Ok(()) => {
+                self.status = format!("copied {label} link");
+            }
+            Err(error) => {
+                self.status = format!("copy failed: {error}");
+            }
+        }
+    }
+
     fn copy_content(&mut self) {
         let Some((content, label)) = self.selected_copy_content() else {
             self.status = "no content selected".to_string();
@@ -11865,6 +11885,20 @@ impl AppState {
             ItemKind::Issue => "issue",
             ItemKind::Notification => "GitHub",
         };
+        Some((url.to_string(), label))
+    }
+
+    fn selected_pr_issue_link(&self) -> Option<(String, &'static str)> {
+        let item = self.current_item()?;
+        let label = match item.kind {
+            ItemKind::PullRequest => "pull request",
+            ItemKind::Issue => "issue",
+            ItemKind::Notification => return None,
+        };
+        let url = item.url.trim();
+        if url.is_empty() {
+            return None;
+        }
         Some((url.to_string(), label))
     }
 

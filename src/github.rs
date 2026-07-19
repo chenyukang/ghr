@@ -1365,6 +1365,7 @@ async fn fetch_search_items(
         return fetch_search_page(kind, query, page, limit, exclude_repos).await;
     }
 
+    let sort = merged_search_items_sort(&queries);
     let mut deduped = HashMap::<String, WorkItem>::new();
     for (index, query) in queries.into_iter().enumerate() {
         if index > 0 {
@@ -1381,13 +1382,7 @@ async fn fetch_search_items(
     }
 
     let mut items = deduped.into_values().collect::<Vec<_>>();
-    items.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.repo.cmp(&right.repo))
-            .then_with(|| left.number.cmp(&right.number))
-    });
+    sort_merged_search_items(&mut items, sort);
     items.truncate(limit);
     Ok(SearchFetchResult {
         items,
@@ -1395,6 +1390,48 @@ async fn fetch_search_items(
         page: 1,
         page_size: search_command_limit(limit),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchItemsSort {
+    CreatedAsc,
+    CreatedDesc,
+    UpdatedAsc,
+    UpdatedDesc,
+}
+
+impl SearchItemsSort {
+    fn from_filters(filters: &str) -> Option<Self> {
+        let (field, order) = search_sort(filters)?;
+        match (field.as_str(), order.as_str()) {
+            ("created" | "created_at", "asc") => Some(Self::CreatedAsc),
+            ("created" | "created_at", "desc") => Some(Self::CreatedDesc),
+            ("updated" | "updated_at", "asc") => Some(Self::UpdatedAsc),
+            ("updated" | "updated_at", "desc") => Some(Self::UpdatedDesc),
+            _ => None,
+        }
+    }
+}
+
+fn merged_search_items_sort(queries: &[String]) -> SearchItemsSort {
+    queries
+        .iter()
+        .find_map(|query| SearchItemsSort::from_filters(query))
+        .unwrap_or(SearchItemsSort::UpdatedDesc)
+}
+
+fn sort_merged_search_items(items: &mut [WorkItem], sort: SearchItemsSort) {
+    items.sort_by(|left, right| {
+        let timestamp_order = match sort {
+            SearchItemsSort::CreatedAsc => left.created_at.cmp(&right.created_at),
+            SearchItemsSort::CreatedDesc => right.created_at.cmp(&left.created_at),
+            SearchItemsSort::UpdatedAsc => left.updated_at.cmp(&right.updated_at),
+            SearchItemsSort::UpdatedDesc => right.updated_at.cmp(&left.updated_at),
+        };
+        timestamp_order
+            .then_with(|| left.repo.cmp(&right.repo))
+            .then_with(|| left.number.cmp(&right.number))
+    });
 }
 
 async fn fetch_search_items_for_query(
@@ -6298,6 +6335,113 @@ mod tests {
             search_kind_filter("repo:rust-lang/rust type:issue"),
             SearchKindFilter::Issues
         );
+    }
+
+    #[test]
+    fn merged_search_items_sort_uses_configured_created_order() {
+        let mut items = vec![
+            search_sort_work_item(
+                "updated-newer",
+                1,
+                "2026-01-01T00:00:00Z",
+                "2026-01-05T00:00:00Z",
+            ),
+            search_sort_work_item(
+                "created-newer",
+                2,
+                "2026-01-03T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+            ),
+            search_sort_work_item("middle", 3, "2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"),
+        ];
+        let queries = vec![
+            "is:open review-requested:@me archived:false sort:created-desc".to_string(),
+            "is:open assignee:@me archived:false sort:created-desc".to_string(),
+        ];
+
+        sort_merged_search_items(&mut items, merged_search_items_sort(&queries));
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["created-newer", "middle", "updated-newer"]
+        );
+    }
+
+    #[test]
+    fn merged_search_items_sort_preserves_configured_updated_order() {
+        let mut items = vec![
+            search_sort_work_item(
+                "updated-newer",
+                1,
+                "2026-01-01T00:00:00Z",
+                "2026-01-05T00:00:00Z",
+            ),
+            search_sort_work_item(
+                "created-newer",
+                2,
+                "2026-01-03T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+            ),
+            search_sort_work_item("middle", 3, "2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"),
+        ];
+        let queries = vec![
+            "is:open review-requested:@me archived:false sort:updated-desc".to_string(),
+            "is:open assignee:@me archived:false sort:updated-desc".to_string(),
+        ];
+
+        sort_merged_search_items(&mut items, merged_search_items_sort(&queries));
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["updated-newer", "middle", "created-newer"]
+        );
+    }
+
+    fn search_sort_work_item(
+        id: &str,
+        number: u64,
+        created_at: &str,
+        updated_at: &str,
+    ) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind: ItemKind::PullRequest,
+            repo: "owner/repo".to_string(),
+            number: Some(number),
+            title: id.to_string(),
+            body: None,
+            author: None,
+            state: Some("open".to_string()),
+            url: format!("https://github.com/owner/repo/pull/{number}"),
+            created_at: Some(
+                DateTime::parse_from_rfc3339(created_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            updated_at: Some(
+                DateTime::parse_from_rfc3339(updated_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            last_read_at: None,
+            labels: Vec::new(),
+            reactions: ReactionSummary::default(),
+            milestone: None,
+            assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
+            comments: None,
+            unread: None,
+            reason: None,
+            extra: None,
+            viewer_subscription: None,
+        }
     }
 
     #[test]

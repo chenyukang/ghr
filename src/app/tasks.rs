@@ -233,7 +233,7 @@ pub(super) fn start_notification_read_sync(
                 Ok(_) => Ok(None),
                 Err(error) => Ok(Some(error.to_string())),
             },
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error_chain_message(error)),
         };
         let _ = tx.send(AppMsg::NotificationReadFinished { thread_id, result });
     });
@@ -250,7 +250,7 @@ pub(super) fn start_notification_done_sync(
                 Ok(_) => Ok(None),
                 Err(error) => Ok(Some(error.to_string())),
             },
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error_chain_message(error)),
         };
         let _ = tx.send(AppMsg::NotificationDoneFinished { thread_id, result });
     });
@@ -263,7 +263,7 @@ pub(super) fn start_inbox_mark_all_read_sync(store: SnapshotStore, tx: Unbounded
                 Ok(_) => Ok(None),
                 Err(error) => Ok(Some(error.to_string())),
             },
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(error_chain_message(error)),
         };
         let _ = tx.send(AppMsg::InboxMarkAllReadFinished { result });
     });
@@ -280,7 +280,7 @@ pub(super) fn start_inbox_thread_action_sync(
             InboxThreadAction::Subscribe => subscribe_notification_thread(&thread_id).await,
             InboxThreadAction::Unsubscribe => unsubscribe_notification_thread(&thread_id).await,
         }
-        .map_err(|error| error.to_string());
+        .map_err(error_chain_message);
         let _ = tx.send(AppMsg::InboxThreadActionFinished { action, result });
     });
 }
@@ -320,7 +320,7 @@ pub(super) fn start_comments_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
         let comments = match item.number {
             Some(number) => fetch_comments(&item.repo, number, item.kind)
                 .await
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             None => Ok(CommentFetchResult {
                 item_metadata: None,
                 item_reactions: None,
@@ -338,7 +338,7 @@ pub(super) fn start_action_hints_load(item: WorkItem, tx: UnboundedSender<AppMsg
         let actions = match item.number {
             Some(number) => fetch_pull_request_action_hints(&item.repo, number)
                 .await
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
@@ -351,7 +351,7 @@ pub(super) fn start_diff_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
         let diff = match item.number {
             Some(number) => match fetch_pull_request_diff(&item.repo, number).await {
                 Ok(diff) => parse_pull_request_diff(&diff),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(error_chain_message(error)),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -634,7 +634,7 @@ pub(super) fn start_review_draft_create(item: WorkItem, body: String, tx: Unboun
             Some(number) => create_pending_pull_request_review(&item.repo, number, &body)
                 .await
                 .map(|review_id| PendingReviewState { review_id, body })
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::ReviewDraftCreated { item_id, result });
@@ -652,7 +652,7 @@ pub(super) fn start_review_submit(
         let result = match item.number {
             Some(number) => submit_pull_request_review(&item.repo, number, event, &body)
                 .await
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::ReviewSubmitted {
@@ -676,7 +676,7 @@ pub(super) fn start_pending_review_submit(
             Some(number) => {
                 submit_pending_pull_request_review(&item.repo, number, review_id, event, &body)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(error_chain_message)
             }
             None => Err("selected item has no pull request number".to_string()),
         };
@@ -699,7 +699,7 @@ pub(super) fn start_pending_review_discard(
         let result = match item.number {
             Some(number) => discard_pending_pull_request_review(&item.repo, number, review_id)
                 .await
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             None => Err("selected item has no pull request number".to_string()),
         };
         let _ = tx.send(AppMsg::PendingReviewDiscarded {
@@ -740,8 +740,8 @@ pub(super) fn start_reaction_submit(
                 match add_result {
                     Ok(()) => fetch_comments(&item.repo, number, item.kind)
                         .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
+                        .map_err(error_chain_message),
+                    Err(error) => Err(error_chain_message(error)),
                 }
             }
             None => Err("selected item has no issue or pull request number".to_string()),
@@ -764,8 +764,8 @@ pub(super) fn start_review_thread_resolution_update(
                 match set_pull_request_review_thread_resolved(&thread_id, resolved).await {
                     Ok(()) => fetch_comments(&item.repo, number, item.kind)
                         .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
+                        .map_err(error_chain_message),
+                    Err(error) => Err(error_chain_message(error)),
                 }
             }
             Some(_) => Err("review threads are available for pull requests".to_string()),
@@ -786,11 +786,11 @@ pub(super) fn start_label_update(item: WorkItem, action: LabelAction, tx: Unboun
         let result = match (item.number, &action) {
             (Some(number), LabelAction::Add(label)) => add_issue_label(&item.repo, number, label)
                 .await
-                .map_err(|error| error.to_string()),
+                .map_err(error_chain_message),
             (Some(number), LabelAction::Remove(label)) => {
                 remove_issue_label(&item.repo, number, label)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(error_chain_message)
             }
             (None, _) => Err("selected item has no issue or pull request number".to_string()),
         };
@@ -813,7 +813,7 @@ pub(super) fn start_label_suggestions_load(
     handle.spawn(async move {
         let result = fetch_repository_labels(&repo)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(error_chain_message);
         if let Ok(labels) = &result
             && let Some(store) = &store
             && let Err(error) = store.save_label_candidates(&repo, labels)
@@ -836,7 +836,7 @@ pub(super) fn start_assignee_suggestions_load(
     handle.spawn(async move {
         let result = fetch_repository_assignees(&repo)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(error_chain_message);
         if let Ok(assignees) = &result
             && let Some(store) = &store
             && let Err(error) = store.save_assignee_candidates(&repo, assignees)
@@ -859,7 +859,7 @@ pub(super) fn start_reviewer_suggestions_load(
     handle.spawn(async move {
         let result = fetch_repository_assignees(&repo)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(error_chain_message);
         if let Ok(reviewers) = &result
             && let Some(store) = &store
             && let Err(error) = store.save_reviewer_candidates(&repo, reviewers)
@@ -878,7 +878,7 @@ pub(super) fn start_mention_user_search_load(query: String, tx: UnboundedSender<
     handle.spawn(async move {
         let result = search_github_users(&query)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(error_chain_message);
         let _ = tx.send(AppMsg::MentionUserSearchLoaded { query, result });
     });
     true
@@ -956,61 +956,61 @@ pub(super) fn start_pr_action(
                 PrAction::Merge if item.kind == ItemKind::PullRequest => {
                     merge_pull_request(&item.repo, number, merge_method.unwrap_or_default())
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Close if item.kind == ItemKind::PullRequest => {
                     close_pull_request(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Close if item.kind == ItemKind::Issue => close_issue(&item.repo, number)
                     .await
-                    .map_err(|error| error.to_string()),
+                    .map_err(error_chain_message),
                 PrAction::Reopen if item.kind == ItemKind::PullRequest => {
                     reopen_pull_request(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Reopen if item.kind == ItemKind::Issue => {
                     reopen_issue(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Approve if item.kind == ItemKind::PullRequest => {
                     approve_pull_request(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::EnableAutoMerge if item.kind == ItemKind::PullRequest => {
                     enable_pull_request_auto_merge(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::DisableAutoMerge if item.kind == ItemKind::PullRequest => {
                     disable_pull_request_auto_merge(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Checkout => unreachable!("checkout is handled before remote PR actions"),
                 PrAction::RerunFailedChecks if item.kind == ItemKind::PullRequest => {
                     rerun_failed_pull_request_checks(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::UpdateBranch if item.kind == ItemKind::PullRequest => {
                     update_pull_request_branch(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::ConvertToDraft if item.kind == ItemKind::PullRequest => {
                     convert_pull_request_to_draft(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::MarkReadyForReview if item.kind == ItemKind::PullRequest => {
                     mark_pull_request_ready_for_review(&item.repo, number)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 PrAction::Merge
                 | PrAction::Approve
@@ -1042,7 +1042,7 @@ pub(super) fn start_pr_action(
                 let item_id = item.id.clone();
                 let actions = fetch_pull_request_action_hints(&item.repo, number)
                     .await
-                    .map_err(|error| error.to_string());
+                    .map_err(error_chain_message);
                 let _ = tx.send(AppMsg::ActionHintsLoaded { item_id, actions });
             }
             let _ = tx.send(AppMsg::RefreshStarted {
@@ -1074,7 +1074,7 @@ pub(super) fn start_milestones_load(item: WorkItem, tx: UnboundedSender<AppMsg>)
         let item_id = item.id.clone();
         let result = fetch_open_milestones(&item.repo)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(error_chain_message);
         let _ = tx.send(AppMsg::MilestonesLoaded { item_id, result });
     });
 }
@@ -1095,7 +1095,7 @@ pub(super) fn start_milestone_change(
                     changed_milestone = milestone.clone();
                     change_issue_milestone(&item.repo, number, milestone.as_ref().map(|m| m.number))
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 Err(error) => Err(error),
             },
@@ -1143,7 +1143,7 @@ pub(super) async fn resolve_milestone_choice(
         MilestoneChoice::Create(title) => create_milestone(repository, &title)
             .await
             .map(Some)
-            .map_err(|error| error.to_string()),
+            .map_err(error_chain_message),
     }
 }
 
@@ -1162,12 +1162,12 @@ pub(super) fn start_reviewer_action(
                 ReviewerAction::Request => {
                     request_pull_request_reviewers(&item.repo, number, &reviewers)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
                 ReviewerAction::Remove => {
                     remove_pull_request_reviewers(&item.repo, number, &reviewers)
                         .await
-                        .map_err(|error| error.to_string())
+                        .map_err(error_chain_message)
                 }
             },
             None => Err("selected item has no pull request number".to_string()),
@@ -1217,7 +1217,7 @@ pub(super) fn start_assignee_update(
             Some(number) => {
                 update_issue_assignees(&item.repo, number, item.kind, action, &assignees)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(error_chain_message)
             }
             None => Err("selected item has no issue or pull request number".to_string()),
         };

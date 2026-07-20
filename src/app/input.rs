@@ -983,7 +983,18 @@ pub(super) fn handle_mouse_with_sync(
     if app.help_dialog {
         return false;
     }
-    if app.message_dialog.is_some() {
+    if let Some(dialog) = app.message_dialog.as_ref() {
+        if dialog.kind != MessageDialogKind::RetryableError
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && rect_contains(
+                message_dialog_ok_area(message_dialog_area(dialog, area)),
+                mouse.column,
+                mouse.row,
+            )
+        {
+            app.dismiss_message_dialog();
+            return true;
+        }
         return false;
     }
     if app.command_palette.is_some()

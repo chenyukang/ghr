@@ -139,12 +139,12 @@ use render::*;
 use runtime::*;
 use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
 use status::{
-    comment_pending_dialog, compact_error_label, message_dialog, operation_error_body,
-    persistent_success_message_dialog, pr_action_error_body, pr_action_error_status,
-    pr_action_error_title, pr_action_success_body, pr_action_success_title, refresh_error_status,
-    retryable_message_dialog, reviewer_action_error_status, reviewer_action_error_title,
-    reviewer_action_success_body, reviewer_action_success_title, setup_dialog_from_error,
-    success_message_dialog,
+    comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
+    operation_error_body, persistent_success_message_dialog, pr_action_error_body,
+    pr_action_error_status, pr_action_error_title, pr_action_success_body, pr_action_success_title,
+    refresh_error_status, retryable_message_dialog, reviewer_action_error_status,
+    reviewer_action_error_title, reviewer_action_success_body, reviewer_action_success_title,
+    setup_dialog_from_error, success_message_dialog,
 };
 use switchers::*;
 use tasks::*;
@@ -1271,6 +1271,14 @@ fn inbox_thread_action_success_status(action: InboxThreadAction) -> &'static str
     }
 }
 
+fn inbox_thread_action_error_title(action: InboxThreadAction) -> &'static str {
+    match action {
+        InboxThreadAction::Mute => "Mute Thread Failed",
+        InboxThreadAction::Subscribe => "Subscribe to Thread Failed",
+        InboxThreadAction::Unsubscribe => "Unsubscribe from Thread Failed",
+    }
+}
+
 fn item_subscription_action_label(action: ItemSubscriptionAction) -> &'static str {
     match action {
         ItemSubscriptionAction::Subscribe => "subscribe item",
@@ -1301,6 +1309,21 @@ fn item_subscription_action_success_status(
         ItemSubscriptionAction::Unsubscribe => {
             format!("unsubscribed from {label} conversation")
         }
+    }
+}
+
+fn item_subscription_action_error_title(
+    action: ItemSubscriptionAction,
+    item_kind: ItemKind,
+) -> String {
+    let label = match item_kind {
+        ItemKind::PullRequest => "Pull Request",
+        ItemKind::Issue => "Issue",
+        ItemKind::Notification => "Item",
+    };
+    match action {
+        ItemSubscriptionAction::Subscribe => format!("Subscribe to {label} Failed"),
+        ItemSubscriptionAction::Unsubscribe => format!("Unsubscribe from {label} Failed"),
     }
 }
 
@@ -4455,18 +4478,7 @@ impl AppState {
                         ));
                     }
                     Err(error) => {
-                        let setup_dialog = setup_dialog_from_error(&error);
-                        if self.setup_dialog.is_none() {
-                            self.setup_dialog = setup_dialog;
-                        }
-                        if setup_dialog.is_none() {
-                            self.message_dialog = Some(message_dialog(
-                                "Review Failed",
-                                operation_error_body(&error),
-                            ));
-                        } else {
-                            self.message_dialog = None;
-                        }
+                        self.show_operation_error_dialog("Review Failed", &error);
                         self.status = "review submit failed".to_string();
                     }
                 }
@@ -4569,18 +4581,10 @@ impl AppState {
                         ));
                     }
                     Err(error) => {
-                        let setup_dialog = setup_dialog_from_error(&error);
-                        if self.setup_dialog.is_none() {
-                            self.setup_dialog = setup_dialog;
-                        }
-                        if setup_dialog.is_none() {
-                            self.message_dialog = Some(message_dialog(
-                                pr_action_error_title(action, item_kind),
-                                pr_action_error_body(&error),
-                            ));
-                        } else {
-                            self.message_dialog = None;
-                        }
+                        self.show_operation_error_dialog(
+                            pr_action_error_title(action, item_kind),
+                            &error,
+                        );
                         self.status = if action == PrAction::Merge {
                             format!(
                                 "pull request {} merge failed",
@@ -4808,19 +4812,22 @@ impl AppState {
                 match result {
                     Ok(save_error) => {
                         let changed = self.apply_notification_read_local(&thread_id);
-                        self.status = match (changed, save_error) {
+                        self.status = match (changed, save_error.as_deref()) {
                             (_, Some(error)) => {
                                 format!("notification marked read; snapshot save failed: {error}")
                             }
                             (true, None) => "notification marked read".to_string(),
                             (false, None) => "notification read synced".to_string(),
                         };
+                        if let Some(error) = save_error {
+                            self.show_operation_error_dialog(
+                                "Notification Snapshot Save Failed",
+                                &error,
+                            );
+                        }
                     }
                     Err(error) => {
-                        let setup_dialog = setup_dialog_from_error(&error);
-                        if self.setup_dialog.is_none() {
-                            self.setup_dialog = setup_dialog;
-                        }
+                        self.show_operation_error_dialog("Mark Notification Read Failed", &error);
                         self.status = format!(
                             "notification read sync failed: {}",
                             operation_error_body(&error)
@@ -4833,19 +4840,22 @@ impl AppState {
                 match result {
                     Ok(save_error) => {
                         let changed = self.apply_notification_done_local(&thread_id);
-                        self.status = match (changed, save_error) {
+                        self.status = match (changed, save_error.as_deref()) {
                             (_, Some(error)) => {
                                 format!("notification marked done; snapshot save failed: {error}")
                             }
                             (true, None) => "notification marked done".to_string(),
                             (false, None) => "notification done synced".to_string(),
                         };
+                        if let Some(error) = save_error {
+                            self.show_operation_error_dialog(
+                                "Notification Snapshot Save Failed",
+                                &error,
+                            );
+                        }
                     }
                     Err(error) => {
-                        let setup_dialog = setup_dialog_from_error(&error);
-                        if self.setup_dialog.is_none() {
-                            self.setup_dialog = setup_dialog;
-                        }
+                        self.show_operation_error_dialog("Mark Notification Done Failed", &error);
                         self.status = format!(
                             "notification done sync failed: {}",
                             operation_error_body(&error)
@@ -4856,7 +4866,7 @@ impl AppState {
             AppMsg::InboxMarkAllReadFinished { result } => match result {
                 Ok(save_error) => {
                     let changed = self.apply_all_notifications_read_local();
-                    self.status = match (changed, save_error) {
+                    self.status = match (changed, save_error.as_deref()) {
                         (_, Some(error)) => {
                             format!(
                                 "all inbox notifications marked read; snapshot save failed: {error}"
@@ -4865,12 +4875,12 @@ impl AppState {
                         (true, None) => "all inbox notifications marked read".to_string(),
                         (false, None) => "all inbox notifications already read".to_string(),
                     };
+                    if let Some(error) = save_error {
+                        self.show_operation_error_dialog("Inbox Snapshot Save Failed", &error);
+                    }
                 }
                 Err(error) => {
-                    let setup_dialog = setup_dialog_from_error(&error);
-                    if self.setup_dialog.is_none() {
-                        self.setup_dialog = setup_dialog;
-                    }
+                    self.show_operation_error_dialog("Mark All Notifications Read Failed", &error);
                     self.status = format!(
                         "mark all inbox read failed: {}",
                         operation_error_body(&error)
@@ -4882,10 +4892,10 @@ impl AppState {
                     self.status = inbox_thread_action_success_status(action).to_string();
                 }
                 Err(error) => {
-                    let setup_dialog = setup_dialog_from_error(&error);
-                    if self.setup_dialog.is_none() {
-                        self.setup_dialog = setup_dialog;
-                    }
+                    self.show_operation_error_dialog(
+                        inbox_thread_action_error_title(action),
+                        &error,
+                    );
                     self.status = format!(
                         "{} failed: {}",
                         inbox_thread_action_label(action),
@@ -4906,10 +4916,10 @@ impl AppState {
                     self.status = item_subscription_action_success_status(action, item_kind);
                 }
                 Err(error) => {
-                    let setup_dialog = setup_dialog_from_error(&error);
-                    if self.setup_dialog.is_none() {
-                        self.setup_dialog = setup_dialog;
-                    }
+                    self.show_operation_error_dialog(
+                        item_subscription_action_error_title(action, item_kind),
+                        &error,
+                    );
                     self.status = format!(
                         "{} failed: {}",
                         item_subscription_action_label(action),
@@ -5037,6 +5047,16 @@ impl AppState {
     fn dismiss_message_dialog(&mut self) {
         self.message_dialog = None;
         self.status = "message dismissed".to_string();
+    }
+
+    fn show_operation_error_dialog(&mut self, title: impl Into<String>, error: &str) {
+        let setup_dialog = setup_dialog_from_error(error);
+        if self.setup_dialog.is_none() {
+            self.setup_dialog = setup_dialog;
+        }
+        self.message_dialog = setup_dialog
+            .is_none()
+            .then(|| message_dialog(title, operation_error_body(error)));
     }
 
     fn dismiss_retryable_message_dialog(&mut self, cancel: bool) {
@@ -9434,7 +9454,7 @@ impl AppState {
             return;
         }
         self.review_submit_running = true;
-        self.message_dialog = Some(message_dialog(
+        self.message_dialog = Some(info_message_dialog(
             "Creating Pending Review",
             "Waiting for GitHub to create the pending review...",
         ));
@@ -9461,7 +9481,7 @@ impl AppState {
         let mode = dialog.mode;
         let item = dialog.item;
         self.review_submit_running = true;
-        self.message_dialog = Some(message_dialog(
+        self.message_dialog = Some(info_message_dialog(
             "Submitting Review",
             format!("Waiting for GitHub to {}...", event.label()),
         ));
@@ -9509,7 +9529,7 @@ impl AppState {
         self.comment_dialog = None;
         self.pr_action_dialog = None;
         self.review_submit_running = true;
-        self.message_dialog = Some(message_dialog(
+        self.message_dialog = Some(info_message_dialog(
             "Discarding Pending Review",
             "Waiting for GitHub to discard the pending review...",
         ));

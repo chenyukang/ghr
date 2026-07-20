@@ -16870,6 +16870,113 @@ fn milestone_change_failure_opens_message_dialog() {
 }
 
 #[test]
+fn approve_review_failure_opens_blocking_error_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.review_submit_running = true;
+    app.message_dialog = Some(info_message_dialog(
+        "Submitting Review",
+        "Waiting for GitHub to approve...",
+    ));
+    let error = anyhow::anyhow!(
+        "GitHub API request failed: HTTP 422: Unprocessable Entity; errors: Review Can not approve your own pull request"
+    )
+    .context("failed to submit review for chenyukang/ghr#81");
+
+    app.handle_msg(AppMsg::ReviewSubmitted {
+        item_id: "1".to_string(),
+        event: PullRequestReviewEvent::Approve,
+        result: Err(error_chain_message(error)),
+    });
+
+    assert!(!app.review_submit_running);
+    assert_eq!(app.status, "review submit failed");
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Review Failed");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
+    assert!(dialog.body.contains("HTTP 422"));
+    assert!(
+        dialog
+            .body
+            .contains("Can not approve your own pull request")
+    );
+    assert!(dialog.auto_close_at.is_none());
+}
+
+#[test]
+fn user_triggered_write_failures_open_error_dialogs() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+    app.handle_msg(AppMsg::NotificationReadFinished {
+        thread_id: "thread-1".to_string(),
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark Notification Read Failed")
+    );
+
+    app.handle_msg(AppMsg::NotificationDoneFinished {
+        thread_id: "thread-1".to_string(),
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark Notification Done Failed")
+    );
+
+    app.handle_msg(AppMsg::InboxMarkAllReadFinished {
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark All Notifications Read Failed")
+    );
+
+    app.handle_msg(AppMsg::InboxThreadActionFinished {
+        action: InboxThreadAction::Mute,
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mute Thread Failed")
+    );
+
+    app.handle_msg(AppMsg::ItemSubscriptionUpdated {
+        item_id: "1".to_string(),
+        item_kind: ItemKind::PullRequest,
+        action: ItemSubscriptionAction::Subscribe,
+        result: Err("HTTP 403".to_string()),
+    });
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Subscribe to Pull Request Failed");
+    assert_eq!(dialog.body, "HTTP 403");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
+}
+
+#[test]
+fn notification_snapshot_save_failure_opens_error_dialog() {
+    let mut app = AppState::new(SectionKind::Notifications, vec![test_section()]);
+
+    app.handle_msg(AppMsg::NotificationReadFinished {
+        thread_id: "thread-1".to_string(),
+        result: Ok(Some("database is locked".to_string())),
+    });
+
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Notification Snapshot Save Failed");
+    assert_eq!(dialog.body, "database is locked");
+    assert!(app.status.contains("snapshot save failed"));
+}
+
+#[test]
 fn message_dialog_enter_dismisses() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -16887,6 +16994,57 @@ fn message_dialog_enter_dismisses() {
 
     assert!(app.message_dialog.is_none());
     assert_eq!(app.status, "message dismissed");
+}
+
+#[test]
+fn message_dialog_esc_and_ok_click_dismiss() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Esc),
+        &config,
+        &store,
+        &tx
+    ));
+    assert!(app.message_dialog.is_none());
+
+    let area = Rect::new(0, 0, 120, 40);
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    let dialog = app.message_dialog.as_ref().expect("message dialog");
+    let ok_area = message_dialog_ok_area(message_dialog_area(dialog, area));
+    assert!(handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: ok_area.x,
+            row: ok_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    ));
+    assert!(app.message_dialog.is_none());
+}
+
+#[test]
+fn message_dialog_renders_ok_button() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+
+    terminal
+        .draw(|frame| draw(frame, &app, &paths))
+        .expect("draw");
+
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("[ OK ]"));
+    assert!(rendered.contains("Esc: close  Enter: OK"));
 }
 
 #[test]

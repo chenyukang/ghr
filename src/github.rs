@@ -4744,10 +4744,7 @@ async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
         bail!("GitHub backend expected a `gh api` request");
     }
     match crate::github_api::selected_backend() {
-        crate::github_api::GitHubBackend::DirectApi => {
-            let request = crate::github_api::parse_api_args(args)?;
-            crate::github_api::run_direct_request(&request).await
-        }
+        crate::github_api::GitHubBackend::DirectApi => crate::github_api::run_api(args).await,
         crate::github_api::GitHubBackend::GitHubCli => crate::github_gh::run_api(args).await,
     }
 }

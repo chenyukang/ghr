@@ -3275,7 +3275,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         expanded_comments: Vec::new(),
         details_scroll_by_item: HashMap::new(),
         selected_comment_index_by_item: HashMap::new(),
-        viewed_item_at: HashMap::new(),
+        seen_item_updated_at: HashMap::new(),
         selected_diff_file: HashMap::new(),
         selected_diff_line: HashMap::new(),
         diff_file_details_scroll: HashMap::new(),
@@ -3556,52 +3556,53 @@ fn section_switch_restores_conversation_details_position_for_current_item() {
 }
 
 #[test]
-fn viewed_item_at_marks_items_updated_after_last_view_unseen() {
+fn seen_item_updated_at_marks_newer_item_updates_unseen() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_before_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(seen_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
 
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 }
 
 #[test]
-fn focusing_details_marks_current_item_viewed_by_time() {
+fn focusing_details_marks_current_item_updated_at_seen() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     app.sections[0].items[0].updated_at = Some(updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at
+        .insert(key.clone(), seen_updated_at);
     assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 
     app.focus_details();
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+    assert_eq!(app.seen_item_updated_at.get(&key), Some(&updated_at));
 }
 
 #[test]
-fn focusing_details_refreshes_cached_comments_when_item_updated_after_view() {
+fn focusing_details_refreshes_cached_comments_when_item_updated_after_seen_version() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     app.details.insert(
         "1".to_string(),
         DetailState::Loaded(vec![comment("alice", "cached before update", None)]),
     );
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
 
     app.focus_details();
 
@@ -3613,12 +3614,12 @@ fn focusing_details_refreshes_cached_comments_when_item_updated_after_view() {
 #[test]
 fn comments_loaded_records_item_updated_at_for_cache_freshness() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
 
     app.handle_msg(AppMsg::CommentsLoaded {
         item_id: "1".to_string(),
@@ -3630,7 +3631,7 @@ fn comments_loaded_records_item_updated_at_for_cache_freshness() {
                 state: None,
                 url: None,
                 created_at: None,
-                updated_at: Some(updated_after_view),
+                updated_at: Some(newer_updated_at),
                 labels: None,
                 assignees: None,
                 comments: Some(1),
@@ -3710,13 +3711,12 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
 #[test]
 fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_before_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(seen_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
     app.handle_msg(AppMsg::CommentsLoaded {
@@ -3729,7 +3729,7 @@ fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
                 state: None,
                 url: None,
                 created_at: None,
-                updated_at: Some(updated_after_view),
+                updated_at: Some(newer_updated_at),
                 labels: None,
                 assignees: None,
                 comments: Some(3),

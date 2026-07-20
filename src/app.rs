@@ -1573,7 +1573,7 @@ struct AppState {
     diff_inline_comments_visible: bool,
     revealed_diff_inline_comments: HashMap<String, HashSet<usize>>,
     conversation_details_state: HashMap<String, ConversationDetailsState>,
-    viewed_item_at: HashMap<String, DateTime<Utc>>,
+    seen_item_updated_at: HashMap<String, DateTime<Utc>>,
     action_hints: HashMap<String, ActionHintState>,
     action_hints_stale: HashSet<String>,
     action_hints_refreshing: HashSet<String>,
@@ -2991,7 +2991,7 @@ impl AppState {
             diff_inline_comments_visible: true,
             revealed_diff_inline_comments: HashMap::new(),
             conversation_details_state,
-            viewed_item_at: ui_state.viewed_item_at.clone(),
+            seen_item_updated_at: ui_state.seen_item_updated_at.clone(),
             action_hints: HashMap::new(),
             action_hints_stale: HashSet::new(),
             action_hints_refreshing: HashSet::new(),
@@ -3248,7 +3248,7 @@ impl AppState {
                 .iter()
                 .map(|(item_id, state)| (item_id.clone(), state.selected_comment_index))
                 .collect(),
-            viewed_item_at: self.viewed_item_at.clone(),
+            seen_item_updated_at: self.seen_item_updated_at.clone(),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
@@ -12048,9 +12048,9 @@ impl AppState {
         let Some(updated_at) = item.updated_at else {
             return false;
         };
-        self.viewed_item_at
+        self.seen_item_updated_at
             .get(&key)
-            .is_some_and(|viewed_at| updated_at > *viewed_at)
+            .is_some_and(|seen_updated_at| updated_at > *seen_updated_at)
     }
 
     fn mark_current_details_stale_if_unseen(&mut self) {
@@ -12072,8 +12072,11 @@ impl AppState {
         {
             return;
         }
+        let Some(updated_at) = item.updated_at else {
+            return;
+        };
         if let Some(key) = work_item_details_memory_key(&item) {
-            self.viewed_item_at.insert(key, Utc::now());
+            self.seen_item_updated_at.insert(key, updated_at);
         }
     }
 

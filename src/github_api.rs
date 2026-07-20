@@ -3,6 +3,9 @@ use std::{env, sync::OnceLock};
 use anyhow::{Context, Result, anyhow, bail};
 use octocrab::Octocrab;
 use serde_json::{Map, Value};
+use tracing::{debug, error};
+
+use crate::log::{GhLogRequest, fail_api_request, finish_api_request, start_gh_request};
 
 const TOKEN_ENV_VARS: [&str; 3] = ["GHR_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
 
@@ -48,46 +51,204 @@ pub fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
     parse_api_args_impl(args)
 }
 
-pub async fn run_direct_request(request: &ApiRequest) -> Result<String> {
+pub async fn run_api(args: &[String]) -> Result<String> {
+    let request = match parse_api_args(args) {
+        Ok(request) => request,
+        Err(request_error) => {
+            let command = unparsed_request_display(args);
+            let log_request = start_gh_request("api", &command, None);
+            debug!(kind = "api", command, "GitHub API request started");
+            log_request_failed(log_request, &command, &request_error);
+            return Err(request_error);
+        }
+    };
+    let command = request_display(&request);
+    let log_request = start_gh_request("api", &command, None);
+    debug!(kind = "api", command, "GitHub API request started");
+
+    run_direct_request(&request, log_request, &command).await
+}
+
+async fn run_direct_request(
+    request: &ApiRequest,
+    log_request: GhLogRequest,
+    command: &str,
+) -> Result<String> {
     let graphql = request.graphql;
-    let client = client()?;
+    let client = match client() {
+        Ok(client) => client,
+        Err(request_error) => {
+            log_request_failed(log_request, command, &request_error);
+            return Err(request_error);
+        }
+    };
     let path = normalized_path(&request.path);
 
-    let response = if request.method == "GET" {
-        let path = append_query_fields(&path, &request.fields)?;
-        let headers = request_headers(&request.headers)?;
-        client._get_with_headers(path, Some(headers)).await?
-    } else {
-        let body = if request.graphql {
-            graphql_body(request.fields.clone())?
+    let response_result: Result<_> = async {
+        if request.method == "GET" {
+            let path = append_query_fields(&path, &request.fields)?;
+            let headers = request_headers(&request.headers)?;
+            Ok(client._get_with_headers(path, Some(headers)).await?)
         } else {
-            Value::Object(request.fields.clone())
-        };
-        match request.method.as_str() {
-            "POST" => client._post(path, Some(&body)).await?,
-            "PATCH" => client._patch(path, Some(&body)).await?,
-            "PUT" => client._put(path, Some(&body)).await?,
-            "DELETE" => client._delete(path, Some(&body)).await?,
-            method => bail!("direct GitHub API backend does not support method {method}"),
+            let body = if request.graphql {
+                graphql_body(request.fields.clone())?
+            } else {
+                Value::Object(request.fields.clone())
+            };
+            match request.method.as_str() {
+                "POST" => Ok(client._post(path, Some(&body)).await?),
+                "PATCH" => Ok(client._patch(path, Some(&body)).await?),
+                "PUT" => Ok(client._put(path, Some(&body)).await?),
+                "DELETE" => Ok(client._delete(path, Some(&body)).await?),
+                method => bail!("direct GitHub API backend does not support method {method}"),
+            }
+        }
+    }
+    .await;
+    let response = match response_result {
+        Ok(response) => response,
+        Err(request_error) => {
+            log_request_failed(log_request, command, &request_error);
+            return Err(request_error);
         }
     };
 
     let status = response.status();
-    let body = client
+    let body = match client
         .body_to_string(response)
         .await
-        .context("failed to read GitHub API response")?;
+        .context("failed to read GitHub API response")
+    {
+        Ok(body) => body,
+        Err(request_error) => {
+            log_request_finished(
+                log_request,
+                command,
+                status.as_u16(),
+                0,
+                Some(&request_error.to_string()),
+            );
+            return Err(request_error);
+        }
+    };
     if !status.is_success() {
         let message = github_error_message(&body);
-        bail!(
+        let request_error = anyhow!(
             "GitHub API request failed: HTTP {}: {message}",
             status.as_u16()
         );
+        log_request_finished(
+            log_request,
+            command,
+            status.as_u16(),
+            body.len(),
+            Some(&message),
+        );
+        return Err(request_error);
     }
     if graphql && let Some(message) = graphql_error_message(&body) {
-        bail!("GitHub GraphQL request failed: {message}");
+        let request_error = anyhow!("GitHub GraphQL request failed: {message}");
+        log_request_finished(
+            log_request,
+            command,
+            status.as_u16(),
+            body.len(),
+            Some(&message),
+        );
+        return Err(request_error);
     }
+    log_request_succeeded(log_request, command, status.as_u16(), body.len());
     Ok(body)
+}
+
+fn request_display(request: &ApiRequest) -> String {
+    let mut details = Vec::new();
+    if request.graphql
+        && let Some(query) = request.fields.get("query").and_then(Value::as_str)
+    {
+        details.push(format!("document=<{} chars>", query.chars().count()));
+    }
+    details.extend(
+        request
+            .fields
+            .iter()
+            .filter(|(name, _)| !request.graphql || name.as_str() != "query")
+            .map(|(name, value)| format!("{name}={}", request_value_display(value))),
+    );
+
+    let request_line = format!("{} {}", request.method, normalized_path(&request.path));
+    if details.is_empty() {
+        request_line
+    } else {
+        format!("{request_line}  {}", details.join("  "))
+    }
+}
+
+fn request_value_display(value: &Value) -> String {
+    let value = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    let char_count = value.chars().count();
+    if char_count > 80 || value.contains(['\r', '\n']) {
+        format!("<{char_count} chars>")
+    } else if value.is_empty() || value.chars().any(char::is_whitespace) {
+        format!("{value:?}")
+    } else {
+        value
+    }
+}
+
+fn unparsed_request_display(args: &[String]) -> String {
+    let args = args
+        .iter()
+        .skip(1)
+        .map(|arg| {
+            if let Some(query) = arg.strip_prefix("query=") {
+                format!("query=<{} chars>", query.chars().count())
+            } else {
+                request_value_display(&Value::String(arg.clone()))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("api {args}").trim_end().to_string()
+}
+
+fn log_request_succeeded(request: GhLogRequest, command: &str, status: u16, response_bytes: usize) {
+    debug!(
+        kind = "api",
+        command, status, response_bytes, "GitHub API request finished"
+    );
+    finish_api_request(request, status, true, response_bytes, None);
+}
+
+fn log_request_finished(
+    request: GhLogRequest,
+    command: &str,
+    status: u16,
+    response_bytes: usize,
+    message: Option<&str>,
+) {
+    error!(
+        kind = "api",
+        command,
+        status,
+        response_bytes,
+        message = message.unwrap_or("unknown error"),
+        "GitHub API request returned failure"
+    );
+    finish_api_request(request, status, false, response_bytes, message);
+}
+
+fn log_request_failed(request: GhLogRequest, command: &str, request_error: &anyhow::Error) {
+    error!(
+        kind = "api",
+        command,
+        error = %request_error,
+        "GitHub API request failed"
+    );
+    fail_api_request(request, request_error);
 }
 
 fn client() -> Result<&'static Octocrab> {
@@ -299,22 +460,49 @@ fn graphql_body(mut fields: Map<String, Value>) -> Result<Value> {
 }
 
 fn github_error_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            let body = body.trim();
-            if body.is_empty() {
-                "empty response".to_string()
-            } else {
-                body.to_string()
-            }
-        })
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return non_empty_error_body(body);
+    };
+
+    let mut parts = value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(errors) = value.get("errors").and_then(Value::as_array) {
+        let details = errors
+            .iter()
+            .map(|error| {
+                error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string())
+            })
+            .collect::<Vec<_>>();
+        if !details.is_empty() {
+            parts.push(format!("errors: {}", details.join("; ")));
+        }
+    }
+    if let Some(documentation_url) = value.get("documentation_url").and_then(Value::as_str) {
+        parts.push(format!("documentation: {documentation_url}"));
+    }
+
+    if parts.is_empty() {
+        non_empty_error_body(body)
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn non_empty_error_body(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        "empty response".to_string()
+    } else {
+        body.to_string()
+    }
 }
 
 fn graphql_error_message(body: &str) -> Option<String> {
@@ -354,6 +542,33 @@ mod tests {
         assert!(request.graphql);
         assert_eq!(request.fields["number"], 57);
         assert_eq!(request.fields["enabled"], true);
+    }
+
+    #[test]
+    fn api_request_display_uses_http_method_and_path() {
+        let request = parse_api_args(&strings(&["api", "user"])).unwrap();
+
+        assert_eq!(request_display(&request), "GET /user");
+    }
+
+    #[test]
+    fn graphql_request_display_summarizes_document_and_keeps_variables() {
+        let query = "query($owner: String!) {\n  repository(owner: $owner) { name }\n}";
+        let request = parse_api_args(&strings(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            "owner=rust-lang",
+        ]))
+        .unwrap();
+
+        let display = request_display(&request);
+        assert!(display.starts_with("POST /graphql  document=<"));
+        assert!(display.contains("owner=rust-lang"));
+        assert!(!display.contains("repository"));
+        assert!(!display.contains('\n'));
     }
 
     #[test]
@@ -403,6 +618,20 @@ mod tests {
             graphql_error_message(body).as_deref(),
             Some("Bad credentials; denied")
         );
+    }
+
+    #[test]
+    fn rest_error_message_keeps_validation_details() {
+        let body = r#"{
+            "message":"Validation Failed",
+            "errors":[{"resource":"Search","field":"q","code":"invalid"}],
+            "documentation_url":"https://docs.github.com/rest/search/search"
+        }"#;
+
+        let message = github_error_message(body);
+        assert!(message.contains("Validation Failed"));
+        assert!(message.contains(r#""field":"q""#));
+        assert!(message.contains("documentation: https://docs.github.com/rest/search/search"));
     }
 
     fn strings(values: &[&str]) -> Vec<String> {

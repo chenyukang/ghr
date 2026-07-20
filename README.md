@@ -205,7 +205,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
 | `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
 | `Info` | Show terminal, version, config/db/log paths, cache counts, runtime state, and ghr system diagnostics in a scrollable popup |
-| `Log` | Show recent `gh` requests with timestamps, status, output sizes, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
+| `Log` | Show recent direct API and `gh api` requests with timestamps, status, response sizes, errors, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
 
 Diff review ranges:
 
@@ -342,7 +342,7 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 
 Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 
-Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed `gh` executions and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. The `Log` command also keeps an in-memory list of recent `gh` calls for the current session, including GitHub rate-limit failures. `RUST_LOG` still overrides this config value when it is set.
+Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, direct GitHub API and `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed API requests, failed `gh` executions, and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. The `Log` command also keeps an in-memory list of recent direct API and `gh` calls for the current session, including response errors and GitHub rate-limit failures. `RUST_LOG` still overrides this config value when it is set.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

@@ -152,7 +152,7 @@ pub(super) fn command_palette_commands(
             "Log",
             "",
             "General",
-            "Show recent gh requests, timestamps, status, and rate-limit events",
+            "Show recent GitHub API requests, status, errors, and rate-limit events",
             PaletteAction::ShowGhLog,
         ),
         palette_command(

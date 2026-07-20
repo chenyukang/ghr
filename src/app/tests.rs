@@ -17201,6 +17201,7 @@ fn user_triggered_write_failures_open_error_dialogs() {
 
     app.handle_msg(AppMsg::NotificationDoneFinished {
         thread_id: "thread-1".to_string(),
+        done_cutoff: Utc::now(),
         result: Err("HTTP 403".to_string()),
     });
     assert_eq!(

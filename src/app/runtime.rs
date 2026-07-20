@@ -102,14 +102,17 @@ pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<
         format!("ignored items: {}", app.ignored_items.len()),
         format!("recent items: {}", app.recent_items.len()),
         format!("recent commands: {}", app.recent_commands.len()),
-        format!("gh log entries: {}", gh_log_entries.len()),
+        format!("GitHub request log entries: {}", gh_log_entries.len()),
     ]
 }
 
 pub(super) fn gh_log_lines_with_details() -> (Vec<String>, Vec<Vec<String>>) {
     let entries = recent_gh_log_entries();
     if entries.is_empty() {
-        return (vec!["No gh requests logged yet".to_string()], Vec::new());
+        return (
+            vec!["No GitHub requests logged yet".to_string()],
+            Vec::new(),
+        );
     }
 
     let lines = entries.iter().map(gh_log_entry_line).collect();
@@ -118,18 +121,21 @@ pub(super) fn gh_log_lines_with_details() -> (Vec<String>, Vec<Vec<String>>) {
 }
 
 fn gh_log_detail_lines(entry: &GhLogEntry) -> Vec<String> {
+    let direct_api = entry.kind == "api";
     let mut lines = vec![
         "Result".to_string(),
         format!("  {}", gh_log_result_label(entry)),
         format!("  Status      {}", entry.status),
         format!("  Duration    {} ms", entry.duration_ms),
-        format!("  Kind        {}", entry.kind),
+        format!("  Backend     {}", gh_log_backend_label(entry)),
         String::new(),
-        "Command".to_string(),
+        if direct_api { "Request" } else { "Command" }.to_string(),
     ];
     push_wrapped_detail_block(&mut lines, &entry.command);
-    lines.extend([String::new(), "Working Directory".to_string()]);
-    push_wrapped_detail_block(&mut lines, entry.cwd.as_deref().unwrap_or("(none)"));
+    if !direct_api {
+        lines.extend([String::new(), "Working Directory".to_string()]);
+        push_wrapped_detail_block(&mut lines, entry.cwd.as_deref().unwrap_or("(none)"));
+    }
     lines.extend([
         String::new(),
         "Timing".to_string(),
@@ -147,11 +153,21 @@ fn gh_log_detail_lines(entry: &GhLogEntry) -> Vec<String> {
                 .with_timezone(&Local)
                 .format("%Y-%m-%d %H:%M:%S")
         ),
-        String::new(),
-        "Output".to_string(),
-        format!("  stdout      {}", format_log_bytes(entry.stdout_bytes)),
-        format!("  stderr      {}", format_log_bytes(entry.stderr_bytes)),
     ]);
+    if entry.kind == "api" {
+        lines.extend([
+            String::new(),
+            "Response".to_string(),
+            format!("  body        {}", format_log_bytes(entry.stdout_bytes)),
+        ]);
+    } else {
+        lines.extend([
+            String::new(),
+            "Output".to_string(),
+            format!("  stdout      {}", format_log_bytes(entry.stdout_bytes)),
+            format!("  stderr      {}", format_log_bytes(entry.stderr_bytes)),
+        ]);
+    }
     if let Some(message) = &entry.message {
         lines.extend([String::new(), "Message".to_string()]);
         push_wrapped_detail_block(&mut lines, message);
@@ -207,6 +223,14 @@ fn gh_log_result_label(entry: &GhLogEntry) -> &'static str {
         "Success"
     } else {
         "Failed"
+    }
+}
+
+fn gh_log_backend_label(entry: &GhLogEntry) -> &str {
+    match entry.kind.as_str() {
+        "api" => "Direct API",
+        "gh" | "gh api" => "GitHub CLI",
+        _ => entry.kind.as_str(),
     }
 }
 
@@ -379,5 +403,38 @@ fn github_auth_summary() -> String {
             }
         }
         Err(error) => format!("unavailable ({error})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    #[test]
+    fn direct_api_log_detail_uses_compact_request_layout() {
+        let now = Utc::now();
+        let entry = GhLogEntry {
+            started_at: now,
+            finished_at: now,
+            duration_ms: 1022,
+            kind: "api".to_string(),
+            command: "POST /graphql  document=<1200 chars>  owner=rust-lang".to_string(),
+            cwd: None,
+            status: "HTTP 200".to_string(),
+            success: true,
+            stdout_bytes: 42,
+            stderr_bytes: 0,
+            message: None,
+            rate_limited: false,
+        };
+
+        let lines = gh_log_detail_lines(&entry);
+        assert!(lines.iter().any(|line| line == "  Backend     Direct API"));
+        assert!(lines.iter().any(|line| line == "Request"));
+        assert!(lines.iter().any(|line| line.contains("POST /graphql")));
+        assert!(!lines.iter().any(|line| line == "Working Directory"));
+        assert!(lines.iter().any(|line| line == "Response"));
     }
 }

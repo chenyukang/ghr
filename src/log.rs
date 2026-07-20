@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 const MAX_GH_LOG_ENTRIES: usize = 200;
 const MAX_GH_LOG_COMMAND_CHARS: usize = 1200;
-const MAX_GH_LOG_MESSAGE_CHARS: usize = 280;
+const MAX_GH_LOG_MESSAGE_CHARS: usize = 1200;
 
 static GH_LOG: OnceLock<Mutex<VecDeque<GhLogEntry>>> = OnceLock::new();
 
@@ -74,6 +74,50 @@ pub fn finish_gh_request(request: GhLogRequest, output: &Output) {
         stderr_bytes: output.stderr.len(),
         message,
         rate_limited,
+    });
+}
+
+pub fn finish_api_request(
+    request: GhLogRequest,
+    status: u16,
+    success: bool,
+    response_bytes: usize,
+    message: Option<&str>,
+) {
+    let message = message.map(|message| truncate_gh_log_text(message, MAX_GH_LOG_MESSAGE_CHARS));
+    let rate_limited =
+        status == 429 || message.as_deref().is_some_and(looks_like_github_rate_limit);
+    push_gh_log_entry(GhLogEntry {
+        started_at: request.started_at,
+        finished_at: Utc::now(),
+        duration_ms: request.started_instant.elapsed().as_millis(),
+        kind: request.kind,
+        command: request.command,
+        cwd: request.cwd,
+        status: format!("HTTP {status}"),
+        success,
+        stdout_bytes: response_bytes,
+        stderr_bytes: 0,
+        message,
+        rate_limited,
+    });
+}
+
+pub fn fail_api_request(request: GhLogRequest, error: impl std::fmt::Display) {
+    let message = error.to_string();
+    push_gh_log_entry(GhLogEntry {
+        started_at: request.started_at,
+        finished_at: Utc::now(),
+        duration_ms: request.started_instant.elapsed().as_millis(),
+        kind: request.kind,
+        command: request.command,
+        cwd: request.cwd,
+        status: "request failed".to_string(),
+        success: false,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        rate_limited: looks_like_github_rate_limit(&message),
+        message: Some(truncate_gh_log_text(&message, MAX_GH_LOG_MESSAGE_CHARS)),
     });
 }
 
@@ -161,7 +205,7 @@ mod tests {
     use std::io::Error;
 
     #[test]
-    fn recent_entries_are_newest_first_and_flag_rate_limits() {
+    fn recent_entries_include_cli_and_api_request_details() {
         clear_gh_log_entries();
         let request = start_gh_request("gh api", "gh api /rate_limit", None);
         fail_gh_request_to_start(request, &Error::other("HTTP 403: API rate limit exceeded"));
@@ -176,6 +220,32 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("API rate limit exceeded"))
+        );
+
+        let request = start_gh_request(
+            "api",
+            "api search/issues -f q=repo:rust-lang/triagebot",
+            None,
+        );
+        finish_api_request(
+            request,
+            422,
+            false,
+            134,
+            Some(r#"{"message":"Validation Failed","errors":[{"field":"q","code":"invalid"}]}"#),
+        );
+
+        let entries = recent_gh_log_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "api");
+        assert_eq!(entries[0].status, "HTTP 422");
+        assert_eq!(entries[0].stdout_bytes, 134);
+        assert!(!entries[0].success);
+        assert!(
+            entries[0]
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Validation Failed"))
         );
     }
 }

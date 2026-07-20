@@ -249,6 +249,37 @@ pub(super) struct DiffInlineCommentSummary {
     pub(super) has_outdated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DiffGutterWidths {
+    old: usize,
+    new: usize,
+}
+
+impl Default for DiffGutterWidths {
+    fn default() -> Self {
+        Self { old: 4, new: 4 }
+    }
+}
+
+impl DiffGutterWidths {
+    fn for_file(file: &DiffFile) -> Self {
+        Self::for_lines(file.hunks.iter().flat_map(|hunk| hunk.lines.iter()))
+    }
+
+    fn for_lines<'a>(lines: impl IntoIterator<Item = &'a DiffLine>) -> Self {
+        let mut widths = Self::default();
+        for line in lines {
+            if let Some(old_line) = line.old_line {
+                widths.old = widths.old.max(diff_line_number_width(old_line));
+            }
+            if let Some(new_line) = line.new_line {
+                widths.new = widths.new.max(diff_line_number_width(new_line));
+            }
+        }
+        widths
+    }
+}
+
 impl From<&DiffReviewTarget> for DiffInlineCommentKey {
     fn from(target: &DiffReviewTarget) -> Self {
         Self {
@@ -1413,6 +1444,20 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
         builder.push_styled_key_value_limited("reviewers", reviewer_segments, 2);
     }
     builder.push_link_value("url", &item.url);
+    if matches!(item.kind, ItemKind::Issue) && !item.linked_pull_requests.is_empty() {
+        builder.push_styled_key_value_limited(
+            "linked PRs",
+            linked_pull_request_segments(&item.linked_pull_requests, &item.repo),
+            3,
+        );
+    }
+    if matches!(item.kind, ItemKind::PullRequest) && !item.linked_issues.is_empty() {
+        builder.push_styled_key_value_limited(
+            "linked issues",
+            linked_issue_segments(&item.linked_issues, &item.repo),
+            3,
+        );
+    }
 
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
         builder.push_blank();
@@ -1457,7 +1502,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                         if position > 0 {
                             builder.push_blank();
                         }
-                        push_timeline_activity(&mut builder, &comments[*index]);
+                        push_timeline_activity(&mut builder, app, &comments[*index]);
                     }
                     builder.push_blank();
                 }
@@ -1734,13 +1779,13 @@ pub(super) fn assignee_detail_segments(item: &WorkItem) -> Vec<DetailSegment> {
     }
     segments.push(DetailSegment::raw("  "));
     segments.push(DetailSegment::action(
-        "@ assign",
+        "@assign",
         DetailAction::AssignAssignee,
     ));
     if !item.assignees.is_empty() {
         segments.push(DetailSegment::raw("  "));
         segments.push(DetailSegment::action(
-            "- unassign",
+            "-unassign",
             DetailAction::UnassignAssignee,
         ));
     }
@@ -1758,6 +1803,133 @@ pub(super) fn subscription_detail_segments(item: &WorkItem) -> Vec<DetailSegment
             "subscribe",
             DetailAction::SubscribeItem,
         )]
+    }
+}
+
+pub(super) fn linked_pull_request_segments(
+    pull_requests: &[LinkedPullRequest],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
+    linked_item_segments(pull_requests, current_repo)
+}
+
+pub(super) fn linked_issue_segments(
+    issues: &[LinkedIssue],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
+    linked_item_segments(issues, current_repo)
+}
+
+trait LinkedDetailItem {
+    fn repository(&self) -> &str;
+    fn number(&self) -> u64;
+    fn title(&self) -> &str;
+    fn state(&self) -> Option<&str>;
+    fn url(&self) -> &str;
+}
+
+impl LinkedDetailItem for LinkedPullRequest {
+    fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    fn number(&self) -> u64 {
+        self.number
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl LinkedDetailItem for LinkedIssue {
+    fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    fn number(&self) -> u64 {
+        self.number
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn state(&self) -> Option<&str> {
+        self.state.as_deref()
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+fn linked_item_segments<T: LinkedDetailItem>(
+    items: &[T],
+    current_repo: &str,
+) -> Vec<DetailSegment> {
+    let mut segments = Vec::new();
+    for item in items {
+        if !segments.is_empty() {
+            segments.push(DetailSegment::raw("; "));
+        }
+        segments.push(DetailSegment::link(
+            linked_item_label(item, current_repo),
+            item.url().to_string(),
+        ));
+        if !item.title().trim().is_empty() {
+            segments.push(DetailSegment::raw(format!(" {}", item.title().trim())));
+        }
+        if let Some(state) = useful_meta_value(item.state()) {
+            segments.push(DetailSegment::raw(" "));
+            segments.push(DetailSegment::styled(
+                linked_item_state_label(state),
+                linked_item_state_style(state),
+            ));
+        }
+    }
+    segments
+}
+
+fn linked_item_label<T: LinkedDetailItem>(item: &T, current_repo: &str) -> String {
+    if item.repository().is_empty() || item.repository() == current_repo {
+        format!("#{}", item.number())
+    } else {
+        format!("{}#{}", item.repository(), item.number())
+    }
+}
+
+fn linked_item_state_label(state: &str) -> String {
+    state.to_ascii_lowercase()
+}
+
+fn linked_item_state_style(state: &str) -> Style {
+    match state.to_ascii_lowercase().as_str() {
+        "open" => active_theme()
+            .panel()
+            .fg(active_theme().success)
+            .add_modifier(Modifier::BOLD),
+        "draft" => active_theme()
+            .panel()
+            .fg(active_theme().warning)
+            .add_modifier(Modifier::BOLD),
+        "merged" => active_theme()
+            .panel()
+            .fg(active_theme().link)
+            .add_modifier(Modifier::BOLD),
+        "closed" => active_theme()
+            .panel()
+            .fg(active_theme().error)
+            .add_modifier(Modifier::BOLD),
+        _ => active_theme().muted(),
     }
 }
 
@@ -1803,6 +1975,7 @@ pub(super) fn push_diff(
         context.file_link_base.as_ref(),
         context.selected_line,
     );
+    let gutter_widths = DiffGutterWidths::for_file(file);
     for metadata in &file.metadata {
         builder.push_line(vec![DetailSegment::styled(
             truncate_inline(metadata, builder.width),
@@ -1843,6 +2016,7 @@ pub(super) fn push_diff(
                     index == context.selected_line || index_in_range(index, context.selected_range)
                 }),
                 inline_summary,
+                gutter_widths,
             );
             if context.comments.is_some() {
                 if context.diff_inline_comments_visible {
@@ -2026,11 +2200,12 @@ pub(super) fn push_diff_line(
     review_index: Option<usize>,
     selected: bool,
     inline_comment_summary: DiffInlineCommentSummary,
+    gutter_widths: DiffGutterWidths,
 ) {
     if let Some(review_index) = review_index {
         builder.mark_diff_line(review_index, selected);
     }
-    let gutter = diff_gutter(line.old_line, line.new_line);
+    let gutter = diff_gutter(line.old_line, line.new_line, gutter_widths);
     let (marker, mut style) = match line.kind {
         DiffLineKind::Context => (" ", diff_context_style()),
         DiffLineKind::Added => ("+", diff_added_style()),
@@ -2141,7 +2316,7 @@ pub(super) fn push_diff_inline_comment(
     if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            "+ react",
+            "+react",
             DetailAction::ReactComment(index),
         ));
     }
@@ -2680,13 +2855,21 @@ pub(super) fn diff_review_side_from_label(label: &str) -> Option<DiffReviewSide>
     }
 }
 
-pub(super) fn diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
+fn diff_line_number_width(line: usize) -> usize {
+    line.to_string().len().max(4)
+}
+
+pub(super) fn diff_gutter(
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    widths: DiffGutterWidths,
+) -> String {
     let old = old_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
+        .map(|line| format!("{line:>width$}", width = widths.old))
+        .unwrap_or_else(|| " ".repeat(widths.old));
     let new = new_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
+        .map(|line| format!("{line:>width$}", width = widths.new))
+        .unwrap_or_else(|| " ".repeat(widths.new));
     format!("{old} {new} │ ")
 }
 
@@ -2789,7 +2972,7 @@ pub(super) fn push_reactions_line(
         } else {
             "  "
         }));
-        segments.push(DetailSegment::action("+ react", DetailAction::ReactItem));
+        segments.push(DetailSegment::action("+react", DetailAction::ReactItem));
     }
     if can_reply {
         segments.push(DetailSegment::raw(if reactions.is_empty() && !can_react {
@@ -2922,7 +3105,7 @@ pub(super) fn push_comment(
     if comment.can_react() {
         header.push(DetailSegment::raw("  "));
         header.push(DetailSegment::action(
-            "+ react",
+            "+react",
             DetailAction::ReactComment(index),
         ));
     }
@@ -3022,7 +3205,11 @@ pub(super) fn push_comment(
     });
 }
 
-pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &CommentPreview) {
+pub(super) fn push_timeline_activity(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    activity: &CommentPreview,
+) {
     let timestamp = activity
         .updated_at
         .as_ref()
@@ -3039,6 +3226,16 @@ pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &Co
         header.push(DetailSegment::link("open", url.clone()));
     }
     builder.push_prefixed_wrapped_limited(header, prefix.clone(), DESCRIPTION_BODY_PADDING, 2);
+    if let Some(commit_activity) = &activity.commit_activity {
+        push_timeline_commit_activity(
+            builder,
+            app,
+            &prefix,
+            commit_activity.total_count,
+            &commit_activity.commits,
+        );
+        return;
+    }
     builder.push_markdown_block_prefixed(
         &activity.body,
         "No activity body.",
@@ -3049,6 +3246,91 @@ pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &Co
             right_padding: DESCRIPTION_BODY_PADDING,
         },
     );
+}
+
+fn push_timeline_commit_activity(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    prefix: &[DetailSegment],
+    total_count: usize,
+    commits: &[PullRequestCommitPreview],
+) {
+    builder.push_prefixed_wrapped_limited(
+        vec![DetailSegment::styled(
+            format!(
+                "pushed {total_count} commit{}",
+                if total_count == 1 { "" } else { "s" }
+            ),
+            active_theme().panel().add_modifier(Modifier::BOLD),
+        )],
+        prefix.to_vec(),
+        DESCRIPTION_BODY_PADDING,
+        2,
+    );
+    builder.push_gap_line(prefix);
+
+    for commit in commits {
+        push_timeline_commit_row(builder, app, prefix, commit);
+    }
+    if total_count > commits.len() {
+        builder.push_prefixed_wrapped_limited(
+            vec![DetailSegment::styled(
+                format!("... {} more commits", total_count - commits.len()),
+                active_theme().muted(),
+            )],
+            prefix.to_vec(),
+            DESCRIPTION_BODY_PADDING,
+            1,
+        );
+    }
+}
+
+fn push_timeline_commit_row(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    prefix: &[DetailSegment],
+    commit: &PullRequestCommitPreview,
+) {
+    let mut segments = vec![commit_status_segment(commit_status_for(app, &commit.sha))];
+    let short_sha = short_commit_sha(&commit.sha).to_string();
+    if let Some(url) = commit.url.as_ref().filter(|url| !url.trim().is_empty()) {
+        segments.push(DetailSegment::link(short_sha, url.clone()));
+        segments.push(DetailSegment::raw(" "));
+        segments.push(DetailSegment::link(commit.title.clone(), url.clone()));
+    } else {
+        segments.push(DetailSegment::styled(short_sha, active_theme().muted()));
+        segments.push(DetailSegment::raw(" "));
+        segments.push(DetailSegment::raw(commit.title.clone()));
+    }
+    builder.push_prefixed_wrapped_limited(segments, prefix.to_vec(), DESCRIPTION_BODY_PADDING, 3);
+}
+
+fn commit_status_for(app: &AppState, sha: &str) -> Option<CommitCheckStatus> {
+    let item = app.current_item()?;
+    let ActionHintState::Loaded(hints) = app.action_hints.get(&item.id)? else {
+        return None;
+    };
+    hints.commit_statuses.get(sha).copied()
+}
+
+fn commit_status_segment(status: Option<CommitCheckStatus>) -> DetailSegment {
+    let (symbol, color) = match status {
+        Some(CommitCheckStatus::Success) => ("✓ ", active_theme().success),
+        Some(CommitCheckStatus::Failure) => ("✗ ", active_theme().error),
+        Some(CommitCheckStatus::Pending) => ("• ", active_theme().warning),
+        None => ("  ", active_theme().subtle),
+    };
+    DetailSegment::styled(
+        symbol,
+        active_theme()
+            .panel()
+            .fg(color)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn short_commit_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 pub(super) fn push_comment_body_gap(
@@ -3233,6 +3515,7 @@ pub(super) fn push_inline_review_context(
 
     let focus_span = inline_diff_focus_span(&hunk.lines, review);
     let (start, end) = inline_diff_context_range(hunk.lines.len(), focus_span);
+    let gutter_widths = DiffGutterWidths::for_lines(hunk.lines.iter());
     let prefix = comment_line_prefix(selected, depth);
     let right_padding = comment_right_padding(selected);
     let original_width = builder.width;
@@ -3256,7 +3539,7 @@ pub(super) fn push_inline_review_context(
     for (offset, line) in hunk.lines[start..end].iter().enumerate() {
         let index = start + offset;
         let focused = focus_span.is_some_and(|(start, end)| (start..=end).contains(&index));
-        push_inline_diff_line(builder, line, prefix.as_slice(), focused);
+        push_inline_diff_line(builder, line, prefix.as_slice(), focused, gutter_widths);
     }
     if end < hunk.lines.len() {
         push_inline_diff_ellipsis(builder, prefix.as_slice());
@@ -3477,6 +3760,7 @@ pub(super) fn push_inline_diff_line(
     line: &DiffLine,
     prefix: &[DetailSegment],
     focused: bool,
+    gutter_widths: DiffGutterWidths,
 ) {
     let marker = match line.kind {
         DiffLineKind::Context => " ",
@@ -3506,7 +3790,7 @@ pub(super) fn push_inline_diff_line(
     let focus_marker = if focused { ">" } else { " " };
     let gutter = format!(
         "{focus_marker}{}",
-        compact_diff_gutter(line.old_line, line.new_line)
+        compact_diff_gutter(line.old_line, line.new_line, gutter_widths)
     );
     let prefix_width = prefix
         .iter()
@@ -3527,14 +3811,12 @@ pub(super) fn push_inline_diff_line(
     builder.push_line(segments);
 }
 
-pub(super) fn compact_diff_gutter(old_line: Option<usize>, new_line: Option<usize>) -> String {
-    let old = old_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
-    let new = new_line
-        .map(|line| format!("{line:>4}"))
-        .unwrap_or_else(|| "    ".to_string());
-    format!("{old} {new} │ ")
+pub(super) fn compact_diff_gutter(
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    widths: DiffGutterWidths,
+) -> String {
+    diff_gutter(old_line, new_line, widths)
 }
 
 pub(super) fn details_comment_count(app: &AppState, item: &WorkItem) -> Option<usize> {

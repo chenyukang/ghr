@@ -41,9 +41,11 @@ pub(super) enum PaletteAction {
     ProjectAdd,
     ProjectRemove,
     CopyGithubLink,
+    CopyPrIssueLink,
     CopyContent,
     ToggleMouseCapture,
     OpenSelected,
+    OpenLinkedItem,
     ShowDiff,
     ClearIgnoredItems,
     ClearCache,
@@ -150,7 +152,7 @@ pub(super) fn command_palette_commands(
             "Log",
             "",
             "General",
-            "Show recent gh requests, timestamps, status, and rate-limit events",
+            "Show recent GitHub API requests, status, errors, and rate-limit events",
             PaletteAction::ShowGhLog,
         ),
         palette_command(
@@ -294,6 +296,13 @@ pub(super) fn command_palette_commands(
             PaletteAction::CopyGithubLink,
         ),
         palette_command(
+            "Copy PR/Issue Link",
+            "",
+            "General",
+            "Copy the current pull request or issue link to the clipboard",
+            PaletteAction::CopyPrIssueLink,
+        ),
+        palette_command(
             "Copy Content",
             "",
             "General",
@@ -313,6 +322,13 @@ pub(super) fn command_palette_commands(
             "General",
             "Open the selected item or PR changes page",
             PaletteAction::OpenSelected,
+        ),
+        palette_command(
+            "Open Linked PR/Issue",
+            "",
+            "Details",
+            "Open the first linked pull request or issue from the current item",
+            PaletteAction::OpenLinkedItem,
         ),
         palette_command(
             "Show Pull Request Diff",
@@ -1144,7 +1160,35 @@ mod tests {
         assert!(
             commands
                 .iter()
+                .any(|command| command.title == "Copy PR/Issue Link")
+        );
+        let pr_issue_link_matches = command_palette_filtered_indices(&commands, "copy pr issue");
+        assert!(
+            pr_issue_link_matches
+                .iter()
+                .any(|index| commands[*index].title == "Copy PR/Issue Link")
+        );
+        assert!(
+            commands
+                .iter()
                 .any(|command| command.title == "Copy Content")
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Open Linked PR/Issue")
+        );
+        let linked_pr_matches = command_palette_filtered_indices(&commands, "linked pr");
+        assert!(
+            linked_pr_matches
+                .iter()
+                .any(|index| commands[*index].title == "Open Linked PR/Issue")
+        );
+        let linked_issue_matches = command_palette_filtered_indices(&commands, "linked issue");
+        assert!(
+            linked_issue_matches
+                .iter()
+                .any(|index| commands[*index].title == "Open Linked PR/Issue")
         );
     }
 

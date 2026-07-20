@@ -3712,13 +3712,13 @@ pub(super) fn reset_milestone_dialog_selection(dialog: &mut MilestoneDialog) {
 }
 
 pub(super) fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog, area: Rect) {
-    let dialog_area = centered_rect(78, message_dialog_height(dialog, area), area);
+    let dialog_area = message_dialog_area(dialog, area);
     let footer = if dialog.kind == MessageDialogKind::RetryableError {
         "Enter: cancel  Esc: edit and retry"
     } else if dialog.auto_close_at.is_some() {
-        "Auto closes shortly | Enter/Esc: close"
+        "Auto closes shortly | Esc: close  Enter: OK"
     } else {
-        "Enter/Esc: close"
+        "Esc: close  Enter: OK"
     };
     let accent = message_dialog_accent(dialog);
     let block = Block::default()
@@ -3739,7 +3739,28 @@ pub(super) fn draw_message_dialog(frame: &mut Frame<'_>, dialog: &MessageDialog,
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(paragraph, dialog_area);
+    if dialog.kind != MessageDialogKind::RetryableError {
+        let ok = Paragraph::new("[ OK ]").alignment(Alignment::Center).style(
+            active_theme()
+                .panel()
+                .fg(active_theme().highlight_fg)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD),
+        );
+        frame.render_widget(ok, message_dialog_ok_area(dialog_area));
+    }
     draw_modal_footer(frame, area, dialog_area, modal_footer_line(footer));
+}
+
+pub(super) fn message_dialog_area(dialog: &MessageDialog, area: Rect) -> Rect {
+    centered_rect(78, message_dialog_height(dialog, area), area)
+}
+
+pub(super) fn message_dialog_ok_area(dialog_area: Rect) -> Rect {
+    let width = 8.min(dialog_area.width.saturating_sub(4)).max(1);
+    let x = dialog_area.x + dialog_area.width.saturating_sub(width) / 2;
+    let y = dialog_area.y + dialog_area.height.saturating_sub(2);
+    Rect::new(x, y, width, 1)
 }
 
 pub(super) fn message_dialog_height(dialog: &MessageDialog, area: Rect) -> u16 {

@@ -196,7 +196,9 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
 | `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
+| `Copy PR/Issue Link` | Copy the current PR/issue link to the clipboard, ignoring selected comments |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
+| `Open Linked PR/Issue` | Open the first linked pull request or issue from the current item |
 | `Clear Cache` | Choose a local cache layer to clear: current section, current view, all list snapshots, suggestions, loaded details/diffs, or all cache |
 | `Mark Done` | Move the selected GitHub inbox notification out of inbox lists; future activity can still notify unless the thread is muted |
 | `Mark All Read` | Mark every GitHub inbox notification as read |
@@ -204,7 +206,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Subscribe Thread` / `Unsubscribe Thread` | Change the selected inbox thread subscription |
 | `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
 | `Info` | Show terminal, version, config/db/log paths, cache counts, runtime state, and ghr system diagnostics in a scrollable popup |
-| `Log` | Show recent `gh` requests with timestamps, status, output sizes, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
+| `Log` | Show recent direct API and `gh api` requests with timestamps, status, response sizes, errors, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
 
 Diff review ranges:
 
@@ -305,18 +307,18 @@ include_read_notifications = true
 [[pr_sections]]
 title = "Needs Attention"
 queries = [
-  "is:open review-requested:@me archived:false sort:updated-desc",
-  "is:open assignee:@me archived:false sort:updated-desc",
-  "is:open mentions:@me archived:false sort:updated-desc",
+  "is:open review-requested:@me archived:false sort:created-desc",
+  "is:open assignee:@me archived:false sort:created-desc",
+  "is:open mentions:@me archived:false sort:created-desc",
 ]
 
 [[pr_sections]]
 title = "My Pull Requests"
-filters = "is:open author:@me archived:false sort:updated-desc"
+filters = "is:open author:@me archived:false sort:created-desc"
 
 [[pr_sections]]
 title = "Reviewed"
-filters = "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
+filters = "is:open reviewed-by:@me -author:@me archived:false sort:created-desc"
 
 [[saved_search_filters]]
 name = "my rust prs"
@@ -329,7 +331,7 @@ sort = "created_at"
 exclude_repos = ["some-org/archive-*"]
 ```
 
-Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:updated-desc"` or `label:"good first issue"` for labels with spaces.
+Use `filters` for a single GitHub search query. Use `queries` when a section should merge several GitHub searches into one deduplicated list. Label filters can be written directly in either form, for example `filters = "is:open label:bug archived:false sort:created-desc"` or `label:"good first issue"` for labels with spaces.
 
 Use `[[repos]]` to add repository tabs to the top bar. Each configured repo shows its `name` as a top-level tab; inside that tab, `show_issues` and `show_prs` control whether the sections are shown as `Issues` and `Pull Requests`. Repo tabs default to open issues and open PRs, with `Issues` shown first. Set `labels` to filter both repo issue and PR lists, or use `issue_labels` / `pr_labels` for kind-specific filters.
 
@@ -341,7 +343,7 @@ Set `command_palette_key` to change the command palette shortcut. Printable keys
 
 Set `theme` to `"auto"`, `"dark"`, or `"light"` to switch the base TUI palette. Set `theme_name` for a fixed named theme such as `"catppuccin_mocha"`, `"gruvbox_light"`, or `"github_dark"`. `auto` follows the macOS system appearance and falls back to dark when the system theme cannot be detected; fixed themes do not auto-switch.
 
-Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed `gh` executions and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. The `Log` command also keeps an in-memory list of recent `gh` calls for the current session, including GitHub rate-limit failures. `RUST_LOG` still overrides this config value when it is set.
+Set `log_level` to `trace`, `debug`, `info`, `warn`, or `error`. In `debug` mode, direct GitHub API and `gh` / `gh api` requests plus UI focus/view changes and mouse clicks are written to `~/.ghr/ghr.log`. Failed API requests, failed `gh` executions, and non-zero `gh` results are logged at `error` level, so they are visible with the default `info` log level. The `Log` command also keeps an in-memory list of recent direct API and `gh` calls for the current session, including response errors and GitHub rate-limit failures. `RUST_LOG` still overrides this config value when it is set.
 
 `pr_per_page` and `issue_per_page` control the page size used for PR and issue search sections. Use `[` and `]` in the list to load adjacent GitHub result pages.
 

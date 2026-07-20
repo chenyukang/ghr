@@ -14,6 +14,15 @@ pub const DEFAULT_EDITOR_SUBMIT_KEY: &str = "Ctrl+O";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_REPO_REMOTE: &str = "origin";
 
+const DEFAULT_NEEDS_ATTENTION_QUERIES: [&str; 3] = [
+    "is:open review-requested:@me archived:false sort:created-desc",
+    "is:open assignee:@me archived:false sort:created-desc",
+    "is:open mentions:@me archived:false sort:created-desc",
+];
+const DEFAULT_MY_PULL_REQUESTS_FILTER: &str = "is:open author:@me archived:false sort:created-desc";
+const DEFAULT_REVIEWED_FILTER: &str =
+    "is:open reviewed-by:@me -author:@me archived:false sort:created-desc";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -334,6 +343,10 @@ impl Config {
     }
 }
 
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
 fn current_github_repo_in(directory: &Path) -> Option<GitHubRemoteCandidate> {
     current_github_remote_candidates(directory)
         .into_iter()
@@ -495,23 +508,18 @@ impl Default for Config {
                 SearchSection {
                     title: "Needs Attention".to_string(),
                     filters: String::new(),
-                    queries: vec![
-                        "is:open review-requested:@me archived:false sort:updated-desc".to_string(),
-                        "is:open assignee:@me archived:false sort:updated-desc".to_string(),
-                        "is:open mentions:@me archived:false sort:updated-desc".to_string(),
-                    ],
+                    queries: strings(&DEFAULT_NEEDS_ATTENTION_QUERIES),
                     limit: None,
                 },
                 SearchSection {
                     title: "My Pull Requests".to_string(),
-                    filters: "is:open author:@me archived:false sort:updated-desc".to_string(),
+                    filters: DEFAULT_MY_PULL_REQUESTS_FILTER.to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
                 SearchSection {
                     title: "Reviewed".to_string(),
-                    filters: "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
-                        .to_string(),
+                    filters: DEFAULT_REVIEWED_FILTER.to_string(),
                     queries: Vec::new(),
                     limit: None,
                 },
@@ -1038,7 +1046,7 @@ mod tests {
             config.pr_sections[0]
                 .queries
                 .iter()
-                .all(|query| query.contains("is:open") && query.contains("sort:updated-desc"))
+                .all(|query| query.contains("is:open") && query.contains("sort:created-desc"))
         );
         assert!(
             config.pr_sections[0]
@@ -1048,11 +1056,11 @@ mod tests {
         );
         assert_eq!(
             config.pr_sections[1].filters,
-            "is:open author:@me archived:false sort:updated-desc"
+            "is:open author:@me archived:false sort:created-desc"
         );
         assert_eq!(
             config.pr_sections[2].filters,
-            "is:open reviewed-by:@me -author:@me archived:false sort:updated-desc"
+            "is:open reviewed-by:@me -author:@me archived:false sort:created-desc"
         );
     }
 

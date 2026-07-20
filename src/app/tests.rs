@@ -240,6 +240,70 @@ fn diff_document_renders_lazygit_style_gutter() {
 }
 
 #[test]
+fn diff_document_aligns_gutter_for_wide_line_numbers() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.show_diff();
+    app.diffs.insert(
+        "1".to_string(),
+        DiffState::Loaded(
+            parse_pull_request_diff(
+                r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11099,4 +11423,5 @@
+ context before
+-old
++new
++extra
+ context after
+"#,
+            )
+            .expect("parse diff"),
+        ),
+    );
+
+    let rendered_lines = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>();
+    let diff_lines = rendered_lines
+        .iter()
+        .filter(|line| {
+            line.contains("│")
+                && ["context before", "old", "new", "extra", "context after"]
+                    .iter()
+                    .any(|text| line.contains(text))
+        })
+        .collect::<Vec<_>>();
+    let separator_columns = diff_lines
+        .iter()
+        .map(|line| {
+            let separator = line.find('│').expect("diff gutter separator");
+            display_width(&line[..separator])
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(
+        separator_columns.len(),
+        1,
+        "diff gutter separators should stay aligned: {diff_lines:?}"
+    );
+    assert!(
+        rendered_lines
+            .iter()
+            .any(|line| line.contains("11100       │ - old")),
+        "removed line should reserve the 5-wide new-line column: {rendered_lines:?}"
+    );
+    assert!(
+        rendered_lines
+            .iter()
+            .any(|line| line.contains("      11424 │ + new")),
+        "added line should reserve the 5-wide old-line column: {rendered_lines:?}"
+    );
+}
+
+#[test]
 fn diff_document_expands_tabs_in_source_lines() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.show_diff();
@@ -284,7 +348,7 @@ fn diff_file_header_links_to_head_branch_near_selected_line() {
     app.show_diff();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             head: Some(PullRequestBranch {
                 repository: "nervosnetwork/fiber".to_string(),
                 branch: "feature/diff-links".to_string(),
@@ -2768,7 +2832,7 @@ fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -2862,7 +2926,7 @@ fn progressive_refresh_does_not_force_current_details_reload() {
     );
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -2885,6 +2949,83 @@ fn progressive_refresh_does_not_force_current_details_reload() {
     let item = app.current_item().expect("current item").clone();
     assert!(!app.start_comments_load_if_needed(&item));
     assert!(matches!(app.details.get("1"), Some(DetailState::Loaded(_))));
+}
+
+#[test]
+fn progressive_issue_refresh_keeps_linked_pull_requests_visible() {
+    let mut item = work_item(
+        "issue-1",
+        "chenyukang/ghr",
+        77,
+        "Notifications reappear",
+        Some("alice"),
+    );
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/77".to_string();
+    let linked_pull_requests = vec![LinkedPullRequest {
+        repository: "chenyukang/ghr".to_string(),
+        number: 78,
+        title: "Fix notification handling".to_string(),
+        state: Some("merged".to_string()),
+        url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+    }];
+    item.linked_pull_requests = linked_pull_requests.clone();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    app.refreshing = true;
+    app.focus_details();
+    app.details
+        .insert("issue-1".to_string(), DetailState::Loaded(Vec::new()));
+
+    let mut refreshed_item = work_item(
+        "issue-1",
+        "chenyukang/ghr",
+        77,
+        "Notifications reappear in inbox",
+        Some("alice"),
+    );
+    refreshed_item.kind = ItemKind::Issue;
+    refreshed_item.url = "https://github.com/chenyukang/ghr/issues/77".to_string();
+    refreshed_item.linked_pull_requests = Vec::new();
+    let refreshed_section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![refreshed_item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+
+    app.handle_msg(AppMsg::RefreshSectionLoaded {
+        section: refreshed_section,
+        save_error: None,
+    });
+
+    let item = app.current_item().expect("current issue");
+    assert_eq!(item.title, "Notifications reappear in inbox");
+    assert_eq!(item.linked_pull_requests, linked_pull_requests);
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
 }
 
 #[test]
@@ -3134,7 +3275,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         expanded_comments: Vec::new(),
         details_scroll_by_item: HashMap::new(),
         selected_comment_index_by_item: HashMap::new(),
-        viewed_item_at: HashMap::new(),
+        seen_item_updated_at: HashMap::new(),
         selected_diff_file: HashMap::new(),
         selected_diff_line: HashMap::new(),
         diff_file_details_scroll: HashMap::new(),
@@ -3416,52 +3557,53 @@ fn section_switch_restores_conversation_details_position_for_current_item() {
 }
 
 #[test]
-fn viewed_item_at_marks_items_updated_after_last_view_unseen() {
+fn seen_item_updated_at_marks_newer_item_updates_unseen() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_before_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(seen_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
 
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 }
 
 #[test]
-fn focusing_details_marks_current_item_viewed_by_time() {
+fn focusing_details_marks_current_item_updated_at_seen() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     app.sections[0].items[0].updated_at = Some(updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at
+        .insert(key.clone(), seen_updated_at);
     assert!(app.item_has_unseen_details(app.current_item().expect("item")));
 
     app.focus_details();
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
+    assert_eq!(app.seen_item_updated_at.get(&key), Some(&updated_at));
 }
 
 #[test]
-fn focusing_details_refreshes_cached_comments_when_item_updated_after_view() {
+fn focusing_details_refreshes_cached_comments_when_item_updated_after_seen_version() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     app.details.insert(
         "1".to_string(),
         DetailState::Loaded(vec![comment("alice", "cached before update", None)]),
     );
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
 
     app.focus_details();
 
@@ -3473,12 +3615,12 @@ fn focusing_details_refreshes_cached_comments_when_item_updated_after_view() {
 #[test]
 fn comments_loaded_records_item_updated_at_for_cache_freshness() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_after_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(newer_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
 
     app.handle_msg(AppMsg::CommentsLoaded {
         item_id: "1".to_string(),
@@ -3490,11 +3632,13 @@ fn comments_loaded_records_item_updated_at_for_cache_freshness() {
                 state: None,
                 url: None,
                 created_at: None,
-                updated_at: Some(updated_after_view),
+                updated_at: Some(newer_updated_at),
                 labels: None,
                 assignees: None,
                 comments: Some(1),
                 viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3547,6 +3691,8 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
                 assignees: None,
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -3566,13 +3712,12 @@ fn comments_loaded_uses_notification_updated_at_when_it_is_newer_than_linked_ite
 #[test]
 fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    let updated_before_view = DateTime::from_timestamp(1_699_999_999, 0).unwrap();
-    let viewed_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let updated_after_view = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
-    app.sections[0].items[0].updated_at = Some(updated_before_view);
+    let seen_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer_updated_at = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    app.sections[0].items[0].updated_at = Some(seen_updated_at);
     let key = work_item_details_memory_key(app.current_item().expect("item"))
         .expect("details memory key");
-    app.viewed_item_at.insert(key, viewed_at);
+    app.seen_item_updated_at.insert(key, seen_updated_at);
     assert!(!app.item_has_unseen_details(app.current_item().expect("item")));
 
     app.handle_msg(AppMsg::CommentsLoaded {
@@ -3585,11 +3730,13 @@ fn comment_metadata_updated_at_marks_unseen_when_not_focused() {
                 state: None,
                 url: None,
                 created_at: None,
-                updated_at: Some(updated_after_view),
+                updated_at: Some(newer_updated_at),
                 labels: None,
                 assignees: None,
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -4044,7 +4191,7 @@ fn stale_pr_action_hints_refresh_keeps_loaded_fields_visible() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Mergeable".to_string()],
             checks: Some(CheckSummary {
                 passed: 4,
@@ -4097,7 +4244,7 @@ fn background_action_hints_error_keeps_last_loaded_fields() {
         ..ActionHints::default()
     };
     app.action_hints
-        .insert("1".to_string(), ActionHintState::Loaded(hints.clone()));
+        .insert("1".to_string(), ActionHintState::loaded(hints.clone()));
     app.action_hints_refreshing.insert("1".to_string());
 
     app.handle_msg(AppMsg::ActionHintsLoaded {
@@ -4108,7 +4255,7 @@ fn background_action_hints_error_keeps_last_loaded_fields() {
     assert!(!app.action_hints_refreshing.contains("1"));
     assert_eq!(
         app.action_hints.get("1"),
-        Some(&ActionHintState::Loaded(hints))
+        Some(&ActionHintState::loaded(hints))
     );
 }
 
@@ -4906,6 +5053,197 @@ fn command_palette_recent_items_opens_recent_picker() {
     assert!(app.command_palette.is_none());
     assert_eq!(app.recent_items_dialog, Some(RecentItemsDialog::default()));
     assert_eq!(app.status, "recent items");
+}
+
+#[test]
+fn command_palette_open_linked_item_opens_current_issue_linked_pull_request() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    item.linked_pull_requests = vec![LinkedPullRequest {
+        repository: "chenyukang/ghr".to_string(),
+        number: 78,
+        title: "Fix notification handling".to_string(),
+        state: Some("merged".to_string()),
+        url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+    }];
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-pr");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked pr".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/chenyukang/ghr/pull/78"
+    );
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_item_reports_missing_linked_pull_request() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-pr-missing");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked pr".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(app.status, "no linked pull request");
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_item_opens_current_pull_request_linked_issue() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.linked_issues = vec![LinkedIssue {
+        repository: "chenyukang/ghr".to_string(),
+        number: 77,
+        title: "Notifications reappear in inbox".to_string(),
+        state: Some("open".to_string()),
+        url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+    }];
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-issue");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked issue".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(
+        app.status,
+        "opened https://github.com/chenyukang/ghr/issues/77"
+    );
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_open_linked_item_reports_missing_linked_issue() {
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![work_item(
+            "pr-78",
+            "chenyukang/ghr",
+            78,
+            "Fix notification handling",
+            Some("alice"),
+        )],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut config = Config::default();
+    let paths = unique_test_paths("command-palette-open-linked-issue-missing");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    app.command_palette = Some(CommandPalette {
+        query: "linked issue".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key_in_area_mut(
+        &mut app,
+        key(KeyCode::Enter),
+        &mut config,
+        &paths,
+        &store,
+        &tx,
+        None,
+    ));
+
+    assert_eq!(app.status, "no linked issue");
+    assert!(app.command_palette.is_none());
 }
 
 #[test]
@@ -6472,7 +6810,7 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
         .iter()
         .position(|line| {
             let text = line.to_string();
-            text.contains("+ react") && text.contains("reply")
+            text.contains("+react") && text.contains("reply")
         })
         .expect("comment header");
     let paths = test_paths();
@@ -6491,7 +6829,7 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
 
     let top_details_line = &buffer_lines(terminal.backend().buffer())[inner.y as usize];
     assert!(
-        !top_details_line.contains("+ react") && !top_details_line.contains("reply"),
+        !top_details_line.contains("+react") && !top_details_line.contains("reply"),
         "stale comment header cells leaked after scroll: {top_details_line:?}"
     );
 }
@@ -9142,7 +9480,7 @@ fn details_title_and_metadata_spacing_are_ordered() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Approvable".to_string()],
             checks: None,
             commits: Some(4),
@@ -9280,6 +9618,7 @@ fn inbox_details_mark_new_since_last_read_updates() {
             viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
+            commit_activity: None,
         }]),
     );
 
@@ -9318,6 +9657,127 @@ fn comments_loaded_updates_details_milestone_metadata() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("milestone: next-release"));
+}
+
+#[test]
+fn comments_loaded_updates_issue_linked_pull_requests_metadata() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "issue-1".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: Some(ItemDetailsMetadata {
+                title: Some("Bug report".to_string()),
+                body: Some("Issue body".to_string()),
+                author: Some("alice".to_string()),
+                state: Some("open".to_string()),
+                url: Some("https://github.com/chenyukang/ghr/issues/1".to_string()),
+                created_at: None,
+                updated_at: None,
+                labels: Some(Vec::new()),
+                assignees: Some(Vec::new()),
+                comments: Some(0),
+                viewer_subscription: None,
+                linked_pull_requests: Some(vec![LinkedPullRequest {
+                    repository: "chenyukang/ghr".to_string(),
+                    number: 78,
+                    title: "Fix notification handling".to_string(),
+                    state: Some("merged".to_string()),
+                    url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+                }]),
+                linked_issues: None,
+            }),
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
+            comments: Vec::new(),
+        }),
+    });
+
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+}
+
+#[test]
+fn comments_loaded_updates_pull_request_linked_issues_metadata() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.url = "https://github.com/chenyukang/ghr/pull/78".to_string();
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+
+    app.handle_msg(AppMsg::CommentsLoaded {
+        item_id: "pr-78".to_string(),
+        comments: Ok(CommentFetchResult {
+            item_metadata: Some(ItemDetailsMetadata {
+                title: Some("Fix notification handling".to_string()),
+                body: Some("Pull request body".to_string()),
+                author: Some("alice".to_string()),
+                state: Some("open".to_string()),
+                url: Some("https://github.com/chenyukang/ghr/pull/78".to_string()),
+                created_at: None,
+                updated_at: None,
+                labels: Some(Vec::new()),
+                assignees: Some(Vec::new()),
+                comments: Some(0),
+                viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: Some(vec![LinkedIssue {
+                    repository: "chenyukang/ghr".to_string(),
+                    number: 77,
+                    title: "Notifications reappear in inbox".to_string(),
+                    state: Some("open".to_string()),
+                    url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+                }]),
+            }),
+            item_reactions: Some(ReactionSummary::default()),
+            item_milestone: Some(None),
+            comments: Vec::new(),
+        }),
+    });
+
+    let rendered = build_details_document(&app, 120)
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("linked issues: #77 Notifications reappear in inbox open"));
 }
 
 #[test]
@@ -9382,6 +9842,8 @@ fn comments_loaded_updates_inbox_notification_description_from_lazy_metadata() {
                 assignees: Some(vec!["alice".to_string()]),
                 comments: Some(3),
                 viewer_subscription: None,
+                linked_pull_requests: None,
+                linked_issues: None,
             }),
             item_reactions: Some(ReactionSummary::default()),
             item_milestone: Some(None),
@@ -9576,6 +10038,123 @@ fn issue_details_meta_links_author() {
 }
 
 #[test]
+fn issue_details_shows_linked_pull_requests() {
+    let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/chenyukang/ghr/issues/1".to_string();
+    item.linked_pull_requests = vec![
+        LinkedPullRequest {
+            repository: "chenyukang/ghr".to_string(),
+            number: 78,
+            title: "Fix notification handling".to_string(),
+            state: Some("merged".to_string()),
+            url: "https://github.com/chenyukang/ghr/pull/78".to_string(),
+        },
+        LinkedPullRequest {
+            repository: "rust-lang/rust".to_string(),
+            number: 159309,
+            title: "Move tests batch 18".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/rust-lang/rust/pull/159309".to_string(),
+        },
+    ];
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let app = AppState::new(SectionKind::Issues, vec![section]);
+    let document = build_details_document(&app, 140);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("linked PRs: #78 Fix notification handling merged"));
+    assert!(rendered.contains("rust-lang/rust#159309 Move tests batch 18 open"));
+    assert_document_link_for_text(
+        &document,
+        "#78",
+        "https://github.com/chenyukang/ghr/pull/78",
+    );
+    assert_document_link_for_text(
+        &document,
+        "rust-lang/rust#159309",
+        "https://github.com/rust-lang/rust/pull/159309",
+    );
+}
+
+#[test]
+fn pull_request_details_shows_linked_issues() {
+    let mut item = work_item(
+        "pr-78",
+        "chenyukang/ghr",
+        78,
+        "Fix notification handling",
+        Some("alice"),
+    );
+    item.url = "https://github.com/chenyukang/ghr/pull/78".to_string();
+    item.linked_issues = vec![
+        LinkedIssue {
+            repository: "chenyukang/ghr".to_string(),
+            number: 77,
+            title: "Notifications reappear in inbox".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/chenyukang/ghr/issues/77".to_string(),
+        },
+        LinkedIssue {
+            repository: "rust-lang/rust".to_string(),
+            number: 159309,
+            title: "Move tests batch 18".to_string(),
+            state: Some("closed".to_string()),
+            url: "https://github.com/rust-lang/rust/issues/159309".to_string(),
+        },
+    ];
+    let section = SectionSnapshot {
+        key: "pull_requests:test".to_string(),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let document = build_details_document(&app, 140);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("linked issues: #77 Notifications reappear in inbox open"));
+    assert!(rendered.contains("rust-lang/rust#159309 Move tests batch 18 closed"));
+    assert_document_link_for_text(
+        &document,
+        "#77",
+        "https://github.com/chenyukang/ghr/issues/77",
+    );
+    assert_document_link_for_text(
+        &document,
+        "rust-lang/rust#159309",
+        "https://github.com/rust-lang/rust/issues/159309",
+    );
+}
+
+#[test]
 fn issue_details_show_empty_labels_as_actionable() {
     let mut item = work_item("issue-1", "chenyukang/ghr", 1, "Bug report", Some("alice"));
     item.kind = ItemKind::Issue;
@@ -9605,7 +10184,7 @@ fn issue_details_show_empty_labels_as_actionable() {
     assert!(rendered.contains("labels:  +"));
     assert!(!rendered.contains("labels: none"));
     assert!(rendered.contains("subscription: subscribe"));
-    assert!(rendered.contains("  reactions:  + react"));
+    assert!(rendered.contains("  reactions:  +react"));
     assert!(!rendered.contains("reactions: none"));
     assert_document_action_for_text_on_line(&document, "labels:", "+", DetailAction::AddLabel);
     assert_document_action_for_text_on_line(
@@ -9623,7 +10202,7 @@ fn issue_details_show_empty_labels_as_actionable() {
     assert_document_action_for_text_on_line(
         &document,
         "reactions:",
-        "+ react",
+        "+react",
         DetailAction::ReactItem,
     );
 }
@@ -9746,7 +10325,7 @@ fn notification_details_hide_unavailable_item_reaction_action() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(!rendered.contains("+ react"));
+    assert!(!rendered.contains("+react"));
     assert!(!rendered.contains("reactions:"));
     assert!(!rendered.contains("subscription:"));
     assert!(
@@ -9796,7 +10375,7 @@ fn notification_details_show_reaction_counts_without_unavailable_action() {
         .join("\n");
 
     assert!(rendered.contains("reactions: 👀 1"));
-    assert!(!rendered.contains("+ react"));
+    assert!(!rendered.contains("+react"));
     assert!(
         !document
             .actions
@@ -9828,7 +10407,7 @@ fn details_meta_shows_pr_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Approvable".to_string(), "Mergeable".to_string()],
             checks: Some(CheckSummary {
                 passed: 10,
@@ -9904,7 +10483,7 @@ fn pr_details_render_check_runs_as_openable_rows() {
     app.focus_details();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 3,
                 failed: 1,
@@ -9970,6 +10549,83 @@ fn pr_details_render_check_runs_as_openable_rows() {
 }
 
 #[test]
+fn pr_details_render_commit_ci_statuses_in_activity() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut activity = comment(
+        "alice",
+        "legacy commit activity",
+        Some("https://github.com/owner/repo/pull/1/commits"),
+    );
+    activity.kind = CommentPreviewKind::Activity;
+    activity.commit_activity = Some(PullRequestCommitActivityPreview {
+        total_count: 4,
+        commits: vec![
+            PullRequestCommitPreview {
+                sha: "1111111111111111111111111111111111111111".to_string(),
+                title: "passing commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/1111111".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "2222222222222222222222222222222222222222".to_string(),
+                title: "failing commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/2222222".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "3333333333333333333333333333333333333333".to_string(),
+                title: "running commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/3333333".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "4444444444444444444444444444444444444444".to_string(),
+                title: "commit without checks".to_string(),
+                url: Some("https://github.com/owner/repo/commit/4444444".to_string()),
+            },
+        ],
+    });
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![activity]));
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::loaded(ActionHints {
+            commit_statuses: HashMap::from([
+                (
+                    "1111111111111111111111111111111111111111".to_string(),
+                    CommitCheckStatus::Success,
+                ),
+                (
+                    "2222222222222222222222222222222222222222".to_string(),
+                    CommitCheckStatus::Failure,
+                ),
+                (
+                    "3333333333333333333333333333333333333333".to_string(),
+                    CommitCheckStatus::Pending,
+                ),
+            ]),
+            ..ActionHints::default()
+        }),
+    );
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("pushed 4 commits"));
+    assert!(rendered.contains("✓ 1111111 passing commit"));
+    assert!(rendered.contains("✗ 2222222 failing commit"));
+    assert!(rendered.contains("• 3333333 running commit"));
+    assert!(rendered.contains("  4444444 commit without checks"));
+    assert_document_link_for_text(
+        &document,
+        "passing commit",
+        "https://github.com/owner/repo/commit/1111111",
+    );
+}
+
+#[test]
 fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -9979,7 +10635,7 @@ fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
     app.select_details_body_without_scroll();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             check_runs: vec![CheckRunSummary {
                 name: "test".to_string(),
                 workflow: Some("CI".to_string()),
@@ -10027,7 +10683,7 @@ fn pr_details_render_merge_queue_and_review_summary() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["In merge queue".to_string()],
             checks: Some(CheckSummary {
                 passed: 43,
@@ -11119,6 +11775,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
+                commit_activity: None,
             },
             CommentPreview {
                 id: None,
@@ -11133,6 +11790,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
+                commit_activity: None,
             },
         ]),
     );
@@ -11244,7 +11902,7 @@ fn details_activity_hides_comment_actions() {
         .find(|line| line.contains("doitian"))
         .expect("activity header");
     assert!(activity_header.contains("activity:"));
-    assert!(!activity_header.contains("+ react"));
+    assert!(!activity_header.contains("+react"));
     assert!(!activity_header.contains("reply"));
     assert!(document.comments.is_empty());
 }
@@ -11437,7 +12095,7 @@ fn details_render_description_and_comment_reactions() {
         .collect::<Vec<_>>();
     let rendered = rendered_lines.join("\n");
 
-    assert!(rendered.contains("  reactions: ❤️ 1  👀 1  + react"));
+    assert!(rendered.contains("  reactions: ❤️ 1  👀 1  +react"));
     assert!(rendered.contains("alice - -  🚀 2  👀 1"));
     let header_index = rendered_lines
         .iter()
@@ -11471,7 +12129,7 @@ fn details_renderer_marks_terminal_wide_symbols_as_skip_cells() {
         Span::raw("Zhangcy0x3 - 16d open "),
         Span::raw("❤️"),
         Span::raw(" 1  "),
-        Span::styled("+ react", active_theme().action),
+        Span::styled("+react", active_theme().action),
     ]);
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 3));
 
@@ -11763,7 +12421,7 @@ fn details_comments_show_inline_review_location() {
         .find(|line| line.contains("inline src/github.rs:876 right"))
         .expect("inline review metadata line");
     assert!(
-        !metadata_line.contains("+ react") && !metadata_line.contains("reply"),
+        !metadata_line.contains("+react") && !metadata_line.contains("reply"),
         "review metadata line should not carry comment actions: {rendered}"
     );
     assert!(rendered.contains("GH_NO_UPDATE_NOTIFIER"));
@@ -11806,7 +12464,7 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         .collect::<Vec<_>>();
     let header_index = rendered
         .iter()
-        .position(|line| line.contains("mejrs") && line.contains("+ react"))
+        .position(|line| line.contains("mejrs") && line.contains("+react"))
         .expect("comment action header");
     let metadata_index = rendered
         .iter()
@@ -11829,8 +12487,7 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         "long review metadata should not share the author/action header: {rendered:?}"
     );
     assert!(
-        !rendered[metadata_index].contains("+ react")
-            && !rendered[metadata_index].contains("reply"),
+        !rendered[metadata_index].contains("+react") && !rendered[metadata_index].contains("reply"),
         "comment actions should stay on the header: {rendered:?}"
     );
 }
@@ -11990,7 +12647,7 @@ fn comment_gap_lines_are_padded_to_clear_stale_header_cells() {
         .collect::<Vec<_>>();
     let header_index = rendered
         .iter()
-        .position(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+        .position(|line| line.contains("Zhangcy0x3") && line.contains("+react"))
         .expect("comment header");
     let gap = rendered
         .get(header_index + 1)
@@ -12031,7 +12688,7 @@ fn selected_comment_right_border_stays_aligned_with_reactions() {
         .expect("selected comment top border");
     let header = rendered
         .iter()
-        .find(|line| line.contains("Zhangcy0x3") && line.contains("+ react"))
+        .find(|line| line.contains("Zhangcy0x3") && line.contains("+react"))
         .expect("selected comment header");
     let body = rendered
         .iter()
@@ -12327,7 +12984,7 @@ fn review_summary_details_show_reply_without_reaction_action() {
         .expect("review summary header");
 
     assert!(rendered[header_line].contains("reply"));
-    assert!(!rendered[header_line].contains("+ react"));
+    assert!(!rendered[header_line].contains("+react"));
     let reply_column = rendered[header_line].find("reply").expect("reply action") as u16;
     assert_eq!(
         document.action_at(header_line, reply_column),
@@ -12346,8 +13003,8 @@ fn assignee_actions_are_rendered_in_details() {
         .position(|line| line.to_string().contains("assignees: -"))
         .expect("empty assignee row");
     let empty_line = document.lines[assignee_line].to_string();
-    let assign_column = empty_line.find("@ assign").expect("assign action") as u16;
-    assert!(!empty_line.contains("- unassign"));
+    let assign_column = empty_line.find("@assign").expect("assign action") as u16;
+    assert!(!empty_line.contains("-unassign"));
     assert_eq!(
         document.action_at(assignee_line, assign_column),
         Some(DetailAction::AssignAssignee)
@@ -12363,11 +13020,11 @@ fn assignee_actions_are_rendered_in_details() {
         .expect("assignee row");
     let assign_column = document.lines[assignee_line]
         .to_string()
-        .find("@ assign")
+        .find("@assign")
         .expect("assign action") as u16;
     let unassign_column = document.lines[assignee_line]
         .to_string()
-        .find("- unassign")
+        .find("-unassign")
         .expect("unassign action") as u16;
 
     assert_eq!(
@@ -12940,6 +13597,64 @@ fn copy_github_link_uses_item_link_without_selected_comment() {
 }
 
 #[test]
+fn copy_pr_issue_link_ignores_selected_comment_when_details_focused() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment(
+            "alice",
+            "looks good",
+            Some("https://github.com/rust-lang/rust/pull/1#issuecomment-1"),
+        )]),
+    );
+    app.focus_details();
+
+    assert_eq!(
+        app.selected_pr_issue_link(),
+        Some((
+            "https://github.com/rust-lang/rust/pull/1".to_string(),
+            "pull request"
+        ))
+    );
+
+    app.copy_pr_issue_link();
+
+    assert_eq!(app.status, "copied pull request link");
+}
+
+#[test]
+fn copy_pr_issue_link_uses_selected_issue_link() {
+    let mut item = work_item("issue-159537", "rust-lang/rust", 159537, "Borrowck", None);
+    item.kind = ItemKind::Issue;
+    item.url = "https://github.com/rust-lang/rust/issues/159537".to_string();
+    let section = SectionSnapshot {
+        key: "issues:test".to_string(),
+        kind: SectionKind::Issues,
+        title: "Issues".to_string(),
+        filters: String::new(),
+        items: vec![item],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Issues, vec![section]);
+
+    assert_eq!(
+        app.selected_pr_issue_link(),
+        Some((
+            "https://github.com/rust-lang/rust/issues/159537".to_string(),
+            "issue"
+        ))
+    );
+
+    app.copy_pr_issue_link();
+
+    assert_eq!(app.status, "copied issue link");
+}
+
+#[test]
 fn copy_content_prefers_selected_comment_when_details_focused() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.details.insert(
@@ -13058,6 +13773,29 @@ fn command_palette_copy_github_link_copies_current_item_link() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     app.command_palette = Some(CommandPalette {
         query: "copy github".to_string(),
+        selected: 0,
+    });
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Enter),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert_eq!(app.status, "copied pull request link");
+    assert!(app.command_palette.is_none());
+}
+
+#[test]
+fn command_palette_copy_pr_issue_link_copies_current_item_link() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.command_palette = Some(CommandPalette {
+        query: "copy pr issue".to_string(),
         selected: 0,
     });
 
@@ -14161,7 +14899,7 @@ fn capital_x_key_opens_checkout_confirmation_for_pull_request_details() {
     app.focus_details();
     app.action_hints.insert(
         "checkout-pr".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -14203,7 +14941,7 @@ fn capital_f_key_opens_rerun_failed_checks_confirmation() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 2,
                 failed: 1,
@@ -14250,7 +14988,7 @@ fn checkout_confirmation_remote_branch_is_clickable() {
     let config = checkout_test_config();
     app.action_hints.insert(
         "checkout-pr".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -15007,7 +15745,7 @@ fn rerun_failed_checks_rejects_pr_without_failed_checks() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 3,
                 failed: 0,
@@ -15033,7 +15771,7 @@ fn rerun_failed_checks_confirmation_submits_action() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 0,
                 failed: 1,
@@ -15797,6 +16535,8 @@ fn item_edit_rejects_non_issue_or_pull_request_items() {
             reactions: ReactionSummary::default(),
             milestone: None,
             assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
             comments: None,
             unread: Some(true),
             reason: Some("mention".to_string()),
@@ -15942,7 +16682,7 @@ fn auto_merge_action_finished_refreshes_details_and_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Auto-mergeable".to_string()],
             checks: None,
             note: None,
@@ -15980,7 +16720,7 @@ fn update_branch_finished_keeps_item_open_and_refreshes_details_and_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Update branch".to_string()],
             checks: None,
             note: None,
@@ -16055,7 +16795,7 @@ fn draft_ready_action_finished_updates_item_extra_and_refreshes_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Draft".to_string()],
             checks: None,
             note: Some("Merge blocked: draft".to_string()),
@@ -16412,6 +17152,113 @@ fn milestone_change_failure_opens_message_dialog() {
 }
 
 #[test]
+fn approve_review_failure_opens_blocking_error_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.review_submit_running = true;
+    app.message_dialog = Some(info_message_dialog(
+        "Submitting Review",
+        "Waiting for GitHub to approve...",
+    ));
+    let error = anyhow::anyhow!(
+        "GitHub API request failed: HTTP 422: Unprocessable Entity; errors: Review Can not approve your own pull request"
+    )
+    .context("failed to submit review for chenyukang/ghr#81");
+
+    app.handle_msg(AppMsg::ReviewSubmitted {
+        item_id: "1".to_string(),
+        event: PullRequestReviewEvent::Approve,
+        result: Err(error_chain_message(error)),
+    });
+
+    assert!(!app.review_submit_running);
+    assert_eq!(app.status, "review submit failed");
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Review Failed");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
+    assert!(dialog.body.contains("HTTP 422"));
+    assert!(
+        dialog
+            .body
+            .contains("Can not approve your own pull request")
+    );
+    assert!(dialog.auto_close_at.is_none());
+}
+
+#[test]
+fn user_triggered_write_failures_open_error_dialogs() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+
+    app.handle_msg(AppMsg::NotificationReadFinished {
+        thread_id: "thread-1".to_string(),
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark Notification Read Failed")
+    );
+
+    app.handle_msg(AppMsg::NotificationDoneFinished {
+        thread_id: "thread-1".to_string(),
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark Notification Done Failed")
+    );
+
+    app.handle_msg(AppMsg::InboxMarkAllReadFinished {
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mark All Notifications Read Failed")
+    );
+
+    app.handle_msg(AppMsg::InboxThreadActionFinished {
+        action: InboxThreadAction::Mute,
+        result: Err("HTTP 403".to_string()),
+    });
+    assert_eq!(
+        app.message_dialog
+            .as_ref()
+            .map(|dialog| dialog.title.as_str()),
+        Some("Mute Thread Failed")
+    );
+
+    app.handle_msg(AppMsg::ItemSubscriptionUpdated {
+        item_id: "1".to_string(),
+        item_kind: ItemKind::PullRequest,
+        action: ItemSubscriptionAction::Subscribe,
+        result: Err("HTTP 403".to_string()),
+    });
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Subscribe to Pull Request Failed");
+    assert_eq!(dialog.body, "HTTP 403");
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
+}
+
+#[test]
+fn notification_snapshot_save_failure_opens_error_dialog() {
+    let mut app = AppState::new(SectionKind::Notifications, vec![test_section()]);
+
+    app.handle_msg(AppMsg::NotificationReadFinished {
+        thread_id: "thread-1".to_string(),
+        result: Ok(Some("database is locked".to_string())),
+    });
+
+    let dialog = app.message_dialog.as_ref().expect("failure dialog");
+    assert_eq!(dialog.title, "Notification Snapshot Save Failed");
+    assert_eq!(dialog.body, "database is locked");
+    assert!(app.status.contains("snapshot save failed"));
+}
+
+#[test]
 fn message_dialog_enter_dismisses() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -16429,6 +17276,57 @@ fn message_dialog_enter_dismisses() {
 
     assert!(app.message_dialog.is_none());
     assert_eq!(app.status, "message dismissed");
+}
+
+#[test]
+fn message_dialog_esc_and_ok_click_dismiss() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Esc),
+        &config,
+        &store,
+        &tx
+    ));
+    assert!(app.message_dialog.is_none());
+
+    let area = Rect::new(0, 0, 120, 40);
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    let dialog = app.message_dialog.as_ref().expect("message dialog");
+    let ok_area = message_dialog_ok_area(message_dialog_area(dialog, area));
+    assert!(handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: ok_area.x,
+            row: ok_area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    ));
+    assert!(app.message_dialog.is_none());
+}
+
+#[test]
+fn message_dialog_renders_ok_button() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.message_dialog = Some(message_dialog("Approve Failed", "HTTP 422"));
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let paths = test_paths();
+
+    terminal
+        .draw(|frame| draw(frame, &app, &paths))
+        .expect("draw");
+
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("[ OK ]"));
+    assert!(rendered.contains("Esc: close  Enter: OK"));
 }
 
 #[test]
@@ -18338,6 +19236,7 @@ fn details_comment_bodies_are_not_truncated() {
             viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
+            commit_activity: None,
         }]),
     );
 
@@ -21290,6 +22189,7 @@ fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     }
 }
 
@@ -21314,6 +22214,7 @@ fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentP
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     }
 }
 
@@ -21335,6 +22236,8 @@ fn work_item(id: &str, repo: &str, number: u64, title: &str, author: Option<&str
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees: Vec::new(),
+        linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: Some(0),
         unread: None,
         reason: None,
@@ -21384,6 +22287,8 @@ fn notification_item(id: &str, unread: bool) -> WorkItem {
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees: Vec::new(),
+        linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: None,
         unread: Some(unread),
         reason: Some("mention".to_string()),

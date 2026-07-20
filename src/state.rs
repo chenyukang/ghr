@@ -29,7 +29,8 @@ pub struct UiState {
     pub expanded_comments: Vec<String>,
     pub details_scroll_by_item: HashMap<String, u16>,
     pub selected_comment_index_by_item: HashMap<String, usize>,
-    pub viewed_item_at: HashMap<String, DateTime<Utc>>,
+    #[serde(default, alias = "viewed_item_at")]
+    pub seen_item_updated_at: HashMap<String, DateTime<Utc>>,
     pub selected_diff_file: HashMap<String, usize>,
     pub selected_diff_line: HashMap<String, usize>,
     pub diff_file_details_scroll: HashMap<String, u16>,
@@ -250,7 +251,8 @@ impl UiState {
             .retain(|key, _| !key.trim().is_empty());
         self.selected_comment_index_by_item =
             normalized_index_map(self.selected_comment_index_by_item);
-        self.viewed_item_at.retain(|key, _| !key.trim().is_empty());
+        self.seen_item_updated_at
+            .retain(|key, _| !key.trim().is_empty());
         self.selected_diff_file = normalized_index_map(self.selected_diff_file);
         self.selected_diff_line = normalized_index_map(self.selected_diff_line);
         self.diff_file_details_scroll
@@ -286,7 +288,7 @@ impl Default for UiState {
             expanded_comments: Vec::new(),
             details_scroll_by_item: HashMap::new(),
             selected_comment_index_by_item: HashMap::new(),
-            viewed_item_at: HashMap::new(),
+            seen_item_updated_at: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
@@ -489,7 +491,7 @@ mod tests {
             expanded_comments: vec!["1:comment:42".to_string()],
             details_scroll_by_item: HashMap::from([("issue-3".to_string(), 12)]),
             selected_comment_index_by_item: HashMap::from([("issue-3".to_string(), 4)]),
-            viewed_item_at: HashMap::from([(
+            seen_item_updated_at: HashMap::from([(
                 "issue:rust-lang/rust:3".to_string(),
                 DateTime::from_timestamp(1_700_000_030, 0).unwrap(),
             )]),
@@ -627,7 +629,7 @@ mod tests {
             Some(&4)
         );
         assert_eq!(
-            state.viewed_item_at.get("issue:rust-lang/rust:3"),
+            state.seen_item_updated_at.get("issue:rust-lang/rust:3"),
             Some(&DateTime::from_timestamp(1_700_000_030, 0).unwrap())
         );
         assert_eq!(state.selected_diff_file.get("issue-3"), Some(&4));
@@ -707,6 +709,24 @@ mod tests {
     #[test]
     fn default_split_ratio_is_even() {
         assert_eq!(UiState::default().list_width_percent, 50);
+    }
+
+    #[test]
+    fn legacy_viewed_item_at_loads_as_seen_item_updated_at() {
+        let content = r#"
+[viewed_item_at]
+"issue:rust-lang/rust:3" = "2026-01-01T00:00:30Z"
+"#;
+
+        let state = toml::from_str::<UiState>(content).expect("parse legacy state");
+
+        assert_eq!(
+            state
+                .seen_item_updated_at
+                .get("issue:rust-lang/rust:3")
+                .copied(),
+            Some(DateTime::from_timestamp(1_767_225_630, 0).unwrap())
+        );
     }
 
     #[test]

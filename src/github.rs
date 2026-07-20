@@ -15,10 +15,12 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
-    FailedCheckRunSummary, ItemKind, MergeQueueInfo, Milestone, PullRequestBranch,
-    PullRequestReviewActor, PullRequestReviewActorState, PullRequestReviewSummary, ReactionSummary,
-    ReviewCommentPreview, SectionKind, SectionSnapshot, WorkItem, builtin_view_key,
-    global_search_view_key, repo_section_filters_with_labels, repo_view_key,
+    CommitCheckStatus, FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest,
+    MergeQueueInfo, Milestone, PullRequestBranch, PullRequestCommitActivityPreview,
+    PullRequestCommitPreview, PullRequestReviewActor, PullRequestReviewActorState,
+    PullRequestReviewSummary, ReactionSummary, ReviewCommentPreview, SectionKind, SectionSnapshot,
+    WorkItem, builtin_view_key, global_search_view_key, repo_section_filters_with_labels,
+    repo_view_key,
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
@@ -80,6 +82,8 @@ pub struct ItemDetailsMetadata {
     pub assignees: Option<Vec<String>>,
     pub comments: Option<u64>,
     pub viewer_subscription: Option<String>,
+    pub linked_pull_requests: Option<Vec<LinkedPullRequest>>,
+    pub linked_issues: Option<Vec<LinkedIssue>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +209,100 @@ struct IssueDetails {
     item_metadata: Option<ItemDetailsMetadata>,
     reactions: ReactionSummary,
     milestone: Option<Milestone>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestsGraphQlRaw {
+    data: IssueLinkedPullRequestsDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueLinkedPullRequestsDataRaw {
+    repository: Option<IssueLinkedPullRequestsRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestsRepositoryRaw {
+    issue: Option<IssueLinkedPullRequestsIssueRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestsIssueRaw {
+    closed_by_pull_requests_references: IssueLinkedPullRequestConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestConnectionRaw {
+    nodes: Option<Vec<IssueLinkedPullRequestRaw>>,
+    page_info: GraphQlPageInfoRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestRaw {
+    repository: Option<IssueLinkedPullRequestRepositoryRaw>,
+    number: u64,
+    title: String,
+    state: Option<String>,
+    is_draft: Option<bool>,
+    merged: Option<bool>,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueLinkedPullRequestRepositoryRaw {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesGraphQlRaw {
+    data: PullRequestLinkedIssuesDataRaw,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestLinkedIssuesDataRaw {
+    repository: Option<PullRequestLinkedIssuesRepositoryRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesRepositoryRaw {
+    pull_request: Option<PullRequestLinkedIssuesPullRequestRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssuesPullRequestRaw {
+    closing_issues_references: PullRequestLinkedIssueConnectionRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueConnectionRaw {
+    nodes: Option<Vec<PullRequestLinkedIssueRaw>>,
+    page_info: GraphQlPageInfoRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueRaw {
+    repository: Option<PullRequestLinkedIssueRepositoryRaw>,
+    number: u64,
+    title: String,
+    state: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestLinkedIssueRepositoryRaw {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -581,6 +679,19 @@ struct PullRequestActionRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestCommitConnectionRaw {
     total_count: usize,
+    nodes: Option<Vec<PullRequestCommitNodeRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestCommitNodeRaw {
+    commit: PullRequestCommitStatusRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitStatusRaw {
+    oid: String,
+    status_check_rollup: Option<PullRequestStatusRollupRaw>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1268,6 +1379,7 @@ async fn fetch_search_items(
         return fetch_search_page(kind, query, page, limit, exclude_repos).await;
     }
 
+    let sort = merged_search_items_sort(&queries);
     let mut deduped = HashMap::<String, WorkItem>::new();
     for (index, query) in queries.into_iter().enumerate() {
         if index > 0 {
@@ -1284,13 +1396,7 @@ async fn fetch_search_items(
     }
 
     let mut items = deduped.into_values().collect::<Vec<_>>();
-    items.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.repo.cmp(&right.repo))
-            .then_with(|| left.number.cmp(&right.number))
-    });
+    sort_merged_search_items(&mut items, sort);
     items.truncate(limit);
     Ok(SearchFetchResult {
         items,
@@ -1298,6 +1404,48 @@ async fn fetch_search_items(
         page: 1,
         page_size: search_command_limit(limit),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchItemsSort {
+    CreatedAsc,
+    CreatedDesc,
+    UpdatedAsc,
+    UpdatedDesc,
+}
+
+impl SearchItemsSort {
+    fn from_filters(filters: &str) -> Option<Self> {
+        let (field, order) = search_sort(filters)?;
+        match (field.as_str(), order.as_str()) {
+            ("created" | "created_at", "asc") => Some(Self::CreatedAsc),
+            ("created" | "created_at", "desc") => Some(Self::CreatedDesc),
+            ("updated" | "updated_at", "asc") => Some(Self::UpdatedAsc),
+            ("updated" | "updated_at", "desc") => Some(Self::UpdatedDesc),
+            _ => None,
+        }
+    }
+}
+
+fn merged_search_items_sort(queries: &[String]) -> SearchItemsSort {
+    queries
+        .iter()
+        .find_map(|query| SearchItemsSort::from_filters(query))
+        .unwrap_or(SearchItemsSort::UpdatedDesc)
+}
+
+fn sort_merged_search_items(items: &mut [WorkItem], sort: SearchItemsSort) {
+    items.sort_by(|left, right| {
+        let timestamp_order = match sort {
+            SearchItemsSort::CreatedAsc => left.created_at.cmp(&right.created_at),
+            SearchItemsSort::CreatedDesc => right.created_at.cmp(&left.created_at),
+            SearchItemsSort::UpdatedAsc => left.updated_at.cmp(&right.updated_at),
+            SearchItemsSort::UpdatedDesc => right.updated_at.cmp(&left.updated_at),
+        };
+        timestamp_order
+            .then_with(|| left.repo.cmp(&right.repo))
+            .then_with(|| left.number.cmp(&right.number))
+    });
 }
 
 async fn fetch_search_items_for_query(
@@ -1607,13 +1755,22 @@ pub async fn fetch_comments(
 
 pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<CommentFetchResult> {
     let issue_output = fetch_issue_details_output(repository, number);
+    let linked_pull_requests = fetch_issue_linked_pull_requests(repository, number);
     let comments_output = fetch_issue_comments_output(repository, number);
     let comment_permissions = fetch_issue_comment_permissions(repository, number, ItemKind::Issue);
     let viewer_login = comment_viewer_login("comment ownership");
     let viewer_subscription =
         fetch_item_subscription_state_optional(repository, number, ItemKind::Issue);
-    let (issue_output, comments_output, comment_permissions, viewer_login, viewer_subscription) = tokio::join!(
+    let (
         issue_output,
+        linked_pull_requests,
+        comments_output,
+        comment_permissions,
+        viewer_login,
+        viewer_subscription,
+    ) = tokio::join!(
+        issue_output,
+        linked_pull_requests,
         comments_output,
         comment_permissions,
         viewer_login,
@@ -1631,7 +1788,7 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
             HashMap::new()
         }
     };
-    let mut issue_details = match issue_output {
+    let issue_details = match issue_output {
         Ok(output) => Some(parse_issue_details_output(&output, repository, number)?),
         Err(error) => {
             warn!(
@@ -1643,13 +1800,19 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
             None
         }
     };
-    if let Some(metadata) = issue_details
-        .as_mut()
-        .and_then(|details| details.item_metadata.as_mut())
-    {
-        metadata.viewer_subscription = viewer_subscription;
-    }
-    let (item_metadata, item_reactions, item_milestone) = match issue_details {
+    let linked_pull_requests = match linked_pull_requests {
+        Ok(linked_pull_requests) => Some(linked_pull_requests),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load linked pull requests while loading issue comments"
+            );
+            None
+        }
+    };
+    let (mut item_metadata, item_reactions, item_milestone) = match issue_details {
         Some(details) => (
             details.item_metadata,
             Some(details.reactions),
@@ -1657,6 +1820,14 @@ pub async fn fetch_issue_comments(repository: &str, number: u64) -> Result<Comme
         ),
         None => (None, None, None),
     };
+    if let Some(linked_pull_requests) = linked_pull_requests
+        && let Some(metadata) = item_metadata.as_mut()
+    {
+        metadata.linked_pull_requests = Some(linked_pull_requests);
+    }
+    if let Some(metadata) = item_metadata.as_mut() {
+        metadata.viewer_subscription = viewer_subscription;
+    }
     Ok(CommentFetchResult {
         item_metadata,
         item_reactions,
@@ -1680,6 +1851,138 @@ async fn fetch_issue_details_output(repository: &str, number: u64) -> Result<Str
         path,
     ])
     .await
+}
+
+async fn fetch_issue_linked_pull_requests(
+    repository: &str,
+    number: u64,
+) -> Result<Vec<LinkedPullRequest>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      closedByPullRequestsReferences(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          repository {
+            nameWithOwner
+          }
+          number
+          title
+          state
+          isDraft
+          merged
+          url
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut cursor = None;
+    let mut pull_requests = Vec::new();
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+
+        let output = run_gh_json(&args).await?;
+        let (mut page, has_next_page, end_cursor) =
+            parse_issue_linked_pull_requests_page(&output, repository, number)?;
+        pull_requests.append(&mut page);
+        if !has_next_page {
+            break;
+        }
+        let Some(next_cursor) = end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(pull_requests)
+}
+
+async fn fetch_pull_request_linked_issues(
+    repository: &str,
+    number: u64,
+) -> Result<Vec<LinkedIssue>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          repository {
+            nameWithOwner
+          }
+          number
+          title
+          state
+          url
+        }
+      }
+    }
+  }
+}
+"#;
+    let mut cursor = None;
+    let mut issues = Vec::new();
+
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={owner}"),
+            "-F".to_string(),
+            format!("name={name}"),
+            "-F".to_string(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.push("-F".to_string());
+            args.push(format!("cursor={cursor}"));
+        }
+
+        let output = run_gh_json(&args).await?;
+        let (mut page, has_next_page, end_cursor) =
+            parse_pull_request_linked_issues_page(&output, repository, number)?;
+        issues.append(&mut page);
+        if !has_next_page {
+            break;
+        }
+        let Some(next_cursor) = end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(issues)
 }
 
 async fn fetch_issue_comments_output(repository: &str, number: u64) -> Result<String> {
@@ -1764,6 +2067,7 @@ pub async fn fetch_pull_request_comments(
     number: u64,
 ) -> Result<CommentFetchResult> {
     let issue_details = fetch_issue_details_output(repository, number);
+    let linked_issues = fetch_pull_request_linked_issues(repository, number);
     let issue_comments = fetch_issue_comments_output(repository, number);
     let issue_comment_permissions =
         fetch_issue_comment_permissions(repository, number, ItemKind::PullRequest);
@@ -1775,6 +2079,7 @@ pub async fn fetch_pull_request_comments(
         fetch_item_subscription_state_optional(repository, number, ItemKind::PullRequest);
     let (
         issue_details,
+        linked_issues,
         issue_output,
         issue_comment_permissions,
         review_output,
@@ -1784,6 +2089,7 @@ pub async fn fetch_pull_request_comments(
         viewer_subscription,
     ) = tokio::join!(
         issue_details,
+        linked_issues,
         issue_comments,
         issue_comment_permissions,
         review_comments,
@@ -1825,6 +2131,18 @@ pub async fn fetch_pull_request_comments(
                 repository,
                 number,
                 "failed to load pull request details while loading comments"
+            );
+            None
+        }
+    };
+    let linked_issues = match linked_issues {
+        Ok(linked_issues) => Some(linked_issues),
+        Err(error) => {
+            warn!(
+                error = %error,
+                repository,
+                number,
+                "failed to load linked issues while loading pull request comments"
             );
             None
         }
@@ -1880,6 +2198,9 @@ pub async fn fetch_pull_request_comments(
         .and_then(|details| details.item_metadata.as_mut())
     {
         metadata.viewer_subscription = viewer_subscription;
+        if let Some(linked_issues) = linked_issues {
+            metadata.linked_issues = Some(linked_issues);
+        }
     }
     let (item_metadata, item_reactions, item_milestone) = match issue_details {
         Some(details) => (
@@ -2208,8 +2529,16 @@ query($owner: String!, $name: String!, $number: Int!) {
       viewerCanEnableAutoMerge
       viewerCanMergeAsAdmin
       viewerDidAuthor
-      commits {
+      commits(last: 100) {
         totalCount
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              state
+            }
+          }
+        }
       }
       viewerLatestReview {
         state
@@ -3659,6 +3988,7 @@ fn issue_comment_preview(
             .map(ReactionSummary::from)
             .unwrap_or_default(),
         review: None,
+        commit_activity: None,
     }
 }
 
@@ -3677,6 +4007,102 @@ fn parse_issue_details_output(output: &str, repository: &str, number: u64) -> Re
             title: milestone.title,
         }),
     })
+}
+
+fn parse_issue_linked_pull_requests_page(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<(Vec<LinkedPullRequest>, bool, Option<String>)> {
+    let raw =
+        serde_json::from_str::<IssueLinkedPullRequestsGraphQlRaw>(output).with_context(|| {
+            format!("failed to parse linked pull requests for {repository}#{number}")
+        })?;
+    let Some(issue) = raw.data.repository.and_then(|repository| repository.issue) else {
+        return Ok((Vec::new(), false, None));
+    };
+    let connection = issue.closed_by_pull_requests_references;
+    let pull_requests = connection
+        .nodes
+        .unwrap_or_default()
+        .into_iter()
+        .map(linked_pull_request_from_raw)
+        .collect::<Vec<_>>();
+
+    Ok((
+        pull_requests,
+        connection.page_info.has_next_page,
+        connection.page_info.end_cursor,
+    ))
+}
+
+fn linked_pull_request_from_raw(raw: IssueLinkedPullRequestRaw) -> LinkedPullRequest {
+    LinkedPullRequest {
+        repository: raw
+            .repository
+            .map(|repository| repository.name_with_owner)
+            .unwrap_or_default(),
+        number: raw.number,
+        title: raw.title,
+        state: linked_pull_request_state(raw.state, raw.is_draft, raw.merged),
+        url: raw.url,
+    }
+}
+
+fn linked_pull_request_state(
+    state: Option<String>,
+    is_draft: Option<bool>,
+    merged: Option<bool>,
+) -> Option<String> {
+    if is_draft == Some(true) {
+        return Some("draft".to_string());
+    }
+    if merged == Some(true) {
+        return Some("merged".to_string());
+    }
+    state.map(|state| state.to_ascii_lowercase())
+}
+
+fn parse_pull_request_linked_issues_page(
+    output: &str,
+    repository: &str,
+    number: u64,
+) -> Result<(Vec<LinkedIssue>, bool, Option<String>)> {
+    let raw = serde_json::from_str::<PullRequestLinkedIssuesGraphQlRaw>(output)
+        .with_context(|| format!("failed to parse linked issues for {repository}#{number}"))?;
+    let Some(pull_request) = raw
+        .data
+        .repository
+        .and_then(|repository| repository.pull_request)
+    else {
+        return Ok((Vec::new(), false, None));
+    };
+    let connection = pull_request.closing_issues_references;
+    let issues = connection
+        .nodes
+        .unwrap_or_default()
+        .into_iter()
+        .map(linked_issue_from_raw)
+        .collect::<Vec<_>>();
+
+    Ok((
+        issues,
+        connection.page_info.has_next_page,
+        connection.page_info.end_cursor,
+    ))
+}
+
+fn linked_issue_from_raw(raw: PullRequestLinkedIssueRaw) -> LinkedIssue {
+    LinkedIssue {
+        repository: raw
+            .repository
+            .map(|repository| repository.name_with_owner)
+            .unwrap_or_default(),
+        number: raw.number,
+        title: raw.title,
+        state: raw.state.map(|state| state.to_ascii_lowercase()),
+        url: raw.url,
+    }
 }
 
 impl IssueDetailsRaw {
@@ -3717,6 +4143,8 @@ impl IssueDetailsRaw {
             }),
             comments: self.comments,
             viewer_subscription: None,
+            linked_pull_requests: None,
+            linked_issues: None,
         })
     }
 }
@@ -3790,6 +4218,7 @@ fn pull_request_review_comment_preview(
             is_resolved: thread_state.is_resolved,
             is_outdated: thread_state.is_outdated,
         }),
+        commit_activity: None,
     }
 }
 
@@ -3904,6 +4333,7 @@ fn pull_request_timeline_review_summary_comment(
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     })
 }
 
@@ -4007,19 +4437,35 @@ fn pull_request_commit_activity_comment(
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: Some(PullRequestCommitActivityPreview {
+            total_count: commit_count,
+            commits: activity
+                .commits
+                .iter()
+                .take(MAX_PULL_REQUEST_ACTIVITY_COMMITS)
+                .map(|commit| PullRequestCommitPreview {
+                    sha: commit.sha.clone(),
+                    title: commit.summary().to_string(),
+                    url: commit.html_url.clone(),
+                })
+                .collect(),
+        }),
     }
 }
 
 impl PullRequestTimelineCommit {
-    fn activity_line(&self) -> String {
-        let short_sha = short_sha(&self.sha);
-        let summary = self
-            .message
+    fn summary(&self) -> &str {
+        self.message
             .lines()
             .next()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .unwrap_or("(no commit message)");
+            .unwrap_or("(no commit message)")
+    }
+
+    fn activity_line(&self) -> String {
+        let short_sha = short_sha(&self.sha);
+        let summary = self.summary();
         match &self.html_url {
             Some(url) => format!("[{short_sha}]({url}) {summary}"),
             None => format!("{short_sha} {summary}"),
@@ -4409,10 +4855,7 @@ async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
         bail!("GitHub backend expected a `gh api` request");
     }
     match crate::github_api::selected_backend() {
-        crate::github_api::GitHubBackend::DirectApi => {
-            let request = crate::github_api::parse_api_args(args)?;
-            crate::github_api::run_direct_request(&request).await
-        }
+        crate::github_api::GitHubBackend::DirectApi => crate::github_api::run_api(args).await,
         crate::github_api::GitHubBackend::GitHubCli => crate::github_gh::run_api(args).await,
     }
 }
@@ -4684,6 +5127,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         .as_ref()
         .map(check_summary_from_rollup);
     let check_runs = check_runs_from_rollup(pr.status_check_rollup.as_ref());
+    let commit_statuses = commit_statuses_from_connection(pr.commits.as_ref());
     let failed_check_runs = failed_check_runs_from_rollup(pr.status_check_rollup.as_ref());
     let can_update = pr.viewer_can_update.unwrap_or(false);
     let can_auto_merge = pr.viewer_can_enable_auto_merge.unwrap_or(false);
@@ -4742,12 +5186,33 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         checks,
         check_runs,
         commits: pr.commits.as_ref().map(|commits| commits.total_count),
+        commit_statuses,
         failed_check_runs,
         note,
         head,
         queue: queue.map(Box::new),
         reviews: reviews.map(Box::new),
     }
+}
+
+fn commit_statuses_from_connection(
+    commits: Option<&PullRequestCommitConnectionRaw>,
+) -> HashMap<String, CommitCheckStatus> {
+    commits
+        .and_then(|commits| commits.nodes.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|node| {
+            let state = node.commit.status_check_rollup.as_ref()?.state.as_deref()?;
+            let status = match state {
+                "SUCCESS" => CommitCheckStatus::Success,
+                "FAILURE" | "ERROR" => CommitCheckStatus::Failure,
+                "PENDING" | "EXPECTED" => CommitCheckStatus::Pending,
+                _ => return None,
+            };
+            Some((node.commit.oid.clone(), status))
+        })
+        .collect()
 }
 
 fn pull_request_merge_queue(pr: &PullRequestActionRaw) -> Option<MergeQueueInfo> {
@@ -5207,6 +5672,8 @@ fn search_api_item_to_work_item(kind: SectionKind, item: SearchApiIssueRaw) -> W
             title: milestone.title,
         }),
         assignees,
+        linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -5325,6 +5792,8 @@ fn issue_api_item_to_work_item(kind: ItemKind, item: IssueItemRaw) -> WorkItem {
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees,
+        linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: item.comments,
         unread: None,
         reason: None,
@@ -5440,6 +5909,8 @@ fn notification_to_work_item(notification: &NotificationRaw) -> WorkItem {
         reactions: ReactionSummary::default(),
         milestone: None,
         assignees: Vec::new(),
+        linked_pull_requests: Vec::new(),
+        linked_issues: Vec::new(),
         comments: None,
         unread: Some(notification.unread),
         reason: Some(normalize_reason_for_display(&notification.reason)),
@@ -5998,6 +6469,113 @@ mod tests {
     }
 
     #[test]
+    fn merged_search_items_sort_uses_configured_created_order() {
+        let mut items = vec![
+            search_sort_work_item(
+                "updated-newer",
+                1,
+                "2026-01-01T00:00:00Z",
+                "2026-01-05T00:00:00Z",
+            ),
+            search_sort_work_item(
+                "created-newer",
+                2,
+                "2026-01-03T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+            ),
+            search_sort_work_item("middle", 3, "2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"),
+        ];
+        let queries = vec![
+            "is:open review-requested:@me archived:false sort:created-desc".to_string(),
+            "is:open assignee:@me archived:false sort:created-desc".to_string(),
+        ];
+
+        sort_merged_search_items(&mut items, merged_search_items_sort(&queries));
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["created-newer", "middle", "updated-newer"]
+        );
+    }
+
+    #[test]
+    fn merged_search_items_sort_preserves_configured_updated_order() {
+        let mut items = vec![
+            search_sort_work_item(
+                "updated-newer",
+                1,
+                "2026-01-01T00:00:00Z",
+                "2026-01-05T00:00:00Z",
+            ),
+            search_sort_work_item(
+                "created-newer",
+                2,
+                "2026-01-03T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+            ),
+            search_sort_work_item("middle", 3, "2026-01-02T00:00:00Z", "2026-01-04T00:00:00Z"),
+        ];
+        let queries = vec![
+            "is:open review-requested:@me archived:false sort:updated-desc".to_string(),
+            "is:open assignee:@me archived:false sort:updated-desc".to_string(),
+        ];
+
+        sort_merged_search_items(&mut items, merged_search_items_sort(&queries));
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["updated-newer", "middle", "created-newer"]
+        );
+    }
+
+    fn search_sort_work_item(
+        id: &str,
+        number: u64,
+        created_at: &str,
+        updated_at: &str,
+    ) -> WorkItem {
+        WorkItem {
+            id: id.to_string(),
+            kind: ItemKind::PullRequest,
+            repo: "owner/repo".to_string(),
+            number: Some(number),
+            title: id.to_string(),
+            body: None,
+            author: None,
+            state: Some("open".to_string()),
+            url: format!("https://github.com/owner/repo/pull/{number}"),
+            created_at: Some(
+                DateTime::parse_from_rfc3339(created_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            updated_at: Some(
+                DateTime::parse_from_rfc3339(updated_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            last_read_at: None,
+            labels: Vec::new(),
+            reactions: ReactionSummary::default(),
+            milestone: None,
+            assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
+            comments: None,
+            unread: None,
+            reason: None,
+            extra: None,
+            viewer_subscription: None,
+        }
+    }
+
+    #[test]
     fn search_api_item_maps_repository_url() {
         let item = SearchApiIssueRaw {
             assignees: Some(vec![SearchAuthorRaw {
@@ -6352,6 +6930,103 @@ mod tests {
             parse_issue_comments_output(output, "owner/repo", 1, None, &HashMap::new()).unwrap();
         assert_eq!(comments[0].reactions.plus_one, 2);
         assert_eq!(comments[0].reactions.rocket, 1);
+    }
+
+    #[test]
+    fn issue_linked_pull_requests_parse_graphql_page() {
+        let output = r#"{
+          "data": {
+            "repository": {
+              "issue": {
+                "closedByPullRequestsReferences": {
+                  "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "cursor-2"
+                  },
+                  "nodes": [
+                    {
+                      "repository": { "nameWithOwner": "owner/repo" },
+                      "number": 7,
+                      "title": "Fix linked issue",
+                      "state": "OPEN",
+                      "isDraft": false,
+                      "merged": false,
+                      "url": "https://github.com/owner/repo/pull/7"
+                    },
+                    {
+                      "repository": { "nameWithOwner": "owner/repo" },
+                      "number": 8,
+                      "title": "Close linked issue",
+                      "state": "CLOSED",
+                      "isDraft": false,
+                      "merged": true,
+                      "url": "https://github.com/owner/repo/pull/8"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let (pull_requests, has_next_page, end_cursor) =
+            parse_issue_linked_pull_requests_page(output, "owner/repo", 1).unwrap();
+
+        assert!(has_next_page);
+        assert_eq!(end_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(pull_requests.len(), 2);
+        assert_eq!(pull_requests[0].repository, "owner/repo");
+        assert_eq!(pull_requests[0].number, 7);
+        assert_eq!(pull_requests[0].title, "Fix linked issue");
+        assert_eq!(pull_requests[0].state.as_deref(), Some("open"));
+        assert_eq!(pull_requests[1].state.as_deref(), Some("merged"));
+    }
+
+    #[test]
+    fn pull_request_linked_issues_parse_graphql_page() {
+        let output = r#"{
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "closingIssuesReferences": {
+                  "pageInfo": {
+                    "hasNextPage": true,
+                    "endCursor": "cursor-2"
+                  },
+                  "nodes": [
+                    {
+                      "repository": { "nameWithOwner": "owner/repo" },
+                      "number": 77,
+                      "title": "Notifications reappear in inbox",
+                      "state": "OPEN",
+                      "url": "https://github.com/owner/repo/issues/77"
+                    },
+                    {
+                      "repository": { "nameWithOwner": "other/repo" },
+                      "number": 91,
+                      "title": "Another linked issue",
+                      "state": "CLOSED",
+                      "url": "https://github.com/other/repo/issues/91"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        let (issues, has_next_page, end_cursor) =
+            parse_pull_request_linked_issues_page(output, "owner/repo", 78).unwrap();
+
+        assert!(has_next_page);
+        assert_eq!(end_cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].repository, "owner/repo");
+        assert_eq!(issues[0].number, 77);
+        assert_eq!(issues[0].title, "Notifications reappear in inbox");
+        assert_eq!(issues[0].state.as_deref(), Some("open"));
+        assert_eq!(issues[1].repository, "other/repo");
+        assert_eq!(issues[1].state.as_deref(), Some("closed"));
     }
 
     #[test]
@@ -6808,6 +7483,23 @@ mod tests {
             )
         );
         assert!(!activity.body.contains("old commit"));
+        let commit_activity = activity
+            .commit_activity
+            .as_ref()
+            .expect("structured commit activity");
+        assert_eq!(commit_activity.total_count, 3);
+        assert_eq!(commit_activity.commits.len(), 3);
+        assert_eq!(
+            commit_activity.commits[0],
+            PullRequestCommitPreview {
+                sha: "ee8130a17152a4d7d5fe669927f3fdd0a86074d8".to_string(),
+                title: "fix(cch): correct deployer test config field name".to_string(),
+                url: Some(
+                    "https://github.com/nervosnetwork/fiber/commit/ee8130a17152a4d7d5fe669927f3fdd0a86074d8"
+                        .to_string()
+                ),
+            }
+        );
     }
 
     #[test]
@@ -7211,7 +7903,38 @@ mod tests {
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 5 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 5,
+                nodes: Some(vec![
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "success-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("SUCCESS".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "failure-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("FAILURE".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "pending-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("PENDING".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                ]),
+            }),
             head_ref_name: Some("feature/diagnostics".to_string()),
             head_repository: Some(PullRequestHeadRepositoryRaw {
                 name_with_owner: "rust-lang/rust".to_string(),
@@ -7259,6 +7982,14 @@ mod tests {
         assert_eq!(hints.labels, vec!["Approvable"]);
         assert_eq!(hints.commits, Some(5));
         assert_eq!(
+            hints.commit_statuses,
+            HashMap::from([
+                ("success-sha".to_string(), CommitCheckStatus::Success),
+                ("failure-sha".to_string(), CommitCheckStatus::Failure),
+                ("pending-sha".to_string(), CommitCheckStatus::Pending),
+            ])
+        );
+        assert_eq!(
             hints.checks,
             Some(CheckSummary {
                 passed: 1,
@@ -7285,7 +8016,10 @@ mod tests {
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 2,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(false),
@@ -7339,7 +8073,10 @@ mod tests {
     fn action_hints_prefer_merge_queue_status_when_pr_is_queued() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 1 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 1,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(true),
@@ -7440,7 +8177,10 @@ mod tests {
     fn action_hints_show_conflicts_when_mergeable_is_conflicting() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 2,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(false),

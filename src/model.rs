@@ -50,12 +50,34 @@ pub struct WorkItem {
     pub milestone: Option<Milestone>,
     #[serde(default)]
     pub assignees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_pull_requests: Vec<LinkedPullRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_issues: Vec<LinkedIssue>,
     pub comments: Option<u64>,
     pub unread: Option<bool>,
     pub reason: Option<String>,
     pub extra: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewer_subscription: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedPullRequest {
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub state: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedIssue {
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub state: Option<String>,
+    pub url: String,
 }
 
 impl WorkItem {
@@ -140,6 +162,8 @@ pub struct CommentPreview {
     pub reactions: ReactionSummary,
     #[serde(default)]
     pub review: Option<ReviewCommentPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_activity: Option<PullRequestCommitActivityPreview>,
 }
 
 impl CommentPreview {
@@ -163,6 +187,19 @@ pub enum CommentPreviewKind {
     Comment,
     ReviewSummary,
     Activity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommitActivityPreview {
+    pub total_count: usize,
+    pub commits: Vec<PullRequestCommitPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommitPreview {
+    pub sha: String,
+    pub title: String,
+    pub url: Option<String>,
 }
 
 impl CommentPreviewKind {
@@ -214,11 +251,19 @@ pub struct ActionHints {
     pub checks: Option<CheckSummary>,
     pub check_runs: Vec<CheckRunSummary>,
     pub commits: Option<usize>,
+    pub commit_statuses: HashMap<String, CommitCheckStatus>,
     pub failed_check_runs: Vec<FailedCheckRunSummary>,
     pub note: Option<String>,
     pub head: Option<PullRequestBranch>,
     pub queue: Option<Box<MergeQueueInfo>>,
     pub reviews: Option<Box<PullRequestReviewSummary>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCheckStatus {
+    Success,
+    Failure,
+    Pending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +564,7 @@ pub fn merge_refreshed_sections(
         .into_iter()
         .map(|mut section| match refreshed_by_key.remove(&section.key) {
             Some(mut refreshed) if refreshed.error.is_none() => {
+                preserve_detail_only_item_fields(&section, &mut refreshed);
                 preserve_lazy_notification_item_details(&section, &mut refreshed);
                 refreshed
             }
@@ -529,6 +575,20 @@ pub fn merge_refreshed_sections(
             None => section,
         })
         .collect()
+}
+
+fn preserve_detail_only_item_fields(current: &SectionSnapshot, refreshed: &mut SectionSnapshot) {
+    let current_by_id = current
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    for item in &mut refreshed.items {
+        let Some(current_item) = current_by_id.get(item.id.as_str()) else {
+            continue;
+        };
+        preserve_detail_only_fields(current_item, item);
+    }
 }
 
 fn preserve_lazy_notification_item_details(
@@ -582,8 +642,29 @@ fn preserve_lazy_item_details(current: &WorkItem, refreshed: &mut WorkItem) {
     if refreshed.assignees.is_empty() && !current.assignees.is_empty() {
         refreshed.assignees = current.assignees.clone();
     }
+    preserve_detail_only_fields(current, refreshed);
     if refreshed.comments.is_none() {
         refreshed.comments = current.comments;
+    }
+}
+
+fn preserve_detail_only_fields(current: &WorkItem, refreshed: &mut WorkItem) {
+    if current.kind != refreshed.kind {
+        return;
+    }
+    match refreshed.kind {
+        ItemKind::Issue => {
+            if refreshed.linked_pull_requests.is_empty() && !current.linked_pull_requests.is_empty()
+            {
+                refreshed.linked_pull_requests = current.linked_pull_requests.clone();
+            }
+        }
+        ItemKind::PullRequest => {
+            if refreshed.linked_issues.is_empty() && !current.linked_issues.is_empty() {
+                refreshed.linked_issues = current.linked_issues.clone();
+            }
+        }
+        ItemKind::Notification => {}
     }
 }
 
@@ -690,6 +771,7 @@ mod tests {
         .expect("old cached work item should still parse");
 
         assert_eq!(item.body, None);
+        assert!(item.linked_pull_requests.is_empty());
     }
 
     #[test]
@@ -703,7 +785,7 @@ mod tests {
         let refreshed_updated_at = DateTime::parse_from_rfc3339("2026-05-03T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let mut current_item = test_work_item("thread-1", ItemKind::PullRequest);
+        let mut current_item = test_work_item("thread-1", ItemKind::Issue);
         current_item.body = Some("Lazy PR description".to_string());
         current_item.author = Some("alice".to_string());
         current_item.state = Some("open".to_string());
@@ -716,11 +798,19 @@ mod tests {
             title: "next".to_string(),
         });
         current_item.assignees = vec!["bob".to_string()];
+        let linked_pull_requests = vec![LinkedPullRequest {
+            repository: "owner/repo".to_string(),
+            number: 42,
+            title: "Fix example".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/owner/repo/pull/42".to_string(),
+        }];
+        current_item.linked_pull_requests = linked_pull_requests.clone();
         current_item.comments = Some(3);
         current_item.unread = Some(true);
         current_item.reason = Some("subscribed".to_string());
 
-        let mut refreshed_item = test_work_item("thread-1", ItemKind::PullRequest);
+        let mut refreshed_item = test_work_item("thread-1", ItemKind::Issue);
         refreshed_item.updated_at = Some(refreshed_updated_at);
         refreshed_item.unread = Some(false);
         refreshed_item.reason = Some("mention".to_string());
@@ -748,6 +838,7 @@ mod tests {
             })
         );
         assert_eq!(item.assignees, vec!["bob".to_string()]);
+        assert_eq!(item.linked_pull_requests, linked_pull_requests);
         assert_eq!(item.comments, Some(3));
         assert_eq!(item.unread, Some(false));
         assert_eq!(item.reason.as_deref(), Some("mention"));
@@ -771,6 +862,65 @@ mod tests {
         let item = &merged[0].items[0];
         assert!(item.body.is_none());
         assert!(item.labels.is_empty());
+    }
+
+    #[test]
+    fn refreshed_issue_sections_preserve_loaded_linked_pull_requests() {
+        let mut current_item = test_work_item("owner/repo#1", ItemKind::Issue);
+        current_item.body = Some("Old description".to_string());
+        current_item.labels = vec!["old-label".to_string()];
+        let linked_pull_requests = vec![LinkedPullRequest {
+            repository: "owner/repo".to_string(),
+            number: 42,
+            title: "Fix example".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/owner/repo/pull/42".to_string(),
+        }];
+        current_item.linked_pull_requests = linked_pull_requests.clone();
+
+        let mut refreshed_item = test_work_item("owner/repo#1", ItemKind::Issue);
+        refreshed_item.title = "Updated issue title".to_string();
+        let merged = merge_refreshed_sections(
+            vec![test_section(SectionKind::Issues, vec![current_item])],
+            vec![test_section(SectionKind::Issues, vec![refreshed_item])],
+        );
+
+        let item = &merged[0].items[0];
+        assert_eq!(item.title, "Updated issue title");
+        assert!(item.body.is_none());
+        assert!(item.labels.is_empty());
+        assert_eq!(item.linked_pull_requests, linked_pull_requests);
+    }
+
+    #[test]
+    fn refreshed_pull_request_sections_preserve_loaded_linked_issues() {
+        let mut current_item = test_work_item("owner/repo#7", ItemKind::PullRequest);
+        current_item.body = Some("Old description".to_string());
+        current_item.labels = vec!["old-label".to_string()];
+        let linked_issues = vec![LinkedIssue {
+            repository: "owner/repo".to_string(),
+            number: 42,
+            title: "Bug example".to_string(),
+            state: Some("open".to_string()),
+            url: "https://github.com/owner/repo/issues/42".to_string(),
+        }];
+        current_item.linked_issues = linked_issues.clone();
+
+        let mut refreshed_item = test_work_item("owner/repo#7", ItemKind::PullRequest);
+        refreshed_item.title = "Updated PR title".to_string();
+        let merged = merge_refreshed_sections(
+            vec![test_section(SectionKind::PullRequests, vec![current_item])],
+            vec![test_section(
+                SectionKind::PullRequests,
+                vec![refreshed_item],
+            )],
+        );
+
+        let item = &merged[0].items[0];
+        assert_eq!(item.title, "Updated PR title");
+        assert!(item.body.is_none());
+        assert!(item.labels.is_empty());
+        assert_eq!(item.linked_issues, linked_issues);
     }
 
     #[test]
@@ -926,6 +1076,8 @@ mod tests {
             reactions: ReactionSummary::default(),
             milestone: None,
             assignees: Vec::new(),
+            linked_pull_requests: Vec::new(),
+            linked_issues: Vec::new(),
             comments: None,
             unread: None,
             reason: None,

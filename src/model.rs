@@ -162,6 +162,8 @@ pub struct CommentPreview {
     pub reactions: ReactionSummary,
     #[serde(default)]
     pub review: Option<ReviewCommentPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_activity: Option<PullRequestCommitActivityPreview>,
 }
 
 impl CommentPreview {
@@ -185,6 +187,19 @@ pub enum CommentPreviewKind {
     Comment,
     ReviewSummary,
     Activity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommitActivityPreview {
+    pub total_count: usize,
+    pub commits: Vec<PullRequestCommitPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCommitPreview {
+    pub sha: String,
+    pub title: String,
+    pub url: Option<String>,
 }
 
 impl CommentPreviewKind {
@@ -236,11 +251,19 @@ pub struct ActionHints {
     pub checks: Option<CheckSummary>,
     pub check_runs: Vec<CheckRunSummary>,
     pub commits: Option<usize>,
+    pub commit_statuses: HashMap<String, CommitCheckStatus>,
     pub failed_check_runs: Vec<FailedCheckRunSummary>,
     pub note: Option<String>,
     pub head: Option<PullRequestBranch>,
     pub queue: Option<Box<MergeQueueInfo>>,
     pub reviews: Option<Box<PullRequestReviewSummary>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCheckStatus {
+    Success,
+    Failure,
+    Pending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

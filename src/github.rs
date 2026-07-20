@@ -15,8 +15,9 @@ use tracing::{debug, error, info, warn};
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
-    FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest, MergeQueueInfo, Milestone,
-    PullRequestBranch, PullRequestReviewActor, PullRequestReviewActorState,
+    CommitCheckStatus, FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest,
+    MergeQueueInfo, Milestone, PullRequestBranch, PullRequestCommitActivityPreview,
+    PullRequestCommitPreview, PullRequestReviewActor, PullRequestReviewActorState,
     PullRequestReviewSummary, ReactionSummary, ReviewCommentPreview, SectionKind, SectionSnapshot,
     WorkItem, builtin_view_key, global_search_view_key, repo_section_filters_with_labels,
     repo_view_key,
@@ -678,6 +679,19 @@ struct PullRequestActionRaw {
 #[serde(rename_all = "camelCase")]
 struct PullRequestCommitConnectionRaw {
     total_count: usize,
+    nodes: Option<Vec<PullRequestCommitNodeRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestCommitNodeRaw {
+    commit: PullRequestCommitStatusRaw,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitStatusRaw {
+    oid: String,
+    status_check_rollup: Option<PullRequestStatusRollupRaw>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2515,8 +2529,16 @@ query($owner: String!, $name: String!, $number: Int!) {
       viewerCanEnableAutoMerge
       viewerCanMergeAsAdmin
       viewerDidAuthor
-      commits {
+      commits(last: 100) {
         totalCount
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              state
+            }
+          }
+        }
       }
       viewerLatestReview {
         state
@@ -3966,6 +3988,7 @@ fn issue_comment_preview(
             .map(ReactionSummary::from)
             .unwrap_or_default(),
         review: None,
+        commit_activity: None,
     }
 }
 
@@ -4195,6 +4218,7 @@ fn pull_request_review_comment_preview(
             is_resolved: thread_state.is_resolved,
             is_outdated: thread_state.is_outdated,
         }),
+        commit_activity: None,
     }
 }
 
@@ -4309,6 +4333,7 @@ fn pull_request_timeline_review_summary_comment(
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     })
 }
 
@@ -4412,19 +4437,35 @@ fn pull_request_commit_activity_comment(
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: Some(PullRequestCommitActivityPreview {
+            total_count: commit_count,
+            commits: activity
+                .commits
+                .iter()
+                .take(MAX_PULL_REQUEST_ACTIVITY_COMMITS)
+                .map(|commit| PullRequestCommitPreview {
+                    sha: commit.sha.clone(),
+                    title: commit.summary().to_string(),
+                    url: commit.html_url.clone(),
+                })
+                .collect(),
+        }),
     }
 }
 
 impl PullRequestTimelineCommit {
-    fn activity_line(&self) -> String {
-        let short_sha = short_sha(&self.sha);
-        let summary = self
-            .message
+    fn summary(&self) -> &str {
+        self.message
             .lines()
             .next()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .unwrap_or("(no commit message)");
+            .unwrap_or("(no commit message)")
+    }
+
+    fn activity_line(&self) -> String {
+        let short_sha = short_sha(&self.sha);
+        let summary = self.summary();
         match &self.html_url {
             Some(url) => format!("[{short_sha}]({url}) {summary}"),
             None => format!("{short_sha} {summary}"),
@@ -5016,6 +5057,7 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         .as_ref()
         .map(check_summary_from_rollup);
     let check_runs = check_runs_from_rollup(pr.status_check_rollup.as_ref());
+    let commit_statuses = commit_statuses_from_connection(pr.commits.as_ref());
     let failed_check_runs = failed_check_runs_from_rollup(pr.status_check_rollup.as_ref());
     let can_update = pr.viewer_can_update.unwrap_or(false);
     let can_auto_merge = pr.viewer_can_enable_auto_merge.unwrap_or(false);
@@ -5074,12 +5116,33 @@ fn pull_request_action_hints(pr: &PullRequestActionRaw) -> ActionHints {
         checks,
         check_runs,
         commits: pr.commits.as_ref().map(|commits| commits.total_count),
+        commit_statuses,
         failed_check_runs,
         note,
         head,
         queue: queue.map(Box::new),
         reviews: reviews.map(Box::new),
     }
+}
+
+fn commit_statuses_from_connection(
+    commits: Option<&PullRequestCommitConnectionRaw>,
+) -> HashMap<String, CommitCheckStatus> {
+    commits
+        .and_then(|commits| commits.nodes.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|node| {
+            let state = node.commit.status_check_rollup.as_ref()?.state.as_deref()?;
+            let status = match state {
+                "SUCCESS" => CommitCheckStatus::Success,
+                "FAILURE" | "ERROR" => CommitCheckStatus::Failure,
+                "PENDING" | "EXPECTED" => CommitCheckStatus::Pending,
+                _ => return None,
+            };
+            Some((node.commit.oid.clone(), status))
+        })
+        .collect()
 }
 
 fn pull_request_merge_queue(pr: &PullRequestActionRaw) -> Option<MergeQueueInfo> {
@@ -7349,6 +7412,23 @@ mod tests {
             )
         );
         assert!(!activity.body.contains("old commit"));
+        let commit_activity = activity
+            .commit_activity
+            .as_ref()
+            .expect("structured commit activity");
+        assert_eq!(commit_activity.total_count, 3);
+        assert_eq!(commit_activity.commits.len(), 3);
+        assert_eq!(
+            commit_activity.commits[0],
+            PullRequestCommitPreview {
+                sha: "ee8130a17152a4d7d5fe669927f3fdd0a86074d8".to_string(),
+                title: "fix(cch): correct deployer test config field name".to_string(),
+                url: Some(
+                    "https://github.com/nervosnetwork/fiber/commit/ee8130a17152a4d7d5fe669927f3fdd0a86074d8"
+                        .to_string()
+                ),
+            }
+        );
     }
 
     #[test]
@@ -7752,7 +7832,38 @@ mod tests {
     fn action_hints_show_approvable_when_review_is_needed() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 5 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 5,
+                nodes: Some(vec![
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "success-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("SUCCESS".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "failure-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("FAILURE".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                    PullRequestCommitNodeRaw {
+                        commit: PullRequestCommitStatusRaw {
+                            oid: "pending-sha".to_string(),
+                            status_check_rollup: Some(PullRequestStatusRollupRaw {
+                                state: Some("PENDING".to_string()),
+                                contexts: None,
+                            }),
+                        },
+                    },
+                ]),
+            }),
             head_ref_name: Some("feature/diagnostics".to_string()),
             head_repository: Some(PullRequestHeadRepositoryRaw {
                 name_with_owner: "rust-lang/rust".to_string(),
@@ -7800,6 +7911,14 @@ mod tests {
         assert_eq!(hints.labels, vec!["Approvable"]);
         assert_eq!(hints.commits, Some(5));
         assert_eq!(
+            hints.commit_statuses,
+            HashMap::from([
+                ("success-sha".to_string(), CommitCheckStatus::Success),
+                ("failure-sha".to_string(), CommitCheckStatus::Failure),
+                ("pending-sha".to_string(), CommitCheckStatus::Pending),
+            ])
+        );
+        assert_eq!(
             hints.checks,
             Some(CheckSummary {
                 passed: 1,
@@ -7826,7 +7945,10 @@ mod tests {
     fn action_hints_show_mergeable_when_pr_is_ready_and_viewer_can_merge() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 2,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(false),
@@ -7880,7 +8002,10 @@ mod tests {
     fn action_hints_prefer_merge_queue_status_when_pr_is_queued() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 1 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 1,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(true),
@@ -7981,7 +8106,10 @@ mod tests {
     fn action_hints_show_conflicts_when_mergeable_is_conflicting() {
         let hints = pull_request_action_hints(&PullRequestActionRaw {
             auto_merge_request: None,
-            commits: Some(PullRequestCommitConnectionRaw { total_count: 2 }),
+            commits: Some(PullRequestCommitConnectionRaw {
+                total_count: 2,
+                nodes: None,
+            }),
             head_ref_name: None,
             head_repository: None,
             is_in_merge_queue: Some(false),

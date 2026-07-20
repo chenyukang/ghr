@@ -1502,7 +1502,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
                         if position > 0 {
                             builder.push_blank();
                         }
-                        push_timeline_activity(&mut builder, &comments[*index]);
+                        push_timeline_activity(&mut builder, app, &comments[*index]);
                     }
                     builder.push_blank();
                 }
@@ -3205,7 +3205,11 @@ pub(super) fn push_comment(
     });
 }
 
-pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &CommentPreview) {
+pub(super) fn push_timeline_activity(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    activity: &CommentPreview,
+) {
     let timestamp = activity
         .updated_at
         .as_ref()
@@ -3222,6 +3226,16 @@ pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &Co
         header.push(DetailSegment::link("open", url.clone()));
     }
     builder.push_prefixed_wrapped_limited(header, prefix.clone(), DESCRIPTION_BODY_PADDING, 2);
+    if let Some(commit_activity) = &activity.commit_activity {
+        push_timeline_commit_activity(
+            builder,
+            app,
+            &prefix,
+            commit_activity.total_count,
+            &commit_activity.commits,
+        );
+        return;
+    }
     builder.push_markdown_block_prefixed(
         &activity.body,
         "No activity body.",
@@ -3232,6 +3246,91 @@ pub(super) fn push_timeline_activity(builder: &mut DetailsBuilder, activity: &Co
             right_padding: DESCRIPTION_BODY_PADDING,
         },
     );
+}
+
+fn push_timeline_commit_activity(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    prefix: &[DetailSegment],
+    total_count: usize,
+    commits: &[PullRequestCommitPreview],
+) {
+    builder.push_prefixed_wrapped_limited(
+        vec![DetailSegment::styled(
+            format!(
+                "pushed {total_count} commit{}",
+                if total_count == 1 { "" } else { "s" }
+            ),
+            active_theme().panel().add_modifier(Modifier::BOLD),
+        )],
+        prefix.to_vec(),
+        DESCRIPTION_BODY_PADDING,
+        2,
+    );
+    builder.push_gap_line(prefix);
+
+    for commit in commits {
+        push_timeline_commit_row(builder, app, prefix, commit);
+    }
+    if total_count > commits.len() {
+        builder.push_prefixed_wrapped_limited(
+            vec![DetailSegment::styled(
+                format!("... {} more commits", total_count - commits.len()),
+                active_theme().muted(),
+            )],
+            prefix.to_vec(),
+            DESCRIPTION_BODY_PADDING,
+            1,
+        );
+    }
+}
+
+fn push_timeline_commit_row(
+    builder: &mut DetailsBuilder,
+    app: &AppState,
+    prefix: &[DetailSegment],
+    commit: &PullRequestCommitPreview,
+) {
+    let mut segments = vec![commit_status_segment(commit_status_for(app, &commit.sha))];
+    let short_sha = short_commit_sha(&commit.sha).to_string();
+    if let Some(url) = commit.url.as_ref().filter(|url| !url.trim().is_empty()) {
+        segments.push(DetailSegment::link(short_sha, url.clone()));
+        segments.push(DetailSegment::raw(" "));
+        segments.push(DetailSegment::link(commit.title.clone(), url.clone()));
+    } else {
+        segments.push(DetailSegment::styled(short_sha, active_theme().muted()));
+        segments.push(DetailSegment::raw(" "));
+        segments.push(DetailSegment::raw(commit.title.clone()));
+    }
+    builder.push_prefixed_wrapped_limited(segments, prefix.to_vec(), DESCRIPTION_BODY_PADDING, 3);
+}
+
+fn commit_status_for(app: &AppState, sha: &str) -> Option<CommitCheckStatus> {
+    let item = app.current_item()?;
+    let ActionHintState::Loaded(hints) = app.action_hints.get(&item.id)? else {
+        return None;
+    };
+    hints.commit_statuses.get(sha).copied()
+}
+
+fn commit_status_segment(status: Option<CommitCheckStatus>) -> DetailSegment {
+    let (symbol, color) = match status {
+        Some(CommitCheckStatus::Success) => ("✓ ", active_theme().success),
+        Some(CommitCheckStatus::Failure) => ("✗ ", active_theme().error),
+        Some(CommitCheckStatus::Pending) => ("• ", active_theme().warning),
+        None => ("  ", active_theme().subtle),
+    };
+    DetailSegment::styled(
+        symbol,
+        active_theme()
+            .panel()
+            .fg(color)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn short_commit_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 pub(super) fn push_comment_body_gap(

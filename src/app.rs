@@ -64,9 +64,12 @@ use crate::github::{
     unsubscribe_notification_thread, update_issue_assignees, update_item_subscription,
     update_pull_request_branch, with_background_github_priority,
 };
+#[cfg(test)]
+use crate::model::PullRequestCommitActivityPreview;
 use crate::model::{
-    ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind, EditorDraft,
-    FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest, Milestone, PullRequestBranch,
+    ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
+    CommitCheckStatus, EditorDraft, FailedCheckRunSummary, ItemKind, LinkedIssue,
+    LinkedPullRequest, Milestone, PullRequestBranch, PullRequestCommitPreview,
     PullRequestReviewActor, ReactionSummary, SectionKind, SectionSnapshot, WorkItem,
     builtin_view_key, configured_sections, global_search_view_key,
     mark_all_notifications_read_in_section, mark_notification_done_in_section,
@@ -334,8 +337,14 @@ enum DetailState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionHintState {
     Loading,
-    Loaded(ActionHints),
+    Loaded(Box<ActionHints>),
     Error(String),
+}
+
+impl ActionHintState {
+    fn loaded(hints: ActionHints) -> Self {
+        Self::Loaded(Box::new(hints))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3815,10 +3824,10 @@ impl AppState {
                     self.action_hints_refreshing.remove(&item_id);
                     if !matches!(
                         self.action_hints.get(&item_id),
-                        Some(ActionHintState::Loaded(current)) if current == &actions
+                        Some(ActionHintState::Loaded(current)) if current.as_ref() == &actions
                     ) {
                         self.action_hints
-                            .insert(item_id, ActionHintState::Loaded(actions));
+                            .insert(item_id, ActionHintState::loaded(actions));
                     }
                 }
                 Err(error) => {

@@ -348,7 +348,7 @@ fn diff_file_header_links_to_head_branch_near_selected_line() {
     app.show_diff();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             head: Some(PullRequestBranch {
                 repository: "nervosnetwork/fiber".to_string(),
                 branch: "feature/diff-links".to_string(),
@@ -2832,7 +2832,7 @@ fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -2926,7 +2926,7 @@ fn progressive_refresh_does_not_force_current_details_reload() {
     );
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -4190,7 +4190,7 @@ fn stale_pr_action_hints_refresh_keeps_loaded_fields_visible() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Mergeable".to_string()],
             checks: Some(CheckSummary {
                 passed: 4,
@@ -4243,7 +4243,7 @@ fn background_action_hints_error_keeps_last_loaded_fields() {
         ..ActionHints::default()
     };
     app.action_hints
-        .insert("1".to_string(), ActionHintState::Loaded(hints.clone()));
+        .insert("1".to_string(), ActionHintState::loaded(hints.clone()));
     app.action_hints_refreshing.insert("1".to_string());
 
     app.handle_msg(AppMsg::ActionHintsLoaded {
@@ -4254,7 +4254,7 @@ fn background_action_hints_error_keeps_last_loaded_fields() {
     assert!(!app.action_hints_refreshing.contains("1"));
     assert_eq!(
         app.action_hints.get("1"),
-        Some(&ActionHintState::Loaded(hints))
+        Some(&ActionHintState::loaded(hints))
     );
 }
 
@@ -9278,7 +9278,7 @@ fn details_title_and_metadata_spacing_are_ordered() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Approvable".to_string()],
             checks: None,
             commits: Some(4),
@@ -9416,6 +9416,7 @@ fn inbox_details_mark_new_since_last_read_updates() {
             viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
+            commit_activity: None,
         }]),
     );
 
@@ -10204,7 +10205,7 @@ fn details_meta_shows_pr_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Approvable".to_string(), "Mergeable".to_string()],
             checks: Some(CheckSummary {
                 passed: 10,
@@ -10280,7 +10281,7 @@ fn pr_details_render_check_runs_as_openable_rows() {
     app.focus_details();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 3,
                 failed: 1,
@@ -10346,6 +10347,83 @@ fn pr_details_render_check_runs_as_openable_rows() {
 }
 
 #[test]
+fn pr_details_render_commit_ci_statuses_in_activity() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut activity = comment(
+        "alice",
+        "legacy commit activity",
+        Some("https://github.com/owner/repo/pull/1/commits"),
+    );
+    activity.kind = CommentPreviewKind::Activity;
+    activity.commit_activity = Some(PullRequestCommitActivityPreview {
+        total_count: 4,
+        commits: vec![
+            PullRequestCommitPreview {
+                sha: "1111111111111111111111111111111111111111".to_string(),
+                title: "passing commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/1111111".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "2222222222222222222222222222222222222222".to_string(),
+                title: "failing commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/2222222".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "3333333333333333333333333333333333333333".to_string(),
+                title: "running commit".to_string(),
+                url: Some("https://github.com/owner/repo/commit/3333333".to_string()),
+            },
+            PullRequestCommitPreview {
+                sha: "4444444444444444444444444444444444444444".to_string(),
+                title: "commit without checks".to_string(),
+                url: Some("https://github.com/owner/repo/commit/4444444".to_string()),
+            },
+        ],
+    });
+    app.details
+        .insert("1".to_string(), DetailState::Loaded(vec![activity]));
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::loaded(ActionHints {
+            commit_statuses: HashMap::from([
+                (
+                    "1111111111111111111111111111111111111111".to_string(),
+                    CommitCheckStatus::Success,
+                ),
+                (
+                    "2222222222222222222222222222222222222222".to_string(),
+                    CommitCheckStatus::Failure,
+                ),
+                (
+                    "3333333333333333333333333333333333333333".to_string(),
+                    CommitCheckStatus::Pending,
+                ),
+            ]),
+            ..ActionHints::default()
+        }),
+    );
+
+    let document = build_details_document(&app, 120);
+    let rendered = document
+        .lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("pushed 4 commits"));
+    assert!(rendered.contains("✓ 1111111 passing commit"));
+    assert!(rendered.contains("✗ 2222222 failing commit"));
+    assert!(rendered.contains("• 3333333 running commit"));
+    assert!(rendered.contains("  4444444 commit without checks"));
+    assert_document_link_for_text(
+        &document,
+        "passing commit",
+        "https://github.com/owner/repo/commit/1111111",
+    );
+}
+
+#[test]
 fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -10355,7 +10433,7 @@ fn conversation_details_can_focus_and_open_check_run_with_keyboard() {
     app.select_details_body_without_scroll();
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             check_runs: vec![CheckRunSummary {
                 name: "test".to_string(),
                 workflow: Some("CI".to_string()),
@@ -10403,7 +10481,7 @@ fn pr_details_render_merge_queue_and_review_summary() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["In merge queue".to_string()],
             checks: Some(CheckSummary {
                 passed: 43,
@@ -11495,6 +11573,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
+                commit_activity: None,
             },
             CommentPreview {
                 id: None,
@@ -11509,6 +11588,7 @@ fn details_comments_have_separators_and_raw_urls_are_clickable() {
                 viewer_can_update: None,
                 reactions: ReactionSummary::default(),
                 review: None,
+                commit_activity: None,
             },
         ]),
     );
@@ -14617,7 +14697,7 @@ fn capital_x_key_opens_checkout_confirmation_for_pull_request_details() {
     app.focus_details();
     app.action_hints.insert(
         "checkout-pr".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -14659,7 +14739,7 @@ fn capital_f_key_opens_rerun_failed_checks_confirmation() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 2,
                 failed: 1,
@@ -14706,7 +14786,7 @@ fn checkout_confirmation_remote_branch_is_clickable() {
     let config = checkout_test_config();
     app.action_hints.insert(
         "checkout-pr".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: Vec::new(),
             checks: None,
             commits: None,
@@ -15463,7 +15543,7 @@ fn rerun_failed_checks_rejects_pr_without_failed_checks() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 3,
                 failed: 0,
@@ -15489,7 +15569,7 @@ fn rerun_failed_checks_confirmation_submits_action() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             checks: Some(CheckSummary {
                 passed: 0,
                 failed: 1,
@@ -16400,7 +16480,7 @@ fn auto_merge_action_finished_refreshes_details_and_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Auto-mergeable".to_string()],
             checks: None,
             note: None,
@@ -16438,7 +16518,7 @@ fn update_branch_finished_keeps_item_open_and_refreshes_details_and_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Update branch".to_string()],
             checks: None,
             note: None,
@@ -16513,7 +16593,7 @@ fn draft_ready_action_finished_updates_item_extra_and_refreshes_action_hints() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     app.action_hints.insert(
         "1".to_string(),
-        ActionHintState::Loaded(ActionHints {
+        ActionHintState::loaded(ActionHints {
             labels: vec!["Draft".to_string()],
             checks: None,
             note: Some("Merge blocked: draft".to_string()),
@@ -18954,6 +19034,7 @@ fn details_comment_bodies_are_not_truncated() {
             viewer_can_update: None,
             reactions: ReactionSummary::default(),
             review: None,
+            commit_activity: None,
         }]),
     );
 
@@ -21708,6 +21789,7 @@ fn comment(author: &str, body: &str, url: Option<&str>) -> CommentPreview {
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     }
 }
 
@@ -21732,6 +21814,7 @@ fn own_comment(id: u64, author: &str, body: &str, url: Option<&str>) -> CommentP
         viewer_can_update: None,
         reactions: ReactionSummary::default(),
         review: None,
+        commit_activity: None,
     }
 }
 

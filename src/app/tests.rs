@@ -2777,6 +2777,128 @@ fn idle_sweep_does_not_merge_current_active_view() {
 }
 
 #[test]
+fn inbox_idle_refresh_runs_every_minute_only_between_other_refreshes() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.last_inbox_refresh_request = Instant::now() - INBOX_IDLE_REFRESH_INTERVAL;
+
+    assert!(app.should_start_inbox_idle_refresh());
+
+    app.refreshing = true;
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.refreshing = false;
+    app.idle_sweep_refreshing = true;
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.idle_sweep_refreshing = false;
+    app.notification_read_pending.insert("thread-1".to_string());
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.notification_read_pending.clear();
+
+    app.handle_msg(AppMsg::InboxIdleRefreshStarted);
+    assert!(app.inbox_idle_refreshing);
+    assert!(!app.should_start_inbox_idle_refresh());
+
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: Vec::new(),
+    });
+    assert!(!app.inbox_idle_refreshing);
+    assert!(!app.should_start_inbox_idle_refresh());
+}
+
+#[test]
+fn inbox_idle_refresh_updates_notifications_without_changing_active_view_or_status() {
+    let inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![notification_item("thread-1", false)],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(
+        SectionKind::PullRequests,
+        vec![test_section(), inbox.clone()],
+    );
+    app.status = "steady".to_string();
+
+    let mut refreshed_inbox = inbox;
+    refreshed_inbox.items = vec![
+        notification_item("thread-1", true),
+        notification_item("thread-2", true),
+    ];
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![refreshed_inbox],
+    });
+
+    assert_eq!(app.active_view, "pull_requests");
+    assert_eq!(app.status, "steady");
+    assert_eq!(app.unread_notification_count(), 2);
+    let inbox = app
+        .sections
+        .iter()
+        .find(|section| section.key == "notifications:All")
+        .expect("inbox section should remain loaded");
+    assert_eq!(inbox.items.len(), 2);
+    assert!(inbox.items.iter().all(|item| item.unread == Some(true)));
+}
+
+#[test]
+fn inbox_idle_refresh_preserves_selected_notification_and_details_position() {
+    let mut inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![
+            notification_item("thread-1", true),
+            notification_item("thread-2", true),
+        ],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox.clone()]);
+    app.set_current_selected_position(1);
+    app.focus = FocusTarget::Details;
+    app.details_scroll = 7;
+
+    inbox.items = vec![
+        notification_item("thread-2", true),
+        notification_item("thread-3", true),
+    ];
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![inbox],
+    });
+
+    assert_eq!(
+        app.current_item().map(|item| item.id.as_str()),
+        Some("thread-2")
+    );
+    assert_eq!(app.focus, FocusTarget::Details);
+    assert_eq!(app.details_scroll, 7);
+}
+
+#[test]
+fn visible_inbox_refresh_resets_independent_idle_timer() {
+    let inbox = SectionSnapshot::empty(SectionKind::Notifications, "All", "is:all");
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox]);
+    app.last_inbox_refresh_request = Instant::now() - INBOX_IDLE_REFRESH_INTERVAL;
+
+    app.handle_msg(AppMsg::RefreshStarted {
+        scope: RefreshScope::View("notifications".to_string()),
+    });
+
+    assert!(app.refreshing);
+    assert!(app.last_inbox_refresh_request.elapsed() < Duration::from_secs(1));
+    assert!(!app.should_start_inbox_idle_refresh());
+}
+
+#[test]
 fn startup_refresh_finishes_with_ready_dialog() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let paths = test_paths();

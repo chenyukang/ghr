@@ -16,7 +16,7 @@
 ## Features
 
 - Inbox, pull request, and issue views.
-- Snapshot-first startup: cached data is shown immediately, the active view refreshes first, and non-active PR/issue sections are kept warm by a quiet idle sweep.
+- Snapshot-first startup: cached data is shown immediately, the active view refreshes first, Inbox refreshes every 60 seconds while idle, and non-active PR/issue sections are kept warm by a quiet idle sweep.
 - Configurable sections and repo tabs, including multi-query sections such as `Needs Attention`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.

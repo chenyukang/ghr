@@ -79,6 +79,37 @@ pub(super) fn start_idle_sweep(
     });
 }
 
+pub(super) fn start_inbox_idle_refresh(
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    let _ = tx.send(AppMsg::InboxIdleRefreshStarted);
+    tokio::spawn(async move {
+        let refresh = refresh_notification_sections(&config);
+        let refreshed = with_background_github_priority(refresh).await;
+        let mut sections = Vec::new();
+
+        for section in refreshed {
+            if let Some(error) = &section.error {
+                warn!(error = %error, "failed to refresh inbox in background");
+                continue;
+            }
+
+            if let Err(error) = store.save_section(&section) {
+                warn!(
+                    error = %error,
+                    section = %section.key,
+                    "failed to save background inbox snapshot"
+                );
+            }
+            sections.push(section);
+        }
+
+        let _ = tx.send(AppMsg::InboxIdleRefreshFinished { sections });
+    });
+}
+
 pub(super) fn start_section_page_load(
     app: &mut AppState,
     config: &Config,

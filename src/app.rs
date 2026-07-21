@@ -57,12 +57,13 @@ use crate::github::{
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
-    refresh_section_page, remove_issue_label, remove_pull_request_reviewers, reopen_issue,
-    reopen_pull_request, request_pull_request_reviewers, rerun_failed_pull_request_checks,
-    search_github_users, search_global, set_pull_request_review_thread_resolved,
-    submit_pending_pull_request_review, submit_pull_request_review, subscribe_notification_thread,
-    unsubscribe_notification_thread, update_issue_assignees, update_item_subscription,
-    update_pull_request_branch, with_background_github_priority,
+    refresh_notification_sections, refresh_section_page, remove_issue_label,
+    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    request_pull_request_reviewers, rerun_failed_pull_request_checks, search_github_users,
+    search_global, set_pull_request_review_thread_resolved, submit_pending_pull_request_review,
+    submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
+    update_issue_assignees, update_item_subscription, update_pull_request_branch,
+    with_background_github_priority,
 };
 #[cfg(test)]
 use crate::model::PullRequestCommitActivityPreview;
@@ -174,6 +175,10 @@ enum AppMsg {
     IdleSweepFinished {
         sections: Vec<SectionSnapshot>,
         next_cursor: usize,
+    },
+    InboxIdleRefreshStarted,
+    InboxIdleRefreshFinished {
+        sections: Vec<SectionSnapshot>,
     },
     CommentsLoaded {
         item_id: String,
@@ -1527,6 +1532,7 @@ const GLOBAL_SEARCH_SUGGESTION_LIMIT: usize = 6;
 const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
+const INBOX_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 struct AppState {
     theme_name: ThemeName,
@@ -1590,6 +1596,8 @@ struct AppState {
     idle_sweep_refreshing: bool,
     idle_sweep_cursor: usize,
     last_idle_sweep_request: Instant,
+    inbox_idle_refreshing: bool,
+    last_inbox_refresh_request: Instant,
     details: HashMap<String, DetailState>,
     details_synced_at: HashMap<String, DateTime<Utc>>,
     details_refreshed_at: HashMap<String, DateTime<Utc>>,
@@ -2053,6 +2061,8 @@ async fn run_loop(
 
         if !started_pending_full_refresh
             && !app.refreshing
+            && !app.idle_sweep_refreshing
+            && !app.inbox_idle_refreshing
             && config.defaults.refetch_interval_seconds > 0
             && app.last_refresh_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
@@ -2064,6 +2074,8 @@ async fn run_loop(
                 RefreshPriority::Background,
                 RefreshScope::View(app.active_view.clone()),
             );
+        } else if !started_pending_full_refresh && app.should_start_inbox_idle_refresh() {
+            start_inbox_idle_refresh(config.clone(), store.clone(), tx.clone());
         } else if !started_pending_full_refresh && app.should_start_idle_sweep(config) {
             start_idle_sweep(
                 config.clone(),
@@ -2900,6 +2912,15 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
     !recent.id.is_empty() && item.id == recent.id
 }
 
+fn refresh_scope_includes_inbox(scope: &RefreshScope) -> bool {
+    match scope {
+        RefreshScope::Full => true,
+        RefreshScope::View(view) => {
+            same_view_key(view, &builtin_view_key(SectionKind::Notifications))
+        }
+    }
+}
+
 impl AppState {
     fn with_ui_state(
         active_view: SectionKind,
@@ -3008,6 +3029,8 @@ impl AppState {
             idle_sweep_refreshing: false,
             idle_sweep_cursor: 0,
             last_idle_sweep_request: Instant::now() - INITIAL_IDLE_SWEEP_DELAY,
+            inbox_idle_refreshing: false,
+            last_inbox_refresh_request: Instant::now() - INBOX_IDLE_REFRESH_INTERVAL,
             details: HashMap::new(),
             details_synced_at: HashMap::new(),
             details_refreshed_at: HashMap::new(),
@@ -3494,12 +3517,25 @@ impl AppState {
     fn should_start_idle_sweep(&self, config: &Config) -> bool {
         !self.refreshing
             && !self.idle_sweep_refreshing
+            && !self.inbox_idle_refreshing
             && self.setup_dialog.is_none()
             && self.section_page_loading.is_none()
             && !self.global_search_running
             && config.defaults.refetch_interval_seconds > 0
             && self.last_idle_sweep_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
+    }
+
+    fn should_start_inbox_idle_refresh(&self) -> bool {
+        !self.refreshing
+            && !self.idle_sweep_refreshing
+            && !self.inbox_idle_refreshing
+            && self.setup_dialog.is_none()
+            && self.section_page_loading.is_none()
+            && !self.global_search_running
+            && self.notification_read_pending.is_empty()
+            && self.notification_done_pending.is_empty()
+            && self.last_inbox_refresh_request.elapsed() >= INBOX_IDLE_REFRESH_INTERVAL
     }
 
     fn record_unseen_repo_items_for_sections(&mut self, sections: &[SectionSnapshot]) {
@@ -3624,6 +3660,40 @@ impl AppState {
         self.sections = merge_refreshed_sections(current, sections);
     }
 
+    fn apply_inbox_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
+        let anchor = self.current_refresh_anchor();
+        let previous_details_scroll = self.details_scroll;
+        let previous_comment_index = self.selected_comment_index;
+        let sections = sections
+            .into_iter()
+            .filter(|section| matches!(section.kind, SectionKind::Notifications))
+            .filter(|section| !self.has_active_section_filter(&section.key))
+            .filter(|section| !self.should_preserve_user_section_page(section))
+            .collect::<Vec<_>>();
+
+        if sections.is_empty() {
+            return;
+        }
+
+        self.invalidate_action_hints_for_sections(&sections);
+        for section in &sections {
+            self.remember_base_filters(section);
+        }
+
+        let current = std::mem::take(&mut self.sections);
+        self.sections = merge_refreshed_sections(current, sections);
+        if self.restore_refresh_anchor(&anchor) {
+            self.details_scroll = previous_details_scroll;
+            self.selected_comment_index = previous_comment_index;
+            if let Some(item_id) = anchor.item_id {
+                self.details_stale.insert(item_id);
+            }
+            self.clamp_selected_comment();
+        } else {
+            self.reset_or_restore_current_conversation_details_state();
+        }
+    }
+
     fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
@@ -3707,6 +3777,9 @@ impl AppState {
                 self.refreshing = true;
                 self.current_refresh_scope = scope;
                 self.last_refresh_request = Instant::now();
+                if refresh_scope_includes_inbox(&self.current_refresh_scope) {
+                    self.last_inbox_refresh_request = Instant::now();
+                }
                 if self.section_page_loading.is_none() {
                     self.status = refresh_started_status(&self.current_refresh_scope);
                 }
@@ -3729,6 +3802,15 @@ impl AppState {
                 self.idle_sweep_cursor = next_cursor;
                 self.last_idle_sweep_request = Instant::now();
                 self.apply_idle_refreshed_sections(sections);
+            }
+            AppMsg::InboxIdleRefreshStarted => {
+                self.inbox_idle_refreshing = true;
+                self.last_inbox_refresh_request = Instant::now();
+            }
+            AppMsg::InboxIdleRefreshFinished { sections } => {
+                self.inbox_idle_refreshing = false;
+                self.last_inbox_refresh_request = Instant::now();
+                self.apply_inbox_idle_refreshed_sections(sections);
             }
             AppMsg::RefreshFinished {
                 sections,

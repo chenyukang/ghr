@@ -83,6 +83,7 @@ pub(super) fn info_lines(app: &AppState, config: &Config, paths: &Paths) -> Vec<
         format!("refreshing: {}", app.refreshing),
         format!("refresh_scope: {:?}", app.current_refresh_scope),
         format!("idle_sweep_refreshing: {}", app.idle_sweep_refreshing),
+        format!("inbox_idle_refreshing: {}", app.inbox_idle_refreshing),
         format!(
             "mouse: {}",
             if app.mouse_capture_enabled {

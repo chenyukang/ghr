@@ -17,6 +17,7 @@
 
 - Inbox, pull request, and issue views.
 - Snapshot-first startup: cached data is shown immediately, the active view refreshes first, Inbox refreshes every 60 seconds while idle, and non-active PR/issue sections are kept warm by a quiet idle sweep.
+- Bounded read-request scheduling per GitHub backend, with limited foreground concurrency, serialized background work, foreground priority, resource-specific rate-limit cooldowns, and rate-limit-aware retries; write operations run immediately and are never retried automatically.
 - Configurable sections and repo tabs, including multi-query sections such as `Needs Attention`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
@@ -206,6 +207,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
 | `Info` | Show terminal, version, config/db/log paths, cache counts, runtime state, and ghr system diagnostics in a scrollable popup |
 | `Log` | Show recent direct API and `gh api` requests with timestamps, status, response sizes, errors, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
+| `Rate Limit` | Query and show current GitHub core, search, and GraphQL quotas together with local queue and cooldown state |
 
 Diff review ranges:
 

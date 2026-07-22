@@ -1070,6 +1070,7 @@ impl AppState {
         self.action_hints_refreshing.clear();
         self.details_stale.clear();
         self.details_refreshing.clear();
+        self.details_auto_retry_blocked.clear();
         self.pending_details_load = None;
         self.reset_or_restore_current_conversation_details_state();
         count

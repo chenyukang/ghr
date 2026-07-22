@@ -889,6 +889,7 @@ pub(super) fn trigger_refresh(
     tx: &UnboundedSender<AppMsg>,
 ) {
     if !app.refreshing {
+        app.mark_current_details_stale_for_user_refresh();
         app.queue_full_refresh_after_view();
     }
     trigger_refresh_scope(

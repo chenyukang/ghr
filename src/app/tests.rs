@@ -2881,6 +2881,44 @@ fn inbox_idle_refresh_preserves_selected_notification_and_details_position() {
     );
     assert_eq!(app.focus, FocusTarget::Details);
     assert_eq!(app.details_scroll, 7);
+    assert!(!app.details_stale.contains("thread-2"));
+}
+
+#[test]
+fn inbox_idle_refresh_only_stales_selected_details_when_item_updated() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut old_item = notification_item("thread-1", true);
+    old_item.updated_at = Some(older);
+    let inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![old_item],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox.clone()]);
+    app.details.insert(
+        "thread-1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![inbox.clone()],
+    });
+    assert!(!app.details_stale.contains("thread-1"));
+
+    let mut refreshed = inbox;
+    refreshed.items[0].updated_at = Some(newer);
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![refreshed],
+    });
+    assert!(app.details_stale.contains("thread-1"));
 }
 
 #[test]
@@ -2951,7 +2989,11 @@ fn refresh_finished_does_not_open_ready_dialog_without_startup_dialog() {
 
 #[test]
 fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
     app.action_hints.insert(
         "1".to_string(),
         ActionHintState::loaded(ActionHints {
@@ -2965,8 +3007,10 @@ fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
         }),
     );
 
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
     app.handle_msg(AppMsg::RefreshFinished {
-        sections: vec![test_section()],
+        sections: vec![refreshed],
         save_error: None,
     });
 
@@ -3071,6 +3115,33 @@ fn progressive_refresh_does_not_force_current_details_reload() {
     let item = app.current_item().expect("current item").clone();
     assert!(!app.start_comments_load_if_needed(&item));
     assert!(matches!(app.details.get("1"), Some(DetailState::Loaded(_))));
+}
+
+#[test]
+fn progressive_refresh_stales_details_when_updated_at_advances() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::loaded(ActionHints::default()),
+    );
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
+
+    app.handle_msg(AppMsg::RefreshSectionLoaded {
+        section: refreshed,
+        save_error: None,
+    });
+
+    assert!(app.details_stale.contains("1"));
+    assert!(app.action_hints_stale.contains("1"));
 }
 
 #[test]
@@ -4027,7 +4098,7 @@ fn ui_state_saves_and_restores_project_view_snapshot() {
 }
 
 #[test]
-fn refresh_preserves_details_scroll_when_current_item_survives() {
+fn refresh_preserves_details_without_staling_unchanged_item() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.set_selection(1);
     app.focus_details();
@@ -4065,7 +4136,29 @@ fn refresh_preserves_details_scroll_when_current_item_survives() {
     assert_eq!(app.current_selected_position(), 0);
     assert_eq!(app.details_scroll, 9);
     assert_eq!(app.selected_comment_index, 1);
-    assert!(app.details_stale.contains("2"));
+    assert!(!app.details_stale.contains("2"));
+}
+
+#[test]
+fn refresh_stales_selected_details_when_updated_at_advances() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
+
+    app.handle_msg(AppMsg::RefreshFinished {
+        sections: vec![refreshed],
+        save_error: None,
+    });
+
+    assert!(app.details_stale.contains("1"));
 }
 
 #[test]
@@ -4188,7 +4281,7 @@ fn refresh_preserves_repo_anchor_over_builtin_duplicate_item() {
     assert_eq!(app.current_selected_position(), 0);
     assert_eq!(app.details_scroll, 12);
     assert_eq!(app.selected_comment_index, 1);
-    assert!(app.details_stale.contains("fiber-1294"));
+    assert!(!app.details_stale.contains("fiber-1294"));
 }
 
 #[test]
@@ -4268,6 +4361,9 @@ fn stale_details_refresh_failure_preserves_loaded_comments() {
     );
     assert!(!app.details_stale.contains("1"));
     assert!(!app.details_refreshing.contains("1"));
+    assert!(app.details_auto_retry_blocked.contains("1"));
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.comments_auto_refresh_due(&item, Instant::now() + COMMENTS_AUTO_REFRESH_INTERVAL));
     assert!(app.setup_dialog.is_none());
     assert!(app.status.contains("keeping cached comments"));
 
@@ -4279,6 +4375,26 @@ fn stale_details_refresh_failure_preserves_loaded_comments() {
         .join("\n");
     assert!(rendered.contains("old cached comment"));
     assert!(!rendered.contains("Failed to load comments"));
+
+    app.mark_current_details_stale_for_user_refresh();
+    assert!(app.comments_load_needed(&item));
+}
+
+#[test]
+fn loading_and_error_details_do_not_start_duplicate_automatic_loads() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let item = app.current_item().cloned().expect("selected item");
+
+    app.details.insert("1".to_string(), DetailState::Loading);
+    app.details_stale.insert("1".to_string());
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.start_comments_load_if_needed(&item));
+
+    app.details
+        .insert("1".to_string(), DetailState::Error("failed".to_string()));
+    app.details_stale.remove("1");
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.start_comments_load_if_needed(&item));
 }
 
 #[test]
@@ -5000,6 +5116,76 @@ fn command_palette_log_opens_recent_gh_request_dialog() {
     );
     assert_eq!(app.status, "log");
     clear_gh_log_entries();
+}
+
+#[test]
+fn rate_limit_result_opens_quota_and_scheduler_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.rate_limit_loading = true;
+    app.handle_msg(AppMsg::RateLimitLoaded {
+        result: Ok(GitHubRateLimitSnapshot {
+            fetched_at: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+            resources: vec![crate::github::GitHubRateLimitResource {
+                name: "core".to_string(),
+                limit: 5_000,
+                used: 1_250,
+                remaining: 3_750,
+                reset: 1_800_000_600,
+            }],
+            scheduler: crate::github_queue::GitHubQueueSnapshot {
+                backend: crate::github_queue::GitHubQueueBackend::DirectApi,
+                active: 2,
+                max_active: 16,
+                resources: vec![crate::github_queue::GitHubQueueResourceSnapshot {
+                    resource: crate::github_queue::GitHubRateResource::Core,
+                    user_waiting: 1,
+                    background_waiting: 3,
+                    cooldown_remaining: Some(Duration::from_secs(42)),
+                }],
+            },
+        }),
+    });
+
+    assert!(!app.rate_limit_loading);
+    let dialog = app.diagnostics_dialog.as_ref().expect("rate limit dialog");
+    assert_eq!(dialog.kind, DiagnosticsDialogKind::RateLimit);
+    assert_eq!(dialog.title, "Rate Limit");
+    assert!(dialog.lines.iter().any(|line| line == "GitHub quotas"));
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line.contains("core:") && line.contains("3750"))
+    );
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line == "active: 2 / 16 foreground slots")
+    );
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line.contains("1 foreground, 3 background")
+                && line.contains("42s remaining"))
+    );
+    assert_eq!(app.status, "rate limits");
+}
+
+#[test]
+fn rate_limit_error_uses_operation_error_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.rate_limit_loading = true;
+    app.handle_msg(AppMsg::RateLimitLoaded {
+        result: Err("HTTP 403: secondary rate limit".to_string()),
+    });
+
+    assert!(!app.rate_limit_loading);
+    let dialog = app.message_dialog.as_ref().expect("error dialog");
+    assert_eq!(dialog.title, "Rate Limit Failed");
+    assert!(dialog.body.contains("secondary rate limit"));
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
 }
 
 #[tokio::test]
@@ -9867,7 +10053,10 @@ fn issue_or_pr_description_renders_without_preview_truncation() {
 
 #[test]
 fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
     let mut item = notification_item("thread-1", true);
+    item.updated_at = Some(older);
     item.body = Some("Loaded from the linked pull request.".to_string());
     item.author = Some("rustbot".to_string());
     item.labels = vec!["T-compiler".to_string()];
@@ -9889,12 +10078,14 @@ fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
         DetailState::Loaded(vec![comment("alice", "cached comment", None)]),
     );
 
+    let mut refreshed_item = notification_item("thread-1", false);
+    refreshed_item.updated_at = Some(newer);
     let refreshed_section = SectionSnapshot {
         key: "notifications:all".to_string(),
         kind: SectionKind::Notifications,
         title: "All".to_string(),
         filters: "is:all".to_string(),
-        items: vec![notification_item("thread-1", false)],
+        items: vec![refreshed_item],
         total_count: None,
         page: 1,
         page_size: 50,
@@ -13276,6 +13467,30 @@ fn capital_r_replies_in_details_while_lowercase_r_keeps_refreshing() {
     ));
     assert_eq!(app.status, "refresh already running");
     assert!(app.comment_dialog.is_none());
+}
+
+#[test]
+fn lowercase_r_retries_failed_details() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.details
+        .insert("1".to_string(), DetailState::Error("failed".to_string()));
+    app.details_auto_retry_blocked.insert("1".to_string());
+    let item = app.current_item().cloned().expect("selected item");
+    assert!(!app.comments_load_needed(&item));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('r')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert!(app.details_stale.contains("1"));
+    assert!(app.comments_load_needed(&item));
 }
 
 #[test]

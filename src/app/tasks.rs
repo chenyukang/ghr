@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) fn spawn_rate_limit_load(tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = fetch_github_rate_limits()
+            .await
+            .map_err(error_chain_message);
+        let _ = tx.send(AppMsg::RateLimitLoaded { result });
+    });
+}
+
 pub(super) fn start_refresh(
     config: Config,
     store: SnapshotStore,

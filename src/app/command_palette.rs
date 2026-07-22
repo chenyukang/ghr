@@ -28,6 +28,7 @@ pub(super) enum PaletteAction {
     Quit,
     ShowInfo,
     ShowGhLog,
+    ShowRateLimit,
     ShowHelp,
     ShowCommandPalette,
     SubmitEditor,
@@ -154,6 +155,13 @@ pub(super) fn command_palette_commands(
             "General",
             "Show recent GitHub API requests, status, errors, and rate-limit events",
             PaletteAction::ShowGhLog,
+        ),
+        palette_command(
+            "Rate Limit",
+            "",
+            "General",
+            "Show current GitHub core, search, and GraphQL quotas and local cooldowns",
+            PaletteAction::ShowRateLimit,
         ),
         palette_command(
             "Close or Cancel",
@@ -1041,6 +1049,9 @@ mod tests {
                 .any(|command| command.title == "Change Milestone")
         );
         assert!(commands.iter().any(|command| command.title == "Info"));
+        assert!(commands.iter().any(|command| {
+            command.title == "Rate Limit" && matches!(command.action, PaletteAction::ShowRateLimit)
+        }));
         assert!(
             commands
                 .iter()

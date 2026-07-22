@@ -5,6 +5,7 @@ use octocrab::Octocrab;
 use serde_json::{Map, Value};
 use tracing::{debug, error};
 
+use crate::github_queue::{GitHubQueueBackend, GitHubRateResource, observe_response};
 use crate::log::{GhLogRequest, fail_api_request, finish_api_request, start_gh_request};
 
 const TOKEN_ENV_VARS: [&str; 3] = ["GHR_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
@@ -51,7 +52,7 @@ pub fn parse_api_args(args: &[String]) -> Result<ApiRequest> {
     parse_api_args_impl(args)
 }
 
-pub async fn run_api(args: &[String]) -> Result<String> {
+pub async fn run_api(args: &[String], resource: GitHubRateResource) -> Result<String> {
     let request = match parse_api_args(args) {
         Ok(request) => request,
         Err(request_error) => {
@@ -66,11 +67,12 @@ pub async fn run_api(args: &[String]) -> Result<String> {
     let log_request = start_gh_request("api", &command, None);
     debug!(kind = "api", command, "GitHub API request started");
 
-    run_direct_request(&request, log_request, &command).await
+    run_direct_request(&request, resource, log_request, &command).await
 }
 
 async fn run_direct_request(
     request: &ApiRequest,
+    resource: GitHubRateResource,
     log_request: GhLogRequest,
     command: &str,
 ) -> Result<String> {
@@ -114,6 +116,7 @@ async fn run_direct_request(
     };
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = match client
         .body_to_string(response)
         .await
@@ -121,6 +124,13 @@ async fn run_direct_request(
     {
         Ok(body) => body,
         Err(request_error) => {
+            observe_response(
+                GitHubQueueBackend::DirectApi,
+                resource,
+                status.as_u16(),
+                &headers,
+                Some(&request_error.to_string()),
+            );
             log_request_finished(
                 log_request,
                 command,
@@ -131,8 +141,22 @@ async fn run_direct_request(
             return Err(request_error);
         }
     };
+    let response_message = if !status.is_success() {
+        Some(github_error_message(&body))
+    } else if graphql {
+        graphql_error_message(&body)
+    } else {
+        None
+    };
+    observe_response(
+        GitHubQueueBackend::DirectApi,
+        resource,
+        status.as_u16(),
+        &headers,
+        response_message.as_deref(),
+    );
     if !status.is_success() {
-        let message = github_error_message(&body);
+        let message = response_message.expect("failed response should have an error message");
         let request_error = anyhow!(
             "GitHub API request failed: HTTP {}: {message}",
             status.as_u16()
@@ -146,7 +170,7 @@ async fn run_direct_request(
         );
         return Err(request_error);
     }
-    if graphql && let Some(message) = graphql_error_message(&body) {
+    if let Some(message) = response_message {
         let request_error = anyhow!("GitHub GraphQL request failed: {message}");
         log_request_finished(
             log_request,

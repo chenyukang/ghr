@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) fn spawn_rate_limit_load(tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let result = fetch_github_rate_limits()
+            .await
+            .map_err(error_chain_message);
+        let _ = tx.send(AppMsg::RateLimitLoaded { result });
+    });
+}
+
 pub(super) fn start_refresh(
     config: Config,
     store: SnapshotStore,
@@ -76,6 +85,37 @@ pub(super) fn start_idle_sweep(
             sections,
             next_cursor: result.next_cursor,
         });
+    });
+}
+
+pub(super) fn start_inbox_idle_refresh(
+    config: Config,
+    store: SnapshotStore,
+    tx: UnboundedSender<AppMsg>,
+) {
+    let _ = tx.send(AppMsg::InboxIdleRefreshStarted);
+    tokio::spawn(async move {
+        let refresh = refresh_notification_sections(&config);
+        let refreshed = with_background_github_priority(refresh).await;
+        let mut sections = Vec::new();
+
+        for section in refreshed {
+            if let Some(error) = &section.error {
+                warn!(error = %error, "failed to refresh inbox in background");
+                continue;
+            }
+
+            if let Err(error) = store.save_section(&section) {
+                warn!(
+                    error = %error,
+                    section = %section.key,
+                    "failed to save background inbox snapshot"
+                );
+            }
+            sections.push(section);
+        }
+
+        let _ = tx.send(AppMsg::InboxIdleRefreshFinished { sections });
     });
 }
 

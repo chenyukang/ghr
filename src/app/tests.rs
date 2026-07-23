@@ -2777,6 +2777,198 @@ fn idle_sweep_does_not_merge_current_active_view() {
 }
 
 #[test]
+fn inbox_idle_refresh_runs_every_minute_only_between_other_refreshes() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.last_inbox_refresh_request = Instant::now() - INBOX_IDLE_REFRESH_INTERVAL;
+
+    assert!(app.should_start_inbox_idle_refresh());
+
+    app.refreshing = true;
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.refreshing = false;
+    app.idle_sweep_refreshing = true;
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.idle_sweep_refreshing = false;
+    app.notification_read_pending.insert("thread-1".to_string());
+    assert!(!app.should_start_inbox_idle_refresh());
+    app.notification_read_pending.clear();
+
+    app.handle_msg(AppMsg::InboxIdleRefreshStarted);
+    assert!(app.inbox_idle_refreshing);
+    assert!(!app.should_start_inbox_idle_refresh());
+
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: Vec::new(),
+    });
+    assert!(!app.inbox_idle_refreshing);
+    assert!(!app.should_start_inbox_idle_refresh());
+}
+
+#[test]
+fn inbox_idle_refresh_updates_notifications_without_changing_active_view_or_status() {
+    let inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![notification_item("thread-1", false)],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(
+        SectionKind::PullRequests,
+        vec![test_section(), inbox.clone()],
+    );
+    app.status = "steady".to_string();
+
+    let mut refreshed_inbox = inbox;
+    refreshed_inbox.items = vec![
+        notification_item("thread-1", true),
+        notification_item("thread-2", true),
+    ];
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![refreshed_inbox],
+    });
+
+    assert_eq!(app.active_view, "pull_requests");
+    assert_eq!(app.status, "steady");
+    assert_eq!(app.unread_notification_count(), 2);
+    let inbox = app
+        .sections
+        .iter()
+        .find(|section| section.key == "notifications:All")
+        .expect("inbox section should remain loaded");
+    assert_eq!(inbox.items.len(), 2);
+    assert!(inbox.items.iter().all(|item| item.unread == Some(true)));
+}
+
+#[test]
+fn inbox_idle_refresh_keeps_done_threads_hidden_until_new_activity() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let inbox = notification_section(Vec::new());
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox]);
+    app.done_notification_threads
+        .insert("thread-1".to_string(), done_at);
+
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![notification_section(vec![old_item])],
+    });
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+
+    let mut new_item = notification_item("thread-1", true);
+    new_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![notification_section(vec![new_item])],
+    });
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-1");
+    assert!(!app.done_notification_threads.contains_key("thread-1"));
+    assert_eq!(
+        app.take_done_notification_threads_to_delete(),
+        vec!["thread-1".to_string()]
+    );
+}
+
+#[test]
+fn inbox_idle_refresh_preserves_selected_notification_and_details_position() {
+    let mut inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![
+            notification_item("thread-1", true),
+            notification_item("thread-2", true),
+        ],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox.clone()]);
+    app.set_current_selected_position(1);
+    app.focus = FocusTarget::Details;
+    app.details_scroll = 7;
+
+    inbox.items = vec![
+        notification_item("thread-2", true),
+        notification_item("thread-3", true),
+    ];
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![inbox],
+    });
+
+    assert_eq!(
+        app.current_item().map(|item| item.id.as_str()),
+        Some("thread-2")
+    );
+    assert_eq!(app.focus, FocusTarget::Details);
+    assert_eq!(app.details_scroll, 7);
+    assert!(!app.details_stale.contains("thread-2"));
+}
+
+#[test]
+fn inbox_idle_refresh_only_stales_selected_details_when_item_updated() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut old_item = notification_item("thread-1", true);
+    old_item.updated_at = Some(older);
+    let inbox = SectionSnapshot {
+        key: "notifications:All".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items: vec![old_item],
+        total_count: None,
+        page: 1,
+        page_size: 50,
+        refreshed_at: None,
+        error: None,
+    };
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox.clone()]);
+    app.details.insert(
+        "thread-1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![inbox.clone()],
+    });
+    assert!(!app.details_stale.contains("thread-1"));
+
+    let mut refreshed = inbox;
+    refreshed.items[0].updated_at = Some(newer);
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![refreshed],
+    });
+    assert!(app.details_stale.contains("thread-1"));
+}
+
+#[test]
+fn visible_inbox_refresh_resets_independent_idle_timer() {
+    let inbox = SectionSnapshot::empty(SectionKind::Notifications, "All", "is:all");
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox]);
+    app.last_inbox_refresh_request = Instant::now() - INBOX_IDLE_REFRESH_INTERVAL;
+
+    app.handle_msg(AppMsg::RefreshStarted {
+        scope: RefreshScope::View("notifications".to_string()),
+    });
+
+    assert!(app.refreshing);
+    assert!(app.last_inbox_refresh_request.elapsed() < Duration::from_secs(1));
+    assert!(!app.should_start_inbox_idle_refresh());
+}
+
+#[test]
 fn startup_refresh_finishes_with_ready_dialog() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let paths = test_paths();
@@ -2829,7 +3021,11 @@ fn refresh_finished_does_not_open_ready_dialog_without_startup_dialog() {
 
 #[test]
 fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
     app.action_hints.insert(
         "1".to_string(),
         ActionHintState::loaded(ActionHints {
@@ -2843,8 +3039,10 @@ fn refresh_finished_marks_pr_action_hints_stale_without_hiding_loaded_fields() {
         }),
     );
 
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
     app.handle_msg(AppMsg::RefreshFinished {
-        sections: vec![test_section()],
+        sections: vec![refreshed],
         save_error: None,
     });
 
@@ -2949,6 +3147,33 @@ fn progressive_refresh_does_not_force_current_details_reload() {
     let item = app.current_item().expect("current item").clone();
     assert!(!app.start_comments_load_if_needed(&item));
     assert!(matches!(app.details.get("1"), Some(DetailState::Loaded(_))));
+}
+
+#[test]
+fn progressive_refresh_stales_details_when_updated_at_advances() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+    app.action_hints.insert(
+        "1".to_string(),
+        ActionHintState::loaded(ActionHints::default()),
+    );
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
+
+    app.handle_msg(AppMsg::RefreshSectionLoaded {
+        section: refreshed,
+        save_error: None,
+    });
+
+    assert!(app.details_stale.contains("1"));
+    assert!(app.action_hints_stale.contains("1"));
 }
 
 #[test]
@@ -3906,7 +4131,7 @@ fn ui_state_saves_and_restores_project_view_snapshot() {
 }
 
 #[test]
-fn refresh_preserves_details_scroll_when_current_item_survives() {
+fn refresh_preserves_details_without_staling_unchanged_item() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.set_selection(1);
     app.focus_details();
@@ -3944,7 +4169,29 @@ fn refresh_preserves_details_scroll_when_current_item_survives() {
     assert_eq!(app.current_selected_position(), 0);
     assert_eq!(app.details_scroll, 9);
     assert_eq!(app.selected_comment_index, 1);
-    assert!(app.details_stale.contains("2"));
+    assert!(!app.details_stale.contains("2"));
+}
+
+#[test]
+fn refresh_stales_selected_details_when_updated_at_advances() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
+    let mut initial = test_section();
+    initial.items[0].updated_at = Some(older);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![initial]);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![comment("alice", "cached", None)]),
+    );
+    let mut refreshed = test_section();
+    refreshed.items[0].updated_at = Some(newer);
+
+    app.handle_msg(AppMsg::RefreshFinished {
+        sections: vec![refreshed],
+        save_error: None,
+    });
+
+    assert!(app.details_stale.contains("1"));
 }
 
 #[test]
@@ -4067,7 +4314,7 @@ fn refresh_preserves_repo_anchor_over_builtin_duplicate_item() {
     assert_eq!(app.current_selected_position(), 0);
     assert_eq!(app.details_scroll, 12);
     assert_eq!(app.selected_comment_index, 1);
-    assert!(app.details_stale.contains("fiber-1294"));
+    assert!(!app.details_stale.contains("fiber-1294"));
 }
 
 #[test]
@@ -4147,6 +4394,9 @@ fn stale_details_refresh_failure_preserves_loaded_comments() {
     );
     assert!(!app.details_stale.contains("1"));
     assert!(!app.details_refreshing.contains("1"));
+    assert!(app.details_auto_retry_blocked.contains("1"));
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.comments_auto_refresh_due(&item, Instant::now() + COMMENTS_AUTO_REFRESH_INTERVAL));
     assert!(app.setup_dialog.is_none());
     assert!(app.status.contains("keeping cached comments"));
 
@@ -4158,6 +4408,26 @@ fn stale_details_refresh_failure_preserves_loaded_comments() {
         .join("\n");
     assert!(rendered.contains("old cached comment"));
     assert!(!rendered.contains("Failed to load comments"));
+
+    app.mark_current_details_stale_for_user_refresh();
+    assert!(app.comments_load_needed(&item));
+}
+
+#[test]
+fn loading_and_error_details_do_not_start_duplicate_automatic_loads() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let item = app.current_item().cloned().expect("selected item");
+
+    app.details.insert("1".to_string(), DetailState::Loading);
+    app.details_stale.insert("1".to_string());
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.start_comments_load_if_needed(&item));
+
+    app.details
+        .insert("1".to_string(), DetailState::Error("failed".to_string()));
+    app.details_stale.remove("1");
+    assert!(!app.comments_load_needed(&item));
+    assert!(!app.start_comments_load_if_needed(&item));
 }
 
 #[test]
@@ -4749,6 +5019,20 @@ fn command_palette_recent_ties_fall_back_to_default_order() {
 }
 
 #[test]
+fn command_palette_search_relevance_overrides_recent_history() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let commands = app.available_command_palette_commands();
+    app.recent_commands = vec![RecentCommand {
+        id: "Copy PR/Issue Link".to_string(),
+        selected_at: DateTime::from_timestamp(1_700_000_100, 0).unwrap(),
+    }];
+
+    let matches = app.command_palette_match_indices(&commands, "pull");
+
+    assert_eq!(commands[matches[0]].title, "Pull Requests");
+}
+
+#[test]
 fn command_palette_submission_records_recent_command() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -4879,6 +5163,76 @@ fn command_palette_log_opens_recent_gh_request_dialog() {
     );
     assert_eq!(app.status, "log");
     clear_gh_log_entries();
+}
+
+#[test]
+fn rate_limit_result_opens_quota_and_scheduler_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.rate_limit_loading = true;
+    app.handle_msg(AppMsg::RateLimitLoaded {
+        result: Ok(GitHubRateLimitSnapshot {
+            fetched_at: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+            resources: vec![crate::github::GitHubRateLimitResource {
+                name: "core".to_string(),
+                limit: 5_000,
+                used: 1_250,
+                remaining: 3_750,
+                reset: 1_800_000_600,
+            }],
+            scheduler: crate::github_queue::GitHubQueueSnapshot {
+                backend: crate::github_queue::GitHubQueueBackend::DirectApi,
+                active: 2,
+                max_active: 16,
+                resources: vec![crate::github_queue::GitHubQueueResourceSnapshot {
+                    resource: crate::github_queue::GitHubRateResource::Core,
+                    user_waiting: 1,
+                    background_waiting: 3,
+                    cooldown_remaining: Some(Duration::from_secs(42)),
+                }],
+            },
+        }),
+    });
+
+    assert!(!app.rate_limit_loading);
+    let dialog = app.diagnostics_dialog.as_ref().expect("rate limit dialog");
+    assert_eq!(dialog.kind, DiagnosticsDialogKind::RateLimit);
+    assert_eq!(dialog.title, "Rate Limit");
+    assert!(dialog.lines.iter().any(|line| line == "GitHub quotas"));
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line.contains("core:") && line.contains("3750"))
+    );
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line == "active: 2 / 16 foreground slots")
+    );
+    assert!(
+        dialog
+            .lines
+            .iter()
+            .any(|line| line.contains("1 foreground, 3 background")
+                && line.contains("42s remaining"))
+    );
+    assert_eq!(app.status, "rate limits");
+}
+
+#[test]
+fn rate_limit_error_uses_operation_error_dialog() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    app.rate_limit_loading = true;
+    app.handle_msg(AppMsg::RateLimitLoaded {
+        result: Err("HTTP 403: secondary rate limit".to_string()),
+    });
+
+    assert!(!app.rate_limit_loading);
+    let dialog = app.message_dialog.as_ref().expect("error dialog");
+    assert_eq!(dialog.title, "Rate Limit Failed");
+    assert!(dialog.body.contains("secondary rate limit"));
+    assert_eq!(dialog.kind, MessageDialogKind::Error);
 }
 
 #[tokio::test]
@@ -6113,6 +6467,83 @@ fn top_menu_switcher_lists_all_top_tabs_and_filters() {
 }
 
 #[test]
+fn command_palette_generates_direct_commands_for_current_top_menu() {
+    let sections = vec![
+        SectionSnapshot::empty(
+            SectionKind::Notifications,
+            "All",
+            "is:unread reason:subscribed",
+        ),
+        test_section(),
+        SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+        SectionSnapshot::empty_for_view(
+            "repo:Fiber",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:nervosnetwork/fiber is:open",
+        ),
+    ];
+    let app = AppState::new(SectionKind::PullRequests, sections);
+    let commands = app.available_command_palette_commands();
+    let matches = app.command_palette_match_indices(&commands, "inb");
+    let command = matches
+        .first()
+        .and_then(|index| commands.get(*index))
+        .expect("Inbox should be the first matching command");
+
+    assert_eq!(command.title, "Inbox");
+    assert!(matches!(
+        &command.action,
+        PaletteAction::SwitchTopMenu { key, label }
+            if key == &builtin_view_key(SectionKind::Notifications) && label == "Inbox"
+    ));
+    assert!(commands.iter().any(|command| {
+        matches!(
+            &command.action,
+            PaletteAction::SwitchTopMenu { key, label }
+                if key == "repo:Fiber" && label == "Fiber"
+        )
+    }));
+}
+
+#[test]
+fn command_palette_direct_top_menu_command_switches_and_delays_list_focus() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let config = Config::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+    app.focus_details();
+    app.command_palette = Some(CommandPalette {
+        query: "Issues".to_string(),
+        selected: 0,
+    });
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &config,
+        &store,
+        &tx,
+    );
+
+    assert!(app.command_palette.is_none());
+    assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert_eq!(app.status, "top menu switched: Issues");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+}
+
+#[test]
 fn command_palette_top_menu_switch_opens_top_menu_switcher() {
     let config = Config::default();
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
@@ -6137,7 +6568,7 @@ fn command_palette_top_menu_switch_opens_top_menu_switcher() {
 }
 
 #[test]
-fn top_menu_switcher_enter_switches_view_and_focuses_top_menu() {
+fn top_menu_switcher_enter_delays_list_focus() {
     let sections = vec![
         test_section(),
         SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
@@ -6153,6 +6584,17 @@ fn top_menu_switcher_enter_switches_view_and_focuses_top_menu() {
     assert_eq!(app.focus, FocusTarget::Ghr);
     assert!(app.top_menu_switcher.is_none());
     assert_eq!(app.status, "top menu switched: Issues");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(!app.apply_pending_list_focus(ready_at - Duration::from_millis(1)));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+    assert!(app.pending_list_focus.is_none());
+    assert_eq!(app.status, "list focused");
 }
 
 #[test]
@@ -6255,6 +6697,17 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
         app.view_tabs()
             .iter()
             .any(|view| view.key == "repo:ghr" && view.label == "ghr")
+    );
+    assert!(
+        app.available_command_palette_commands()
+            .iter()
+            .any(|command| {
+                matches!(
+                    &command.action,
+                    PaletteAction::SwitchTopMenu { key, label }
+                        if key == "repo:ghr" && label == "ghr"
+                )
+            })
     );
     assert_eq!(
         app.visible_sections()
@@ -9947,7 +10400,10 @@ fn issue_or_pr_description_renders_without_preview_truncation() {
 
 #[test]
 fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
+    let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let newer = DateTime::from_timestamp(1_700_000_001, 0).unwrap();
     let mut item = notification_item("thread-1", true);
+    item.updated_at = Some(older);
     item.body = Some("Loaded from the linked pull request.".to_string());
     item.author = Some("rustbot".to_string());
     item.labels = vec!["T-compiler".to_string()];
@@ -9969,12 +10425,14 @@ fn inbox_refresh_keeps_lazy_description_visible_while_details_reload() {
         DetailState::Loaded(vec![comment("alice", "cached comment", None)]),
     );
 
+    let mut refreshed_item = notification_item("thread-1", false);
+    refreshed_item.updated_at = Some(newer);
     let refreshed_section = SectionSnapshot {
         key: "notifications:all".to_string(),
         kind: SectionKind::Notifications,
         title: "All".to_string(),
         filters: "is:all".to_string(),
-        items: vec![notification_item("thread-1", false)],
+        items: vec![refreshed_item],
         total_count: None,
         page: 1,
         page_size: 50,
@@ -13356,6 +13814,30 @@ fn capital_r_replies_in_details_while_lowercase_r_keeps_refreshing() {
     ));
     assert_eq!(app.status, "refresh already running");
     assert!(app.comment_dialog.is_none());
+}
+
+#[test]
+fn lowercase_r_retries_failed_details() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.details
+        .insert("1".to_string(), DetailState::Error("failed".to_string()));
+    app.details_auto_retry_blocked.insert("1".to_string());
+    let item = app.current_item().cloned().expect("selected item");
+    assert!(!app.comments_load_needed(&item));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('r')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    assert!(app.details_stale.contains("1"));
+    assert!(app.comments_load_needed(&item));
 }
 
 #[test]
@@ -19296,7 +19778,7 @@ fn mouse_clicking_table_header_does_not_change_selection() {
 }
 
 #[test]
-fn mouse_clicking_view_tab_switches_view_and_focuses_ghr() {
+fn mouse_clicking_view_tab_delays_list_focus() {
     let sections = vec![
         test_section(),
         SectionSnapshot {
@@ -19333,6 +19815,13 @@ fn mouse_clicking_view_tab_switches_view_and_focuses_ghr() {
     assert_eq!(app.focus, FocusTarget::Ghr);
     assert!(!app.search_active);
     assert_eq!(app.status, "GHR focused");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
 }
 
 #[test]
@@ -20270,6 +20759,41 @@ fn number_focus_keys_work_from_details() {
 }
 
 #[test]
+fn manual_focus_key_cancels_pending_list_focus() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let now = Instant::now();
+    app.schedule_top_menu_list_focus(now);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('1')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
+    assert!(!app.apply_pending_list_focus(now + LIST_FOCUS_RETURN_DELAY));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+}
+
+#[test]
+fn pending_list_focus_shortens_terminal_poll_timeout() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let now = Instant::now();
+    app.schedule_top_menu_list_focus(now);
+
+    assert_eq!(app.next_terminal_poll_timeout(now), LIST_FOCUS_RETURN_DELAY);
+    assert_eq!(
+        app.next_terminal_poll_timeout(now + Duration::from_millis(150)),
+        Duration::from_millis(50)
+    );
+}
+
+#[test]
 fn n_and_p_mirror_j_and_k_between_ghr_sections_and_list_focus() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -20352,6 +20876,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_ghr();
+    app.schedule_top_menu_list_focus(Instant::now());
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Char('l')),
@@ -20361,6 +20886,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     app.focus_sections();
     assert!(!handle_key(
@@ -20385,6 +20911,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.current_section_position(), 1);
     assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.pending_list_focus.is_none());
 
     app.focus_ghr();
     assert!(!handle_key(
@@ -20396,6 +20923,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     assert!(!handle_key(
         &mut app,
@@ -20589,6 +21117,7 @@ fn tab_switches_the_current_focused_tab_group() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_ghr();
+    app.schedule_top_menu_list_focus(Instant::now());
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Tab),
@@ -20598,6 +21127,7 @@ fn tab_switches_the_current_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     app.switch_view(builtin_view_key(SectionKind::PullRequests));
     app.focus_sections();
@@ -20612,6 +21142,7 @@ fn tab_switches_the_current_focused_tab_group() {
     assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
     assert_eq!(app.current_section_position(), 1);
     assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.pending_list_focus.is_none());
 
     assert!(!handle_key(
         &mut app,
@@ -20694,9 +21225,162 @@ fn tab_toggles_between_list_and_details_in_conversation_mode() {
         &tx
     ));
     assert_eq!(app.details_mode, DetailsMode::Conversation);
-    assert_eq!(app.focus, FocusTarget::Details);
+    assert_eq!(app.focus, FocusTarget::Sections);
     assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
     assert_eq!(app.current_section_position(), 0);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+}
+
+#[test]
+fn shift_tab_from_list_switches_previous_section_then_returns_to_list() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot {
+            key: "pull_requests:assigned".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Assigned".to_string(),
+            filters: String::new(),
+            items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_list();
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::BackTab),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+    assert_eq!(app.focus, FocusTarget::Sections);
+    assert_eq!(app.status, "Sections focused");
+    assert!(app.has_pending_list_focus_from(FocusTarget::Sections));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::BackTab),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    assert_eq!(app.focus, FocusTarget::Sections);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("repeated Shift+Tab should reschedule list focus")
+        .ready_at;
+    assert!(!app.apply_pending_list_focus(ready_at - Duration::from_millis(1)));
+    assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+    assert!(app.pending_list_focus.is_none());
+}
+
+#[test]
+fn shifted_brackets_from_list_switch_sections_in_both_directions() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot {
+            key: "pull_requests:assigned".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Assigned".to_string(),
+            filters: String::new(),
+            items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+        SectionSnapshot {
+            key: "pull_requests:review-requested".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Review Requested".to_string(),
+            filters: String::new(),
+            items: vec![work_item("3", "nervosnetwork/fiber", 3, "Review", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_list();
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('[')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::SHIFT),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+    assert_eq!(app.focus, FocusTarget::Sections);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('}')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 2);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('{')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+
+    assert!(!handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::SHIFT),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("shifted bracket should reschedule list focus")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
 }
 
 #[test]

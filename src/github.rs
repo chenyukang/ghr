@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,6 +12,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SearchSection, github_repo_from_remote_url};
+use crate::github_queue::{GitHubQueueBackend, GitHubRateResource, GitHubRequestPriority};
 use crate::model::{
     ActionHints, CheckRunSummary, CheckSummary, CommentPreview, CommentPreviewKind,
     CommitCheckStatus, FailedCheckRunSummary, ItemKind, LinkedIssue, LinkedPullRequest,
@@ -24,17 +24,45 @@ use crate::model::{
 };
 
 static VIEWER_LOGIN: OnceCell<String> = OnceCell::const_new();
-static USER_GH_REQUESTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 const SEARCH_API_MAX_RESULTS: usize = 1000;
 const SEARCH_API_MAX_PAGE_SIZE: usize = 100;
 const SEARCH_REFRESH_SPACING: Duration = Duration::from_millis(350);
-const BACKGROUND_GH_YIELD_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_PULL_REQUEST_COMMIT_ACTIVITIES: usize = 5;
 const MAX_PULL_REQUEST_ACTIVITY_COMMITS: usize = 20;
 const GITHUB_API_PAGE_SIZE: usize = 100;
 const GH_JSON_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(300), Duration::from_millis(1_000)];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubRateLimitResource {
+    pub name: String,
+    pub limit: u64,
+    pub used: u64,
+    pub remaining: u64,
+    pub reset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitHubRateLimitSnapshot {
+    pub fetched_at: DateTime<Utc>,
+    pub resources: Vec<GitHubRateLimitResource>,
+    pub scheduler: crate::github_queue::GitHubQueueSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRateLimitResponse {
+    resources: HashMap<String, GitHubRateLimitResourceRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRateLimitResourceRaw {
+    limit: u64,
+    #[serde(default)]
+    used: u64,
+    remaining: u64,
+    reset: i64,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -86,14 +114,8 @@ pub struct ItemDetailsMetadata {
     pub linked_issues: Option<Vec<LinkedIssue>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GhRequestPriority {
-    User,
-    Background,
-}
-
 tokio::task_local! {
-    static GH_REQUEST_PRIORITY: GhRequestPriority;
+    static GH_REQUEST_PRIORITY: GitHubRequestPriority;
 }
 
 pub async fn with_background_github_priority<F>(future: F) -> F::Output
@@ -101,35 +123,14 @@ where
     F: Future,
 {
     GH_REQUEST_PRIORITY
-        .scope(GhRequestPriority::Background, future)
+        .scope(GitHubRequestPriority::Background, future)
         .await
 }
 
-fn current_gh_request_priority() -> GhRequestPriority {
+fn current_gh_request_priority() -> GitHubRequestPriority {
     GH_REQUEST_PRIORITY
         .try_with(|priority| *priority)
-        .unwrap_or(GhRequestPriority::User)
-}
-
-struct UserGhRequestGuard;
-
-impl UserGhRequestGuard {
-    fn new() -> Self {
-        USER_GH_REQUESTS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-        Self
-    }
-}
-
-impl Drop for UserGhRequestGuard {
-    fn drop(&mut self) {
-        USER_GH_REQUESTS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-async fn wait_for_user_gh_requests() {
-    while USER_GH_REQUESTS_IN_FLIGHT.load(Ordering::Acquire) > 0 {
-        sleep(BACKGROUND_GH_YIELD_INTERVAL).await;
-    }
+        .unwrap_or(GitHubRequestPriority::User)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2314,18 +2315,7 @@ async fn fetch_paginated_api_array_output(
     path: &str,
     accept_header: Option<&str>,
 ) -> Result<String> {
-    if gh_api_slurp_supported().await {
-        return fetch_paginated_api_array_output_with_slurp(path, accept_header).await;
-    }
-
     fetch_paginated_api_array_output_without_slurp(path, accept_header).await
-}
-
-async fn fetch_paginated_api_array_output_with_slurp(
-    path: &str,
-    accept_header: Option<&str>,
-) -> Result<String> {
-    run_gh_json(&paginated_api_slurp_args(path, accept_header)).await
 }
 
 async fn fetch_paginated_api_array_output_without_slurp(
@@ -2352,25 +2342,6 @@ async fn fetch_paginated_api_array_output_without_slurp(
     }
 
     serde_json::to_string(&pages).context("failed to encode paginated gh api output")
-}
-
-async fn gh_api_slurp_supported() -> bool {
-    if !crate::github_api::selected_backend().supports_cli_commands() {
-        return false;
-    }
-    crate::github_gh::api_slurp_supported().await
-}
-
-fn paginated_api_slurp_args(path: &str, accept_header: Option<&str>) -> Vec<String> {
-    let mut args = vec!["api".to_string()];
-    if let Some(header) = accept_header {
-        args.push("-H".to_string());
-        args.push(header.to_string());
-    }
-    args.push("--paginate".to_string());
-    args.push("--slurp".to_string());
-    args.push(path.to_string());
-    args
 }
 
 fn paginated_api_array_args(page_path: &str, accept_header: Option<&str>) -> Vec<String> {
@@ -4553,7 +4524,7 @@ fn parse_issue_comment_permissions_page(
     ))
 }
 
-async fn refresh_notification_sections(config: &Config) -> Vec<SectionSnapshot> {
+pub async fn refresh_notification_sections(config: &Config) -> Vec<SectionSnapshot> {
     let limit = notification_fetch_limit(config);
     let include_all = should_fetch_all_notifications(config);
     let fetched = fetch_notifications(limit, include_all).await;
@@ -4814,16 +4785,53 @@ fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 async fn run_gh_json(args: &[String]) -> Result<String> {
-    match current_gh_request_priority() {
-        GhRequestPriority::User => {
-            let _guard = UserGhRequestGuard::new();
-            run_gh_json_raw(args).await
-        }
-        GhRequestPriority::Background => {
-            wait_for_user_gh_requests().await;
-            run_gh_json_raw(args).await
-        }
-    }
+    run_gh_json_raw(args).await
+}
+
+pub(crate) async fn fetch_github_rate_limits() -> Result<GitHubRateLimitSnapshot> {
+    let args = vec!["api".to_string(), "/rate_limit".to_string()];
+    let backend = crate::github_api::selected_backend();
+    // This diagnostic must remain reachable while the core queue is waiting for reset.
+    let (queue_backend, output) = match backend {
+        crate::github_api::GitHubBackend::DirectApi => (
+            GitHubQueueBackend::DirectApi,
+            crate::github_api::run_api(&args, GitHubRateResource::Core).await?,
+        ),
+        crate::github_api::GitHubBackend::GitHubCli => (
+            GitHubQueueBackend::GitHubCli,
+            crate::github_gh::run_api(&args, GitHubRateResource::Core).await?,
+        ),
+    };
+    let resources = parse_rate_limit_resources(&output)?;
+    Ok(GitHubRateLimitSnapshot {
+        fetched_at: Utc::now(),
+        resources,
+        scheduler: crate::github_queue::snapshot(queue_backend),
+    })
+}
+
+fn parse_rate_limit_resources(output: &str) -> Result<Vec<GitHubRateLimitResource>> {
+    let response: GitHubRateLimitResponse =
+        serde_json::from_str(output).context("failed to parse GitHub rate limits")?;
+    let mut resources = response
+        .resources
+        .into_iter()
+        .filter(|(name, _)| matches!(name.as_str(), "core" | "search" | "graphql"))
+        .map(|(name, resource)| GitHubRateLimitResource {
+            name,
+            limit: resource.limit,
+            used: resource.used,
+            remaining: resource.remaining,
+            reset: resource.reset,
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by_key(|resource| match resource.name.as_str() {
+        "core" => 0,
+        "search" => 1,
+        "graphql" => 2,
+        _ => 3,
+    });
+    Ok(resources)
 }
 
 async fn run_gh_json_raw(args: &[String]) -> Result<String> {
@@ -4839,7 +4847,7 @@ async fn run_gh_json_raw(args: &[String]) -> Result<String> {
                     retry_in_ms = delay.as_millis(),
                     error = %error,
                     command = %crate::github_gh::command_display(args),
-                    "retrying transient gh request failure"
+                    "retrying read-only GitHub request"
                 );
                 sleep(delay).await;
             }
@@ -4854,24 +4862,88 @@ async fn run_gh_json_raw_once(args: &[String]) -> Result<String> {
     if args.first().map(String::as_str) != Some("api") {
         bail!("GitHub backend expected a `gh api` request");
     }
-    match crate::github_api::selected_backend() {
-        crate::github_api::GitHubBackend::DirectApi => crate::github_api::run_api(args).await,
-        crate::github_api::GitHubBackend::GitHubCli => crate::github_gh::run_api(args).await,
+    let backend = crate::github_api::selected_backend();
+    let queue_backend = match backend {
+        crate::github_api::GitHubBackend::DirectApi => GitHubQueueBackend::DirectApi,
+        crate::github_api::GitHubBackend::GitHubCli => GitHubQueueBackend::GitHubCli,
+    };
+    let resource = github_request_rate_resource(args);
+    let _permit = if github_request_bypasses_queue(args) {
+        None
+    } else {
+        Some(
+            crate::github_queue::acquire(queue_backend, current_gh_request_priority(), resource)
+                .await,
+        )
+    };
+    match backend {
+        crate::github_api::GitHubBackend::DirectApi => {
+            crate::github_api::run_api(args, resource).await
+        }
+        crate::github_api::GitHubBackend::GitHubCli => {
+            crate::github_gh::run_api(args, resource).await
+        }
+    }
+}
+
+fn github_request_rate_resource(args: &[String]) -> GitHubRateResource {
+    if args.get(1).is_some_and(|arg| arg == "graphql") {
+        GitHubRateResource::Graphql
+    } else if args
+        .iter()
+        .any(|arg| arg.trim_start_matches('/').starts_with("search/"))
+    {
+        GitHubRateResource::Search
+    } else {
+        GitHubRateResource::Core
     }
 }
 
 fn is_retryable_gh_json_request(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("api") if args.get(1).is_some_and(|arg| arg == "graphql") => !args.iter().any(|arg| {
-            arg.trim_start_matches("query=")
-                .trim_start()
-                .starts_with("mutation")
-        }),
+        Some("api") if args.get(1).is_some_and(|arg| arg == "graphql") => args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("query="))
+            .is_some_and(graphql_document_is_read_only),
         Some("api") => gh_api_method(args)
             .map(|method| method.eq_ignore_ascii_case("GET"))
-            .unwrap_or(true),
+            .unwrap_or_else(|| !gh_api_args_default_to_post(args)),
         _ => false,
     }
+}
+
+fn github_request_bypasses_queue(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("api") if args.get(1).is_some_and(|arg| arg == "graphql") => args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("query="))
+            .is_some_and(graphql_document_is_mutation),
+        Some("api") => gh_api_method(args)
+            .map(|method| !method.eq_ignore_ascii_case("GET"))
+            .unwrap_or_else(|| gh_api_args_default_to_post(args)),
+        _ => false,
+    }
+}
+
+fn graphql_document_is_read_only(document: &str) -> bool {
+    !graphql_document_is_mutation(document)
+}
+
+fn graphql_document_is_mutation(document: &str) -> bool {
+    document
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token.eq_ignore_ascii_case("mutation"))
+}
+
+fn gh_api_args_default_to_post(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-f" | "--raw-field" | "-F" | "--field" | "--input"
+        ) || arg.starts_with("--raw-field=")
+            || arg.starts_with("--field=")
+            || arg.starts_with("--input=")
+    })
 }
 
 fn gh_api_method(args: &[String]) -> Option<&str> {
@@ -4899,29 +4971,30 @@ fn gh_api_method(args: &[String]) -> Option<&str> {
 
 fn is_retryable_gh_json_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    [
-        "tls handshake timeout",
-        "i/o timeout",
-        "timeout awaiting response headers",
-        "client.timeout",
-        "connection reset",
-        "connection refused",
-        "connection timed out",
-        "error connecting to api.github.com",
-        "check your internet connection",
-        "unexpected eof",
-        " eof",
-        ": eof",
-        "temporary failure",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-        "http 502",
-        "http 503",
-        "http 504",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
+    crate::github_queue::message_looks_rate_limited(&error)
+        || [
+            "tls handshake timeout",
+            "i/o timeout",
+            "timeout awaiting response headers",
+            "client.timeout",
+            "connection reset",
+            "connection refused",
+            "connection timed out",
+            "error connecting to api.github.com",
+            "check your internet connection",
+            "unexpected eof",
+            " eof",
+            ": eof",
+            "temporary failure",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "http 502",
+            "http 503",
+            "http 504",
+        ]
+        .iter()
+        .any(|needle| error.contains(needle))
 }
 
 async fn run_git_text_in_dir(args: &[String], directory: &Path) -> Result<String> {
@@ -5708,11 +5781,6 @@ fn open_milestones_path(repository: &str) -> String {
     format!("repos/{repository}/milestones?state=open&per_page=100")
 }
 
-#[cfg(test)]
-fn open_milestones_args(repository: &str) -> Vec<String> {
-    paginated_api_slurp_args(&open_milestones_path(repository), None)
-}
-
 fn create_milestone_args(repository: &str, title: &str) -> Vec<String> {
     vec![
         "api".to_string(),
@@ -6075,7 +6143,7 @@ mod tests {
 
     #[test]
     fn gh_request_priority_defaults_to_user() {
-        assert_eq!(current_gh_request_priority(), GhRequestPriority::User);
+        assert_eq!(current_gh_request_priority(), GitHubRequestPriority::User);
     }
 
     #[tokio::test]
@@ -6083,8 +6151,8 @@ mod tests {
         let priority =
             with_background_github_priority(async { current_gh_request_priority() }).await;
 
-        assert_eq!(priority, GhRequestPriority::Background);
-        assert_eq!(current_gh_request_priority(), GhRequestPriority::User);
+        assert_eq!(priority, GitHubRequestPriority::Background);
+        assert_eq!(current_gh_request_priority(), GitHubRequestPriority::User);
     }
 
     #[test]
@@ -6100,6 +6168,9 @@ mod tests {
         ));
         assert!(is_retryable_gh_json_error(
             "gh api user failed: error connecting to api.github.com\ncheck your internet connection"
+        ));
+        assert!(is_retryable_gh_json_error(
+            "GitHub API request failed: HTTP 403: You have exceeded a secondary rate limit"
         ));
     }
 
@@ -6137,6 +6208,12 @@ mod tests {
         ]));
         assert!(!is_retryable_gh_json_request(&[
             "api".to_string(),
+            "repos/owner/repo/issues/1/comments".to_string(),
+            "-f".to_string(),
+            "body=hello".to_string(),
+        ]));
+        assert!(!is_retryable_gh_json_request(&[
+            "api".to_string(),
             "--method=PATCH".to_string(),
             "repos/owner/repo/issues/1".to_string(),
         ]));
@@ -6147,6 +6224,102 @@ mod tests {
             "query=mutation($id: ID!) { updateSubscription(input: {subscribableId: $id}) { subscribable { id } } }"
                 .to_string(),
         ]));
+        assert!(!is_retryable_gh_json_request(&[
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            "query=fragment Fields on PullRequest { id } mutation { updatePullRequest(input: {}) { pullRequest { ...Fields } } }"
+                .to_string(),
+        ]));
+    }
+
+    #[test]
+    fn write_requests_bypass_the_backend_queue() {
+        for method in ["POST", "PATCH", "PUT", "DELETE"] {
+            assert!(github_request_bypasses_queue(&[
+                "api".to_string(),
+                "-X".to_string(),
+                method.to_string(),
+                "repos/owner/repo/issues/1".to_string(),
+            ]));
+        }
+        assert!(github_request_bypasses_queue(&[
+            "api".to_string(),
+            "repos/owner/repo/issues/1/comments".to_string(),
+            "-f".to_string(),
+            "body=hello".to_string(),
+        ]));
+        assert!(github_request_bypasses_queue(&[
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            "query=mutation { addComment(input: {}) { clientMutationId } }".to_string(),
+        ]));
+        assert!(!github_request_bypasses_queue(&[
+            "api".to_string(),
+            "repos/owner/repo/issues/1".to_string(),
+        ]));
+        assert!(!github_request_bypasses_queue(&[
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            "query=query { viewer { login } }".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn requests_are_assigned_to_rate_limit_resources() {
+        assert_eq!(
+            github_request_rate_resource(&[
+                "api".to_string(),
+                "repos/owner/repo/issues/1".to_string(),
+            ]),
+            GitHubRateResource::Core
+        );
+        assert_eq!(
+            github_request_rate_resource(&[
+                "api".to_string(),
+                "--method".to_string(),
+                "GET".to_string(),
+                "/search/issues".to_string(),
+            ]),
+            GitHubRateResource::Search
+        );
+        assert_eq!(
+            github_request_rate_resource(&[
+                "api".to_string(),
+                "graphql".to_string(),
+                "-f".to_string(),
+                "query=query { viewer { login } }".to_string(),
+            ]),
+            GitHubRateResource::Graphql
+        );
+    }
+
+    #[test]
+    fn rate_limit_response_keeps_and_orders_used_resources() {
+        let resources = parse_rate_limit_resources(
+            r#"{
+                "resources": {
+                    "graphql": {"limit": 5000, "used": 700, "remaining": 4300, "reset": 1800000300},
+                    "actions_runner_registration": {"limit": 10000, "used": 1, "remaining": 9999, "reset": 1800000400},
+                    "core": {"limit": 5000, "used": 1200, "remaining": 3800, "reset": 1800000100},
+                    "search": {"limit": 30, "used": 5, "remaining": 25, "reset": 1800000200}
+                }
+            }"#,
+        )
+        .expect("rate limit response");
+
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>(),
+            ["core", "search", "graphql"]
+        );
+        assert_eq!(resources[0].used, 1200);
+        assert_eq!(resources[1].remaining, 25);
+        assert_eq!(resources[2].limit, 5000);
     }
 
     #[test]
@@ -6697,33 +6870,10 @@ mod tests {
     }
 
     #[test]
-    fn paginated_api_helpers_fall_back_when_gh_slurp_is_missing() {
+    fn paginated_api_helpers_build_individually_queued_pages() {
         assert_eq!(
             open_milestones_path("owner/repo"),
             "repos/owner/repo/milestones?state=open&per_page=100"
-        );
-        assert_eq!(
-            open_milestones_args("owner/repo"),
-            vec![
-                "api",
-                "--paginate",
-                "--slurp",
-                "repos/owner/repo/milestones?state=open&per_page=100"
-            ]
-        );
-        assert_eq!(
-            paginated_api_slurp_args(
-                "repos/owner/repo/issues/1/comments?per_page=100",
-                Some("Accept: application/vnd.github.squirrel-girl-preview+json"),
-            ),
-            vec![
-                "api",
-                "-H",
-                "Accept: application/vnd.github.squirrel-girl-preview+json",
-                "--paginate",
-                "--slurp",
-                "repos/owner/repo/issues/1/comments?per_page=100"
-            ]
         );
         assert_eq!(
             paginated_api_page_path("repos/owner/repo/issues/1/comments?per_page=100", 2),

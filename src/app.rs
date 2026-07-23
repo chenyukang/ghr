@@ -43,7 +43,7 @@ use crate::config::{
 };
 use crate::dirs::Paths;
 use crate::github::{
-    AssigneeAction, CommentFetchResult, ItemDetailsMetadata, MergeMethod,
+    AssigneeAction, CommentFetchResult, GitHubRateLimitSnapshot, ItemDetailsMetadata, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
     add_issue_comment_reaction, add_issue_label, add_issue_reaction,
     add_pull_request_review_comment_reaction, approve_pull_request, change_issue_milestone,
@@ -51,14 +51,14 @@ use crate::github::{
     create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
-    fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
-    fetch_repository_assignees, fetch_repository_labels, mark_all_notifications_read,
-    mark_notification_thread_done, mark_notification_thread_read,
+    fetch_github_rate_limits, fetch_open_milestones, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, fetch_repository_assignees, fetch_repository_labels,
+    mark_all_notifications_read, mark_notification_thread_done, mark_notification_thread_read,
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
-    refresh_notification_section_page, refresh_section_page, remove_issue_label,
-    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    refresh_notification_section_page, refresh_notification_sections, refresh_section_page,
+    remove_issue_label, remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
     request_pull_request_reviewers, rerun_failed_pull_request_checks, search_github_users,
     search_global, set_pull_request_review_thread_resolved, submit_pending_pull_request_review,
     submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
@@ -109,7 +109,7 @@ mod text;
 use command_palette::{
     CommandPalette, PaletteAction, PaletteCommand, command_palette_area, command_palette_commands,
     command_palette_filtered_indices, command_palette_input_line, command_palette_normalized_text,
-    command_palette_result_line, command_palette_visible_start,
+    command_palette_result_line, command_palette_visible_start, top_menu_palette_command,
 };
 use details::*;
 use dialogs::*;
@@ -160,6 +160,9 @@ const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
 const NO_SELECTED_CHECK_RUN_INDEX: usize = usize::MAX;
 
 enum AppMsg {
+    RateLimitLoaded {
+        result: std::result::Result<GitHubRateLimitSnapshot, String>,
+    },
     RefreshStarted {
         scope: RefreshScope,
     },
@@ -175,6 +178,10 @@ enum AppMsg {
     IdleSweepFinished {
         sections: Vec<SectionSnapshot>,
         next_cursor: usize,
+    },
+    InboxIdleRefreshStarted,
+    InboxIdleRefreshFinished {
+        sections: Vec<SectionSnapshot>,
     },
     CommentsLoaded {
         item_id: String,
@@ -949,6 +956,7 @@ enum DiagnosticsDialogKind {
     Info,
     GhLog,
     GhLogDetail,
+    RateLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1593,6 +1601,15 @@ const GLOBAL_SEARCH_SUGGESTION_LIMIT: usize = 6;
 const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
+const INBOX_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const LIST_FOCUS_RETURN_DELAY: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone)]
+struct PendingListFocus {
+    view: String,
+    expected_focus: FocusTarget,
+    ready_at: Instant,
+}
 
 struct AppState {
     theme_name: ThemeName,
@@ -1633,6 +1650,7 @@ struct AppState {
     command_palette: Option<CommandPalette>,
     project_switcher: Option<ProjectSwitcher>,
     top_menu_switcher: Option<TopMenuSwitcher>,
+    pending_list_focus: Option<PendingListFocus>,
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     diagnostics_dialog: Option<DiagnosticsDialog>,
@@ -1649,6 +1667,7 @@ struct AppState {
     cache_clear_dialog: Option<CacheClearDialog>,
     command_palette_key: String,
     status: String,
+    rate_limit_loading: bool,
     refreshing: bool,
     current_refresh_scope: RefreshScope,
     pending_full_refresh_after_view: bool,
@@ -1657,6 +1676,8 @@ struct AppState {
     idle_sweep_refreshing: bool,
     idle_sweep_cursor: usize,
     last_idle_sweep_request: Instant,
+    inbox_idle_refreshing: bool,
+    last_inbox_refresh_request: Instant,
     details: HashMap<String, DetailState>,
     details_synced_at: HashMap<String, DateTime<Utc>>,
     details_refreshed_at: HashMap<String, DateTime<Utc>>,
@@ -1688,6 +1709,7 @@ struct AppState {
     mention_selected: usize,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
+    details_auto_retry_blocked: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
     comments_refresh_requested_at: HashMap<String, Instant>,
     comments_refresh_after: HashMap<String, Instant>,
@@ -2102,6 +2124,7 @@ async fn run_loop(
         }
 
         needs_draw |= drain_app_messages(app, rx);
+        needs_draw |= app.apply_pending_list_focus(Instant::now());
         let started_pending_full_refresh = if app.take_pending_full_refresh_after_view() {
             start_refresh(
                 config.clone(),
@@ -2129,6 +2152,8 @@ async fn run_loop(
 
         if !started_pending_full_refresh
             && !app.refreshing
+            && !app.idle_sweep_refreshing
+            && !app.inbox_idle_refreshing
             && config.defaults.refetch_interval_seconds > 0
             && app.last_refresh_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
@@ -2140,6 +2165,8 @@ async fn run_loop(
                 RefreshPriority::Background,
                 RefreshScope::View(app.active_view.clone()),
             );
+        } else if !started_pending_full_refresh && app.should_start_inbox_idle_refresh() {
+            start_inbox_idle_refresh(config.clone(), store.clone(), tx.clone());
         } else if !started_pending_full_refresh && app.should_start_idle_sweep(config) {
             start_idle_sweep(
                 config.clone(),
@@ -2163,7 +2190,9 @@ async fn run_loop(
         }
 
         let mut should_quit = false;
-        let Some(event_ready) = poll_terminal_event()? else {
+        let Some(event_ready) =
+            poll_terminal_event_with_timeout(app.next_terminal_poll_timeout(Instant::now()))?
+        else {
             break;
         };
         if event_ready {
@@ -2240,10 +2269,6 @@ fn terminal_disconnect_error(error: &io::Error) -> bool {
             | io::ErrorKind::NotConnected
             | io::ErrorKind::UnexpectedEof
     ) || matches!(error.raw_os_error(), Some(5 | 6 | 9 | 19 | 25))
-}
-
-fn poll_terminal_event() -> Result<Option<bool>> {
-    poll_terminal_event_with_timeout(EVENT_POLL_TIMEOUT)
 }
 
 fn poll_terminal_event_now() -> Result<Option<bool>> {
@@ -2978,7 +3003,10 @@ fn recent_commands_to_saved(items: &[RecentCommand]) -> Vec<RecentCommandState> 
 }
 
 fn command_palette_command_id(command: &PaletteCommand) -> String {
-    command.title.to_string()
+    match &command.action {
+        PaletteAction::SwitchTopMenu { key, .. } => format!("top-menu:{key}"),
+        _ => command.title.clone(),
+    }
 }
 
 fn recent_item_state_kind(kind: ItemKind) -> &'static str {
@@ -3067,6 +3095,15 @@ fn repo_candidates_from_sections(
     repos.sort_by_key(|repo| repo.to_ascii_lowercase());
     repos.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     repos
+}
+
+fn refresh_scope_includes_inbox(scope: &RefreshScope) -> bool {
+    match scope {
+        RefreshScope::Full => true,
+        RefreshScope::View(view) => {
+            same_view_key(view, &builtin_view_key(SectionKind::Notifications))
+        }
+    }
 }
 
 impl AppState {
@@ -3166,6 +3203,7 @@ impl AppState {
             command_palette: None,
             project_switcher: None,
             top_menu_switcher: None,
+            pending_list_focus: None,
             theme_switcher: None,
             recent_items_dialog: None,
             diagnostics_dialog: None,
@@ -3186,6 +3224,7 @@ impl AppState {
             cache_clear_dialog: None,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
+            rate_limit_loading: false,
             refreshing: false,
             current_refresh_scope: RefreshScope::Full,
             pending_full_refresh_after_view: false,
@@ -3194,6 +3233,8 @@ impl AppState {
             idle_sweep_refreshing: false,
             idle_sweep_cursor: 0,
             last_idle_sweep_request: Instant::now() - INITIAL_IDLE_SWEEP_DELAY,
+            inbox_idle_refreshing: false,
+            last_inbox_refresh_request: Instant::now() - INBOX_IDLE_REFRESH_INTERVAL,
             details: HashMap::new(),
             details_synced_at: HashMap::new(),
             details_refreshed_at: HashMap::new(),
@@ -3225,6 +3266,7 @@ impl AppState {
             mention_selected: 0,
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
+            details_auto_retry_blocked: HashSet::new(),
             pending_details_load: None,
             comments_refresh_requested_at: HashMap::new(),
             comments_refresh_after: HashMap::new(),
@@ -3682,12 +3724,25 @@ impl AppState {
     fn should_start_idle_sweep(&self, config: &Config) -> bool {
         !self.refreshing
             && !self.idle_sweep_refreshing
+            && !self.inbox_idle_refreshing
             && self.setup_dialog.is_none()
             && self.section_page_loading.is_none()
             && !self.global_search_running
             && config.defaults.refetch_interval_seconds > 0
             && self.last_idle_sweep_request.elapsed().as_secs()
                 >= config.defaults.refetch_interval_seconds
+    }
+
+    fn should_start_inbox_idle_refresh(&self) -> bool {
+        !self.refreshing
+            && !self.idle_sweep_refreshing
+            && !self.inbox_idle_refreshing
+            && self.setup_dialog.is_none()
+            && self.section_page_loading.is_none()
+            && !self.global_search_running
+            && self.notification_read_pending.is_empty()
+            && self.notification_done_pending.is_empty()
+            && self.last_inbox_refresh_request.elapsed() >= INBOX_IDLE_REFRESH_INTERVAL
     }
 
     fn record_unseen_repo_items_for_sections(&mut self, sections: &[SectionSnapshot]) {
@@ -3813,6 +3868,45 @@ impl AppState {
         self.sections = merge_refreshed_sections(current, sections);
     }
 
+    fn apply_inbox_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
+        let anchor = self.current_refresh_anchor();
+        let previous_details_scroll = self.details_scroll;
+        let previous_comment_index = self.selected_comment_index;
+        let mut sections = sections
+            .into_iter()
+            .filter(|section| matches!(section.kind, SectionKind::Notifications))
+            .filter(|section| !self.has_active_section_filter(&section.key))
+            .filter(|section| !self.should_preserve_user_section_page(section))
+            .collect::<Vec<_>>();
+        self.filter_done_notification_threads(&mut sections);
+
+        if sections.is_empty() {
+            return;
+        }
+
+        let updated_item_ids = self.updated_item_ids_for_sections(&sections);
+        self.invalidate_action_hints_for_item_ids(&updated_item_ids);
+        for section in &sections {
+            self.remember_base_filters(section);
+        }
+
+        let current = std::mem::take(&mut self.sections);
+        self.sections = merge_refreshed_sections(current, sections);
+        if self.restore_refresh_anchor(&anchor) {
+            self.details_scroll = previous_details_scroll;
+            self.selected_comment_index = previous_comment_index;
+            if let Some(item_id) = anchor
+                .item_id
+                .filter(|item_id| updated_item_ids.contains(item_id))
+            {
+                self.details_stale.insert(item_id);
+            }
+            self.clamp_selected_comment();
+        } else {
+            self.reset_or_restore_current_conversation_details_state();
+        }
+    }
+
     fn apply_refreshed_section(
         &mut self,
         mut section: SectionSnapshot,
@@ -3852,6 +3946,8 @@ impl AppState {
         }
 
         self.filter_done_notification_threads(std::slice::from_mut(&mut section));
+        let updated_item_ids = self.updated_item_ids_for_sections(std::slice::from_ref(&section));
+        self.invalidate_action_hints_for_item_ids(&updated_item_ids);
         self.record_unseen_repo_items_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
@@ -3860,6 +3956,12 @@ impl AppState {
         if restored_item {
             self.details_scroll = previous_details_scroll;
             self.selected_comment_index = previous_comment_index;
+            if let Some(item_id) = anchor
+                .item_id
+                .filter(|item_id| updated_item_ids.contains(item_id))
+            {
+                self.details_stale.insert(item_id);
+            }
             self.clamp_selected_comment();
         } else {
             self.reset_or_restore_current_conversation_details_state();
@@ -3897,10 +3999,26 @@ impl AppState {
 
     fn handle_msg(&mut self, message: AppMsg) {
         match message {
+            AppMsg::RateLimitLoaded { result } => {
+                self.rate_limit_loading = false;
+                match result {
+                    Ok(snapshot) => self.show_diagnostics_dialog(
+                        DiagnosticsDialogKind::RateLimit,
+                        "Rate Limit",
+                        rate_limit_lines(&snapshot),
+                        Vec::new(),
+                        "rate limits",
+                    ),
+                    Err(error) => self.show_operation_error_dialog("Rate Limit Failed", &error),
+                }
+            }
             AppMsg::RefreshStarted { scope } => {
                 self.refreshing = true;
                 self.current_refresh_scope = scope;
                 self.last_refresh_request = Instant::now();
+                if refresh_scope_includes_inbox(&self.current_refresh_scope) {
+                    self.last_inbox_refresh_request = Instant::now();
+                }
                 if self.section_page_loading.is_none() {
                     self.status = refresh_started_status(&self.current_refresh_scope);
                 }
@@ -3924,6 +4042,15 @@ impl AppState {
                 self.last_idle_sweep_request = Instant::now();
                 self.apply_idle_refreshed_sections(sections);
             }
+            AppMsg::InboxIdleRefreshStarted => {
+                self.inbox_idle_refreshing = true;
+                self.last_inbox_refresh_request = Instant::now();
+            }
+            AppMsg::InboxIdleRefreshFinished { sections } => {
+                self.inbox_idle_refreshing = false;
+                self.last_inbox_refresh_request = Instant::now();
+                self.apply_inbox_idle_refreshed_sections(sections);
+            }
             AppMsg::RefreshFinished {
                 sections,
                 save_error,
@@ -3940,7 +4067,6 @@ impl AppState {
                     .find_map(|section| section.error.as_deref())
                     .map(str::to_string);
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
-                self.invalidate_action_hints_for_sections(&sections);
                 for section in &sections {
                     self.remember_base_filters(section);
                 }
@@ -3950,6 +4076,8 @@ impl AppState {
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
                 self.filter_done_notification_threads(&mut sections);
+                let updated_item_ids = self.updated_item_ids_for_sections(&sections);
+                self.invalidate_action_hints_for_item_ids(&updated_item_ids);
                 self.record_unseen_repo_items_for_sections(&sections);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
@@ -3957,7 +4085,10 @@ impl AppState {
                 if restored_item {
                     self.details_scroll = previous_details_scroll;
                     self.selected_comment_index = previous_comment_index;
-                    if let Some(item_id) = anchor.item_id {
+                    if let Some(item_id) = anchor
+                        .item_id
+                        .filter(|item_id| updated_item_ids.contains(item_id))
+                    {
                         self.details_stale.insert(item_id);
                     }
                     self.clamp_selected_comment();
@@ -3989,6 +4120,7 @@ impl AppState {
                 Ok(mut result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.details_auto_retry_blocked.remove(&item_id);
                     self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.merge_optimistic_comments(&item_id, &mut result.comments);
@@ -4000,6 +4132,7 @@ impl AppState {
                 Err(error) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.details_auto_retry_blocked.insert(item_id.clone());
                     if matches!(self.details.get(&item_id), Some(DetailState::Loaded(_))) {
                         self.status = format!(
                             "comments refresh failed; keeping cached comments: {}",
@@ -5455,6 +5588,16 @@ impl AppState {
         debug!("log dialog opened");
     }
 
+    fn start_rate_limit_load(&mut self, tx: &UnboundedSender<AppMsg>) {
+        if self.rate_limit_loading {
+            self.status = "rate limits already loading".to_string();
+            return;
+        }
+        self.rate_limit_loading = true;
+        self.status = "loading GitHub rate limits".to_string();
+        spawn_rate_limit_load(tx.clone());
+    }
+
     fn show_diagnostics_dialog(
         &mut self,
         kind: DiagnosticsDialogKind,
@@ -5571,6 +5714,17 @@ impl AppState {
         self.status = "command palette dismissed".to_string();
     }
 
+    fn available_command_palette_commands(&self) -> Vec<PaletteCommand> {
+        let mut commands =
+            command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        commands.extend(
+            self.view_tabs()
+                .into_iter()
+                .map(|view| top_menu_palette_command(view.key, view.label)),
+        );
+        commands
+    }
+
     fn handle_command_palette_key(
         &mut self,
         key: KeyEvent,
@@ -5631,7 +5785,7 @@ impl AppState {
         else {
             return;
         };
-        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        let commands = self.available_command_palette_commands();
         let len = self.command_palette_match_indices(&commands, &query).len();
         if let Some(palette) = &mut self.command_palette {
             palette.selected = move_wrapping(palette.selected, len, delta);
@@ -5666,6 +5820,10 @@ impl AppState {
                 self.show_gh_log_dialog();
                 false
             }
+            PaletteAction::ShowRateLimit => {
+                self.start_rate_limit_load(tx);
+                false
+            }
             PaletteAction::ShowHelp => {
                 self.show_help_dialog();
                 false
@@ -5691,6 +5849,10 @@ impl AppState {
             }
             PaletteAction::TopMenuSwitch => {
                 self.show_top_menu_switcher();
+                false
+            }
+            PaletteAction::SwitchTopMenu { key, label } => {
+                self.activate_top_menu_item(key, label);
                 false
             }
             PaletteAction::SearchCurrentRepo => {
@@ -5806,7 +5968,7 @@ impl AppState {
 
     fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
         let palette = self.command_palette.as_ref()?;
-        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        let commands = self.available_command_palette_commands();
         let matches = self.command_palette_match_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
         matches
@@ -5821,16 +5983,19 @@ impl AppState {
         query: &str,
     ) -> Vec<usize> {
         let mut matches = command_palette_filtered_indices(commands, query);
+        if !query.trim().is_empty() {
+            return matches;
+        }
         matches.sort_by(|left, right| {
             let left_selected_at = self.command_palette_selected_at(&commands[*left]);
             let right_selected_at = self.command_palette_selected_at(&commands[*right]);
             match (left_selected_at, right_selected_at) {
-                (Some(left_selected_at), Some(right_selected_at)) => right_selected_at
-                    .cmp(&left_selected_at)
-                    .then_with(|| left.cmp(right)),
+                (Some(left_selected_at), Some(right_selected_at)) => {
+                    right_selected_at.cmp(&left_selected_at)
+                }
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left.cmp(right),
+                (None, None) => std::cmp::Ordering::Equal,
             }
         });
         matches
@@ -5967,16 +6132,31 @@ impl AppState {
         }
     }
 
+    fn updated_item_ids_for_sections(&self, sections: &[SectionSnapshot]) -> HashSet<String> {
+        sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| {
+                let refreshed_at = item.updated_at?;
+                self.item_updated_at_by_id(&item.id)
+                    .is_some_and(|current_at| refreshed_at > current_at)
+                    .then(|| item.id.clone())
+            })
+            .collect()
+    }
+
+    fn invalidate_action_hints_for_item_ids(&mut self, item_ids: &HashSet<String>) {
+        for item_id in item_ids {
+            self.mark_action_hints_stale(item_id.clone());
+        }
+    }
+
     fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
         let item_ids = sections
             .iter()
-            .flat_map(|section| {
-                section
-                    .items
-                    .iter()
-                    .filter(|item| item.kind == ItemKind::PullRequest)
-                    .map(|item| item.id.clone())
-            })
+            .flat_map(|section| section.items.iter())
+            .filter(|item| item.kind == ItemKind::PullRequest)
+            .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         for item_id in item_ids {
             self.mark_action_hints_stale(item_id);
@@ -6417,8 +6597,9 @@ impl AppState {
         self.sections
             .iter()
             .flat_map(|section| section.items.iter())
-            .find(|item| item.id == item_id)
-            .and_then(|item| item.updated_at)
+            .filter(|item| item.id == item_id)
+            .filter_map(|item| item.updated_at)
+            .max()
     }
 
     fn append_local_comment(&mut self, item_id: &str, comment: CommentPreview) -> usize {
@@ -6712,6 +6893,17 @@ impl AppState {
     }
 
     fn comments_load_needed(&self, item: &WorkItem) -> bool {
+        if self.details_refreshing.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Loading))
+        {
+            return false;
+        }
+        if (self.details_auto_retry_blocked.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Error(_))))
+            && !self.details_stale.contains(&item.id)
+        {
+            return false;
+        }
         !self.details.contains_key(&item.id)
             || self.details_stale.contains(&item.id)
             || self.details_cache_outdated(item)
@@ -6924,6 +7116,11 @@ impl AppState {
     }
 
     fn start_comments_load_if_needed_at(&mut self, item: &WorkItem, now: Instant) -> bool {
+        if self.details_refreshing.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Loading))
+        {
+            return false;
+        }
         let should_refresh =
             self.details_stale.remove(&item.id) || self.details_cache_outdated(item);
         if self.details.contains_key(&item.id) && !should_refresh {
@@ -6937,6 +7134,7 @@ impl AppState {
         }
         self.comments_refresh_requested_at
             .insert(item.id.clone(), now);
+        self.details_auto_retry_blocked.remove(&item.id);
         true
     }
 
@@ -6959,9 +7157,10 @@ impl AppState {
             return false;
         }
         if self.details_refreshing.contains(&item.id)
+            || self.details_auto_retry_blocked.contains(&item.id)
             || matches!(
                 self.details.get(&item.id),
-                Some(DetailState::Loading) | None
+                Some(DetailState::Loading | DetailState::Error(_)) | None
             )
         {
             return false;
@@ -7007,6 +7206,60 @@ impl AppState {
         let restored = self.switch_view_with_fallback(view, FocusTarget::Ghr);
         self.focus = FocusTarget::Ghr;
         restored
+    }
+
+    fn schedule_top_menu_list_focus(&mut self, now: Instant) {
+        self.schedule_list_focus(FocusTarget::Ghr, now);
+    }
+
+    fn schedule_section_list_focus(&mut self, now: Instant) {
+        self.schedule_list_focus(FocusTarget::Sections, now);
+    }
+
+    fn schedule_list_focus(&mut self, expected_focus: FocusTarget, now: Instant) {
+        self.pending_list_focus = Some(PendingListFocus {
+            view: self.active_view.clone(),
+            expected_focus,
+            ready_at: now + LIST_FOCUS_RETURN_DELAY,
+        });
+    }
+
+    fn has_pending_list_focus_from(&self, expected_focus: FocusTarget) -> bool {
+        self.pending_list_focus
+            .as_ref()
+            .is_some_and(|pending| pending.expected_focus == expected_focus)
+    }
+
+    fn cancel_pending_list_focus(&mut self) {
+        self.pending_list_focus = None;
+    }
+
+    fn apply_pending_list_focus(&mut self, now: Instant) -> bool {
+        let Some(pending) = self.pending_list_focus.as_ref() else {
+            return false;
+        };
+        if now < pending.ready_at {
+            return false;
+        }
+
+        let pending = self
+            .pending_list_focus
+            .take()
+            .expect("pending list focus should exist");
+        if self.focus != pending.expected_focus || !same_view_key(&self.active_view, &pending.view)
+        {
+            return false;
+        }
+        self.focus_primary_list();
+        true
+    }
+
+    fn next_terminal_poll_timeout(&self, now: Instant) -> Duration {
+        self.pending_list_focus
+            .as_ref()
+            .map(|pending| pending.ready_at.saturating_duration_since(now))
+            .map(|remaining| remaining.min(EVENT_POLL_TIMEOUT))
+            .unwrap_or(EVENT_POLL_TIMEOUT)
     }
 
     fn switch_view_with_fallback(
@@ -12523,6 +12776,16 @@ impl AppState {
         if self.details_cache_outdated(&item) {
             self.details_stale.insert(item.id);
         }
+    }
+
+    fn mark_current_details_stale_for_user_refresh(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if self.details.contains_key(&item.id) {
+            self.details_stale.insert(item.id.clone());
+        }
+        self.mark_action_hints_stale(item.id);
     }
 
     fn mark_current_details_viewed(&mut self) {

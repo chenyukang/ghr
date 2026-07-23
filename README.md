@@ -16,7 +16,8 @@
 ## Features
 
 - Inbox, pull request, and issue views.
-- Snapshot-first startup: cached data is shown immediately, the active view refreshes first, and non-active PR/issue sections are kept warm by a quiet idle sweep.
+- Snapshot-first startup: cached data is shown immediately, the active view refreshes first, Inbox refreshes every 60 seconds while idle, and non-active PR/issue sections are kept warm by a quiet idle sweep.
+- Bounded read-request scheduling per GitHub backend, with limited foreground concurrency, serialized background work, foreground priority, resource-specific rate-limit cooldowns, and rate-limit-aware retries; write operations run immediately and are never retried automatically.
 - Configurable sections and repo tabs, including multi-query sections such as `Needs Attention`.
 - Automatic current-repo tab persistence when launched inside a Git checkout with a GitHub remote.
 - Paged PR and issue lists with configurable page size.
@@ -117,9 +118,12 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 | Key | Action |
 | --- | --- |
-| `:` | Open the command palette and fuzzy search commands; recently run commands appear first |
+| `:` | Open the command palette; recent commands lead before typing, then fuzzy relevance wins |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
-| `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
+| `Tab` | Switch list/details focus; when ghr or Sections is focused, move to the next tab |
+| `Shift+Tab` in List | Switch to the previous Section, then return focus to List after 200 ms |
+| `Shift+[` / `Shift+]` in List | Switch to the left/right Section, then return focus to List after 200 ms |
+| `Shift+Tab` elsewhere | Return from Details to List, or move backward within focused ghr/Sections tabs |
 | `h` / `l` or `[` / `]` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff mode |
@@ -185,7 +189,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 ## Commands
 
-Open the command palette with `:` to fuzzy search and run commands. Recently run commands appear first.
+Open the command palette with `:` to fuzzy search and run commands. Recently run commands appear
+first before you type; once you enter a query, the closest matches appear first. Every current
+top-menu item is also generated as a direct command, including projects added at runtime, so typing
+`Inb` or a project name switches to that tab without opening another picker.
 
 | Command | Action |
 | --- | --- |
@@ -195,6 +202,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
 | `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
 | `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
+| `Top Menu Switch` | Switch Inbox, PR, issue, search, or repo tabs, then focus the list after a short delay |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy PR/Issue Link` | Copy the current PR/issue link to the clipboard, ignoring selected comments |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |
@@ -207,6 +215,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Subscribe Item` / `Unsubscribe Item` | Change the selected issue or pull request conversation subscription |
 | `Info` | Show terminal, version, config/db/log paths, cache counts, runtime state, and ghr system diagnostics in a scrollable popup |
 | `Log` | Show recent direct API and `gh api` requests with timestamps, status, response sizes, errors, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
+| `Rate Limit` | Query and show current GitHub core, search, and GraphQL quotas together with local queue and cooldown state |
 
 Diff review ranges:
 

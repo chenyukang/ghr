@@ -4,6 +4,7 @@ mod dirs;
 mod github;
 mod github_api;
 mod github_gh;
+mod github_queue;
 mod log;
 mod model;
 mod snapshot;

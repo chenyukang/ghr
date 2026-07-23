@@ -229,6 +229,13 @@ pub(super) fn handle_key_in_area_mut(
 ) -> bool {
     app.command_palette_key = normalized_command_palette_key(&config.defaults.command_palette_key);
     app.editor_submit_key = normalized_editor_submit_key(&config.defaults.editor_submit_key);
+    let continues_section_switch = list_section_switch_delta(key).is_some()
+        && app.details_mode == DetailsMode::Conversation
+        && app.focus == FocusTarget::Sections
+        && app.has_pending_list_focus_from(FocusTarget::Sections);
+    if !continues_section_switch {
+        app.cancel_pending_list_focus();
+    }
 
     if is_ctrl_c_key(key) {
         return true;
@@ -457,6 +464,9 @@ pub(super) fn handle_key_in_area_mut(
     }
 
     if handle_global_focus_key(app, key) {
+        return false;
+    }
+    if handle_list_section_switch_key(app, key) {
         return false;
     }
     if handle_diff_focus_toggle_key(app, key) {
@@ -767,6 +777,49 @@ pub(super) fn is_inbox_mark_done_key(app: &AppState, key: KeyEvent) -> bool {
             .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
 }
 
+fn list_section_switch_delta(key: KeyEvent) -> Option<isize> {
+    if key.code == KeyCode::BackTab {
+        return Some(-1);
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(-1),
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::SHIFT) => Some(1),
+        KeyCode::Char('{') => Some(-1),
+        KeyCode::Char('}') => Some(1),
+        _ => None,
+    }
+}
+
+pub(super) fn handle_list_section_switch_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.details_mode != DetailsMode::Conversation {
+        return false;
+    }
+    let Some(delta) = list_section_switch_delta(key) else {
+        return false;
+    };
+    let starts_switch = app.focus == FocusTarget::List;
+    let continues_switch = app.focus == FocusTarget::Sections
+        && app.has_pending_list_focus_from(FocusTarget::Sections);
+    if !starts_switch && !continues_switch {
+        return false;
+    }
+
+    if starts_switch {
+        app.focus_sections();
+    }
+    app.move_section(delta);
+    if app.focus == FocusTarget::Sections {
+        app.schedule_section_list_focus(Instant::now());
+    }
+    true
+}
+
 pub(super) fn handle_diff_focus_toggle_key(app: &mut AppState, key: KeyEvent) -> bool {
     if app.details_mode != DetailsMode::Diff {
         return false;
@@ -905,6 +958,7 @@ pub(super) fn trigger_refresh(
     tx: &UnboundedSender<AppMsg>,
 ) {
     if !app.refreshing {
+        app.mark_current_details_stale_for_user_refresh();
         app.queue_full_refresh_after_view();
     }
     trigger_refresh_scope(
@@ -989,6 +1043,9 @@ pub(super) fn handle_mouse_with_sync(
 ) -> bool {
     if !app.mouse_capture_enabled {
         return false;
+    }
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        app.cancel_pending_list_focus();
     }
     if app.setup_dialog.is_some() {
         return false;
@@ -1934,6 +1991,9 @@ pub(super) fn handle_left_click(
             "mouse click handled"
         );
         app.switch_top_menu_view(view);
+        if !same_view_key(&previous_view, &app.active_view) {
+            app.schedule_top_menu_list_focus(Instant::now());
+        }
         app.search_active = false;
         app.comment_search_active = false;
         app.global_search_active = false;

@@ -893,6 +893,9 @@ fn diagnostics_dialog_footer(kind: DiagnosticsDialogKind) -> &'static str {
         DiagnosticsDialogKind::Info => {
             "j/k/Up/Down: scroll    PageUp/PageDown: jump    Enter/Esc/q: close"
         }
+        DiagnosticsDialogKind::RateLimit => {
+            "j/k/Up/Down: scroll    PageUp/PageDown: jump    Enter/Esc/q: close"
+        }
         DiagnosticsDialogKind::GhLogDetail => {
             "j/k/Up/Down: scroll    PageUp/PageDown: jump    Esc: list    Enter/q: close"
         }

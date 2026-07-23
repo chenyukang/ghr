@@ -121,6 +121,80 @@ pub(super) fn gh_log_lines_with_details() -> (Vec<String>, Vec<Vec<String>>) {
     (lines, details)
 }
 
+pub(super) fn rate_limit_lines(snapshot: &GitHubRateLimitSnapshot) -> Vec<String> {
+    let mut lines = vec![
+        "GitHub quotas".to_string(),
+        format!("backend: {}", snapshot.scheduler.backend.label()),
+        format!(
+            "checked: {}",
+            snapshot
+                .fetched_at
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+        ),
+        String::new(),
+    ];
+
+    for resource in &snapshot.resources {
+        lines.push(format!(
+            "{}: {:>5} remaining / {:>5} limit | {:>5} used | reset {}",
+            resource.name,
+            resource.remaining,
+            resource.limit,
+            resource.used,
+            rate_limit_reset_summary(resource.reset, snapshot.fetched_at),
+        ));
+    }
+    if snapshot.resources.is_empty() {
+        lines.push("No core, search, or graphql quota returned".to_string());
+    }
+
+    lines.extend([
+        String::new(),
+        "Local scheduler".to_string(),
+        format!(
+            "active: {} / {} foreground slots",
+            snapshot.scheduler.active, snapshot.scheduler.max_active
+        ),
+    ]);
+    for resource in &snapshot.scheduler.resources {
+        let cooldown = resource
+            .cooldown_remaining
+            .map(|duration| format!("{} remaining", compact_duration(duration)))
+            .unwrap_or_else(|| "none".to_string());
+        lines.push(format!(
+            "{} queue: {} foreground, {} background waiting | cooldown {cooldown}",
+            resource.resource.label(),
+            resource.user_waiting,
+            resource.background_waiting,
+        ));
+    }
+    lines
+}
+
+fn rate_limit_reset_summary(reset_epoch: i64, checked_at: DateTime<Utc>) -> String {
+    let Some(reset) = DateTime::<Utc>::from_timestamp(reset_epoch, 0) else {
+        return "unknown".to_string();
+    };
+    let until_reset = reset.signed_duration_since(checked_at).num_seconds().max(0) as u64;
+    format!(
+        "{} (in {})",
+        reset.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"),
+        compact_duration(Duration::from_secs(until_reset))
+    )
+}
+
+fn compact_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
 fn gh_log_detail_lines(entry: &GhLogEntry) -> Vec<String> {
     let direct_api = entry.kind == "api";
     let mut lines = vec![

@@ -2,23 +2,23 @@ use std::io::{self, ErrorKind};
 use std::process::{Command as StdCommand, Output};
 
 use anyhow::{Context, Result, anyhow, bail};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::OnceCell;
 use tracing::{debug, error};
 
+use crate::github_queue::{GitHubQueueBackend, GitHubRateResource, observe_response};
 use crate::log::{GhLogRequest, fail_gh_request_to_start, finish_gh_request, start_gh_request};
 
-static API_SLURP_SUPPORTED: OnceCell<bool> = OnceCell::const_new();
-
-pub async fn run_api(args: &[String]) -> Result<String> {
+pub async fn run_api(args: &[String], resource: GitHubRateResource) -> Result<String> {
     if args.first().map(String::as_str) != Some("api") {
         bail!("GitHub CLI backend expected a `gh api` request");
     }
 
     let request = log_request_started(args);
-    let output = TokioCommand::new("gh")
+    let command_args = included_headers_args(args);
+    let mut output = TokioCommand::new("gh")
         .env("GH_PROMPT_DISABLED", "1")
-        .args(args)
+        .args(&command_args)
         .output()
         .await
         .map_err(|error| {
@@ -29,6 +29,28 @@ pub async fn run_api(args: &[String]) -> Result<String> {
                 anyhow!("failed to run {}: {error}", command_display(args))
             }
         })?;
+    let response = match parse_included_response(&output.stdout) {
+        Ok(response) => response,
+        Err(parse_error) => {
+            log_request_finished(request, args, &output);
+            if !output.status.success() {
+                bail!("{}", failure_message(args, &output_message(&output)));
+            }
+            return Err(anyhow!(
+                "failed to parse response headers from {}: {parse_error}",
+                command_display(args)
+            ));
+        }
+    };
+    let message = (!output.status.success()).then(|| output_message(&output));
+    observe_response(
+        GitHubQueueBackend::GitHubCli,
+        resource,
+        response.status,
+        &response.headers,
+        message.as_deref(),
+    );
+    output.stdout = response.body;
     log_request_finished(request, args, &output);
 
     if !output.status.success() {
@@ -37,12 +59,6 @@ pub async fn run_api(args: &[String]) -> Result<String> {
     }
 
     String::from_utf8(output.stdout).context("gh output was not UTF-8")
-}
-
-pub async fn api_slurp_supported() -> bool {
-    *API_SLURP_SUPPORTED
-        .get_or_init(detect_api_slurp_support)
-        .await
 }
 
 pub fn version_output() -> io::Result<Output> {
@@ -70,44 +86,67 @@ pub fn command_display(args: &[String]) -> String {
     format!("gh {}", args.join(" "))
 }
 
-async fn detect_api_slurp_support() -> bool {
-    let args = vec!["api".to_string(), "--help".to_string()];
-    let request = log_request_started(&args);
-    let output = TokioCommand::new("gh")
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(&args)
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => {
-            log_request_finished(request, &args, &output);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            api_help_has_flag(&stdout, "--slurp") || api_help_has_flag(&stderr, "--slurp")
-        }
-        Ok(output) => {
-            log_request_finished(request, &args, &output);
-            debug!(
-                status = %output.status,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
-        Err(error) => {
-            log_request_failed_to_start(request, &args, &error);
-            debug!(
-                error = %error,
-                "failed to inspect gh api help for --slurp support; assuming supported"
-            );
-            true
-        }
-    }
+struct IncludedResponse {
+    status: u16,
+    headers: HeaderMap,
+    body: Vec<u8>,
 }
 
-fn api_help_has_flag(help: &str, flag: &str) -> bool {
-    help.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '[' | ']' | '(' | ')' | '`'))
-        .any(|token| token == flag)
+fn included_headers_args(args: &[String]) -> Vec<String> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-i" | "--include"))
+    {
+        return args.to_vec();
+    }
+    let mut command_args = args.to_vec();
+    command_args.insert(1, "--include".to_string());
+    command_args
+}
+
+fn parse_included_response(output: &[u8]) -> Result<IncludedResponse> {
+    let output = std::str::from_utf8(output).context("gh api response was not UTF-8")?;
+    let (header_text, body) = split_headers_and_body(output)
+        .ok_or_else(|| anyhow!("gh api response did not include an HTTP header block"))?;
+    let mut lines = header_text.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("gh api response status line is missing"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow!("invalid gh api response status line `{status_line}`"))?
+        .parse::<u16>()
+        .with_context(|| format!("invalid gh api response status line `{status_line}`"))?;
+    let mut headers = HeaderMap::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid gh api response header `{line}`"))?;
+        let name = HeaderName::from_bytes(name.trim().to_ascii_lowercase().as_bytes())
+            .with_context(|| format!("invalid gh api response header name `{name}`"))?;
+        let value = HeaderValue::from_str(value.trim())
+            .with_context(|| format!("invalid gh api response header value for `{name}`"))?;
+        headers.append(name, value);
+    }
+
+    Ok(IncludedResponse {
+        status,
+        headers,
+        body: body.as_bytes().to_vec(),
+    })
+}
+
+fn split_headers_and_body(output: &str) -> Option<(&str, &str)> {
+    let crlf = output.find("\r\n\r\n").map(|index| (index, 4));
+    let lf = output.find("\n\n").map(|index| (index, 2));
+    let (index, delimiter_len) = match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(crlf), None) => Some(crlf),
+        (None, Some(lf)) => Some(lf),
+        (None, None) => None,
+    }?;
+    Some((&output[..index], &output[index + delimiter_len..]))
 }
 
 fn log_request_started(args: &[String]) -> GhLogRequest {
@@ -241,15 +280,22 @@ mod tests {
     }
 
     #[test]
-    fn api_help_flag_detection_matches_complete_flags() {
-        assert!(api_help_has_flag(
-            "      --slurp               Use an array of arrays for paginated responses",
-            "--slurp"
-        ));
-        assert!(!api_help_has_flag(
-            "      --paginate            Fetch all pages",
-            "--slurp"
-        ));
+    fn gh_api_requests_include_response_headers() {
+        assert_eq!(
+            included_headers_args(&["api".to_string(), "user".to_string()]),
+            vec!["api", "--include", "user"]
+        );
+    }
+
+    #[test]
+    fn included_response_parser_returns_headers_and_clean_body() {
+        let output = b"HTTP/2.0 200 OK\nX-RateLimit-Remaining: 42\r\nX-RateLimit-Resource: core\r\n\r\n{\"login\":\"octocat\"}";
+        let response = parse_included_response(output).expect("response should parse");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers["x-ratelimit-remaining"], "42");
+        assert_eq!(response.headers["x-ratelimit-resource"], "core");
+        assert_eq!(response.body, br#"{"login":"octocat"}"#);
     }
 
     #[test]

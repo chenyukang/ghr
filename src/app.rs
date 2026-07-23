@@ -43,7 +43,7 @@ use crate::config::{
 };
 use crate::dirs::Paths;
 use crate::github::{
-    AssigneeAction, CommentFetchResult, ItemDetailsMetadata, MergeMethod,
+    AssigneeAction, CommentFetchResult, GitHubRateLimitSnapshot, ItemDetailsMetadata, MergeMethod,
     PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
     add_issue_comment_reaction, add_issue_label, add_issue_reaction,
     add_pull_request_review_comment_reaction, approve_pull_request, change_issue_milestone,
@@ -51,9 +51,9 @@ use crate::github::{
     create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
-    fetch_open_milestones, fetch_pull_request_action_hints, fetch_pull_request_diff,
-    fetch_repository_assignees, fetch_repository_labels, mark_all_notifications_read,
-    mark_notification_thread_done, mark_notification_thread_read,
+    fetch_github_rate_limits, fetch_open_milestones, fetch_pull_request_action_hints,
+    fetch_pull_request_diff, fetch_repository_assignees, fetch_repository_labels,
+    mark_all_notifications_read, mark_notification_thread_done, mark_notification_thread_read,
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
@@ -160,6 +160,9 @@ const NO_SELECTED_COMMENT_INDEX: usize = usize::MAX;
 const NO_SELECTED_CHECK_RUN_INDEX: usize = usize::MAX;
 
 enum AppMsg {
+    RateLimitLoaded {
+        result: std::result::Result<GitHubRateLimitSnapshot, String>,
+    },
     RefreshStarted {
         scope: RefreshScope,
     },
@@ -952,6 +955,7 @@ enum DiagnosticsDialogKind {
     Info,
     GhLog,
     GhLogDetail,
+    RateLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1588,6 +1592,7 @@ struct AppState {
     cache_clear_dialog: Option<CacheClearDialog>,
     command_palette_key: String,
     status: String,
+    rate_limit_loading: bool,
     refreshing: bool,
     current_refresh_scope: RefreshScope,
     pending_full_refresh_after_view: bool,
@@ -1628,6 +1633,7 @@ struct AppState {
     mention_selected: usize,
     details_stale: HashSet<String>,
     details_refreshing: HashSet<String>,
+    details_auto_retry_blocked: HashSet<String>,
     pending_details_load: Option<PendingDetailsLoad>,
     comments_refresh_requested_at: HashMap<String, Instant>,
     comments_refresh_after: HashMap<String, Instant>,
@@ -3021,6 +3027,7 @@ impl AppState {
             cache_clear_dialog: None,
             command_palette_key: DEFAULT_COMMAND_PALETTE_KEY.to_string(),
             status: "loading snapshot; background refresh started".to_string(),
+            rate_limit_loading: false,
             refreshing: false,
             current_refresh_scope: RefreshScope::Full,
             pending_full_refresh_after_view: false,
@@ -3061,6 +3068,7 @@ impl AppState {
             mention_selected: 0,
             details_stale: HashSet::new(),
             details_refreshing: HashSet::new(),
+            details_auto_retry_blocked: HashSet::new(),
             pending_details_load: None,
             comments_refresh_requested_at: HashMap::new(),
             comments_refresh_after: HashMap::new(),
@@ -3675,7 +3683,8 @@ impl AppState {
             return;
         }
 
-        self.invalidate_action_hints_for_sections(&sections);
+        let updated_item_ids = self.updated_item_ids_for_sections(&sections);
+        self.invalidate_action_hints_for_item_ids(&updated_item_ids);
         for section in &sections {
             self.remember_base_filters(section);
         }
@@ -3685,7 +3694,10 @@ impl AppState {
         if self.restore_refresh_anchor(&anchor) {
             self.details_scroll = previous_details_scroll;
             self.selected_comment_index = previous_comment_index;
-            if let Some(item_id) = anchor.item_id {
+            if let Some(item_id) = anchor
+                .item_id
+                .filter(|item_id| updated_item_ids.contains(item_id))
+            {
                 self.details_stale.insert(item_id);
             }
             self.clamp_selected_comment();
@@ -3728,6 +3740,8 @@ impl AppState {
             return;
         }
 
+        let updated_item_ids = self.updated_item_ids_for_sections(std::slice::from_ref(&section));
+        self.invalidate_action_hints_for_item_ids(&updated_item_ids);
         self.record_unseen_repo_items_for_sections(std::slice::from_ref(&section));
         let current = std::mem::take(&mut self.sections);
         self.sections = merge_refreshed_sections(current, vec![section]);
@@ -3736,6 +3750,12 @@ impl AppState {
         if restored_item {
             self.details_scroll = previous_details_scroll;
             self.selected_comment_index = previous_comment_index;
+            if let Some(item_id) = anchor
+                .item_id
+                .filter(|item_id| updated_item_ids.contains(item_id))
+            {
+                self.details_stale.insert(item_id);
+            }
             self.clamp_selected_comment();
         } else {
             self.reset_or_restore_current_conversation_details_state();
@@ -3773,6 +3793,19 @@ impl AppState {
 
     fn handle_msg(&mut self, message: AppMsg) {
         match message {
+            AppMsg::RateLimitLoaded { result } => {
+                self.rate_limit_loading = false;
+                match result {
+                    Ok(snapshot) => self.show_diagnostics_dialog(
+                        DiagnosticsDialogKind::RateLimit,
+                        "Rate Limit",
+                        rate_limit_lines(&snapshot),
+                        Vec::new(),
+                        "rate limits",
+                    ),
+                    Err(error) => self.show_operation_error_dialog("Rate Limit Failed", &error),
+                }
+            }
             AppMsg::RefreshStarted { scope } => {
                 self.refreshing = true;
                 self.current_refresh_scope = scope;
@@ -3828,7 +3861,6 @@ impl AppState {
                     .find_map(|section| section.error.as_deref())
                     .map(str::to_string);
                 let setup_dialog = first_error.as_deref().and_then(setup_dialog_from_error);
-                self.invalidate_action_hints_for_sections(&sections);
                 for section in &sections {
                     self.remember_base_filters(section);
                 }
@@ -3837,6 +3869,8 @@ impl AppState {
                     .filter(|section| !self.has_active_section_filter(&section.key))
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
+                let updated_item_ids = self.updated_item_ids_for_sections(&sections);
+                self.invalidate_action_hints_for_item_ids(&updated_item_ids);
                 self.record_unseen_repo_items_for_sections(&sections);
                 let current = std::mem::take(&mut self.sections);
                 self.sections = merge_refreshed_sections(current, sections);
@@ -3844,7 +3878,10 @@ impl AppState {
                 if restored_item {
                     self.details_scroll = previous_details_scroll;
                     self.selected_comment_index = previous_comment_index;
-                    if let Some(item_id) = anchor.item_id {
+                    if let Some(item_id) = anchor
+                        .item_id
+                        .filter(|item_id| updated_item_ids.contains(item_id))
+                    {
                         self.details_stale.insert(item_id);
                     }
                     self.clamp_selected_comment();
@@ -3876,6 +3913,7 @@ impl AppState {
                 Ok(mut result) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.details_auto_retry_blocked.remove(&item_id);
                     self.remember_details_synced_at(&item_id, &result);
                     self.apply_comment_fetch_result_metadata(&item_id, &result);
                     self.merge_optimistic_comments(&item_id, &mut result.comments);
@@ -3887,6 +3925,7 @@ impl AppState {
                 Err(error) => {
                     self.details_stale.remove(&item_id);
                     self.details_refreshing.remove(&item_id);
+                    self.details_auto_retry_blocked.insert(item_id.clone());
                     if matches!(self.details.get(&item_id), Some(DetailState::Loaded(_))) {
                         self.status = format!(
                             "comments refresh failed; keeping cached comments: {}",
@@ -5336,6 +5375,16 @@ impl AppState {
         debug!("log dialog opened");
     }
 
+    fn start_rate_limit_load(&mut self, tx: &UnboundedSender<AppMsg>) {
+        if self.rate_limit_loading {
+            self.status = "rate limits already loading".to_string();
+            return;
+        }
+        self.rate_limit_loading = true;
+        self.status = "loading GitHub rate limits".to_string();
+        spawn_rate_limit_load(tx.clone());
+    }
+
     fn show_diagnostics_dialog(
         &mut self,
         kind: DiagnosticsDialogKind,
@@ -5545,6 +5594,10 @@ impl AppState {
             }
             PaletteAction::ShowGhLog => {
                 self.show_gh_log_dialog();
+                false
+            }
+            PaletteAction::ShowRateLimit => {
+                self.start_rate_limit_load(tx);
                 false
             }
             PaletteAction::ShowHelp => {
@@ -5848,16 +5901,31 @@ impl AppState {
         }
     }
 
+    fn updated_item_ids_for_sections(&self, sections: &[SectionSnapshot]) -> HashSet<String> {
+        sections
+            .iter()
+            .flat_map(|section| section.items.iter())
+            .filter_map(|item| {
+                let refreshed_at = item.updated_at?;
+                self.item_updated_at_by_id(&item.id)
+                    .is_some_and(|current_at| refreshed_at > current_at)
+                    .then(|| item.id.clone())
+            })
+            .collect()
+    }
+
+    fn invalidate_action_hints_for_item_ids(&mut self, item_ids: &HashSet<String>) {
+        for item_id in item_ids {
+            self.mark_action_hints_stale(item_id.clone());
+        }
+    }
+
     fn invalidate_action_hints_for_sections(&mut self, sections: &[SectionSnapshot]) {
         let item_ids = sections
             .iter()
-            .flat_map(|section| {
-                section
-                    .items
-                    .iter()
-                    .filter(|item| item.kind == ItemKind::PullRequest)
-                    .map(|item| item.id.clone())
-            })
+            .flat_map(|section| section.items.iter())
+            .filter(|item| item.kind == ItemKind::PullRequest)
+            .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         for item_id in item_ids {
             self.mark_action_hints_stale(item_id);
@@ -6232,8 +6300,9 @@ impl AppState {
         self.sections
             .iter()
             .flat_map(|section| section.items.iter())
-            .find(|item| item.id == item_id)
-            .and_then(|item| item.updated_at)
+            .filter(|item| item.id == item_id)
+            .filter_map(|item| item.updated_at)
+            .max()
     }
 
     fn append_local_comment(&mut self, item_id: &str, comment: CommentPreview) -> usize {
@@ -6527,6 +6596,17 @@ impl AppState {
     }
 
     fn comments_load_needed(&self, item: &WorkItem) -> bool {
+        if self.details_refreshing.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Loading))
+        {
+            return false;
+        }
+        if (self.details_auto_retry_blocked.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Error(_))))
+            && !self.details_stale.contains(&item.id)
+        {
+            return false;
+        }
         !self.details.contains_key(&item.id)
             || self.details_stale.contains(&item.id)
             || self.details_cache_outdated(item)
@@ -6739,6 +6819,11 @@ impl AppState {
     }
 
     fn start_comments_load_if_needed_at(&mut self, item: &WorkItem, now: Instant) -> bool {
+        if self.details_refreshing.contains(&item.id)
+            || matches!(self.details.get(&item.id), Some(DetailState::Loading))
+        {
+            return false;
+        }
         let should_refresh =
             self.details_stale.remove(&item.id) || self.details_cache_outdated(item);
         if self.details.contains_key(&item.id) && !should_refresh {
@@ -6752,6 +6837,7 @@ impl AppState {
         }
         self.comments_refresh_requested_at
             .insert(item.id.clone(), now);
+        self.details_auto_retry_blocked.remove(&item.id);
         true
     }
 
@@ -6774,9 +6860,10 @@ impl AppState {
             return false;
         }
         if self.details_refreshing.contains(&item.id)
+            || self.details_auto_retry_blocked.contains(&item.id)
             || matches!(
                 self.details.get(&item.id),
-                Some(DetailState::Loading) | None
+                Some(DetailState::Loading | DetailState::Error(_)) | None
             )
         {
             return false;
@@ -12171,6 +12258,16 @@ impl AppState {
         if self.details_cache_outdated(&item) {
             self.details_stale.insert(item.id);
         }
+    }
+
+    fn mark_current_details_stale_for_user_refresh(&mut self) {
+        let Some(item) = self.current_item().cloned() else {
+            return;
+        };
+        if self.details.contains_key(&item.id) {
+            self.details_stale.insert(item.id.clone());
+        }
+        self.mark_action_hints_stale(item.id);
     }
 
     fn mark_current_details_viewed(&mut self) {

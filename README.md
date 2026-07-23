@@ -118,9 +118,12 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 | Key | Action |
 | --- | --- |
-| `:` | Open the command palette and fuzzy search commands; recently run commands appear first |
+| `:` | Open the command palette; recent commands lead before typing, then fuzzy relevance wins |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
-| `Tab` / `Shift+Tab` | Switch list/details focus; when ghr or Sections is focused, move within that tab group |
+| `Tab` | Switch list/details focus; when ghr or Sections is focused, move to the next tab |
+| `Shift+Tab` in List | Switch to the previous Section, then return focus to List after 200 ms |
+| `Shift+[` / `Shift+]` in List | Switch to the left/right Section, then return focus to List after 200 ms |
+| `Shift+Tab` elsewhere | Return from Details to List, or move backward within focused ghr/Sections tabs |
 | `h` / `l` or `[` / `]` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |
 | `Esc` | Return from details to list, clear search, or leave diff mode |
@@ -185,7 +188,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 
 ## Commands
 
-Open the command palette with `:` to fuzzy search and run commands. Recently run commands appear first.
+Open the command palette with `:` to fuzzy search and run commands. Recently run commands appear
+first before you type; once you enter a query, the closest matches appear first. Every current
+top-menu item is also generated as a direct command, including projects added at runtime, so typing
+`Inb` or a project name switches to that tab without opening another picker.
 
 | Command | Action |
 | --- | --- |
@@ -195,6 +201,7 @@ Open the command palette with `:` to fuzzy search and run commands. Recently run
 | `Recent Items` | Fuzzy search recently viewed PRs/issues, including linked inbox notifications, and jump back to the selected item |
 | `Saved Search Filter` | Pick a named saved PR/issue search filter from `config.toml` and run it |
 | `Set Color Theme` | Choose `auto` or a fixed color theme and save it to `config.toml` |
+| `Top Menu Switch` | Switch Inbox, PR, issue, search, or repo tabs, then focus the list after a short delay |
 | `Copy GitHub Link` | Copy the selected comment link, or the current PR/issue link, to the clipboard |
 | `Copy PR/Issue Link` | Copy the current PR/issue link to the clipboard, ignoring selected comments |
 | `Copy Content` | Copy the selected comment content, or the current PR/issue description, to the clipboard |

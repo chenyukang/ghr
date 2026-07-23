@@ -109,7 +109,7 @@ mod text;
 use command_palette::{
     CommandPalette, PaletteAction, PaletteCommand, command_palette_area, command_palette_commands,
     command_palette_filtered_indices, command_palette_input_line, command_palette_normalized_text,
-    command_palette_result_line, command_palette_visible_start,
+    command_palette_result_line, command_palette_visible_start, top_menu_palette_command,
 };
 use details::*;
 use dialogs::*;
@@ -1537,6 +1537,14 @@ const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 const INBOX_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const LIST_FOCUS_RETURN_DELAY: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone)]
+struct PendingListFocus {
+    view: String,
+    expected_focus: FocusTarget,
+    ready_at: Instant,
+}
 
 struct AppState {
     theme_name: ThemeName,
@@ -1577,6 +1585,7 @@ struct AppState {
     command_palette: Option<CommandPalette>,
     project_switcher: Option<ProjectSwitcher>,
     top_menu_switcher: Option<TopMenuSwitcher>,
+    pending_list_focus: Option<PendingListFocus>,
     theme_switcher: Option<ThemeSwitcher>,
     recent_items_dialog: Option<RecentItemsDialog>,
     diagnostics_dialog: Option<DiagnosticsDialog>,
@@ -2041,6 +2050,7 @@ async fn run_loop(
         }
 
         needs_draw |= drain_app_messages(app, rx);
+        needs_draw |= app.apply_pending_list_focus(Instant::now());
         let started_pending_full_refresh = if app.take_pending_full_refresh_after_view() {
             start_refresh(
                 config.clone(),
@@ -2105,7 +2115,9 @@ async fn run_loop(
         }
 
         let mut should_quit = false;
-        let Some(event_ready) = poll_terminal_event()? else {
+        let Some(event_ready) =
+            poll_terminal_event_with_timeout(app.next_terminal_poll_timeout(Instant::now()))?
+        else {
             break;
         };
         if event_ready {
@@ -2168,10 +2180,6 @@ fn terminal_disconnect_error(error: &io::Error) -> bool {
             | io::ErrorKind::NotConnected
             | io::ErrorKind::UnexpectedEof
     ) || matches!(error.raw_os_error(), Some(5 | 6 | 9 | 19 | 25))
-}
-
-fn poll_terminal_event() -> Result<Option<bool>> {
-    poll_terminal_event_with_timeout(EVENT_POLL_TIMEOUT)
 }
 
 fn poll_terminal_event_now() -> Result<Option<bool>> {
@@ -2848,7 +2856,10 @@ fn recent_commands_to_saved(items: &[RecentCommand]) -> Vec<RecentCommandState> 
 }
 
 fn command_palette_command_id(command: &PaletteCommand) -> String {
-    command.title.to_string()
+    match &command.action {
+        PaletteAction::SwitchTopMenu { key, .. } => format!("top-menu:{key}"),
+        _ => command.title.clone(),
+    }
 }
 
 fn recent_item_state_kind(kind: ItemKind) -> &'static str {
@@ -3008,6 +3019,7 @@ impl AppState {
             command_palette: None,
             project_switcher: None,
             top_menu_switcher: None,
+            pending_list_focus: None,
             theme_switcher: None,
             recent_items_dialog: None,
             diagnostics_dialog: None,
@@ -5501,6 +5513,17 @@ impl AppState {
         self.status = "command palette dismissed".to_string();
     }
 
+    fn available_command_palette_commands(&self) -> Vec<PaletteCommand> {
+        let mut commands =
+            command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        commands.extend(
+            self.view_tabs()
+                .into_iter()
+                .map(|view| top_menu_palette_command(view.key, view.label)),
+        );
+        commands
+    }
+
     fn handle_command_palette_key(
         &mut self,
         key: KeyEvent,
@@ -5561,7 +5584,7 @@ impl AppState {
         else {
             return;
         };
-        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        let commands = self.available_command_palette_commands();
         let len = self.command_palette_match_indices(&commands, &query).len();
         if let Some(palette) = &mut self.command_palette {
             palette.selected = move_wrapping(palette.selected, len, delta);
@@ -5625,6 +5648,10 @@ impl AppState {
             }
             PaletteAction::TopMenuSwitch => {
                 self.show_top_menu_switcher();
+                false
+            }
+            PaletteAction::SwitchTopMenu { key, label } => {
+                self.activate_top_menu_item(key, label);
                 false
             }
             PaletteAction::SearchCurrentRepo => {
@@ -5740,7 +5767,7 @@ impl AppState {
 
     fn selected_command_palette_command(&self) -> Option<PaletteCommand> {
         let palette = self.command_palette.as_ref()?;
-        let commands = command_palette_commands(&self.command_palette_key, &self.editor_submit_key);
+        let commands = self.available_command_palette_commands();
         let matches = self.command_palette_match_indices(&commands, &palette.query);
         let selected = palette.selected.min(matches.len().saturating_sub(1));
         matches
@@ -5755,16 +5782,19 @@ impl AppState {
         query: &str,
     ) -> Vec<usize> {
         let mut matches = command_palette_filtered_indices(commands, query);
+        if !query.trim().is_empty() {
+            return matches;
+        }
         matches.sort_by(|left, right| {
             let left_selected_at = self.command_palette_selected_at(&commands[*left]);
             let right_selected_at = self.command_palette_selected_at(&commands[*right]);
             match (left_selected_at, right_selected_at) {
-                (Some(left_selected_at), Some(right_selected_at)) => right_selected_at
-                    .cmp(&left_selected_at)
-                    .then_with(|| left.cmp(right)),
+                (Some(left_selected_at), Some(right_selected_at)) => {
+                    right_selected_at.cmp(&left_selected_at)
+                }
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left.cmp(right),
+                (None, None) => std::cmp::Ordering::Equal,
             }
         });
         matches
@@ -6909,6 +6939,60 @@ impl AppState {
         let restored = self.switch_view_with_fallback(view, FocusTarget::Ghr);
         self.focus = FocusTarget::Ghr;
         restored
+    }
+
+    fn schedule_top_menu_list_focus(&mut self, now: Instant) {
+        self.schedule_list_focus(FocusTarget::Ghr, now);
+    }
+
+    fn schedule_section_list_focus(&mut self, now: Instant) {
+        self.schedule_list_focus(FocusTarget::Sections, now);
+    }
+
+    fn schedule_list_focus(&mut self, expected_focus: FocusTarget, now: Instant) {
+        self.pending_list_focus = Some(PendingListFocus {
+            view: self.active_view.clone(),
+            expected_focus,
+            ready_at: now + LIST_FOCUS_RETURN_DELAY,
+        });
+    }
+
+    fn has_pending_list_focus_from(&self, expected_focus: FocusTarget) -> bool {
+        self.pending_list_focus
+            .as_ref()
+            .is_some_and(|pending| pending.expected_focus == expected_focus)
+    }
+
+    fn cancel_pending_list_focus(&mut self) {
+        self.pending_list_focus = None;
+    }
+
+    fn apply_pending_list_focus(&mut self, now: Instant) -> bool {
+        let Some(pending) = self.pending_list_focus.as_ref() else {
+            return false;
+        };
+        if now < pending.ready_at {
+            return false;
+        }
+
+        let pending = self
+            .pending_list_focus
+            .take()
+            .expect("pending list focus should exist");
+        if self.focus != pending.expected_focus || !same_view_key(&self.active_view, &pending.view)
+        {
+            return false;
+        }
+        self.focus_primary_list();
+        true
+    }
+
+    fn next_terminal_poll_timeout(&self, now: Instant) -> Duration {
+        self.pending_list_focus
+            .as_ref()
+            .map(|pending| pending.ready_at.saturating_duration_since(now))
+            .map(|remaining| remaining.min(EVENT_POLL_TIMEOUT))
+            .unwrap_or(EVENT_POLL_TIMEOUT)
     }
 
     fn switch_view_with_fallback(

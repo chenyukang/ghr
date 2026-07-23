@@ -73,7 +73,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
     }
 
     if let Some(palette) = &app.command_palette {
-        draw_command_palette(frame, app, palette, area, &app.command_palette_key);
+        draw_command_palette(frame, app, palette, area);
     }
     if let Some(switcher) = &app.project_switcher {
         draw_project_switcher(frame, app, switcher, area);

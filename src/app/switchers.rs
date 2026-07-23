@@ -88,7 +88,15 @@ impl AppState {
         let key = candidate.key.clone();
         let label = candidate.label.clone();
         self.top_menu_switcher = None;
+        self.activate_top_menu_item(key, label);
+    }
+
+    pub(super) fn activate_top_menu_item(&mut self, key: String, label: String) {
+        let previous_view = self.active_view.clone();
         self.switch_top_menu_view(key);
+        if !same_view_key(&previous_view, &self.active_view) {
+            self.schedule_top_menu_list_focus(Instant::now());
+        }
         self.status = format!("top menu switched: {label}");
     }
 

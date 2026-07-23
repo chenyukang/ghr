@@ -15,7 +15,7 @@ pub(super) struct CommandPalette {
 
 #[derive(Debug, Clone)]
 pub(super) struct PaletteCommand {
-    pub(super) title: &'static str,
+    pub(super) title: String,
     pub(super) keys: String,
     pub(super) scope: &'static str,
     pub(super) detail: &'static str,
@@ -35,6 +35,7 @@ pub(super) enum PaletteAction {
     RecentItems,
     SetColorTheme,
     TopMenuSwitch,
+    SwitchTopMenu { key: String, label: String },
     SearchCurrentRepo,
     SavedSearchFilter,
     SwitchProject,
@@ -201,7 +202,7 @@ pub(super) fn command_palette_commands(
             "Top Menu Switch",
             "",
             "General",
-            "Switch Inbox, PR, issue, search, or repo tabs and focus the top menu",
+            "Switch Inbox, PR, issue, search, or repo tabs, then focus the list",
             PaletteAction::TopMenuSwitch,
         ),
         palette_command(
@@ -374,10 +375,24 @@ pub(super) fn command_palette_commands(
         ),
         palette_command(
             "Toggle List Details Focus",
-            "Tab / Shift+Tab",
+            "Tab",
             "Focus",
             "Switch focus between the list and details panes",
             palette_key(KeyCode::Tab),
+        ),
+        palette_command(
+            "Previous Section from List",
+            "Shift+Tab / Shift+[",
+            "List",
+            "Switch to the previous section, then return to the list after 400 ms",
+            palette_key(KeyCode::BackTab),
+        ),
+        palette_command(
+            "Next Section from List",
+            "Shift+]",
+            "List",
+            "Switch to the next section, then return to the list after 400 ms",
+            palette_shift_key(KeyCode::Char(']')),
         ),
         palette_command(
             "Focus GHR Tabs",
@@ -839,15 +854,25 @@ pub(super) fn command_palette_commands(
     commands
 }
 
+pub(super) fn top_menu_palette_command(key: String, label: String) -> PaletteCommand {
+    palette_command(
+        label.clone(),
+        "",
+        "Top Menu",
+        "Switch directly to this top menu item, then focus the list",
+        PaletteAction::SwitchTopMenu { key, label },
+    )
+}
+
 fn palette_command(
-    title: &'static str,
+    title: impl Into<String>,
     keys: impl Into<String>,
     scope: &'static str,
     detail: &'static str,
     action: PaletteAction,
 ) -> PaletteCommand {
     PaletteCommand {
-        title,
+        title: title.into(),
         keys: keys.into(),
         scope,
         detail,
@@ -874,6 +899,10 @@ fn palette_ctrl_key(code: KeyCode) -> PaletteAction {
 
 fn palette_alt_key(code: KeyCode) -> PaletteAction {
     PaletteAction::Key(KeyEvent::new(code, KeyModifiers::ALT))
+}
+
+fn palette_shift_key(code: KeyCode) -> PaletteAction {
+    PaletteAction::Key(KeyEvent::new(code, KeyModifiers::SHIFT))
 }
 
 pub(super) fn command_palette_filtered_indices(
@@ -908,7 +937,7 @@ fn command_palette_score(command: &PaletteCommand, query: &str) -> Option<i64> {
     }
 
     let fields = [
-        (command.title, 40_000),
+        (command.title.as_str(), 40_000),
         (command.keys.as_str(), 30_000),
         (command.scope, 20_000),
         (command.detail, 10_000),
@@ -1118,7 +1147,7 @@ mod tests {
         let milestone_matches = command_palette_filtered_indices(&commands, "milestone");
         let milestone_titles = milestone_matches
             .iter()
-            .map(|index| commands[*index].title)
+            .map(|index| commands[*index].title.as_str())
             .collect::<Vec<_>>();
         assert!(milestone_titles.contains(&"Change Milestone"));
         assert!(!milestone_titles.contains(&"Open PR Merge Confirmation"));

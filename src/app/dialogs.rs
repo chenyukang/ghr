@@ -300,9 +300,8 @@ pub(super) fn draw_command_palette(
     app: &AppState,
     palette: &CommandPalette,
     area: Rect,
-    command_palette_key: &str,
 ) {
-    let commands = command_palette_commands(command_palette_key, &app.editor_submit_key);
+    let commands = app.available_command_palette_commands();
     let matches = app.command_palette_match_indices(&commands, &palette.query);
     let dialog_area = command_palette_area(area);
     let inner = block_inner(dialog_area);
@@ -4585,7 +4584,10 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("q", "quit ghr outside help"),
         help_key_line("q / Esc in diff", "return to the state before opening diff"),
         help_key_line("r", "refresh from GitHub"),
-        help_key_line("Tab / Shift+Tab", "switch list/details focus"),
+        help_key_line(
+            "Tab / Shift+Tab",
+            "switch list/details or move List to the previous Section",
+        ),
         help_key_line("1 / 2 / 3 / 4", "focus GHR / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
         help_key_line("S", "search PRs and issues in the current repo"),
@@ -4614,7 +4616,11 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
             "j/k/n/p or Up/Down",
             "move selection; k/p at first item focuses Sections",
         ),
-        help_key_line("Tab / Shift+Tab", "focus Details"),
+        help_key_line("Tab", "focus Details"),
+        help_key_line(
+            "Shift+Tab / Shift+[ / Shift+]",
+            "previous / left / right Section, then return to List after 400 ms",
+        ),
         help_key_line("[ / ]", "load previous / next GitHub result page"),
         help_key_line("PgDown/PgUp or d/u", "move by visible page"),
         help_key_line("g / G", "first / last item"),

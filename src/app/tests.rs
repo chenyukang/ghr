@@ -4870,6 +4870,20 @@ fn command_palette_recent_ties_fall_back_to_default_order() {
 }
 
 #[test]
+fn command_palette_search_relevance_overrides_recent_history() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let commands = app.available_command_palette_commands();
+    app.recent_commands = vec![RecentCommand {
+        id: "Copy PR/Issue Link".to_string(),
+        selected_at: DateTime::from_timestamp(1_700_000_100, 0).unwrap(),
+    }];
+
+    let matches = app.command_palette_match_indices(&commands, "pull");
+
+    assert_eq!(commands[matches[0]].title, "Pull Requests");
+}
+
+#[test]
 fn command_palette_submission_records_recent_command() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -6234,6 +6248,83 @@ fn top_menu_switcher_lists_all_top_tabs_and_filters() {
 }
 
 #[test]
+fn command_palette_generates_direct_commands_for_current_top_menu() {
+    let sections = vec![
+        SectionSnapshot::empty(
+            SectionKind::Notifications,
+            "All",
+            "is:unread reason:subscribed",
+        ),
+        test_section(),
+        SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+        SectionSnapshot::empty_for_view(
+            "repo:Fiber",
+            SectionKind::PullRequests,
+            "Pull Requests",
+            "repo:nervosnetwork/fiber is:open",
+        ),
+    ];
+    let app = AppState::new(SectionKind::PullRequests, sections);
+    let commands = app.available_command_palette_commands();
+    let matches = app.command_palette_match_indices(&commands, "inb");
+    let command = matches
+        .first()
+        .and_then(|index| commands.get(*index))
+        .expect("Inbox should be the first matching command");
+
+    assert_eq!(command.title, "Inbox");
+    assert!(matches!(
+        &command.action,
+        PaletteAction::SwitchTopMenu { key, label }
+            if key == &builtin_view_key(SectionKind::Notifications) && label == "Inbox"
+    ));
+    assert!(commands.iter().any(|command| {
+        matches!(
+            &command.action,
+            PaletteAction::SwitchTopMenu { key, label }
+                if key == "repo:Fiber" && label == "Fiber"
+        )
+    }));
+}
+
+#[test]
+fn command_palette_direct_top_menu_command_switches_and_delays_list_focus() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let config = Config::default();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+    app.focus_details();
+    app.command_palette = Some(CommandPalette {
+        query: "Issues".to_string(),
+        selected: 0,
+    });
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &config,
+        &store,
+        &tx,
+    );
+
+    assert!(app.command_palette.is_none());
+    assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert_eq!(app.status, "top menu switched: Issues");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+}
+
+#[test]
 fn command_palette_top_menu_switch_opens_top_menu_switcher() {
     let config = Config::default();
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
@@ -6258,7 +6349,7 @@ fn command_palette_top_menu_switch_opens_top_menu_switcher() {
 }
 
 #[test]
-fn top_menu_switcher_enter_switches_view_and_focuses_top_menu() {
+fn top_menu_switcher_enter_delays_list_focus() {
     let sections = vec![
         test_section(),
         SectionSnapshot::empty(SectionKind::Issues, "Issues", "is:open"),
@@ -6274,6 +6365,17 @@ fn top_menu_switcher_enter_switches_view_and_focuses_top_menu() {
     assert_eq!(app.focus, FocusTarget::Ghr);
     assert!(app.top_menu_switcher.is_none());
     assert_eq!(app.status, "top menu switched: Issues");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(!app.apply_pending_list_focus(ready_at - Duration::from_millis(1)));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+    assert!(app.pending_list_focus.is_none());
+    assert_eq!(app.status, "list focused");
 }
 
 #[test]
@@ -6376,6 +6478,17 @@ fn project_add_saves_repo_to_config_and_adds_menu_tab() {
         app.view_tabs()
             .iter()
             .any(|view| view.key == "repo:ghr" && view.label == "ghr")
+    );
+    assert!(
+        app.available_command_palette_commands()
+            .iter()
+            .any(|command| {
+                matches!(
+                    &command.action,
+                    PaletteAction::SwitchTopMenu { key, label }
+                        if key == "repo:ghr" && label == "ghr"
+                )
+            })
     );
     assert_eq!(
         app.visible_sections()
@@ -19215,7 +19328,7 @@ fn mouse_clicking_table_header_does_not_change_selection() {
 }
 
 #[test]
-fn mouse_clicking_view_tab_switches_view_and_focuses_ghr() {
+fn mouse_clicking_view_tab_delays_list_focus() {
     let sections = vec![
         test_section(),
         SectionSnapshot {
@@ -19252,6 +19365,13 @@ fn mouse_clicking_view_tab_switches_view_and_focuses_ghr() {
     assert_eq!(app.focus, FocusTarget::Ghr);
     assert!(!app.search_active);
     assert_eq!(app.status, "GHR focused");
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
 }
 
 #[test]
@@ -20189,6 +20309,41 @@ fn number_focus_keys_work_from_details() {
 }
 
 #[test]
+fn manual_focus_key_cancels_pending_list_focus() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    let now = Instant::now();
+    app.schedule_top_menu_list_focus(now);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('1')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
+    assert!(!app.apply_pending_list_focus(now + LIST_FOCUS_RETURN_DELAY));
+    assert_eq!(app.focus, FocusTarget::Ghr);
+}
+
+#[test]
+fn pending_list_focus_shortens_terminal_poll_timeout() {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let now = Instant::now();
+    app.schedule_top_menu_list_focus(now);
+
+    assert_eq!(app.next_terminal_poll_timeout(now), EVENT_POLL_TIMEOUT);
+    assert_eq!(
+        app.next_terminal_poll_timeout(now + Duration::from_millis(350)),
+        Duration::from_millis(50)
+    );
+}
+
+#[test]
 fn n_and_p_mirror_j_and_k_between_ghr_sections_and_list_focus() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let (tx, _rx) = mpsc::unbounded_channel();
@@ -20271,6 +20426,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_ghr();
+    app.schedule_top_menu_list_focus(Instant::now());
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Char('l')),
@@ -20280,6 +20436,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     app.focus_sections();
     assert!(!handle_key(
@@ -20304,6 +20461,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.current_section_position(), 1);
     assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.pending_list_focus.is_none());
 
     app.focus_ghr();
     assert!(!handle_key(
@@ -20315,6 +20473,7 @@ fn h_l_and_brackets_switch_only_the_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     assert!(!handle_key(
         &mut app,
@@ -20508,6 +20667,7 @@ fn tab_switches_the_current_focused_tab_group() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_ghr();
+    app.schedule_top_menu_list_focus(Instant::now());
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Tab),
@@ -20517,6 +20677,7 @@ fn tab_switches_the_current_focused_tab_group() {
     ));
     assert_eq!(app.active_view, builtin_view_key(SectionKind::Issues));
     assert_eq!(app.focus, FocusTarget::Ghr);
+    assert!(app.pending_list_focus.is_none());
 
     app.switch_view(builtin_view_key(SectionKind::PullRequests));
     app.focus_sections();
@@ -20531,6 +20692,7 @@ fn tab_switches_the_current_focused_tab_group() {
     assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
     assert_eq!(app.current_section_position(), 1);
     assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.pending_list_focus.is_none());
 
     assert!(!handle_key(
         &mut app,
@@ -20613,9 +20775,162 @@ fn tab_toggles_between_list_and_details_in_conversation_mode() {
         &tx
     ));
     assert_eq!(app.details_mode, DetailsMode::Conversation);
-    assert_eq!(app.focus, FocusTarget::Details);
+    assert_eq!(app.focus, FocusTarget::Sections);
     assert_eq!(app.active_view, builtin_view_key(SectionKind::PullRequests));
     assert_eq!(app.current_section_position(), 0);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("list focus should be scheduled")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+}
+
+#[test]
+fn shift_tab_from_list_switches_previous_section_then_returns_to_list() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot {
+            key: "pull_requests:assigned".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Assigned".to_string(),
+            filters: String::new(),
+            items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_list();
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::BackTab),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+    assert_eq!(app.focus, FocusTarget::Sections);
+    assert_eq!(app.status, "Sections focused");
+    assert!(app.has_pending_list_focus_from(FocusTarget::Sections));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::BackTab),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    assert_eq!(app.focus, FocusTarget::Sections);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("repeated Shift+Tab should reschedule list focus")
+        .ready_at;
+    assert!(!app.apply_pending_list_focus(ready_at - Duration::from_millis(1)));
+    assert_eq!(app.focus, FocusTarget::Sections);
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
+    assert!(app.pending_list_focus.is_none());
+}
+
+#[test]
+fn shifted_brackets_from_list_switch_sections_in_both_directions() {
+    let sections = vec![
+        test_section(),
+        SectionSnapshot {
+            key: "pull_requests:assigned".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Assigned".to_string(),
+            filters: String::new(),
+            items: vec![work_item("2", "nervosnetwork/fiber", 2, "Fiber", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+        SectionSnapshot {
+            key: "pull_requests:review-requested".to_string(),
+            kind: SectionKind::PullRequests,
+            title: "Review Requested".to_string(),
+            filters: String::new(),
+            items: vec![work_item("3", "nervosnetwork/fiber", 3, "Review", None)],
+            total_count: None,
+            page: 1,
+            page_size: 0,
+            refreshed_at: None,
+            error: None,
+        },
+    ];
+    let mut app = AppState::new(SectionKind::PullRequests, sections);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+    app.focus_list();
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('[')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    assert_eq!(app.focus, FocusTarget::List);
+
+    assert!(!handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::SHIFT),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+    assert_eq!(app.focus, FocusTarget::Sections);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('}')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 2);
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('{')),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 1);
+
+    assert!(!handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::SHIFT),
+        &config,
+        &store,
+        &tx
+    ));
+    assert_eq!(app.current_section_position(), 0);
+    let ready_at = app
+        .pending_list_focus
+        .as_ref()
+        .expect("shifted bracket should reschedule list focus")
+        .ready_at;
+    assert!(app.apply_pending_list_focus(ready_at));
+    assert_eq!(app.focus, FocusTarget::List);
 }
 
 #[test]

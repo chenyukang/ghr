@@ -8,9 +8,13 @@ pub(super) fn global_search_dialog_query(
     let labels = dialog.label.text().trim();
     let author = dialog.author.text().trim();
     let assignee = dialog.assignee.text().trim();
+    let repos = dialog.repo_filter.text().trim();
     let sort = dialog.sort.text().trim();
-    let has_filters =
-        !status.is_empty() || !labels.is_empty() || !author.is_empty() || !assignee.is_empty();
+    let has_filters = !status.is_empty()
+        || !labels.is_empty()
+        || !author.is_empty()
+        || !assignee.is_empty()
+        || (dialog.repo.is_none() && !repos.is_empty());
 
     if !has_filters
         && is_plain_number_lookup_title(title)
@@ -22,6 +26,11 @@ pub(super) fn global_search_dialog_query(
     let mut tokens = Vec::new();
     if !title.is_empty() {
         tokens.push(title.to_string());
+    }
+    if dialog.repo.is_none() {
+        for repo in parse_global_search_repos(repos) {
+            tokens.push(format!("repo:{repo}"));
+        }
     }
     if let Some(token) = global_search_status_token(status)? {
         tokens.push(token);
@@ -46,6 +55,31 @@ pub(super) fn global_search_dialog_query(
     }
 
     Ok(tokens.join(" "))
+}
+
+pub(super) fn notification_search_dialog_filter(
+    dialog: &GlobalSearchDialog,
+) -> std::result::Result<Option<QuickFilter>, String> {
+    let status = dialog.status.text().trim();
+    let reason = dialog.reason.text().trim();
+    let repo = dialog.repo_filter.text().trim();
+    let mut tokens = Vec::new();
+    if !status.is_empty() {
+        tokens.push(status.to_string());
+    }
+    if !reason.is_empty() {
+        let reason = normalized_notification_dialog_values(reason, &["reason:"]);
+        if !reason.is_empty() {
+            tokens.push(format!("reason:{reason}"));
+        }
+    }
+    if !repo.is_empty() {
+        let repo = normalized_notification_dialog_values(repo, &["repo:"]);
+        if !repo.is_empty() {
+            tokens.push(format!("repo:{repo}"));
+        }
+    }
+    QuickFilter::parse_for_section(&tokens.join(" "), SectionKind::Notifications)
 }
 
 pub(super) fn is_plain_number_lookup_title(value: &str) -> bool {
@@ -92,6 +126,15 @@ pub(super) fn parse_global_search_labels(value: &str) -> Vec<String> {
                 .to_string()
         })
         .filter(|label| !label.is_empty())
+        .collect()
+}
+
+pub(super) fn parse_global_search_repos(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .map(|repo| strip_filter_prefix(repo, &["repo:"]).trim())
+        .filter(|repo| !repo.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -161,6 +204,27 @@ pub(super) fn global_search_static_status_choices() -> Vec<String> {
         .collect()
 }
 
+pub(super) fn notification_search_static_status_choices() -> Vec<String> {
+    ["done", "unread", "read", "all"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+pub(super) fn notification_search_static_reason_choices() -> Vec<String> {
+    [
+        "mention",
+        "review-requested",
+        "assign",
+        "subscribed",
+        "participating",
+        "others",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 pub(super) fn global_search_static_sort_choices() -> Vec<String> {
     [
         "created_at",
@@ -180,10 +244,17 @@ pub(super) fn global_search_static_sort_choices() -> Vec<String> {
 pub(super) fn global_search_dialog_suggestion_matches(dialog: &GlobalSearchDialog) -> Vec<String> {
     match dialog.field {
         GlobalSearchField::Title => Vec::new(),
-        GlobalSearchField::Status => prefix_filter_candidates(
-            &global_search_static_status_choices(),
-            global_search_dialog_status_suggestion_prefix(dialog),
-        ),
+        GlobalSearchField::Status => {
+            let choices = if dialog.kind == GlobalSearchDialogKind::Notifications {
+                notification_search_static_status_choices()
+            } else {
+                global_search_static_status_choices()
+            };
+            prefix_filter_candidates(
+                &choices,
+                global_search_dialog_status_suggestion_prefix(dialog),
+            )
+        }
         GlobalSearchField::Label => substring_filter_candidates(
             &dialog.labels,
             global_search_dialog_label_suggestion_prefix(dialog),
@@ -199,6 +270,14 @@ pub(super) fn global_search_dialog_suggestion_matches(dialog: &GlobalSearchDialo
         GlobalSearchField::Sort => prefix_filter_candidates(
             &global_search_static_sort_choices(),
             global_search_dialog_sort_suggestion_prefix(dialog),
+        ),
+        GlobalSearchField::Reason => prefix_filter_candidates(
+            &notification_search_static_reason_choices(),
+            global_search_dialog_reason_suggestion_prefix(dialog),
+        ),
+        GlobalSearchField::Repo => substring_filter_candidates(
+            &dialog.repo_candidates,
+            global_search_dialog_repo_suggestion_prefix(dialog),
         ),
     }
 }
@@ -267,6 +346,12 @@ pub(super) fn global_search_dialog_locked_prefix(
 
 pub(super) fn global_search_dialog_status_suggestion_prefix(dialog: &GlobalSearchDialog) -> String {
     global_search_dialog_locked_prefix(dialog, GlobalSearchField::Status).unwrap_or_else(|| {
+        if dialog.kind == GlobalSearchDialogKind::Notifications {
+            return static_dropdown_suggestion_prefix(
+                &notification_search_static_status_choices(),
+                normalized_global_search_status_prefix(dialog.status.text()),
+            );
+        }
         static_dropdown_suggestion_prefix(
             &global_search_static_status_choices(),
             normalized_global_search_status_prefix(dialog.status.text()),
@@ -300,6 +385,20 @@ pub(super) fn global_search_dialog_sort_suggestion_prefix(dialog: &GlobalSearchD
     })
 }
 
+pub(super) fn global_search_dialog_reason_suggestion_prefix(dialog: &GlobalSearchDialog) -> String {
+    global_search_dialog_locked_prefix(dialog, GlobalSearchField::Reason).unwrap_or_else(|| {
+        static_dropdown_suggestion_prefix(
+            &notification_search_static_reason_choices(),
+            normalized_notification_reason_prefix(dialog.reason.text()),
+        )
+    })
+}
+
+pub(super) fn global_search_dialog_repo_suggestion_prefix(dialog: &GlobalSearchDialog) -> String {
+    global_search_dialog_locked_prefix(dialog, GlobalSearchField::Repo)
+        .unwrap_or_else(|| repo_completion_prefix(dialog.repo_filter.text()))
+}
+
 pub(super) fn global_search_dialog_current_suggestion_prefix(
     dialog: &GlobalSearchDialog,
 ) -> String {
@@ -310,6 +409,8 @@ pub(super) fn global_search_dialog_current_suggestion_prefix(
         GlobalSearchField::Author => global_search_dialog_author_suggestion_prefix(dialog),
         GlobalSearchField::Assignee => global_search_dialog_assignee_suggestion_prefix(dialog),
         GlobalSearchField::Sort => global_search_dialog_sort_suggestion_prefix(dialog),
+        GlobalSearchField::Reason => global_search_dialog_reason_suggestion_prefix(dialog),
+        GlobalSearchField::Repo => global_search_dialog_repo_suggestion_prefix(dialog),
     }
 }
 
@@ -321,6 +422,8 @@ pub(super) fn global_search_dialog_current_suggestion_value(dialog: &GlobalSearc
         GlobalSearchField::Author => login_completion_prefix(dialog.author.text()),
         GlobalSearchField::Assignee => login_completion_prefix(dialog.assignee.text()),
         GlobalSearchField::Sort => normalized_global_search_sort_prefix(dialog.sort.text()),
+        GlobalSearchField::Reason => normalized_notification_reason_prefix(dialog.reason.text()),
+        GlobalSearchField::Repo => repo_completion_prefix(dialog.repo_filter.text()),
     }
 }
 
@@ -663,21 +766,51 @@ pub(super) fn insert_search_tokens_before_sort(
 }
 
 pub(super) fn normalized_global_search_status_prefix(value: &str) -> String {
-    value
-        .trim()
-        .strip_prefix("status:")
-        .or_else(|| value.trim().strip_prefix("state:"))
-        .or_else(|| value.trim().strip_prefix("is:"))
-        .unwrap_or(value.trim())
+    strip_filter_prefix(value.trim(), &["status:", "state:", "is:"]).to_string()
+}
+
+pub(super) fn normalized_notification_reason_prefix(value: &str) -> String {
+    strip_filter_prefix(value.trim(), &["reason:"])
+        .replace('_', "-")
         .to_string()
 }
 
 pub(super) fn normalized_global_search_sort_prefix(value: &str) -> String {
+    strip_filter_prefix(value.trim(), &["sort:"]).replace([':', '-'], " ")
+}
+
+fn strip_filter_prefix<'a>(value: &'a str, prefixes: &[&str]) -> &'a str {
+    let value = value.trim();
+    prefixes
+        .iter()
+        .find_map(|prefix| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                .then(|| &value[prefix.len()..])
+        })
+        .unwrap_or(value)
+}
+
+fn normalized_notification_dialog_values(value: &str, prefixes: &[&str]) -> String {
     value
-        .trim()
-        .strip_prefix("sort:")
-        .unwrap_or(value.trim())
-        .replace([':', '-'], " ")
+        .split(',')
+        .map(|part| strip_filter_prefix(part, prefixes).trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(super) fn repo_completion_prefix(value: &str) -> String {
+    strip_filter_prefix(
+        value
+            .rsplit(|ch: char| ch == ',' || ch.is_whitespace())
+            .next()
+            .unwrap_or_default()
+            .trim(),
+        &["repo:"],
+    )
+    .to_string()
 }
 
 pub(super) fn label_completion_prefix(value: &str) -> String {
@@ -724,6 +857,11 @@ pub(super) fn apply_global_search_dialog_suggestion(
         GlobalSearchField::Author => dialog.author.set_text(suggestion),
         GlobalSearchField::Assignee => dialog.assignee.set_text(suggestion),
         GlobalSearchField::Sort => dialog.sort.set_text(suggestion),
+        GlobalSearchField::Reason => dialog.reason.set_text(suggestion),
+        GlobalSearchField::Repo => {
+            let value = replace_last_comma_component(dialog.repo_filter.text(), suggestion);
+            dialog.repo_filter.set_text(value);
+        }
     }
 }
 
@@ -747,6 +885,7 @@ pub(super) fn clear_global_search_dialog_conditions(dialog: &mut GlobalSearchDia
     dialog.label.set_text("");
     dialog.author.set_text("");
     dialog.assignee.set_text("");
+    dialog.repo_filter.set_text("");
     dialog.sort.set_text("created_at");
     dialog.field = GlobalSearchField::Title;
     reset_global_search_dialog_suggestions(dialog);

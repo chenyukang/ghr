@@ -769,23 +769,37 @@ pub(super) fn active_list_input_prompt(app: &AppState) -> Option<(String, Color)
     if app.filter_input_active {
         return Some((
             format!(
-                "Filter: f{}_  Enter apply  empty/clear resets  Esc cancel",
-                app.filter_input_query
+                "Filter: {}_  Fields: {}  Enter apply  empty/clear resets  Esc cancel",
+                app.filter_input_query,
+                filter_input_fields_hint(app),
             ),
             theme.focus,
         ));
     }
 
     if app.global_search_active {
+        if app
+            .global_search_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.kind == GlobalSearchDialogKind::Notifications)
+        {
+            return Some((
+                "Inbox Search: dialog open  Enter choose/apply  Ctrl+U clear  Esc cancel"
+                    .to_string(),
+                theme.action,
+            ));
+        }
         let scope = app
-            .global_search_scope
-            .clone()
-            .or_else(|| app.current_repo_scope())
-            .map(|repo| format!(" in {repo}"))
-            .unwrap_or_default();
+            .global_search_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.repo.clone());
+        let name = match scope.as_deref() {
+            Some(repo) => format!("Repo Search in {repo}"),
+            None => "GitHub Search".to_string(),
+        };
         return Some((
             format!(
-                "Repo Search{scope}: dialog open  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel"
+                "{name}: dialog open  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel"
             ),
             theme.action,
         ));
@@ -1252,13 +1266,20 @@ pub(super) fn footer_groups(app: &AppState) -> Vec<Vec<Span<'static>>> {
         Some(
             app.global_search_dialog
                 .as_ref()
-                .map(|dialog| format!("repo-search: {}", dialog.field.label()))
-                .unwrap_or_else(|| "repo-search".to_string()),
+                .map(|dialog| {
+                    let name = match (dialog.kind, dialog.repo.as_ref()) {
+                        (GlobalSearchDialogKind::Notifications, _) => "inbox-search",
+                        (GlobalSearchDialogKind::Search, Some(_)) => "repo-search",
+                        (GlobalSearchDialogKind::Search, None) => "github-search",
+                    };
+                    format!("{name}: {}", dialog.field.dialog_label(dialog.kind))
+                })
+                .unwrap_or_else(|| "github-search".to_string()),
         )
     } else if app.global_search_running {
         Some("repo search running".to_string())
     } else if app.filter_input_active {
-        Some(format!("filter: f{}_", app.filter_input_query))
+        Some(format!("filter: {}_", app.filter_input_query))
     } else if app.search_active {
         Some(format!("local-search: /{}_", app.search_query))
     } else if app.search_query.is_empty() {
@@ -1316,6 +1337,16 @@ pub(super) fn footer_status(app: &AppState) -> String {
         app.status.clone()
     } else {
         format!("{} · {}", app.status, age)
+    }
+}
+
+fn filter_input_fields_hint(app: &AppState) -> &'static str {
+    match app.current_section().map(|section| section.kind) {
+        Some(SectionKind::Notifications) => "done, read, unread, all, reason:, repo:",
+        Some(SectionKind::PullRequests | SectionKind::Issues) => {
+            "state:, label:, author:, assignee:"
+        }
+        None => "state:, label:, author:, assignee:",
     }
 }
 
@@ -1432,6 +1463,12 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 if app.is_global_search_results_view() {
                     push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 }
+                if app
+                    .current_section()
+                    .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+                {
+                    push_footer_pair(&mut spans, "x/Del", "done", Color::LightRed);
+                }
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "i", "ignore", Color::LightRed);
                 if app.current_item().is_some_and(item_supports_metadata_edit) {
@@ -1455,6 +1492,12 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 push_footer_pair(&mut spans, "tab", "List", Color::Cyan);
                 push_footer_pair(&mut spans, "v", "diff", Color::LightMagenta);
                 push_footer_pair(&mut spans, "/", "search", Color::Yellow);
+                if app
+                    .current_section()
+                    .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+                {
+                    push_footer_pair(&mut spans, "x/Del", "done", Color::LightRed);
+                }
                 push_footer_pair(&mut spans, "c/a", "comment", Color::LightBlue);
                 if has_check_runs {
                     push_footer_pair(&mut spans, "n/p", "focus", Color::LightBlue);

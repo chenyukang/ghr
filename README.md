@@ -23,7 +23,7 @@
 - Paged PR and issue lists with configurable page size.
 - Persistent ignored PRs and issues, stored in UI state and hidden from all lists.
 - Recent Items command for jumping back to the last 200 PRs and issues, including linked inbox notifications, where you spent at least 5 seconds in Details.
-- Fuzzy filtering in every loaded list with `/`, quick PR/issue section filters with `f`, plus repo-scoped GitHub search with `S`.
+- Fuzzy filtering in every loaded list with `/`, quick PR/issue/inbox section filters with `f`, plus structured GitHub search with `S`.
 - Details pane with rendered Markdown, clickable links and image attachments, fenced code blocks with lightweight Rust and plain/log highlighting, descriptions, comments, review comments, PR commit activity, labels, milestones, action hints, and check summaries.
 - Inbox notifications lazily load linked PR or issue details when opened, so descriptions and recent PR commit activity appear without making the initial inbox fetch heavier.
 - PR diff mode with a changed-file list, per-file diff rendering, inline review comments, and review ranges.
@@ -136,9 +136,10 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `g` / `G` | Jump to top/bottom in list, details, or diff; in conversation details, top clears comment focus and bottom focuses the last comment |
 | `[` / `]` in diff mode | Switch diff files |
 | `/` | In PR/issue lists, open the repo search dialog; in other lists, fuzzy filter the loaded list |
-| `f` | Filter the current PR/issue section with qualifiers such as `state:closed label:bug author:alice`; empty input or `clear` resets |
-| `S` | Search matching PRs and issues with remembered per-repo fields for title/number, type, status, label, author, assignee, and sort; use `Tab` to switch fields, `↑`/`↓` to move candidates, `Enter` to choose or search, `Ctrl+S` to save reusable conditions, and `Ctrl+U` to clear conditions |
+| `f` | Filter the current PR/issue/inbox section with qualifiers such as `state:closed label:bug author:alice`, `unread reason:mention`, or `done`; empty input or `clear` resets |
+| `S` | Search matching PRs and issues; global PR/issue lists include a Repo field, repo tabs use remembered per-repo fields, and Inbox searches by state, reason, and repo; use `Tab` to switch fields, `↑`/`↓` to move candidates, `Enter` to choose or search, `Ctrl+S` to save reusable PR/issue conditions, and `Ctrl+U` to clear conditions |
 | `i` | Ignore the selected PR or issue and hide it from future lists |
+| `x` / `Delete` in Inbox | Mark the selected GitHub inbox notification done |
 | `v` | Open PR diff mode |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page; in Details, open the focused check URL when one is selected |

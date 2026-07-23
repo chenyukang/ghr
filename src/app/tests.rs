@@ -2846,6 +2846,38 @@ fn inbox_idle_refresh_updates_notifications_without_changing_active_view_or_stat
 }
 
 #[test]
+fn inbox_idle_refresh_keeps_done_threads_hidden_until_new_activity() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let inbox = notification_section(Vec::new());
+    let mut app = AppState::new(SectionKind::Notifications, vec![inbox]);
+    app.done_notification_threads
+        .insert("thread-1".to_string(), done_at);
+
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![notification_section(vec![old_item])],
+    });
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+
+    let mut new_item = notification_item("thread-1", true);
+    new_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    app.handle_msg(AppMsg::InboxIdleRefreshFinished {
+        sections: vec![notification_section(vec![new_item])],
+    });
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-1");
+    assert!(!app.done_notification_threads.contains_key("thread-1"));
+    assert_eq!(
+        app.take_done_notification_threads_to_delete(),
+        vec!["thread-1".to_string()]
+    );
+}
+
+#[test]
 fn inbox_idle_refresh_preserves_selected_notification_and_details_position() {
     let mut inbox = SectionSnapshot {
         key: "notifications:All".to_string(),
@@ -3473,6 +3505,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         selected_diff_line: HashMap::new(),
         diff_file_details_scroll: HashMap::new(),
         ignored_items: Vec::new(),
+        done_notification_threads: HashMap::new(),
         recent_items: Vec::new(),
         recent_commands: Vec::new(),
         repo_unseen_items: HashMap::new(),
@@ -4767,7 +4800,7 @@ fn help_dialog_content_lists_core_shortcuts() {
     assert!(text.contains("open PR update-branch confirmation"));
     assert!(text.contains("toggle PR draft / ready for review"));
     assert!(text.contains("change issue or PR milestone"));
-    assert!(text.contains("search PRs and issues in the current repo"));
+    assert!(text.contains("search PRs/issues or inbox notifications"));
     assert!(text.contains("terminal text selection"));
     assert!(text.contains("@ / -"));
     assert!(text.contains("add a reaction"));
@@ -4810,7 +4843,7 @@ fn help_dialog_two_columns_wrap_instead_of_clipping() {
     assert!(two_columns.len() > help_dialog_content(DEFAULT_COMMAND_PALETTE_KEY).len() / 2);
     assert!(collapsed.contains("open PR disable auto-merge confirmation"));
     assert!(collapsed.contains("filter with state:closed"));
-    assert!(collapsed.contains("label:bug author:alice"));
+    assert!(collapsed.contains("label:bug, unread, or done"));
     assert!(
         two_columns
             .iter()
@@ -7579,6 +7612,25 @@ fn footer_uses_list_shortcuts_and_status() {
 }
 
 #[test]
+fn footer_shows_inbox_mark_done_shortcut_for_notifications() {
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![notification_item(
+            "thread-1", true,
+        )])],
+    );
+    let paths = test_paths();
+
+    app.focus_list();
+    let list = footer_line(&app, &paths).to_string();
+    assert!(list.contains("x/Del done"));
+
+    app.focus_details();
+    let details = footer_line(&app, &paths).to_string();
+    assert!(details.contains("x/Del done"));
+}
+
+#[test]
 fn section_page_loading_overrides_generic_refresh_status() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     app.refreshing = true;
@@ -8072,9 +8124,10 @@ fn list_title_shows_repo_search_input_prompt() {
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
-    assert!(rendered.contains("Repo Search in rust-lang/rust: dialog open"));
+    assert!(rendered.contains("GitHub Search: dialog open"));
     assert!(rendered.contains("Search Issues and Pull Requests"));
     assert!(rendered.contains("Title / #"));
+    assert!(rendered.contains("Repo"));
     assert!(rendered.contains("borrow"));
     assert!(rendered.contains("created_at"));
 }
@@ -8085,9 +8138,10 @@ fn quick_filter_query_replaces_state_and_adds_qualifiers_before_sort() {
     let filter = filter.expect("filter");
 
     assert_eq!(
-        quick_filter_query(
+        quick_filter_query_for_section(
             "repo:owner/repo is:open author:me label:old archived:false sort:updated-desc",
             &filter,
+            SectionKind::PullRequests,
         ),
         "repo:owner/repo archived:false is:closed assignee:bob author:alice label:bug sort:updated-desc"
     );
@@ -8102,26 +8156,42 @@ fn quick_filter_state_shortcuts_toggle_query_state() {
     let draft = QuickFilter::parse("draft").unwrap().expect("draft");
     let all = QuickFilter::parse("all").unwrap().expect("all");
 
-    assert!(quick_filter_query(base, &closed).contains("is:closed"));
-    assert!(quick_filter_query(base, &close).contains("is:closed"));
+    assert!(
+        quick_filter_query_for_section(base, &closed, SectionKind::PullRequests)
+            .contains("is:closed")
+    );
+    assert!(
+        quick_filter_query_for_section(base, &close, SectionKind::PullRequests)
+            .contains("is:closed")
+    );
     assert_eq!(close.display(), "state:closed");
-    assert!(quick_filter_query(base, &merged).contains("is:merged"));
-    assert!(quick_filter_query(base, &draft).contains("is:draft"));
+    assert!(
+        quick_filter_query_for_section(base, &merged, SectionKind::PullRequests)
+            .contains("is:merged")
+    );
+    assert!(
+        quick_filter_query_for_section(base, &draft, SectionKind::PullRequests)
+            .contains("is:draft")
+    );
     assert_eq!(
-        quick_filter_query(base, &all),
+        quick_filter_query_for_section(base, &all, SectionKind::PullRequests),
         "repo:owner/repo archived:false sort:updated-desc"
     );
 }
 
 #[test]
 fn quick_filter_applies_assignee_author_and_multiple_labels() {
-    let filter = QuickFilter::parse("assignee:bob author:alice labels:bug,regression")
+    let filter = QuickFilter::parse("Assignee:bob AUTHOR:alice LABELS:bug,regression,Bug")
         .unwrap()
         .expect("filter");
 
     assert_eq!(
-        quick_filter_query("is:open sort:updated-desc", &filter),
-        "is:open assignee:bob author:alice label:bug label:regression sort:updated-desc"
+        quick_filter_query_for_section(
+            "IS:Open AUTHOR:old LABEL:old sort:updated-desc",
+            &filter,
+            SectionKind::PullRequests
+        ),
+        "IS:Open assignee:bob author:alice label:bug label:regression sort:updated-desc"
     );
     assert_eq!(
         filter.display(),
@@ -8130,10 +8200,52 @@ fn quick_filter_applies_assignee_author_and_multiple_labels() {
 }
 
 #[test]
+fn quick_filter_supports_notification_tokens_and_done_state() {
+    let filter = QuickFilter::parse_for_section(
+        "DONE Reason:Mention REPO:Rust-Lang/Rust",
+        SectionKind::Notifications,
+    )
+    .unwrap()
+    .expect("filter");
+
+    assert!(filter.matches_done_notifications());
+    assert_eq!(
+        quick_filter_query_for_section(
+            "IS:Unread Reason:Subscribed",
+            &filter,
+            SectionKind::Notifications
+        ),
+        "is:all reason:mention repo:Rust-Lang/Rust"
+    );
+    assert_eq!(
+        filter.display(),
+        "state:done reason:mention repo:Rust-Lang/Rust"
+    );
+
+    let unread = QuickFilter::parse_for_section("Is:Unread", SectionKind::Notifications)
+        .unwrap()
+        .expect("unread");
+    assert_eq!(
+        quick_filter_query_for_section("is:all", &unread, SectionKind::Notifications),
+        "is:unread"
+    );
+}
+
+#[test]
+fn quick_filter_rejects_section_specific_tokens() {
+    assert!(QuickFilter::parse_for_section("reason:mention", SectionKind::PullRequests).is_err());
+    assert!(QuickFilter::parse_for_section("repo:rust-lang/rust", SectionKind::Issues).is_err());
+    assert!(QuickFilter::parse_for_section("state:closed", SectionKind::Notifications).is_err());
+    assert!(QuickFilter::parse_for_section("done", SectionKind::PullRequests).is_err());
+}
+
+#[test]
 fn quick_filter_clear_inputs_reset_overlay() {
     assert_eq!(QuickFilter::parse("").unwrap(), None);
     assert_eq!(QuickFilter::parse("clear").unwrap(), None);
     assert_eq!(QuickFilter::parse("reset").unwrap(), None);
+    assert_eq!(QuickFilter::parse("CLEAR").unwrap(), None);
+    assert_eq!(QuickFilter::parse("Reset").unwrap(), None);
 }
 
 #[test]
@@ -8175,9 +8287,41 @@ fn filter_input_prompt_is_discoverable_and_prefilled() {
     assert_eq!(
         active_list_input_prompt(&app).map(|(prompt, _)| prompt),
         Some(
-            "Filter: fstate:closed author:alice_  Enter apply  empty/clear resets  Esc cancel"
+            "Filter: state:closed author:alice_  Fields: state:, label:, author:, assignee:  Enter apply  empty/clear resets  Esc cancel"
                 .to_string()
         )
+    );
+}
+
+#[test]
+fn notification_filter_input_prompt_is_discoverable_and_prefilled() {
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![notification_item(
+            "thread-1", true,
+        )])],
+    );
+    app.quick_filters.insert(
+        "notifications:all".to_string(),
+        QuickFilter::parse_for_section("done", SectionKind::Notifications)
+            .unwrap()
+            .expect("done filter"),
+    );
+
+    app.start_filter_input();
+
+    assert!(app.filter_input_active);
+    assert_eq!(app.filter_input_query, "state:done");
+    assert_eq!(
+        active_list_input_prompt(&app).map(|(prompt, _)| prompt),
+        Some(
+            "Filter: state:done_  Fields: done, read, unread, all, reason:, repo:  Enter apply  empty/clear resets  Esc cancel"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        app.status,
+        "filter mode: done unread reason:mention repo:owner/repo"
     );
 }
 
@@ -8742,13 +8886,56 @@ fn capital_s_starts_global_search_input() {
         app.global_search_dialog.as_ref().map(|dialog| dialog.field),
         Some(GlobalSearchField::Title)
     );
+    let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+    assert_eq!(dialog.repo, None);
+    assert_eq!(dialog.fields(), GlobalSearchField::GLOBAL_SEARCH_FIELDS);
+    assert_eq!(dialog.sort.text(), "created_at");
     assert_eq!(
-        app.global_search_dialog
-            .as_ref()
-            .map(|dialog| dialog.sort.text()),
-        Some("created_at")
+        dialog.repo_candidates,
+        vec![
+            "nervosnetwork/fiber".to_string(),
+            "rust-lang/rust".to_string()
+        ]
     );
-    assert_eq!(app.status, "repo search mode in rust-lang/rust");
+    assert_eq!(app.global_search_scope, None);
+    assert_eq!(app.status, "search mode");
+}
+
+#[test]
+fn capital_s_starts_notification_search_dialog_in_inbox() {
+    let mut first = notification_item("thread-1", true);
+    first.repo = "rust-lang/rust".to_string();
+    let mut second = notification_item("thread-2", true);
+    second.repo = "nervosnetwork/fiber".to_string();
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![first, second])],
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
+
+    assert!(!handle_key(
+        &mut app,
+        key(KeyCode::Char('S')),
+        &config,
+        &store,
+        &tx
+    ));
+
+    let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+    assert!(app.global_search_active);
+    assert_eq!(dialog.kind, GlobalSearchDialogKind::Notifications);
+    assert_eq!(dialog.field, GlobalSearchField::Status);
+    assert_eq!(dialog.fields(), GlobalSearchField::NOTIFICATION_FIELDS);
+    assert_eq!(
+        dialog.repo_candidates,
+        vec![
+            "nervosnetwork/fiber".to_string(),
+            "rust-lang/rust".to_string()
+        ]
+    );
+    assert_eq!(app.status, "inbox search mode");
 }
 
 #[test]
@@ -8794,8 +8981,8 @@ fn global_search_enter_submits_query() {
     assert!(!app.global_search_active);
     assert!(app.global_search_running);
     assert!(app.global_search_started_at.is_some());
-    assert_eq!(app.global_search_scope.as_deref(), Some("rust-lang/rust"));
-    assert_eq!(app.status, "searching rust-lang/rust for 'fib'");
+    assert_eq!(app.global_search_scope, None);
+    assert_eq!(app.status, "searching GitHub for 'fib'");
 
     let rendered = global_search_loading_content(&app, 1)
         .into_iter()
@@ -8804,13 +8991,14 @@ fn global_search_enter_submits_query() {
         .join("\n");
     assert!(rendered.contains("Searching pull requests and issues."));
     assert!(rendered.contains("query: fib"));
-    assert!(rendered.contains("scope: rust-lang/rust"));
+    assert!(rendered.contains("scope: GitHub"));
 }
 
 #[test]
 fn global_search_dialog_builds_filter_query() {
     let mut dialog = GlobalSearchDialog::default();
     dialog.title.set_text("borrowck");
+    dialog.repo_filter.set_text("repo:rust-lang/rust");
     dialog.status.set_text("open");
     dialog.label.set_text("T-compiler, good first issue");
     dialog.author.set_text("@alice");
@@ -8819,8 +9007,53 @@ fn global_search_dialog_builds_filter_query() {
 
     assert_eq!(
         global_search_dialog_query(&dialog).expect("query"),
-        "borrowck is:open label:T-compiler label:\"good first issue\" author:alice assignee:bob sort:updated-asc"
+        "borrowck repo:rust-lang/rust is:open label:T-compiler label:\"good first issue\" author:alice assignee:bob sort:updated-asc"
     );
+}
+
+#[test]
+fn repo_scoped_global_search_omits_repo_field() {
+    let mut app = repo_pr_app("Fiber", "nervosnetwork/fiber");
+
+    app.start_global_search_input();
+
+    let dialog = app.global_search_dialog.as_ref().expect("search dialog");
+    assert_eq!(dialog.repo.as_deref(), Some("nervosnetwork/fiber"));
+    assert_eq!(dialog.fields(), GlobalSearchField::SEARCH_FIELDS);
+    assert_eq!(
+        app.global_search_scope.as_deref(),
+        Some("nervosnetwork/fiber")
+    );
+    assert_eq!(app.status, "repo search mode in nervosnetwork/fiber");
+}
+
+#[test]
+fn notification_search_dialog_builds_quick_filter() {
+    let mut dialog = GlobalSearchDialog {
+        kind: GlobalSearchDialogKind::Notifications,
+        field: GlobalSearchField::Status,
+        ..GlobalSearchDialog::default()
+    };
+    dialog.status.set_text("DONE");
+    dialog.reason.set_text("Reason:Mention, Reason:Assign");
+    dialog
+        .repo_filter
+        .set_text("REPO:Rust-Lang/Rust, repo:NervosNetwork/Fiber");
+
+    let filter = notification_search_dialog_filter(&dialog)
+        .expect("filter")
+        .expect("non-empty filter");
+
+    assert!(filter.matches_done_notifications());
+    assert_eq!(
+        quick_filter_query_for_section("is:unread", &filter, SectionKind::Notifications),
+        "is:all reason:mention reason:assign repo:Rust-Lang/Rust repo:NervosNetwork/Fiber"
+    );
+
+    dialog.status.set_text("");
+    dialog.reason.set_text("");
+    dialog.repo_filter.set_text("");
+    assert_eq!(notification_search_dialog_filter(&dialog).unwrap(), None);
 }
 
 #[test]
@@ -8836,7 +9069,7 @@ fn global_search_dialog_keeps_plain_number_lookup_query() {
 
 #[test]
 fn global_search_dropdown_suggestions_fill_active_field() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut app = repo_pr_app("Rust", "rust-lang/rust");
     app.label_suggestions_cache.insert(
         "rust-lang/rust".to_string(),
         vec![
@@ -9081,8 +9314,9 @@ fn global_search_ctrl_u_clears_current_repo_conditions() {
     );
     let mut app = AppState::with_ui_state(
         SectionKind::PullRequests,
-        vec![test_section()],
+        vec![repo_pull_requests_section("Rust", "rust-lang/rust")],
         UiState {
+            active_view: repo_view_key("Rust"),
             global_search_by_repo: saved_searches,
             ..UiState::default()
         },
@@ -9121,7 +9355,7 @@ fn global_search_ctrl_u_clears_current_repo_conditions() {
 
 #[test]
 fn global_search_ctrl_s_prompts_for_named_saved_search_filter() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut app = repo_pr_app("Rust", "rust-lang/rust");
     let mut config = Config::default();
     let paths = unique_test_paths("saved-search-config");
     app.start_global_search_input();
@@ -9236,7 +9470,7 @@ fn saved_search_candidates_are_run_from_named_filter_dialog() {
 
 #[test]
 fn global_search_loaded_candidates_update_active_dialog() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut app = repo_pr_app("Rust", "rust-lang/rust");
     app.start_global_search_input();
 
     app.handle_msg(AppMsg::LabelSuggestionsLoaded {
@@ -17449,6 +17683,7 @@ fn user_triggered_write_failures_open_error_dialogs() {
 
     app.handle_msg(AppMsg::NotificationDoneFinished {
         thread_id: "thread-1".to_string(),
+        done_cutoff: Utc::now(),
         result: Err("HTTP 403".to_string()),
     });
     assert_eq!(
@@ -21517,12 +21752,15 @@ fn notification_read_finished_updates_local_state_and_clears_pending() {
 
 #[test]
 fn notification_done_finished_updates_local_state_and_clears_pending() {
+    let updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(updated_at);
     let sections = vec![SectionSnapshot {
         key: "notifications:all".to_string(),
         kind: SectionKind::Notifications,
         title: "All".to_string(),
         filters: "is:all".to_string(),
-        items: vec![notification_item("thread-1", false)],
+        items: vec![item],
         total_count: None,
         page: 1,
         page_size: 0,
@@ -21534,12 +21772,147 @@ fn notification_done_finished_updates_local_state_and_clears_pending() {
 
     app.handle_msg(AppMsg::NotificationDoneFinished {
         thread_id: "thread-1".to_string(),
+        done_cutoff: updated_at,
         result: Ok(None),
     });
 
     assert!(!app.notification_done_pending.contains("thread-1"));
     assert!(app.sections[0].items.is_empty());
+    assert_eq!(
+        app.done_notification_threads.get("thread-1"),
+        Some(&updated_at)
+    );
     assert_eq!(app.status, "notification marked done");
+}
+
+#[test]
+fn notification_done_cutoff_uses_dismiss_time_after_stale_notification_timestamp() {
+    let item_updated_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let dismissed_at = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(item_updated_at);
+    let app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![item])],
+    );
+
+    assert_eq!(
+        app.notification_done_cutoff("thread-1", Some(item_updated_at), dismissed_at),
+        dismissed_at
+    );
+}
+
+#[test]
+fn refreshed_notifications_stay_hidden_for_api_timestamp_before_dismiss_time() {
+    let dismissed_at = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![])],
+    );
+    app.done_notification_threads
+        .insert("thread-1".to_string(), dismissed_at);
+
+    let mut item = notification_item("thread-1", false);
+    item.updated_at = Some(DateTime::from_timestamp(1_700_000_050, 0).unwrap());
+    app.apply_refreshed_section(notification_section(vec![item]), None);
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+    assert!(app.take_done_notification_threads_to_delete().is_empty());
+}
+
+#[test]
+fn refreshed_notifications_hide_done_threads_until_new_activity() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![])],
+    );
+    app.done_notification_threads
+        .insert("thread-1".to_string(), done_at);
+
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    app.apply_refreshed_section(notification_section(vec![old_item]), None);
+
+    assert!(app.sections[0].items.is_empty());
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+
+    let mut new_item = notification_item("thread-1", true);
+    new_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    app.apply_refreshed_section(notification_section(vec![new_item]), None);
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-1");
+    assert!(!app.done_notification_threads.contains_key("thread-1"));
+    assert_eq!(
+        app.take_done_notification_threads_to_delete(),
+        vec!["thread-1".to_string()]
+    );
+}
+
+#[test]
+fn done_notification_threads_filter_cached_sections_on_startup() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut old_item = notification_item("thread-1", false);
+    old_item.updated_at = Some(done_at);
+    let mut revived_item = notification_item("thread-2", true);
+    revived_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    let app = AppState::with_ui_state_and_done_notifications(
+        SectionKind::Notifications,
+        vec![notification_section(vec![old_item, revived_item])],
+        UiState::default(),
+        HashMap::from([
+            ("thread-1".to_string(), done_at),
+            ("thread-2".to_string(), done_at),
+        ]),
+    );
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-2");
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+    assert!(!app.done_notification_threads.contains_key("thread-2"));
+    assert!(app.done_notification_threads_to_delete.contains("thread-2"));
+}
+
+#[test]
+fn done_notification_filter_shows_only_locally_done_threads() {
+    let done_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let mut done_item = notification_item("thread-1", false);
+    done_item.updated_at = Some(done_at);
+    let mut active_item = notification_item("thread-2", true);
+    active_item.updated_at = Some(done_at);
+    let mut revived_item = notification_item("thread-3", true);
+    revived_item.updated_at = Some(DateTime::from_timestamp(1_700_000_001, 0).unwrap());
+    let mut app = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![])],
+    );
+    app.quick_filters.insert(
+        "notifications:all".to_string(),
+        QuickFilter::parse_for_section("done", SectionKind::Notifications)
+            .unwrap()
+            .expect("done filter"),
+    );
+    app.done_notification_threads.extend([
+        ("thread-1".to_string(), done_at),
+        ("thread-3".to_string(), done_at),
+    ]);
+
+    app.handle_msg(AppMsg::FilterSectionLoaded {
+        section_key: "notifications:all".to_string(),
+        section: notification_section(vec![done_item, active_item, revived_item]),
+    });
+
+    assert_eq!(app.sections[0].items.len(), 1);
+    assert_eq!(app.sections[0].items[0].id, "thread-1");
+    assert!(app.done_notification_threads.contains_key("thread-1"));
+    assert!(!app.done_notification_threads.contains_key("thread-3"));
+    assert_eq!(
+        app.take_done_notification_threads_to_delete(),
+        vec!["thread-3".to_string()]
+    );
+    assert_eq!(app.status, "filter applied: state:done");
 }
 
 #[test]
@@ -21583,6 +21956,34 @@ fn inbox_keyboard_navigation_does_not_mark_notification_read() {
             .iter()
             .all(|item| item.unread == Some(true))
     );
+}
+
+#[test]
+fn x_and_delete_are_inbox_mark_done_shortcuts_only_for_notifications() {
+    let inbox = AppState::new(
+        SectionKind::Notifications,
+        vec![notification_section(vec![notification_item(
+            "thread-1", true,
+        )])],
+    );
+    assert!(is_inbox_mark_done_key(&inbox, key(KeyCode::Char('x'))));
+    assert!(is_inbox_mark_done_key(&inbox, key(KeyCode::Delete)));
+    assert!(!is_inbox_mark_done_key(&inbox, key(KeyCode::Char('X'))));
+    assert!(!is_inbox_mark_done_key(
+        &inbox,
+        ctrl_key(KeyCode::Char('x'))
+    ));
+    assert!(!is_inbox_mark_done_key(&inbox, ctrl_key(KeyCode::Delete)));
+
+    let pull_requests = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    assert!(!is_inbox_mark_done_key(
+        &pull_requests,
+        key(KeyCode::Char('x'))
+    ));
+    assert!(!is_inbox_mark_done_key(
+        &pull_requests,
+        key(KeyCode::Delete)
+    ));
 }
 
 #[test]
@@ -22083,6 +22484,38 @@ fn test_section() -> SectionSnapshot {
     }
 }
 
+fn repo_pr_app(name: &str, repo: &str) -> AppState {
+    AppState::with_ui_state(
+        SectionKind::PullRequests,
+        vec![repo_pull_requests_section(name, repo)],
+        UiState {
+            active_view: repo_view_key(name),
+            ..UiState::default()
+        },
+    )
+}
+
+fn repo_pull_requests_section(name: &str, repo: &str) -> SectionSnapshot {
+    SectionSnapshot {
+        key: format!("repo:{name}:pull_requests:Pull Requests"),
+        kind: SectionKind::PullRequests,
+        title: "Pull Requests".to_string(),
+        filters: format!("repo:{repo} is:open archived:false sort:created-desc"),
+        items: vec![work_item(
+            &format!("{repo}-pr-1"),
+            repo,
+            1,
+            "Repository update",
+            None,
+        )],
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
+    }
+}
+
 fn assert_manual_refresh_scope(mut app: AppState, expected_view: &str) {
     let config = Config::default();
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
@@ -22546,5 +22979,20 @@ fn notification_item(id: &str, unread: bool) -> WorkItem {
         reason: Some("mention".to_string()),
         extra: Some("PullRequest".to_string()),
         viewer_subscription: None,
+    }
+}
+
+fn notification_section(items: Vec<WorkItem>) -> SectionSnapshot {
+    SectionSnapshot {
+        key: "notifications:all".to_string(),
+        kind: SectionKind::Notifications,
+        title: "All".to_string(),
+        filters: "is:all".to_string(),
+        items,
+        total_count: None,
+        page: 1,
+        page_size: 0,
+        refreshed_at: None,
+        error: None,
     }
 }

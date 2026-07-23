@@ -4619,7 +4619,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("Tab", "focus Details"),
         help_key_line(
             "Shift+Tab / Shift+[ / Shift+]",
-            "previous / left / right Section, then return to List after 400 ms",
+            "previous / left / right Section, then return to List after 200 ms",
         ),
         help_key_line("[ / ]", "load previous / next GitHub result page"),
         help_key_line("PgDown/PgUp or d/u", "move by visible page"),

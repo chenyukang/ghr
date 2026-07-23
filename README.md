@@ -120,8 +120,8 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `:` | Open the command palette; recent commands lead before typing, then fuzzy relevance wins |
 | `1` / `2` / `3` / `4` | Focus ghr / Sections / list / Details |
 | `Tab` | Switch list/details focus; when ghr or Sections is focused, move to the next tab |
-| `Shift+Tab` in List | Switch to the previous Section, then return focus to List after 400 ms |
-| `Shift+[` / `Shift+]` in List | Switch to the left/right Section, then return focus to List after 400 ms |
+| `Shift+Tab` in List | Switch to the previous Section, then return focus to List after 200 ms |
+| `Shift+[` / `Shift+]` in List | Switch to the left/right Section, then return focus to List after 200 ms |
 | `Shift+Tab` elsewhere | Return from Details to List, or move backward within focused ghr/Sections tabs |
 | `h` / `l` or `[` / `]` | Move within the focused ghr or Sections tab group, wrapping at the ends |
 | `Enter` | Focus the details pane from the list |

@@ -384,14 +384,14 @@ pub(super) fn command_palette_commands(
             "Previous Section from List",
             "Shift+Tab / Shift+[",
             "List",
-            "Switch to the previous section, then return to the list after 400 ms",
+            "Switch to the previous section, then return to the list after 200 ms",
             palette_key(KeyCode::BackTab),
         ),
         palette_command(
             "Next Section from List",
             "Shift+]",
             "List",
-            "Switch to the next section, then return to the list after 400 ms",
+            "Switch to the next section, then return to the list after 200 ms",
             palette_shift_key(KeyCode::Char(']')),
         ),
         palette_command(

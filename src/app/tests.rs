@@ -20336,9 +20336,9 @@ fn pending_list_focus_shortens_terminal_poll_timeout() {
     let now = Instant::now();
     app.schedule_top_menu_list_focus(now);
 
-    assert_eq!(app.next_terminal_poll_timeout(now), EVENT_POLL_TIMEOUT);
+    assert_eq!(app.next_terminal_poll_timeout(now), LIST_FOCUS_RETURN_DELAY);
     assert_eq!(
-        app.next_terminal_poll_timeout(now + Duration::from_millis(350)),
+        app.next_terminal_poll_timeout(now + Duration::from_millis(150)),
         Duration::from_millis(50)
     );
 }

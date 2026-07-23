@@ -1533,7 +1533,7 @@ const MENTION_SUGGESTION_LIMIT: usize = 6;
 const IDLE_SWEEP_SECTION_LIMIT: usize = 2;
 const INITIAL_IDLE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 const INBOX_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const LIST_FOCUS_RETURN_DELAY: Duration = Duration::from_millis(400);
+const LIST_FOCUS_RETURN_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 struct PendingListFocus {

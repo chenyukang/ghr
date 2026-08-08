@@ -215,7 +215,7 @@ pub(super) fn command_palette_commands(
         ),
         palette_command(
             "Mark Done",
-            "",
+            "x / Delete",
             "Inbox",
             "Move the selected GitHub notification out of inbox lists",
             PaletteAction::InboxMarkDone,
@@ -263,10 +263,10 @@ pub(super) fn command_palette_commands(
             PaletteAction::ItemSubscriptionAction(ItemSubscriptionAction::Unsubscribe),
         ),
         palette_command(
-            "Search Current Repo",
+            "Search Current List",
             "S",
             "General",
-            "Search the current PR or issue list with structured fields",
+            "Search the current PR/issue list or Inbox notifications with structured fields",
             PaletteAction::SearchCurrentRepo,
         ),
         palette_command(
@@ -1091,7 +1091,11 @@ mod tests {
                 .iter()
                 .any(|command| command.title == "Mark All Read")
         );
-        assert!(commands.iter().any(|command| command.title == "Mark Done"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.title == "Mark Done" && command.keys == "x / Delete")
+        );
         assert!(
             commands
                 .iter()

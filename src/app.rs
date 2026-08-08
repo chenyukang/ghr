@@ -57,8 +57,8 @@ use crate::github::{
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
-    refresh_notification_sections, refresh_section_page, remove_issue_label,
-    remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
+    refresh_notification_section_page, refresh_notification_sections, refresh_section_page,
+    remove_issue_label, remove_pull_request_reviewers, reopen_issue, reopen_pull_request,
     request_pull_request_reviewers, rerun_failed_pull_request_checks, search_github_users,
     search_global, set_pull_request_review_thread_resolved, submit_pending_pull_request_review,
     submit_pull_request_review, subscribe_notification_thread, unsubscribe_notification_thread,
@@ -141,7 +141,7 @@ use pr_checkout::{
 };
 use render::*;
 use runtime::*;
-use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query};
+use search::{QuickFilter, filtered_indices, fuzzy_score, quick_filter_query_for_section};
 use status::{
     comment_pending_dialog, compact_error_label, info_message_dialog, message_dialog,
     operation_error_body, persistent_success_message_dialog, pr_action_error_body,
@@ -305,6 +305,7 @@ enum AppMsg {
     },
     NotificationDoneFinished {
         thread_id: String,
+        done_cutoff: DateTime<Utc>,
         result: std::result::Result<Option<String>, String>,
     },
     InboxMarkAllReadFinished {
@@ -966,16 +967,32 @@ enum GlobalSearchField {
     Author,
     Assignee,
     Sort,
+    Reason,
+    Repo,
 }
 
 impl GlobalSearchField {
-    const FIELDS: [GlobalSearchField; 6] = [
+    const SEARCH_FIELDS: [GlobalSearchField; 6] = [
         GlobalSearchField::Title,
         GlobalSearchField::Status,
         GlobalSearchField::Label,
         GlobalSearchField::Author,
         GlobalSearchField::Assignee,
         GlobalSearchField::Sort,
+    ];
+    const GLOBAL_SEARCH_FIELDS: [GlobalSearchField; 7] = [
+        GlobalSearchField::Title,
+        GlobalSearchField::Repo,
+        GlobalSearchField::Status,
+        GlobalSearchField::Label,
+        GlobalSearchField::Author,
+        GlobalSearchField::Assignee,
+        GlobalSearchField::Sort,
+    ];
+    const NOTIFICATION_FIELDS: [GlobalSearchField; 3] = [
+        GlobalSearchField::Status,
+        GlobalSearchField::Reason,
+        GlobalSearchField::Repo,
     ];
 
     fn label(self) -> &'static str {
@@ -986,6 +1003,15 @@ impl GlobalSearchField {
             Self::Author => "Author",
             Self::Assignee => "Assignee",
             Self::Sort => "Sort",
+            Self::Reason => "Reason",
+            Self::Repo => "Repo",
+        }
+    }
+
+    fn dialog_label(self, kind: GlobalSearchDialogKind) -> &'static str {
+        match (kind, self) {
+            (GlobalSearchDialogKind::Notifications, Self::Status) => "State",
+            _ => self.label(),
         }
     }
 
@@ -997,6 +1023,8 @@ impl GlobalSearchField {
             Self::Author => "author",
             Self::Assignee => "assignee",
             Self::Sort => "sort",
+            Self::Reason => "reason",
+            Self::Repo => "repo",
         }
     }
 
@@ -1007,12 +1035,13 @@ impl GlobalSearchField {
             "author" => Self::Author,
             "assignee" => Self::Assignee,
             "sort" => Self::Sort,
+            "reason" => Self::Reason,
+            "repo" => Self::Repo,
             _ => Self::Title,
         }
     }
 
-    fn next(self, delta: isize) -> Self {
-        let fields = Self::FIELDS;
+    fn next(self, delta: isize, fields: &[GlobalSearchField]) -> Self {
         let index = fields
             .iter()
             .position(|field| *field == self)
@@ -1020,6 +1049,12 @@ impl GlobalSearchField {
         let next = (index as isize + delta).rem_euclid(fields.len() as isize) as usize;
         fields[next]
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalSearchDialogKind {
+    Search,
+    Notifications,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,6 +1065,7 @@ struct GlobalSearchSuggestionFilter {
 
 #[derive(Debug, Clone)]
 struct GlobalSearchDialog {
+    kind: GlobalSearchDialogKind,
     repo: Option<String>,
     title: EditorText,
     status: EditorText,
@@ -1037,10 +1073,13 @@ struct GlobalSearchDialog {
     author: EditorText,
     assignee: EditorText,
     sort: EditorText,
+    reason: EditorText,
+    repo_filter: EditorText,
     field: GlobalSearchField,
     labels: Vec<String>,
     labels_loading: bool,
     labels_error: Option<String>,
+    repo_candidates: Vec<String>,
     author_candidates: Vec<String>,
     assignee_candidates: Vec<String>,
     assignees_loading: bool,
@@ -1052,6 +1091,7 @@ struct GlobalSearchDialog {
 impl Default for GlobalSearchDialog {
     fn default() -> Self {
         Self {
+            kind: GlobalSearchDialogKind::Search,
             repo: None,
             title: EditorText::from_text(""),
             status: EditorText::from_text(""),
@@ -1059,10 +1099,13 @@ impl Default for GlobalSearchDialog {
             author: EditorText::from_text(""),
             assignee: EditorText::from_text(""),
             sort: EditorText::from_text("created_at"),
+            reason: EditorText::from_text(""),
+            repo_filter: EditorText::from_text(""),
             field: GlobalSearchField::Title,
             labels: Vec::new(),
             labels_loading: false,
             labels_error: None,
+            repo_candidates: Vec::new(),
             author_candidates: Vec::new(),
             assignee_candidates: Vec::new(),
             assignees_loading: false,
@@ -1082,18 +1125,40 @@ impl GlobalSearchDialog {
             GlobalSearchField::Author => &mut self.author,
             GlobalSearchField::Assignee => &mut self.assignee,
             GlobalSearchField::Sort => &mut self.sort,
+            GlobalSearchField::Reason => &mut self.reason,
+            GlobalSearchField::Repo => &mut self.repo_filter,
         }
     }
 
     fn active_editor(&self) -> &EditorText {
-        match self.field {
+        self.editor_for_field(self.field)
+    }
+
+    fn editor_for_field(&self, field: GlobalSearchField) -> &EditorText {
+        match field {
             GlobalSearchField::Title => &self.title,
             GlobalSearchField::Status => &self.status,
             GlobalSearchField::Label => &self.label,
             GlobalSearchField::Author => &self.author,
             GlobalSearchField::Assignee => &self.assignee,
             GlobalSearchField::Sort => &self.sort,
+            GlobalSearchField::Reason => &self.reason,
+            GlobalSearchField::Repo => &self.repo_filter,
         }
+    }
+
+    fn fields(&self) -> &'static [GlobalSearchField] {
+        match self.kind {
+            GlobalSearchDialogKind::Notifications => &GlobalSearchField::NOTIFICATION_FIELDS,
+            GlobalSearchDialogKind::Search if self.repo.is_none() => {
+                &GlobalSearchField::GLOBAL_SEARCH_FIELDS
+            }
+            GlobalSearchDialogKind::Search => &GlobalSearchField::SEARCH_FIELDS,
+        }
+    }
+
+    fn next_field(&self, delta: isize) -> GlobalSearchField {
+        self.field.next(delta, self.fields())
     }
 }
 
@@ -1595,6 +1660,7 @@ struct AppState {
     repo_unseen_items: HashMap<String, RepoUnseenItems>,
     repo_views_seen_this_session: HashSet<String>,
     details_visit: Option<DetailsVisitState>,
+    done_notification_threads_to_delete: HashSet<String>,
     current_repo_remote_dialog: Option<CurrentRepoRemoteDialog>,
     project_add_dialog: Option<ProjectAddDialog>,
     project_remove_dialog: Option<ProjectRemoveDialog>,
@@ -1621,6 +1687,7 @@ struct AppState {
     selected_diff_line: HashMap<String, usize>,
     diff_file_details_scroll: HashMap<String, u16>,
     ignored_items: HashSet<String>,
+    done_notification_threads: HashMap<String, DateTime<Utc>>,
     diff_mark: HashMap<String, DiffMarkState>,
     last_diff_click: Option<DiffClickState>,
     diff_mode_state: HashMap<String, DiffModeState>,
@@ -1928,6 +1995,8 @@ pub async fn run(
     let repo_candidate_cache = store.load_repo_candidate_cache()?;
     let editor_drafts = store.load_editor_drafts()?;
     let ui_state = UiState::load_or_default(&paths.state_path);
+    store.migrate_done_notification_threads(&ui_state.done_notification_threads)?;
+    let done_notification_threads = store.load_done_notification_threads()?;
     let migrated_saved_search_filters =
         saved_search_filters_from_map(&ui_state.global_search_saved_by_repo);
     if config.saved_search_filters.is_empty() && !migrated_saved_search_filters.is_empty() {
@@ -1940,7 +2009,12 @@ pub async fn run(
             );
         }
     }
-    let mut app = AppState::with_ui_state(config.defaults.view, sections, ui_state);
+    let mut app = AppState::with_ui_state_and_done_notifications(
+        config.defaults.view,
+        sections,
+        ui_state,
+        done_notification_threads,
+    );
     app.load_saved_search_filters(&config);
     app.load_repo_candidate_cache(repo_candidate_cache);
     app.load_editor_drafts(editor_drafts);
@@ -2071,6 +2145,7 @@ async fn run_loop(
         if app.take_recent_items_dirty() {
             save_ui_state(app, paths);
         }
+        delete_revived_done_notification_threads(app, store);
         needs_draw |= app.auto_save_active_editor_drafts(store, Instant::now());
         needs_draw |= app.dismiss_expired_message_dialog(Instant::now());
         needs_draw |= app.refresh_auto_theme(config, Instant::now());
@@ -2147,6 +2222,20 @@ fn drain_app_messages(app: &mut AppState, rx: &mut UnboundedReceiver<AppMsg>) ->
         handled = true;
     }
     handled
+}
+
+fn delete_revived_done_notification_threads(app: &mut AppState, store: &SnapshotStore) {
+    let thread_ids = app.take_done_notification_threads_to_delete();
+    if thread_ids.is_empty() {
+        return;
+    }
+
+    if let Err(error) = store.delete_done_notification_threads(&thread_ids) {
+        warn!(
+            error = %format!("{error:#}"),
+            "failed to delete revived done notification threads"
+        );
+    }
 }
 
 fn terminal_streams_connected() -> bool {
@@ -2777,6 +2866,64 @@ fn sorted_strings(values: &HashSet<String>) -> Vec<String> {
     values
 }
 
+fn filter_done_notification_threads_in_sections(
+    done_notification_threads: &mut HashMap<String, DateTime<Utc>>,
+    sections: &mut [SectionSnapshot],
+) -> Vec<String> {
+    let mut revived_threads = Vec::new();
+    for section in sections
+        .iter_mut()
+        .filter(|section| matches!(section.kind, SectionKind::Notifications))
+    {
+        section.items.retain(|item| {
+            let Some(done_at) = done_notification_threads.get(&item.id).copied() else {
+                return true;
+            };
+            let item_updated_at = item.updated_at.unwrap_or(done_at);
+            if item_updated_at > done_at {
+                revived_threads.push(item.id.clone());
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    for thread_id in &revived_threads {
+        done_notification_threads.remove(thread_id.as_str());
+    }
+    revived_threads
+}
+
+fn filter_only_done_notification_threads_in_sections(
+    done_notification_threads: &mut HashMap<String, DateTime<Utc>>,
+    sections: &mut [SectionSnapshot],
+) -> Vec<String> {
+    let mut revived_threads = Vec::new();
+    for section in sections
+        .iter_mut()
+        .filter(|section| matches!(section.kind, SectionKind::Notifications))
+    {
+        section.items.retain(|item| {
+            let Some(done_at) = done_notification_threads.get(&item.id).copied() else {
+                return false;
+            };
+            let item_updated_at = item.updated_at.unwrap_or(done_at);
+            if item_updated_at > done_at {
+                revived_threads.push(item.id.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    for thread_id in &revived_threads {
+        done_notification_threads.remove(thread_id.as_str());
+    }
+    revived_threads
+}
+
 fn item_supports_details_memory(item: &WorkItem) -> bool {
     matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) && item.number.is_some()
 }
@@ -2929,6 +3076,27 @@ fn recent_item_matches_work_item(recent: &RecentItem, item: &WorkItem) -> bool {
     !recent.id.is_empty() && item.id == recent.id
 }
 
+fn repo_candidates_from_sections(
+    sections: &[SectionSnapshot],
+    kind: Option<SectionKind>,
+) -> Vec<String> {
+    let mut repos = sections
+        .iter()
+        .filter(|section| kind.is_none_or(|kind| section.kind == kind))
+        .flat_map(|section| {
+            section
+                .items
+                .iter()
+                .map(|item| item.repo.clone())
+                .chain(section_repo_scope(section))
+        })
+        .filter(|repo| !repo.trim().is_empty())
+        .collect::<Vec<_>>();
+    repos.sort_by_key(|repo| repo.to_ascii_lowercase());
+    repos.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    repos
+}
+
 fn refresh_scope_includes_inbox(scope: &RefreshScope) -> bool {
     match scope {
         RefreshScope::Full => true,
@@ -2939,12 +3107,28 @@ fn refresh_scope_includes_inbox(scope: &RefreshScope) -> bool {
 }
 
 impl AppState {
+    #[cfg(test)]
     fn with_ui_state(
         active_view: SectionKind,
         sections: Vec<SectionSnapshot>,
         ui_state: UiState,
     ) -> Self {
+        Self::with_ui_state_and_done_notifications(active_view, sections, ui_state, HashMap::new())
+    }
+
+    fn with_ui_state_and_done_notifications(
+        active_view: SectionKind,
+        mut sections: Vec<SectionSnapshot>,
+        ui_state: UiState,
+        mut done_notification_threads: HashMap<String, DateTime<Utc>>,
+    ) -> Self {
         let ui_state = ui_state.normalized();
+        let done_notification_threads_to_delete = filter_done_notification_threads_in_sections(
+            &mut done_notification_threads,
+            &mut sections,
+        )
+        .into_iter()
+        .collect::<HashSet<_>>();
         let default_view = builtin_view_key(active_view);
         let active_view = if ui_state.active_view.trim().is_empty() {
             default_view
@@ -3033,6 +3217,7 @@ impl AppState {
                 .collect(),
             repo_views_seen_this_session: HashSet::new(),
             details_visit: None,
+            done_notification_threads_to_delete,
             current_repo_remote_dialog: None,
             project_add_dialog: None,
             project_remove_dialog: None,
@@ -3059,6 +3244,7 @@ impl AppState {
             selected_diff_line: ui_state.selected_diff_line.clone(),
             diff_file_details_scroll: ui_state.diff_file_details_scroll.clone(),
             ignored_items: ui_state.ignored_items.iter().cloned().collect(),
+            done_notification_threads,
             diff_mark: HashMap::new(),
             last_diff_click: None,
             diff_mode_state: HashMap::new(),
@@ -3328,6 +3514,7 @@ impl AppState {
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
             ignored_items: sorted_strings(&self.ignored_items),
+            done_notification_threads: HashMap::new(),
             recent_items: recent_items_to_saved(&self.recent_items),
             recent_commands: recent_commands_to_saved(&self.recent_commands),
             repo_unseen_items: self
@@ -3661,11 +3848,12 @@ impl AppState {
 
     fn apply_idle_refreshed_sections(&mut self, sections: Vec<SectionSnapshot>) {
         let active_view = self.active_view.clone();
-        let sections = sections
+        let mut sections = sections
             .into_iter()
             .filter(|section| !same_view_key(&section_view_key(section), &active_view))
             .filter(|section| !self.has_active_section_filter(&section.key))
             .collect::<Vec<_>>();
+        self.filter_done_notification_threads(&mut sections);
 
         if sections.is_empty() {
             return;
@@ -3684,12 +3872,13 @@ impl AppState {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
         let previous_comment_index = self.selected_comment_index;
-        let sections = sections
+        let mut sections = sections
             .into_iter()
             .filter(|section| matches!(section.kind, SectionKind::Notifications))
             .filter(|section| !self.has_active_section_filter(&section.key))
             .filter(|section| !self.should_preserve_user_section_page(section))
             .collect::<Vec<_>>();
+        self.filter_done_notification_threads(&mut sections);
 
         if sections.is_empty() {
             return;
@@ -3718,7 +3907,11 @@ impl AppState {
         }
     }
 
-    fn apply_refreshed_section(&mut self, section: SectionSnapshot, save_error: Option<String>) {
+    fn apply_refreshed_section(
+        &mut self,
+        mut section: SectionSnapshot,
+        save_error: Option<String>,
+    ) {
         let anchor = self.current_refresh_anchor();
         let previous_details_scroll = self.details_scroll;
         let previous_comment_index = self.selected_comment_index;
@@ -3752,6 +3945,7 @@ impl AppState {
             return;
         }
 
+        self.filter_done_notification_threads(std::slice::from_mut(&mut section));
         let updated_item_ids = self.updated_item_ids_for_sections(std::slice::from_ref(&section));
         self.invalidate_action_hints_for_item_ids(&updated_item_ids);
         self.record_unseen_repo_items_for_sections(std::slice::from_ref(&section));
@@ -3876,11 +4070,12 @@ impl AppState {
                 for section in &sections {
                     self.remember_base_filters(section);
                 }
-                let sections = sections
+                let mut sections = sections
                     .into_iter()
                     .filter(|section| !self.has_active_section_filter(&section.key))
                     .filter(|section| !self.should_preserve_user_section_page(section))
                     .collect::<Vec<_>>();
+                self.filter_done_notification_threads(&mut sections);
                 let updated_item_ids = self.updated_item_ids_for_sections(&sections);
                 self.invalidate_action_hints_for_item_ids(&updated_item_ids);
                 self.record_unseen_repo_items_for_sections(&sections);
@@ -4977,14 +5172,19 @@ impl AppState {
                     }
                 }
             }
-            AppMsg::NotificationDoneFinished { thread_id, result } => {
+            AppMsg::NotificationDoneFinished {
+                thread_id,
+                done_cutoff,
+                result,
+            } => {
                 self.notification_done_pending.remove(&thread_id);
                 match result {
                     Ok(save_error) => {
+                        self.remember_done_notification_thread(&thread_id, done_cutoff);
                         let changed = self.apply_notification_done_local(&thread_id);
                         self.status = match (changed, save_error.as_deref()) {
                             (_, Some(error)) => {
-                                format!("notification marked done; snapshot save failed: {error}")
+                                format!("notification marked done; local save failed: {error}")
                             }
                             (true, None) => "notification marked done".to_string(),
                             (false, None) => "notification done synced".to_string(),
@@ -5092,13 +5292,14 @@ impl AppState {
             }
             AppMsg::FilterSectionLoaded {
                 section_key,
-                section,
+                mut section,
             } => {
                 let error = section.error.clone();
                 let filter_label = self.section_filter_label_for_key(&section_key);
                 if self.setup_dialog.is_none() {
                     self.setup_dialog = error.as_deref().and_then(setup_dialog_from_error);
                 }
+                self.filter_done_notification_threads_for_filter(&section_key, &mut section);
                 self.replace_section_page(&section_key, section);
                 self.refreshing = false;
                 self.section_page_loading = None;
@@ -6110,17 +6311,29 @@ impl AppState {
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        let Some(thread_id) = self.current_inbox_thread_id() else {
+        if self
+            .current_section()
+            .is_none_or(|section| !matches!(section.kind, SectionKind::Notifications))
+        {
+            self.status = "select an inbox item to mark done".to_string();
+            return;
+        }
+        let Some(item) = self.current_item() else {
             self.status = "select an inbox item to mark done".to_string();
             return;
         };
+        let thread_id = item.id.clone();
+        let selected_updated_at = item.updated_at;
+        let done_cutoff =
+            self.notification_done_cutoff(&thread_id, selected_updated_at, Utc::now());
 
-        self.mark_notification_done(thread_id, store, tx);
+        self.mark_notification_done(thread_id, done_cutoff, store, tx);
     }
 
     fn mark_notification_done(
         &mut self,
         thread_id: String,
+        done_cutoff: DateTime<Utc>,
         store: &SnapshotStore,
         tx: &UnboundedSender<AppMsg>,
     ) {
@@ -6129,7 +6342,7 @@ impl AppState {
         }
 
         self.status = "marking notification done".to_string();
-        start_notification_done_sync(thread_id, store.clone(), tx.clone());
+        start_notification_done_sync(thread_id, done_cutoff, store.clone(), tx.clone());
     }
 
     fn mark_all_inbox_read(&mut self, store: &SnapshotStore, tx: &UnboundedSender<AppMsg>) {
@@ -6219,6 +6432,60 @@ impl AppState {
             self.clamp_positions();
         }
         changed
+    }
+
+    fn remember_done_notification_thread(&mut self, thread_id: &str, done_cutoff: DateTime<Utc>) {
+        self.done_notification_threads
+            .insert(thread_id.to_string(), done_cutoff);
+        self.done_notification_threads_to_delete.remove(thread_id);
+    }
+
+    fn notification_done_cutoff(
+        &self,
+        thread_id: &str,
+        selected_updated_at: Option<DateTime<Utc>>,
+        dismissed_at: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        self.sections
+            .iter()
+            .filter(|section| matches!(section.kind, SectionKind::Notifications))
+            .flat_map(|section| section.items.iter())
+            .filter(|item| item.id == thread_id)
+            .filter_map(|item| item.updated_at)
+            .chain(selected_updated_at)
+            .chain(std::iter::once(dismissed_at))
+            .max()
+            .unwrap_or(dismissed_at)
+    }
+
+    fn filter_done_notification_threads(&mut self, sections: &mut [SectionSnapshot]) {
+        self.done_notification_threads_to_delete.extend(
+            filter_done_notification_threads_in_sections(
+                &mut self.done_notification_threads,
+                sections,
+            ),
+        );
+    }
+
+    fn filter_done_notification_threads_for_filter(
+        &mut self,
+        section_key: &str,
+        section: &mut SectionSnapshot,
+    ) {
+        if self
+            .quick_filters
+            .get(section_key)
+            .is_some_and(QuickFilter::matches_done_notifications)
+        {
+            self.done_notification_threads_to_delete.extend(
+                filter_only_done_notification_threads_in_sections(
+                    &mut self.done_notification_threads,
+                    std::slice::from_mut(section),
+                ),
+            );
+        } else {
+            self.filter_done_notification_threads(std::slice::from_mut(section));
+        }
     }
 
     fn update_item_reactions(&mut self, item_id: &str, reactions: ReactionSummary) {
@@ -6489,7 +6756,7 @@ impl AppState {
         let base_filters = self.base_filters_for_section(section);
         self.quick_filters
             .get(&section.key)
-            .map(|filter| quick_filter_query(&base_filters, filter))
+            .map(|filter| quick_filter_query_for_section(&base_filters, filter, section.kind))
             .unwrap_or(base_filters)
     }
 
@@ -11305,6 +11572,14 @@ impl AppState {
         store: Option<&SnapshotStore>,
         tx: Option<&UnboundedSender<AppMsg>>,
     ) {
+        if self
+            .current_section()
+            .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
+        {
+            self.start_notification_search_input();
+            return;
+        }
+
         self.save_current_conversation_details_state();
         if !self.is_global_search_results_view() {
             self.global_search_return_view = Some(self.active_view.clone());
@@ -11316,8 +11591,9 @@ impl AppState {
             )
             .then_some(section.kind)
         });
-        let repo_scope = self.current_repo_scope();
-        let mut dialog = self.global_search_dialog_for_repo(repo_scope.clone());
+        let repo_scope = self.current_global_search_repo_scope();
+        let mut dialog = self
+            .global_search_dialog_for_repo(repo_scope.clone(), self.global_search_preferred_kind);
         let labels_refreshing = repo_scope
             .as_ref()
             .and_then(|repo| {
@@ -11350,13 +11626,60 @@ impl AppState {
         self.review_submit_dialog = None;
         self.item_edit_dialog = None;
         self.reviewer_dialog = None;
-        self.status = match self.current_repo_scope() {
+        self.status = match repo_scope {
             Some(repo) => format!("repo search mode in {repo}"),
             None => "search mode".to_string(),
         };
     }
 
-    fn global_search_dialog_for_repo(&self, repo: Option<String>) -> GlobalSearchDialog {
+    fn start_notification_search_input(&mut self) {
+        let Some(section) = self.current_section() else {
+            self.status = "no section selected".to_string();
+            return;
+        };
+        let section_key = section.key.clone();
+        let mut dialog = GlobalSearchDialog {
+            kind: GlobalSearchDialogKind::Notifications,
+            field: GlobalSearchField::Status,
+            sort: EditorText::from_text(""),
+            repo_filter: EditorText::from_text(""),
+            ..GlobalSearchDialog::default()
+        };
+        if let Some(filter) = self.quick_filters.get(&section_key) {
+            let (state, reasons, repos) = filter.notification_dialog_values();
+            dialog.status.set_text(state);
+            dialog.reason.set_text(reasons);
+            dialog.repo_filter.set_text(repos);
+        }
+        dialog.repo_candidates =
+            repo_candidates_from_sections(&self.sections, Some(SectionKind::Notifications));
+
+        self.save_current_conversation_details_state();
+        self.focus = FocusTarget::List;
+        self.global_search_active = true;
+        self.global_search_scope = None;
+        self.global_search_preferred_kind = Some(SectionKind::Notifications);
+        self.global_search_query.clear();
+        self.global_search_dialog = Some(dialog);
+        self.search_active = false;
+        self.comment_search_active = false;
+        self.filter_input_active = false;
+        self.comment_dialog = None;
+        self.label_dialog = None;
+        self.issue_dialog = None;
+        self.reaction_dialog = None;
+        self.pr_action_dialog = None;
+        self.review_submit_dialog = None;
+        self.item_edit_dialog = None;
+        self.reviewer_dialog = None;
+        self.status = "inbox search mode".to_string();
+    }
+
+    fn global_search_dialog_for_repo(
+        &self,
+        repo: Option<String>,
+        kind: Option<SectionKind>,
+    ) -> GlobalSearchDialog {
         let mut dialog = GlobalSearchDialog {
             repo: repo.clone(),
             ..GlobalSearchDialog::default()
@@ -11379,6 +11702,7 @@ impl AppState {
         } else {
             dialog.author_candidates =
                 global_search_author_candidates_from_sections(&self.sections, None);
+            dialog.repo_candidates = repo_candidates_from_sections(&self.sections, kind);
         }
         let state_key = global_search_repo_state_key(repo.as_deref());
         if let Some(state) = self.global_search_by_repo.get(&state_key) {
@@ -11396,9 +11720,10 @@ impl AppState {
         let section_kind = section.kind;
         if !matches!(
             section_kind,
-            SectionKind::PullRequests | SectionKind::Issues
+            SectionKind::PullRequests | SectionKind::Issues | SectionKind::Notifications
         ) {
-            self.status = "quick filters are available for PR and issue sections".to_string();
+            self.status =
+                "quick filters are available for PR, issue, and inbox sections".to_string();
             return;
         }
 
@@ -11415,7 +11740,14 @@ impl AppState {
         self.comment_search_active = false;
         self.comment_dialog = None;
         self.pr_action_dialog = None;
-        self.status = "filter mode: state:closed label:bug author:alice".to_string();
+        self.status = match section_kind {
+            SectionKind::Notifications => {
+                "filter mode: done unread reason:mention repo:owner/repo".to_string()
+            }
+            SectionKind::PullRequests | SectionKind::Issues => {
+                "filter mode: state:closed label:bug author:alice".to_string()
+            }
+        };
     }
 
     fn handle_filter_input_key(
@@ -11429,7 +11761,12 @@ impl AppState {
                 self.filter_input_active = false;
                 self.status = "filter cancelled".to_string();
             }
-            KeyCode::Enter => match QuickFilter::parse(&self.filter_input_query) {
+            KeyCode::Enter => match self
+                .current_section()
+                .map(|section| section.kind)
+                .ok_or_else(|| "no section selected".to_string())
+                .and_then(|kind| QuickFilter::parse_for_section(&self.filter_input_query, kind))
+            {
                 Ok(filter) => {
                     self.filter_input_active = false;
                     self.filter_input_query.clear();
@@ -11455,7 +11792,19 @@ impl AppState {
         config: &Config,
         tx: &UnboundedSender<AppMsg>,
     ) {
-        let repo_scope = self.current_repo_scope();
+        if self
+            .global_search_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.kind == GlobalSearchDialogKind::Notifications)
+        {
+            self.handle_notification_search_key(key, config, tx);
+            return;
+        }
+
+        let repo_scope = self
+            .global_search_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.repo.clone());
         self.handle_global_search_key_with_submit(key, |query, display_query| {
             start_global_search(
                 query,
@@ -11465,6 +11814,72 @@ impl AppState {
                 tx.clone(),
             );
         });
+    }
+
+    fn handle_notification_search_key(
+        &mut self,
+        key: KeyEvent,
+        config: &Config,
+        tx: &UnboundedSender<AppMsg>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.global_search_active = false;
+                self.global_search_dialog = None;
+                self.global_search_preferred_kind = None;
+                self.status = "search cancelled".to_string();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.clear_notification_search_dialog_conditions();
+            }
+            KeyCode::Enter => {
+                if self.accept_global_search_suggestion() {
+                    return;
+                }
+                let Some(dialog) = &self.global_search_dialog else {
+                    self.status = "notification filter is empty".to_string();
+                    return;
+                };
+                let filter = match notification_search_dialog_filter(dialog) {
+                    Ok(filter) => filter,
+                    Err(message) => {
+                        self.status = message;
+                        return;
+                    }
+                };
+                self.global_search_active = false;
+                self.global_search_dialog = None;
+                self.global_search_preferred_kind = None;
+                self.global_search_scope = None;
+                self.global_search_query.clear();
+                self.search_active = false;
+                self.search_query.clear();
+                self.comment_search_active = false;
+                self.filter_input_active = false;
+                start_filtered_section_load(self, config, tx, filter);
+            }
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.global_search_dialog {
+                    dialog.field = dialog.next_field(1);
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(dialog) = &mut self.global_search_dialog {
+                    dialog.field = dialog.next_field(-1);
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+            KeyCode::Down => self.move_global_search_suggestion(1),
+            KeyCode::Up => self.move_global_search_suggestion(-1),
+            _ => {
+                if let Some(dialog) = &mut self.global_search_dialog
+                    && dialog.active_editor_mut().input_key(key, false)
+                {
+                    reset_global_search_dialog_suggestions(dialog);
+                }
+            }
+        }
     }
 
     fn handle_global_search_key_with_submit<F>(&mut self, key: KeyEvent, mut submit: F)
@@ -11500,12 +11915,12 @@ impl AppState {
                         return;
                     }
                 };
+                let repo_scope = dialog.repo.clone();
                 if self.global_search_running {
                     self.status = "search already running".to_string();
                     return;
                 }
                 self.remember_current_global_search_dialog();
-                let repo_scope = self.current_repo_scope();
                 self.global_search_active = false;
                 self.global_search_dialog = None;
                 self.global_search_running = true;
@@ -11526,14 +11941,14 @@ impl AppState {
             }
             KeyCode::Tab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
-                    dialog.field = dialog.field.next(1);
+                    dialog.field = dialog.next_field(1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
                 self.remember_current_global_search_dialog();
             }
             KeyCode::BackTab => {
                 if let Some(dialog) = &mut self.global_search_dialog {
-                    dialog.field = dialog.field.next(-1);
+                    dialog.field = dialog.next_field(-1);
                     reset_global_search_dialog_suggestions(dialog);
                 }
                 self.remember_current_global_search_dialog();
@@ -11555,12 +11970,27 @@ impl AppState {
         let Some(dialog) = &self.global_search_dialog else {
             return;
         };
+        if dialog.kind == GlobalSearchDialogKind::Notifications {
+            return;
+        }
         let key = global_search_repo_state_key(dialog.repo.as_deref());
         if let Some(state) = global_search_dialog_state(dialog) {
             self.global_search_by_repo.insert(key, state);
         } else {
             self.global_search_by_repo.remove(&key);
         }
+    }
+
+    fn clear_notification_search_dialog_conditions(&mut self) {
+        let Some(dialog) = &mut self.global_search_dialog else {
+            return;
+        };
+        dialog.status.set_text("");
+        dialog.reason.set_text("");
+        dialog.repo_filter.set_text("");
+        dialog.field = GlobalSearchField::Status;
+        reset_global_search_dialog_suggestions(dialog);
+        self.status = "notification search cleared".to_string();
     }
 
     fn clear_current_global_search_dialog_conditions(&mut self) {
@@ -12293,6 +12723,10 @@ impl AppState {
             .or_else(|| self.current_section().and_then(section_repo_scope))
     }
 
+    fn current_global_search_repo_scope(&self) -> Option<String> {
+        self.current_section().and_then(section_repo_scope)
+    }
+
     fn current_item_supports_comments(&self) -> bool {
         self.current_item()
             .map(item_supports_metadata_edit)
@@ -12495,6 +12929,15 @@ impl AppState {
         let dirty = self.recent_items_dirty;
         self.recent_items_dirty = false;
         dirty
+    }
+
+    fn take_done_notification_threads_to_delete(&mut self) -> Vec<String> {
+        let mut thread_ids = self
+            .done_notification_threads_to_delete
+            .drain()
+            .collect::<Vec<_>>();
+        thread_ids.sort();
+        thread_ids
     }
 
     fn jump_to_recent_item(&mut self, item: &RecentItem) -> bool {

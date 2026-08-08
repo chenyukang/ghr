@@ -567,6 +567,9 @@ pub(super) fn handle_key_in_area_mut(
                     app.start_search();
                 }
             }
+            _ if is_inbox_mark_done_key(app, key) => {
+                app.mark_current_notification_done(store, tx);
+            }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
                 app.move_selection(1);
             }
@@ -638,6 +641,11 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Esc => app.focus_list(),
             KeyCode::Char('/') if app.details_mode == DetailsMode::Conversation => {
                 app.start_comment_search()
+            }
+            _ if app.details_mode == DetailsMode::Conversation
+                && is_inbox_mark_done_key(app, key) =>
+            {
+                app.mark_current_notification_done(store, tx);
             }
             KeyCode::Char('M') => app.start_pr_action_dialog(PrAction::Merge),
             KeyCode::Char('C') => app.start_close_or_reopen_dialog(),
@@ -759,6 +767,14 @@ pub(super) fn handle_global_focus_key(app: &mut AppState, key: KeyEvent) -> bool
         _ => return false,
     }
     true
+}
+
+pub(super) fn is_inbox_mark_done_key(app: &AppState, key: KeyEvent) -> bool {
+    key.modifiers.is_empty()
+        && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
+        && app
+            .current_section()
+            .is_some_and(|section| matches!(section.kind, SectionKind::Notifications))
 }
 
 fn list_section_switch_delta(key: KeyEvent) -> Option<isize> {

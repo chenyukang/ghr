@@ -1,4 +1,4 @@
-use crate::model::{SectionSnapshot, WorkItem};
+use crate::model::{SectionKind, SectionSnapshot, WorkItem};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct QuickFilter {
@@ -6,12 +6,17 @@ pub(super) struct QuickFilter {
     assignee: Option<String>,
     author: Option<String>,
     labels: Vec<String>,
+    reasons: Vec<String>,
+    repos: Vec<String>,
 }
 
 impl QuickFilter {
     pub(super) fn parse(input: &str) -> std::result::Result<Option<Self>, String> {
         let input = input.trim();
-        if input.is_empty() || matches!(input, "clear" | "reset") {
+        if input.is_empty()
+            || input.eq_ignore_ascii_case("clear")
+            || input.eq_ignore_ascii_case("reset")
+        {
             return Ok(None);
         }
 
@@ -21,9 +26,8 @@ impl QuickFilter {
                 filter.state = Some(state);
                 continue;
             }
-            if let Some(value) = token
-                .strip_prefix("state:")
-                .or_else(|| token.strip_prefix("is:"))
+            if let Some(value) =
+                strip_ascii_prefix(token, "state:").or_else(|| strip_ascii_prefix(token, "is:"))
             {
                 filter.state = Some(
                     QuickFilterState::parse(value)
@@ -31,21 +35,37 @@ impl QuickFilter {
                 );
                 continue;
             }
-            if let Some(value) = token.strip_prefix("assignee:") {
+            if let Some(value) = strip_ascii_prefix(token, "assignee:") {
                 filter.assignee = Some(non_empty_filter_value("assignee", value)?);
                 continue;
             }
-            if let Some(value) = token.strip_prefix("author:") {
+            if let Some(value) = strip_ascii_prefix(token, "author:") {
                 filter.author = Some(non_empty_filter_value("author", value)?);
                 continue;
             }
-            if let Some(value) = token
-                .strip_prefix("label:")
-                .or_else(|| token.strip_prefix("labels:"))
+            if let Some(value) =
+                strip_ascii_prefix(token, "label:").or_else(|| strip_ascii_prefix(token, "labels:"))
             {
                 for label in comma_separated_filter_values("label", value)? {
-                    if !filter.labels.contains(&label) {
+                    if !contains_ignore_ascii_case(&filter.labels, &label) {
                         filter.labels.push(label);
+                    }
+                }
+                continue;
+            }
+            if let Some(value) = strip_ascii_prefix(token, "reason:") {
+                for reason in comma_separated_filter_values("reason", value)? {
+                    let reason = reason.to_ascii_lowercase();
+                    if !contains_ignore_ascii_case(&filter.reasons, &reason) {
+                        filter.reasons.push(reason);
+                    }
+                }
+                continue;
+            }
+            if let Some(value) = strip_ascii_prefix(token, "repo:") {
+                for repo in comma_separated_filter_values("repo", value)? {
+                    if !contains_ignore_ascii_case(&filter.repos, &repo) {
+                        filter.repos.push(repo);
                     }
                 }
                 continue;
@@ -55,6 +75,63 @@ impl QuickFilter {
         }
 
         Ok(Some(filter))
+    }
+
+    pub(super) fn parse_for_section(
+        input: &str,
+        kind: SectionKind,
+    ) -> std::result::Result<Option<Self>, String> {
+        let Some(filter) = Self::parse(input)? else {
+            return Ok(None);
+        };
+        filter.validate_for_section(kind)?;
+        Ok(Some(filter))
+    }
+
+    fn validate_for_section(&self, kind: SectionKind) -> std::result::Result<(), String> {
+        match kind {
+            SectionKind::Notifications => {
+                if self.assignee.is_some() {
+                    return Err(
+                        "assignee filters are available for PR and issue sections".to_string()
+                    );
+                }
+                if self.author.is_some() {
+                    return Err(
+                        "author filters are available for PR and issue sections".to_string()
+                    );
+                }
+                if !self.labels.is_empty() {
+                    return Err("label filters are available for PR and issue sections".to_string());
+                }
+                if self
+                    .state
+                    .is_some_and(|state| !state.supports_notifications())
+                {
+                    return Err(
+                        "notification filters support read, unread, all, reason:, and repo:"
+                            .to_string(),
+                    );
+                }
+            }
+            SectionKind::PullRequests | SectionKind::Issues => {
+                if self
+                    .state
+                    .is_some_and(QuickFilterState::supports_notifications_only)
+                {
+                    return Err(
+                        "read and unread filters are available for inbox sections".to_string()
+                    );
+                }
+                if !self.reasons.is_empty() {
+                    return Err("reason filters are available for inbox sections".to_string());
+                }
+                if !self.repos.is_empty() {
+                    return Err("repo filters are available for inbox sections".to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn display(&self) -> String {
@@ -69,7 +146,23 @@ impl QuickFilter {
             tokens.push(format!("author:{author}"));
         }
         tokens.extend(self.labels.iter().map(|label| format!("label:{label}")));
+        tokens.extend(self.reasons.iter().map(|reason| format!("reason:{reason}")));
+        tokens.extend(self.repos.iter().map(|repo| format!("repo:{repo}")));
         tokens.join(" ")
+    }
+
+    pub(super) fn matches_done_notifications(&self) -> bool {
+        self.state == Some(QuickFilterState::Done)
+    }
+
+    pub(super) fn notification_dialog_values(&self) -> (String, String, String) {
+        let state = self
+            .state
+            .filter(|state| state.supports_notifications())
+            .map(QuickFilterState::display)
+            .unwrap_or_default()
+            .to_string();
+        (state, self.reasons.join(","), self.repos.join(","))
     }
 }
 
@@ -79,6 +172,9 @@ enum QuickFilterState {
     Closed,
     Merged,
     Draft,
+    Read,
+    Unread,
+    Done,
     All,
 }
 
@@ -89,6 +185,9 @@ impl QuickFilterState {
             "closed" | "close" => Some(Self::Closed),
             "merged" => Some(Self::Merged),
             "draft" => Some(Self::Draft),
+            "read" => Some(Self::Read),
+            "unread" => Some(Self::Unread),
+            "done" => Some(Self::Done),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -100,18 +199,34 @@ impl QuickFilterState {
             Self::Closed => "closed",
             Self::Merged => "merged",
             Self::Draft => "draft",
+            Self::Read => "read",
+            Self::Unread => "unread",
+            Self::Done => "done",
             Self::All => "all",
         }
     }
 
-    fn query_token(self) -> Option<&'static str> {
+    fn query_token(self, kind: SectionKind) -> Option<&'static str> {
         match self {
+            Self::Read if matches!(kind, SectionKind::Notifications) => Some("is:read"),
+            Self::Unread if matches!(kind, SectionKind::Notifications) => Some("is:unread"),
+            Self::Done if matches!(kind, SectionKind::Notifications) => Some("is:all"),
+            Self::All if matches!(kind, SectionKind::Notifications) => Some("is:all"),
+            Self::Read | Self::Unread | Self::Done => None,
             Self::Open => Some("is:open"),
             Self::Closed => Some("is:closed"),
             Self::Merged => Some("is:merged"),
             Self::Draft => Some("is:draft"),
             Self::All => None,
         }
+    }
+
+    fn supports_notifications(self) -> bool {
+        matches!(self, Self::Read | Self::Unread | Self::Done | Self::All)
+    }
+
+    fn supports_notifications_only(self) -> bool {
+        matches!(self, Self::Read | Self::Unread | Self::Done)
     }
 }
 
@@ -191,11 +306,15 @@ fn fuzzy_score_item(item: &WorkItem, query: &str) -> Option<i64> {
     Some(total)
 }
 
-pub(super) fn quick_filter_query(base_filters: &str, filter: &QuickFilter) -> String {
+pub(super) fn quick_filter_query_for_section(
+    base_filters: &str,
+    filter: &QuickFilter,
+    kind: SectionKind,
+) -> String {
     if base_filters.contains(" | ") {
         return base_filters
             .split(" | ")
-            .map(|filters| quick_filter_query(filters, filter))
+            .map(|filters| quick_filter_query_for_section(filters, filter, kind))
             .collect::<Vec<_>>()
             .join(" | ");
     }
@@ -205,21 +324,24 @@ pub(super) fn quick_filter_query(base_filters: &str, filter: &QuickFilter) -> St
         .filter(|token| !quick_filter_replaces_token(token, filter))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let overlay_tokens = quick_filter_tokens(filter);
+    let overlay_tokens = quick_filter_tokens_for_section(filter, kind);
     insert_tokens_before_sort(base_tokens, overlay_tokens).join(" ")
 }
 
 fn quick_filter_replaces_token(token: &str, filter: &QuickFilter) -> bool {
+    let token_lower = token.to_ascii_lowercase();
     (filter.state.is_some() && is_state_filter_token(token))
-        || (filter.assignee.is_some() && token.starts_with("assignee:"))
-        || (filter.author.is_some() && token.starts_with("author:"))
+        || (filter.assignee.is_some() && token_lower.starts_with("assignee:"))
+        || (filter.author.is_some() && token_lower.starts_with("author:"))
         || (!filter.labels.is_empty()
-            && (token.starts_with("label:") || token.starts_with("labels:")))
+            && (token_lower.starts_with("label:") || token_lower.starts_with("labels:")))
+        || (!filter.reasons.is_empty() && token_lower.starts_with("reason:"))
+        || (!filter.repos.is_empty() && token_lower.starts_with("repo:"))
 }
 
-fn quick_filter_tokens(filter: &QuickFilter) -> Vec<String> {
+fn quick_filter_tokens_for_section(filter: &QuickFilter, kind: SectionKind) -> Vec<String> {
     let mut tokens = Vec::new();
-    if let Some(token) = filter.state.and_then(QuickFilterState::query_token) {
+    if let Some(token) = filter.state.and_then(|state| state.query_token(kind)) {
         tokens.push(token.to_string());
     }
     if let Some(assignee) = &filter.assignee {
@@ -229,6 +351,13 @@ fn quick_filter_tokens(filter: &QuickFilter) -> Vec<String> {
         tokens.push(format!("author:{author}"));
     }
     tokens.extend(filter.labels.iter().map(|label| format!("label:{label}")));
+    tokens.extend(
+        filter
+            .reasons
+            .iter()
+            .map(|reason| format!("reason:{reason}")),
+    );
+    tokens.extend(filter.repos.iter().map(|repo| format!("repo:{repo}")));
     tokens
 }
 
@@ -248,10 +377,33 @@ fn insert_tokens_before_sort(
 }
 
 fn is_state_filter_token(token: &str) -> bool {
+    let token = token.to_ascii_lowercase();
     matches!(
-        token,
-        "is:open" | "is:closed" | "is:merged" | "is:draft" | "draft:true" | "draft:false"
+        token.as_str(),
+        "is:open"
+            | "is:closed"
+            | "is:merged"
+            | "is:draft"
+            | "is:read"
+            | "is:unread"
+            | "is:done"
+            | "is:all"
+            | "draft:true"
+            | "draft:false"
     ) || token.starts_with("state:")
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
+}
+
+fn contains_ignore_ascii_case(values: &[String], needle: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(needle))
 }
 
 fn non_empty_filter_value(name: &str, value: &str) -> std::result::Result<String, String> {

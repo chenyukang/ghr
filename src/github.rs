@@ -4572,6 +4572,64 @@ pub async fn refresh_notification_sections(config: &Config) -> Vec<SectionSnapsh
         .collect()
 }
 
+pub async fn refresh_notification_section_page(
+    view: String,
+    title: String,
+    filters: String,
+    limit: usize,
+    config: &Config,
+) -> SectionSnapshot {
+    let limit = limit.clamp(1, 100);
+    let fetch_limit = limit.saturating_mul(3).clamp(1, 100);
+    let include_all =
+        config.defaults.include_read_notifications || notification_filters_request_all(&filters);
+    let mut snapshot =
+        SectionSnapshot::empty_for_view(view, SectionKind::Notifications, title, filters);
+    let started = Instant::now();
+
+    match fetch_notifications(fetch_limit, include_all).await {
+        Ok(notifications) => {
+            snapshot.items = notifications
+                .iter()
+                .filter(|notification| {
+                    !is_excluded_repo(&notification.repository.full_name, &config.exclude_repos)
+                })
+                .filter(|notification| {
+                    notification_matches(
+                        notification,
+                        &snapshot.filters,
+                        config.defaults.include_read_notifications,
+                    )
+                })
+                .take(limit)
+                .map(notification_to_work_item)
+                .collect();
+            snapshot.page = 1;
+            snapshot.page_size = limit;
+            snapshot.refreshed_at = Some(Utc::now());
+            info!(
+                title = %snapshot.title,
+                filters = %snapshot.filters,
+                items = snapshot.items.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "notification section refreshed"
+            );
+        }
+        Err(error) => {
+            let message = error.to_string();
+            warn!(
+                title = %snapshot.title,
+                filters = %snapshot.filters,
+                error = %message,
+                "notification section refresh failed"
+            );
+            snapshot.error = Some(message);
+        }
+    }
+
+    snapshot
+}
+
 async fn fetch_notifications(limit: usize, include_all: bool) -> Result<Vec<NotificationRaw>> {
     let path = if include_all {
         format!("notifications?per_page={limit}&all=true")
@@ -4706,12 +4764,24 @@ fn notification_fetch_limit(config: &Config) -> usize {
 
 fn should_fetch_all_notifications(config: &Config) -> bool {
     config.defaults.include_read_notifications
-        || config.notification_sections.iter().any(|section| {
-            section
-                .filters
-                .split_whitespace()
-                .any(|token| matches!(token, "is:read" | "is:all"))
-        })
+        || config
+            .notification_sections
+            .iter()
+            .any(|section| notification_filters_request_all(&section.filters))
+}
+
+fn notification_filters_request_all(filters: &str) -> bool {
+    filters
+        .split_whitespace()
+        .filter_map(|token| strip_ascii_prefix(token, "is:"))
+        .any(|value| matches!(value.to_ascii_lowercase().as_str(), "read" | "all"))
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
 }
 
 async fn run_gh_json(args: &[String]) -> Result<String> {
@@ -5953,16 +6023,16 @@ fn notification_matches(
     let mut repos = Vec::new();
 
     for token in filters.split_whitespace() {
-        if let Some(value) = token.strip_prefix("is:") {
-            read_filter = Some(value);
-        } else if let Some(value) = token.strip_prefix("reason:") {
+        if let Some(value) = strip_ascii_prefix(token, "is:") {
+            read_filter = Some(value.to_ascii_lowercase());
+        } else if let Some(value) = strip_ascii_prefix(token, "reason:") {
             reasons.push(value);
-        } else if let Some(value) = token.strip_prefix("repo:") {
+        } else if let Some(value) = strip_ascii_prefix(token, "repo:") {
             repos.push(value);
         }
     }
 
-    match read_filter {
+    match read_filter.as_deref() {
         Some("unread") if !notification.unread => return false,
         Some("read") if notification.unread => return false,
         Some("all") | None => {}
@@ -5993,14 +6063,15 @@ fn notification_matches(
 }
 
 fn reason_matches(raw: &str, filter: &str) -> bool {
-    let filter = filter.replace('-', "_");
+    let filter = filter.replace('-', "_").to_ascii_lowercase();
+    let raw = raw.to_ascii_lowercase();
     if filter == "others" || filter == "other" {
-        return !is_primary_notification_reason(raw);
+        return !is_primary_notification_reason(&raw);
     }
 
     if filter == "participating" {
         return matches!(
-            raw,
+            raw.as_str(),
             "author" | "comment" | "mention" | "review_requested" | "assign" | "state_change"
         );
     }

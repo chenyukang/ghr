@@ -3466,60 +3466,21 @@ pub(super) fn draw_global_search_dialog(
     let dialog_area = centered_rect(74, 22, area);
     let inner = block_inner(dialog_area);
     let width = inner.width.max(1);
-    let current_scope = app.current_repo_scope();
-    let repo_scope = app
-        .global_search_scope
-        .as_deref()
-        .or(current_scope.as_deref())
-        .map(|repo| format!("scope: {repo}"))
-        .unwrap_or_else(|| "scope: GitHub".to_string());
-    let scope = app
-        .global_search_preferred_kind
-        .map(|kind| format!("{repo_scope} | {}", saved_search_kind_label(kind)))
-        .unwrap_or(repo_scope);
-    let mut lines = vec![
-        Line::from(vec![Span::styled(
-            scope,
-            themed_fg_style(active_theme().muted),
-        )]),
-        Line::from(""),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Title,
-            dialog.title.text(),
+    let scope = global_search_dialog_scope_label(dialog, app);
+    let mut lines = vec![Line::from(vec![Span::styled(
+        scope,
+        themed_fg_style(active_theme().muted),
+    )])];
+    lines.push(Line::from(""));
+    for field in dialog.fields() {
+        lines.push(global_search_dialog_field_input_line(
+            *field,
+            dialog.editor_for_field(*field).text(),
             dialog.field,
+            dialog.kind,
             width,
-        ),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Status,
-            dialog.status.text(),
-            dialog.field,
-            width,
-        ),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Label,
-            dialog.label.text(),
-            dialog.field,
-            width,
-        ),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Author,
-            dialog.author.text(),
-            dialog.field,
-            width,
-        ),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Assignee,
-            dialog.assignee.text(),
-            dialog.field,
-            width,
-        ),
-        global_search_dialog_field_input_line(
-            GlobalSearchField::Sort,
-            dialog.sort.text(),
-            dialog.field,
-            width,
-        ),
-    ];
+        ));
+    }
     lines.push(Line::from(""));
     push_global_search_suggestion_lines(&mut lines, dialog, usize::from(width));
     let block = Block::default()
@@ -3527,7 +3488,7 @@ pub(super) fn draw_global_search_dialog(
         .border_style(themed_fg_style(Color::LightMagenta))
         .style(modal_surface_style())
         .title(Span::styled(
-            "Search Issues and Pull Requests",
+            global_search_dialog_title(dialog),
             themed_bold_style(Color::LightMagenta),
         ));
     let paragraph = Paragraph::new(Text::from(lines))
@@ -3541,12 +3502,42 @@ pub(super) fn draw_global_search_dialog(
         frame,
         area,
         dialog_area,
-        modal_footer_line(
-            "Tab field  ↑/↓ move  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel",
-        ),
+        modal_footer_line(global_search_dialog_footer(dialog)),
     );
     if let Some(position) = global_search_dialog_cursor_position(dialog, dialog_area, width) {
         frame.set_cursor_position(position);
+    }
+}
+
+fn global_search_dialog_scope_label(dialog: &GlobalSearchDialog, app: &AppState) -> String {
+    if dialog.kind == GlobalSearchDialogKind::Notifications {
+        return "scope: Inbox".to_string();
+    }
+    let repo_scope = dialog
+        .repo
+        .as_deref()
+        .map(|repo| format!("scope: {repo}"))
+        .unwrap_or_else(|| "scope: GitHub".to_string());
+    app.global_search_preferred_kind
+        .map(|kind| format!("{repo_scope} | {}", saved_search_kind_label(kind)))
+        .unwrap_or(repo_scope)
+}
+
+fn global_search_dialog_title(dialog: &GlobalSearchDialog) -> &'static str {
+    match dialog.kind {
+        GlobalSearchDialogKind::Search => "Search Issues and Pull Requests",
+        GlobalSearchDialogKind::Notifications => "Search Inbox Notifications",
+    }
+}
+
+fn global_search_dialog_footer(dialog: &GlobalSearchDialog) -> &'static str {
+    match dialog.kind {
+        GlobalSearchDialogKind::Search => {
+            "Tab field  ↑/↓ move  Enter choose/search  Ctrl+S save  Ctrl+U clear  Esc cancel"
+        }
+        GlobalSearchDialogKind::Notifications => {
+            "Tab field  ↑/↓ move  Enter choose/apply  Ctrl+U clear  Esc cancel"
+        }
     }
 }
 
@@ -3576,6 +3567,8 @@ pub(super) fn push_global_search_suggestion_lines(
 
     let title = match dialog.field {
         GlobalSearchField::Status | GlobalSearchField::Sort => "Options",
+        GlobalSearchField::Reason => "Reasons",
+        GlobalSearchField::Repo => "Repositories",
         GlobalSearchField::Label | GlobalSearchField::Author | GlobalSearchField::Assignee => {
             "Candidates"
         }
@@ -3612,9 +3605,10 @@ pub(super) fn global_search_dialog_field_input_line(
     field: GlobalSearchField,
     value: &str,
     current: GlobalSearchField,
+    kind: GlobalSearchDialogKind,
     width: u16,
 ) -> Line<'static> {
-    let prefix = format!("{:<10}: ", field.label());
+    let prefix = format!("{:<10}: ", field.dialog_label(kind));
     let value_width =
         width.saturating_sub(display_width(&prefix).min(usize::from(u16::MAX)) as u16);
     Line::from(vec![
@@ -3646,10 +3640,11 @@ pub(super) fn global_search_dialog_cursor_position(
     width: u16,
 ) -> Option<Position> {
     let inner = block_inner(dialog_area);
-    let field_index = GlobalSearchField::FIELDS
+    let field_index = dialog
+        .fields()
         .iter()
         .position(|field| *field == dialog.field)?;
-    let prefix = format!("{:<10}: ", dialog.field.label());
+    let prefix = format!("{:<10}: ", dialog.field.dialog_label(dialog.kind));
     let prefix_width = display_width(&prefix).min(usize::from(u16::MAX)) as u16;
     let input_width = width.saturating_sub(prefix_width);
     let editor = dialog.active_editor();
@@ -4593,10 +4588,10 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         ),
         help_key_line("1 / 2 / 3 / 4", "focus GHR / Sections / List / Details"),
         help_key_line("/", "search the current list or Details comments"),
-        help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("S", "search PRs/issues or inbox notifications"),
         help_key_line("Ctrl+U in Search", "clear remembered search conditions"),
         help_key_line("Ctrl+S in Search", "save current search conditions"),
-        help_key_line("f", "filter current PR/issue section"),
+        help_key_line("f", "filter current PR/issue/inbox section"),
         help_key_line(
             "Esc in Search results",
             "return to the previous default list",
@@ -4630,8 +4625,9 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("Enter or 4", "focus Details"),
         help_key_line("o", "open selected item in browser"),
         help_key_line("i", "ignore selected pull request or issue"),
-        help_key_line("S", "search PRs and issues in the current repo"),
-        help_key_line("f", "filter with state:closed label:bug author:alice"),
+        help_key_line("x / Delete in Inbox", "mark selected notification done"),
+        help_key_line("S", "search PRs/issues or inbox notifications"),
+        help_key_line("f", "filter with state:closed label:bug, unread, or done"),
         help_key_line("v", "show pull request diff"),
         help_key_line("e / T", "edit selected issue or PR fields"),
         help_key_line("M", "open PR merge confirmation"),
@@ -4712,7 +4708,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("N", "create an issue, or PR from local_dir in PR lists"),
         help_key_line("T", "edit selected issue or PR fields"),
         help_key_line("Palette", "subscribe or unsubscribe this issue or PR"),
-        help_key_line("S", "search PRs and issues in the current repo"),
+        help_key_line("S", "search PRs/issues or inbox notifications"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open close or reopen confirmation"),
         help_key_line("X", "open local PR checkout confirmation"),

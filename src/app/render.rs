@@ -31,6 +31,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
         draw_startup_dialog(frame, app, paths, dialog, area);
     } else if let Some(dialog) = &app.message_dialog {
         draw_message_dialog(frame, dialog, area);
+    } else if let Some(picker) = &app.commit_picker {
+        draw_commit_picker(frame, app, picker, area);
     } else if let Some(dialog) = &app.diagnostics_dialog {
         draw_diagnostics_dialog(frame, dialog, area);
     } else if app.help_dialog {
@@ -668,8 +670,8 @@ pub(super) fn draw_diff_files(frame: &mut Frame<'_>, app: &AppState, area: Rect)
             );
             let comment_counts = app
                 .current_item()
-                .and_then(|item| app.loaded_comments_for_item(&item.id))
-                .map(|comments| diff_file_comment_counts(diff, comments))
+                .and_then(|item| app.diff_comments_for_item(&item.id))
+                .map(|comments| diff_file_comment_counts(diff, &comments))
                 .unwrap_or_default();
             let entries = diff_tree_entries_with_comment_counts(diff, &comment_counts);
             if let Some(item_id) = app.current_item().map(|item| item.id.as_str()) {
@@ -855,10 +857,15 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let text_selection_mode = !app.mouse_capture_enabled;
     let details_focused = app.focus == FocusTarget::Details;
     let details_prompt = active_details_input_prompt(app);
-    let raw_title = details_prompt
+    let mut raw_title = details_prompt
         .as_ref()
         .map(|(prompt, _)| format!("{} {prompt}", details_title()))
         .unwrap_or_else(|| details_title().to_string());
+    if app.details_mode == DetailsMode::Diff
+        && let Some(item) = app.current_item()
+    {
+        raw_title = format!("{raw_title} | {}", app.commit_diff_label(&item.id));
+    }
     let prompt_color = details_prompt.as_ref().map(|(_, color)| *color);
     let title = focus_panel_title("Details", &raw_title, details_focused);
     let (border_style, mut title_style, border_type) = if app.dragging_split {
@@ -1449,6 +1456,7 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
                 push_footer_pair(&mut spans, "j/k/n/p", "file", Color::Cyan);
                 push_footer_pair(&mut spans, "tab", "diff", Color::Cyan);
                 push_footer_pair(&mut spans, "enter", "diff", Color::Cyan);
+                push_footer_pair(&mut spans, "V", "commits", Color::LightMagenta);
                 push_footer_pair(&mut spans, "esc", "back", Color::Cyan);
                 push_footer_pair(&mut spans, "[ ]", "file", Color::Cyan);
                 push_footer_pair(&mut spans, "i", "comments", Color::Yellow);
@@ -1481,6 +1489,7 @@ pub(super) fn footer_focus_primary_shortcuts(app: &AppState) -> Vec<Span<'static
             if app.details_mode == DetailsMode::Diff {
                 push_footer_pair(&mut spans, "j/k", "line", Color::Cyan);
                 push_footer_pair(&mut spans, "tab", "files", Color::Cyan);
+                push_footer_pair(&mut spans, "V", "commits", Color::LightMagenta);
                 push_footer_pair(&mut spans, "n/p", "comment", Color::LightBlue);
                 push_footer_pair(&mut spans, "h/l", "page", Color::Cyan);
                 push_footer_pair(&mut spans, "i", "comments", Color::Yellow);

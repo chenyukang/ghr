@@ -223,6 +223,10 @@ impl CommentPreviewKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewCommentPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub path: String,
     #[serde(default)]

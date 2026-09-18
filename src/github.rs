@@ -414,6 +414,8 @@ struct IssueCommentRaw {
 
 #[derive(Debug, Deserialize)]
 struct PullRequestReviewCommentRaw {
+    commit_id: Option<String>,
+    original_commit_id: Option<String>,
     id: Option<u64>,
     in_reply_to_id: Option<u64>,
     body: Option<String>,
@@ -2580,6 +2582,154 @@ fn rerun_failed_check_run_args(repository: &str, run_id: u64) -> Vec<String> {
     ]
 }
 
+/// A commit in GitHub's pull request commit order (oldest first).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestCommit {
+    pub oid: String,
+    pub message_headline: String,
+    pub committed_date: DateTime<Utc>,
+    pub author: Option<PullRequestCommitAuthor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestCommitAuthor {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitsPage {
+    nodes: Vec<PullRequestCommitNode>,
+    page_info: PullRequestCommitsPageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestCommitNode {
+    commit: PullRequestCommit,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommitsPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+pub async fn fetch_pull_request_commits(
+    repository: &str,
+    number: u64,
+) -> Result<Vec<PullRequestCommit>> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          commits(first: 100, after: $cursor) {
+            nodes { commit { oid messageHeadline committedDate author { name } } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }"#;
+    let mut commits = Vec::new();
+    let mut cursor = None;
+    loop {
+        let mut args = vec![
+            "api".into(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={query}"),
+            "-F".into(),
+            format!("owner={owner}"),
+            "-F".into(),
+            format!("name={name}"),
+            "-F".into(),
+            format!("number={number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            args.extend(["-f".into(), format!("cursor={cursor}")]);
+        }
+        let output = run_gh_json(&args).await?;
+        let raw: serde_json::Value = serde_json::from_str(&output)?;
+        if let Some(errors) = raw.get("errors") {
+            bail!("failed to fetch commits: {errors}");
+        }
+        let page: PullRequestCommitsPage = serde_json::from_value(
+            raw.pointer("/data/repository/pullRequest/commits")
+                .cloned()
+                .ok_or_else(|| anyhow!("pull request {repository}#{number} was not found"))?,
+        )
+        .context("failed to parse pull request commits")?;
+        commits.extend(page.nodes.into_iter().map(|node| node.commit));
+        if !page.page_info.has_next_page {
+            break;
+        }
+        let next = page
+            .page_info
+            .end_cursor
+            .context("missing commits pagination cursor")?;
+        if cursor.as_ref() == Some(&next) {
+            bail!("commits pagination did not advance");
+        }
+        cursor = Some(next);
+    }
+    Ok(commits)
+}
+
+/// `before` is the excluded commit immediately before the selected range.
+/// For a prefix of the PR, compare against its base branch, as the web UI does.
+pub async fn fetch_commit_range_diff(
+    repository: &str,
+    number: u64,
+    before: Option<&str>,
+    last: &str,
+) -> Result<String> {
+    let output = run_gh_json(&["api".into(), format!("repos/{repository}/pulls/{number}")]).await?;
+    let pr: serde_json::Value = serde_json::from_str(&output)?;
+    let base = pr
+        .pointer("/base/sha")
+        .and_then(serde_json::Value::as_str)
+        .context("missing pull request base SHA")?;
+    let Some(before) = before else {
+        return fetch_comparison_diff(repository, base, last).await;
+    };
+    // Only bring in upstream history already reachable from the selected endpoint.
+    // The virtual merge favors `before`, so later conflict resolutions stay visible.
+    let upstream = fetch_comparison_merge_base(repository, base, last).await?;
+    let ancestor = fetch_comparison_merge_base(repository, before, &upstream).await?;
+    crate::github_diff::merged_range_diff(repository, before, last, &upstream, &ancestor).await
+}
+
+async fn fetch_comparison_merge_base(repository: &str, base: &str, head: &str) -> Result<String> {
+    let output = run_gh_json(&[
+        "api".into(),
+        format!("repos/{repository}/compare/{base}...{head}?per_page=1"),
+    ])
+    .await?;
+    #[derive(Deserialize)]
+    struct Comparison {
+        merge_base_commit: ComparisonCommit,
+    }
+    #[derive(Deserialize)]
+    struct ComparisonCommit {
+        sha: String,
+    }
+    let comparison: Comparison =
+        serde_json::from_str(&output).context("missing comparison merge base")?;
+    Ok(comparison.merge_base_commit.sha)
+}
+
+async fn fetch_comparison_diff(repository: &str, base: &str, head: &str) -> Result<String> {
+    run_gh_json(&[
+        "api".into(),
+        "-H".into(),
+        "Accept: application/vnd.github.v3.diff".into(),
+        format!("repos/{repository}/compare/{base}...{head}"),
+    ])
+    .await
+    .with_context(|| format!("failed to fetch diff for {repository}@{base}..{head}"))
+}
+
 pub async fn fetch_pull_request_diff(repository: &str, number: u64) -> Result<String> {
     let path = format!("repos/{repository}/pulls/{number}");
     run_gh_json(&[
@@ -2896,6 +3046,7 @@ pub async fn change_issue_milestone(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullRequestReviewCommentTarget<'a> {
+    pub commit_id: Option<&'a str>,
     pub path: &'a str,
     pub line: usize,
     pub side: &'a str,
@@ -2959,10 +3110,16 @@ pub async fn post_pull_request_review_comment(
     target: PullRequestReviewCommentTarget<'_>,
     body: &str,
 ) -> Result<CommentPreview> {
-    let pr_path = format!("repos/{repository}/pulls/{number}");
-    let pr_output = run_gh_json(&["api".to_string(), pr_path]).await?;
-    let pr = serde_json::from_str::<PullRequestHeadRaw>(&pr_output)
-        .with_context(|| format!("failed to parse pull request head for {repository}#{number}"))?;
+    let commit_id = if let Some(sha) = target.commit_id {
+        sha.to_string()
+    } else {
+        let pr_path = format!("repos/{repository}/pulls/{number}");
+        let pr_output = run_gh_json(&["api".to_string(), pr_path]).await?;
+        let pr = serde_json::from_str::<PullRequestHeadRaw>(&pr_output).with_context(|| {
+            format!("failed to parse pull request head for {repository}#{number}")
+        })?;
+        pr.head.sha
+    };
     let comments_path = format!("repos/{repository}/pulls/{number}/comments");
     let mut args = vec![
         "api".to_string(),
@@ -2972,7 +3129,7 @@ pub async fn post_pull_request_review_comment(
         "-f".to_string(),
         format!("body={body}"),
         "-f".to_string(),
-        format!("commit_id={}", pr.head.sha),
+        format!("commit_id={commit_id}"),
         "-f".to_string(),
         format!("path={}", target.path),
         "-F".to_string(),
@@ -4177,6 +4334,8 @@ fn pull_request_review_comment_preview(
             .map(ReactionSummary::from)
             .unwrap_or_default(),
         review: Some(ReviewCommentPreview {
+            commit_id: comment.commit_id,
+            original_commit_id: comment.original_commit_id,
             thread_id: thread_state.thread_id,
             path: comment.path.unwrap_or_else(|| "-".to_string()),
             line: comment.line,
@@ -7498,6 +7657,8 @@ mod tests {
               "updated_at": "2026-01-02T00:00:00Z",
               "user": { "login": "alice" },
               "path": "src/app.rs",
+              "commit_id": "2222222",
+              "original_commit_id": "1111111",
               "line": 57,
               "original_line": 50,
               "start_line": 44,
@@ -7536,6 +7697,8 @@ mod tests {
         assert!(comment.can_edit());
         let review = comment.review.as_ref().expect("review metadata");
         assert_eq!(review.path, "src/app.rs");
+        assert_eq!(review.commit_id.as_deref(), Some("2222222"));
+        assert_eq!(review.original_commit_id.as_deref(), Some("1111111"));
         assert_eq!(review.line, Some(57));
         assert_eq!(review.original_line, Some(50));
         assert_eq!(review.start_line, Some(44));

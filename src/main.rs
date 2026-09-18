@@ -3,6 +3,7 @@ mod config;
 mod dirs;
 mod github;
 mod github_api;
+mod github_diff;
 mod github_gh;
 mod github_queue;
 mod log;

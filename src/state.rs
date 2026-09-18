@@ -14,6 +14,46 @@ pub const MAX_RECENT_ITEMS: usize = 200;
 pub const MAX_RECENT_COMMANDS: usize = 100;
 pub const MAX_GLOBAL_SAVED_SEARCHES_PER_REPO: usize = 30;
 
+/// Inclusive endpoints in the PR's oldest-first commit order.
+/// Keep accepting the SHA strings saved by older versions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum CommitSelection {
+    Single(String),
+    Range { first: String, last: String },
+}
+
+impl CommitSelection {
+    pub fn new(first: String, last: String) -> Self {
+        if first == last {
+            Self::Single(first)
+        } else {
+            Self::Range { first, last }
+        }
+    }
+
+    pub fn first(&self) -> &str {
+        match self {
+            Self::Single(sha) => sha,
+            Self::Range { first, .. } => first,
+        }
+    }
+
+    pub fn last(&self) -> &str {
+        match self {
+            Self::Single(sha) => sha,
+            Self::Range { last, .. } => last,
+        }
+    }
+
+    pub fn key(&self) -> String {
+        match self {
+            Self::Single(sha) => sha.clone(),
+            Self::Range { first, last } => format!("{first}..{last}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
@@ -31,6 +71,7 @@ pub struct UiState {
     pub selected_comment_index_by_item: HashMap<String, usize>,
     #[serde(default, alias = "viewed_item_at")]
     pub seen_item_updated_at: HashMap<String, DateTime<Utc>>,
+    pub selected_commits: HashMap<String, CommitSelection>,
     pub selected_diff_file: HashMap<String, usize>,
     pub selected_diff_line: HashMap<String, usize>,
     pub diff_file_details_scroll: HashMap<String, u16>,
@@ -289,6 +330,7 @@ impl Default for UiState {
             details_scroll_by_item: HashMap::new(),
             selected_comment_index_by_item: HashMap::new(),
             seen_item_updated_at: HashMap::new(),
+            selected_commits: HashMap::new(),
             selected_diff_file: HashMap::new(),
             selected_diff_line: HashMap::new(),
             diff_file_details_scroll: HashMap::new(),
@@ -495,6 +537,16 @@ mod tests {
                 "issue:rust-lang/rust:3".to_string(),
                 DateTime::from_timestamp(1_700_000_030, 0).unwrap(),
             )]),
+            selected_commits: HashMap::from([
+                (
+                    "pr-1".to_string(),
+                    CommitSelection::Single("1111111".to_string()),
+                ),
+                (
+                    "pr-2".to_string(),
+                    CommitSelection::new("1111111".into(), "2222222".into()),
+                ),
+            ]),
             selected_diff_file: HashMap::from([("issue-3".to_string(), 4)]),
             selected_diff_line: HashMap::from([("issue-3".to_string(), 9)]),
             diff_file_details_scroll: HashMap::from([("issue-3::src/lib.rs".to_string(), 17)]),
@@ -631,6 +683,17 @@ mod tests {
         assert_eq!(
             state.seen_item_updated_at.get("issue:rust-lang/rust:3"),
             Some(&DateTime::from_timestamp(1_700_000_030, 0).unwrap())
+        );
+        assert_eq!(
+            state
+                .selected_commits
+                .get("pr-1")
+                .map(CommitSelection::last),
+            Some("1111111")
+        );
+        assert_eq!(
+            state.selected_commits.get("pr-2"),
+            Some(&CommitSelection::new("1111111".into(), "2222222".into()))
         );
         assert_eq!(state.selected_diff_file.get("issue-3"), Some(&4));
         assert_eq!(state.selected_diff_line.get("issue-3"), Some(&9));

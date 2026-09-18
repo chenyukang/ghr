@@ -407,6 +407,8 @@ fn diff_review_targets_map_sides_and_paths() {
         targets,
         vec![
             DiffReviewTarget {
+                first_commit_id: None,
+                commit_id: None,
                 path: "src/lib.rs".to_string(),
                 line: 1,
                 side: DiffReviewSide::Left,
@@ -415,6 +417,8 @@ fn diff_review_targets_map_sides_and_paths() {
                 preview: "old".to_string(),
             },
             DiffReviewTarget {
+                first_commit_id: None,
+                commit_id: None,
                 path: "src/lib.rs".to_string(),
                 line: 1,
                 side: DiffReviewSide::Right,
@@ -423,6 +427,8 @@ fn diff_review_targets_map_sides_and_paths() {
                 preview: "new".to_string(),
             },
             DiffReviewTarget {
+                first_commit_id: None,
+                commit_id: None,
                 path: "src/lib.rs".to_string(),
                 line: 2,
                 side: DiffReviewSide::Right,
@@ -457,6 +463,8 @@ fn diff_details_render_inline_review_comments_below_target_line() {
     );
 
     let review = crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -590,6 +598,8 @@ fn text_selection_mode_omits_inline_thread_markers() {
     );
 
     let review = crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -651,6 +661,8 @@ fn diff_mode_can_hide_inline_review_comment_bodies_but_keeps_markers() {
     let mut inline = comment("alice", "Hidden until marker is opened.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -720,6 +732,8 @@ fn clicking_hidden_diff_inline_comment_marker_reveals_that_thread() {
     let mut inline = comment("alice", "Revealed by marker click.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -788,6 +802,8 @@ fn mouse_clicking_hidden_diff_inline_comment_marker_toggles_that_thread() {
     let mut inline = comment("alice", "Toggle me from the marker.", None);
     inline.id = Some(1);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -888,6 +904,8 @@ fn mouse_clicking_inline_comment_author_opens_profile() {
     );
     comment.id = Some(1);
     comment.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -959,6 +977,8 @@ fn diff_details_render_resolved_and_outdated_review_comment_states() {
     let mut resolved = comment("alice", "Fixed now.", None);
     resolved.id = Some(1);
     resolved.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -974,6 +994,8 @@ fn diff_details_render_resolved_and_outdated_review_comment_states() {
     let mut outdated = comment("bob", "This pointed at an old line.", None);
     outdated.id = Some(2);
     outdated.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(99),
@@ -1335,6 +1357,8 @@ fn n_and_p_focus_comments_in_diff_details() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     let mut first = comment("alice", "first inline", None);
     first.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -1349,6 +1373,8 @@ fn n_and_p_focus_comments_in_diff_details() {
     });
     let mut second = comment("bob", "second inline", None);
     second.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
@@ -1415,6 +1441,8 @@ fn n_and_p_reveal_hidden_diff_inline_comment_threads_one_at_a_time() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
     let mut first = comment("alice", "first hidden inline", None);
     first.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -1429,6 +1457,8 @@ fn n_and_p_reveal_hidden_diff_inline_comment_threads_one_at_a_time() {
     });
     let mut second = comment("bob", "second hidden inline", None);
     second.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
@@ -1958,6 +1988,566 @@ fn double_click_begins_and_single_click_ends_diff_range() {
 }
 
 #[test]
+fn commit_picker_keyboard_selects_commit_and_returns_to_conversation() {
+    for open_key in [
+        key(KeyCode::Char('V')),
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SHIFT),
+    ] {
+        let mut app = commit_diff_test_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(PathBuf::from("/tmp/ghr-test-unused.db"));
+        app.focus_details();
+        app.details_scroll = 3;
+        handle_key(&mut app, open_key, &config, &store, &tx);
+        // This must go through global dispatch to catch keys leaking to the PR list.
+        handle_key(&mut app, key(KeyCode::Char('n')), &config, &store, &tx);
+        assert_eq!(app.current_item().expect("selected PR").id, "1");
+        for code in [KeyCode::End, KeyCode::Char(' '), KeyCode::Enter] {
+            handle_key(&mut app, key(code), &config, &store, &tx);
+        }
+        app.handle_msg(AppMsg::DiffLoaded {
+            item_id: "1".to_string(),
+            selection: Some(CommitSelection::Single("2222222".to_string())),
+            diff: Ok(commit_test_diff()),
+        });
+        let document = build_diff_document(&app, 120);
+        let backend = ratatui::backend::TestBackend::new(180, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &test_paths()))
+            .expect("draw commit diff");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Details | 2222222 (2/2) Change 2222222"));
+        assert_eq!(rendered.matches("2222222 (2/2)").count(), 1);
+        assert_eq!(
+            app.selected_open_url().as_deref(),
+            Some("https://github.com/rust-lang/rust/pull/1/commits/2222222")
+        );
+        assert!(
+            document
+                .links
+                .iter()
+                .any(|link| link.url.contains("/blob/2222222/src/lib.rs"))
+        );
+        for code in [KeyCode::Char('V'), KeyCode::Home, KeyCode::Enter] {
+            handle_key(&mut app, key(code), &config, &store, &tx);
+        }
+        assert!(!app.selected_commits.contains_key("1"));
+        assert_eq!(app.details_mode, DetailsMode::Diff);
+        terminal
+            .draw(|frame| draw(frame, &app, &test_paths()))
+            .expect("draw entire PR diff");
+        let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+        assert!(rendered.contains("Details | All commits"));
+        assert_eq!(rendered.matches("All commits").count(), 1);
+        handle_key(&mut app, key(KeyCode::Esc), &config, &store, &tx);
+        assert_eq!(app.details_mode, DetailsMode::Conversation);
+        assert_eq!(app.focus, FocusTarget::Details);
+        assert_eq!(app.details_scroll, 3);
+    }
+}
+
+#[test]
+fn commit_picker_fills_gaps_truncates_and_cancels() {
+    let mut app = commit_diff_test_app();
+    let Some(CommitsState::Loaded(commits)) = app.commits.get_mut("1") else {
+        panic!("commits")
+    };
+    let template = commits[0].clone();
+    *commits = (1..=5)
+        .map(|index| PullRequestCommit {
+            oid: index.to_string().repeat(7),
+            message_headline: format!("Commit {index}"),
+            ..template.clone()
+        })
+        .collect();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(PathBuf::from("/tmp/ghr-test-unused.db"));
+    let press = |app: &mut AppState, codes: &[KeyCode]| {
+        for code in codes {
+            handle_key(app, key(*code), &config, &store, &tx);
+        }
+    };
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::End,
+            KeyCode::Char(' '),
+        ],
+    );
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 25)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &app, &test_paths()))
+        .unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("[ ] 1111111"));
+    for sha in ["2222222", "3333333", "4444444", "5555555"] {
+        assert!(rendered.contains(&format!("[x] {sha}")), "{rendered}");
+    }
+    assert!(
+        !app.selected_commits.contains_key("1"),
+        "selection is pending until applied"
+    );
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://github.com/rust-lang/rust/pull/1/files/1111111..5555555")
+    );
+
+    // Remove commits from the beginning one by one, preserving the later commits.
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+        ],
+    );
+    assert_eq!(
+        app.selected_commits.get("1"),
+        Some(&CommitSelection::new("4444444".into(), "5555555".into()))
+    );
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://github.com/rust-lang/rust/pull/1/files/3333333..5555555")
+    );
+
+    // Extend backwards, then deselect the middle: only commits 1 and 2 survive.
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::Home,
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::End,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+        ],
+    );
+    let range = CommitSelection::new("1111111".into(), "2222222".into());
+    assert_eq!(app.selected_commits.get("1"), Some(&range));
+    assert_eq!(
+        app.selected_open_url().as_deref(),
+        Some("https://github.com/rust-lang/rust/pull/1/files/2222222")
+    );
+    terminal
+        .draw(|frame| draw(frame, &app, &test_paths()))
+        .unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("Details | 1111111..2222222 (1–2/5)"));
+
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Esc,
+        ],
+    );
+    assert_eq!(
+        app.selected_commits.get("1"),
+        Some(&range),
+        "cancel must preserve the active range"
+    );
+    // Deselecting the last leaves the first; deselecting the only commit clears the range.
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+        ],
+    );
+    assert_eq!(
+        app.selected_commits.get("1"),
+        Some(&CommitSelection::Single("1111111".into()))
+    );
+    press(
+        &mut app,
+        &[KeyCode::Char('V'), KeyCode::Char(' '), KeyCode::Enter],
+    );
+    assert!(
+        app.commit_picker.is_some(),
+        "an empty selection cannot be applied"
+    );
+    press(&mut app, &[KeyCode::Home, KeyCode::Enter]);
+    assert!(!app.selected_commits.contains_key("1"));
+
+    // Filling the entire range applies the full PR scope, not a SHA range.
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('V'),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::End,
+            KeyCode::Char(' '),
+        ],
+    );
+    terminal
+        .draw(|frame| draw(frame, &app, &test_paths()))
+        .unwrap();
+    let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
+    assert!(rendered.contains("✓ All commits"));
+    for sha in ["1111111", "2222222", "3333333", "4444444", "5555555"] {
+        assert!(rendered.contains(&format!("[x] {sha}")), "{rendered}");
+    }
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(app.commit_picker.is_none());
+    assert!(!app.selected_commits.contains_key("1"));
+    assert_eq!(app.diff_scope_key("1"), "1");
+    assert_eq!(app.commit_diff_label("1"), "All commits");
+}
+
+#[test]
+fn commit_picker_mouse_selects_the_visible_row_after_scrolling() {
+    let mut app = commit_diff_test_app();
+    let mut commits = match app.commits.remove("1").expect("commits") {
+        CommitsState::Loaded(commits) => commits,
+        _ => panic!("expected loaded commits"),
+    };
+    let template = commits.pop().expect("commit");
+    app.commits.insert(
+        "1".to_string(),
+        CommitsState::Loaded(
+            (0..150)
+                .map(|index| PullRequestCommit {
+                    oid: format!("{index:040x}"),
+                    message_headline: format!("Commit {index}"),
+                    ..template.clone()
+                })
+                .collect(),
+        ),
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = Config::default();
+    let store = SnapshotStore::new(PathBuf::from("/tmp/ghr-test-unused.db"));
+    for code in [KeyCode::Char('V'), KeyCode::End] {
+        handle_key(&mut app, key(code), &config, &store, &tx);
+    }
+    let backend = ratatui::backend::TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &app, &test_paths()))
+        .expect("draw");
+    let lines = buffer_lines(terminal.backend().buffer());
+    let row = lines
+        .iter()
+        .position(|line| line.contains("Commit 148"))
+        .expect("previous commit visible");
+    let area = Rect::new(0, 0, 100, 12);
+    let inner = block_inner(commit_picker_area(area));
+    assert!(lines[inner.y as usize].contains("✓ All commits"));
+    assert!(!lines[inner.y as usize].contains("[x]"));
+    assert!(lines[inner.y as usize + 1].contains("─ Select commits ─"));
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer[(inner.x + 4, inner.y)]
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        !buffer[(inner.x + 4, row as u16)]
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    // The separator is not selectable, even when the commit list has scrolled.
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    assert!(app.commit_picker.is_some());
+    assert!(!app.selected_commits.contains_key("1"));
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + inner.height - 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    assert!(app.commit_picker.is_none());
+    assert_eq!(
+        app.selected_commits.get("1"),
+        Some(&CommitSelection::Single(format!("{:040x}", 148)))
+    );
+    handle_key(&mut app, key(KeyCode::Char('V')), &config, &store, &tx);
+    // All commits stays above the scrolling list and remains a separate action.
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+    );
+    assert!(app.commit_picker.is_none());
+    assert!(!app.selected_commits.contains_key("1"));
+}
+
+#[test]
+fn commit_review_drafts_reopen_only_for_the_same_selection() {
+    let paths = unique_test_paths("commit-review-drafts");
+    let store = SnapshotStore::new(paths.db_path.clone());
+    store.init().expect("init store");
+    let mut app = commit_diff_test_app();
+    let scopes = [
+        (None, "PR draft"),
+        (
+            Some(CommitSelection::Single("1111111".into())),
+            "First draft",
+        ),
+        (
+            Some(CommitSelection::Single("2222222".into())),
+            "Second draft",
+        ),
+        (
+            Some(CommitSelection::new("1111111".into(), "2222222".into())),
+            "Range draft",
+        ),
+    ];
+    for (selection, body) in &scopes {
+        app.select_commit_selection(selection.clone());
+        app.handle_msg(AppMsg::DiffLoaded {
+            item_id: "1".to_string(),
+            selection: selection.clone(),
+            diff: Ok(commit_test_diff()),
+        });
+        app.start_review_comment_dialog();
+        let dialog = app.comment_dialog.as_mut().expect("review dialog");
+        assert!(
+            dialog.body.text().is_empty(),
+            "draft from another scope leaked"
+        );
+        dialog.body.set_text(body);
+        app.save_active_comment_draft_result(&store, Instant::now())
+            .expect("save draft");
+        app.comment_dialog = None;
+    }
+    app.load_editor_drafts(store.load_editor_drafts().expect("load drafts"));
+    for (selection, body) in scopes.iter().rev() {
+        app.select_commit_selection(selection.clone());
+        app.start_review_comment_dialog();
+        assert_eq!(
+            app.comment_dialog
+                .as_ref()
+                .expect("review dialog")
+                .body
+                .text(),
+            *body
+        );
+        app.comment_dialog = None;
+    }
+}
+
+#[test]
+fn commit_diff_renders_original_thread_at_original_line() {
+    let mut app = commit_diff_test_app();
+    let mut original = test_review_comment(1, "src/lib.rs");
+    let review = original.review.as_mut().expect("review");
+    review.original_commit_id = Some("1111111".to_string());
+    review.commit_id = Some("2222222".to_string());
+    review.original_line = Some(2);
+    review.line = Some(15);
+    review.is_outdated = true;
+    let mut other = test_review_comment(2, "src/lib.rs");
+    other.review.as_mut().expect("review").commit_id = Some("2222222".to_string());
+    let mut reply = comment("bob", "reply to first commit", None);
+    reply.id = Some(3);
+    reply.parent_id = Some(1);
+    app.details.insert(
+        "1".to_string(),
+        DetailState::Loaded(vec![original, other, reply]),
+    );
+    app.select_commit_diff(Some("1111111".to_string()));
+    app.handle_msg(AppMsg::DiffLoaded {
+        item_id: "1".to_string(),
+        selection: Some(CommitSelection::Single("1111111".to_string())),
+        diff: Ok(commit_test_diff()),
+    });
+    let document = build_diff_document(&app, 120);
+    assert_eq!(
+        document
+            .comments
+            .iter()
+            .map(|comment| comment.index)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    let target_line = document
+        .diff_lines
+        .iter()
+        .find(|line| line.review_index == 2)
+        .expect("original line")
+        .line;
+    let next_line = document
+        .diff_lines
+        .iter()
+        .find(|line| line.review_index == 3)
+        .expect("next line")
+        .line;
+    for comment in &document.comments {
+        assert!(comment.start_line > target_line && comment.end_line <= next_line);
+    }
+    assert_eq!(
+        app.current_comments().expect("comments")[0]
+            .review
+            .as_ref()
+            .expect("review")
+            .line,
+        Some(15)
+    );
+}
+
+#[test]
+fn removed_commit_selection_falls_back_to_cached_pr_diff() {
+    for remaining in ["1111111", "2222222"] {
+        let mut app = commit_diff_test_app();
+        let diff = commit_test_diff();
+        app.diffs
+            .insert("1".to_string(), DiffState::Loaded(diff.clone()));
+        app.select_commit_selection(Some(CommitSelection::new(
+            "1111111".into(),
+            "2222222".into(),
+        )));
+        let Some(CommitsState::Loaded(mut commits)) = app.commits.remove("1") else {
+            panic!("expected commits")
+        };
+        commits.retain(|commit| commit.oid == remaining);
+        app.handle_msg(AppMsg::CommitsLoaded {
+            item_id: "1".to_string(),
+            commits: Ok(commits),
+        });
+        assert!(!app.selected_commits.contains_key("1"));
+        assert!(matches!(app.current_diff(), Some(DiffState::Loaded(current)) if current == &diff));
+    }
+}
+
+#[test]
+fn commit_picker_delayed_load_does_not_open_after_cancel() {
+    let mut app = commit_diff_test_app();
+    let Some(CommitsState::Loaded(commits)) = app.commits.remove("1") else {
+        panic!()
+    };
+    app.open_commit_picker(Some("2222222".into()), None);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    app.handle_commit_picker_key(key(KeyCode::Esc), &tx);
+    app.handle_msg(AppMsg::CommitsLoaded {
+        item_id: "1".into(),
+        commits: Ok(commits),
+    });
+    assert!(app.commit_picker.is_none());
+    assert_eq!(app.details_mode, DetailsMode::Conversation);
+    assert!(!app.selected_commits.contains_key("1"));
+    app.open_commit_picker(Some("2222222".into()), None);
+    assert_eq!(app.details_mode, DetailsMode::Diff);
+    assert_eq!(
+        app.selected_commits.get("1").map(CommitSelection::last),
+        Some("2222222")
+    );
+}
+
+#[test]
+fn commit_diff_cache_and_scroll_are_separate_from_pr_and_other_commits() {
+    let mut app = commit_diff_test_app();
+    app.diffs
+        .insert("1".into(), DiffState::Loaded(commit_test_diff()));
+    app.show_diff();
+    app.selected_diff_line.insert("1".into(), 2);
+    app.details_scroll = 9;
+    app.select_commit_selection(Some(CommitSelection::new(
+        "1111111".into(),
+        "2222222".into(),
+    )));
+    assert!(app.current_diff().is_none());
+    assert_eq!(app.details_scroll, 0);
+    app.handle_msg(AppMsg::DiffLoaded {
+        item_id: "1".into(),
+        selection: Some(CommitSelection::new("1111111".into(), "2222222".into())),
+        diff: Ok(commit_test_diff()),
+    });
+    app.selected_diff_line.insert("1".into(), 1);
+    app.details_scroll = 4;
+    app.select_commit_diff(Some("2222222".into()));
+    assert!(app.current_diff().is_none());
+    assert_eq!(app.details_scroll, 0);
+    app.select_commit_diff(None);
+    assert!(matches!(app.current_diff(), Some(DiffState::Loaded(_))));
+    assert_eq!(app.selected_diff_line.get("1"), Some(&2));
+    assert_eq!(app.details_scroll, 9);
+    app.select_commit_selection(Some(CommitSelection::new(
+        "1111111".into(),
+        "2222222".into(),
+    )));
+    assert_eq!(app.selected_diff_line.get("1"), Some(&1));
+    assert_eq!(app.details_scroll, 4);
+}
+
+#[test]
+fn commit_diff_delayed_results_never_replace_selected_scope() {
+    let mut app = commit_diff_test_app();
+    let range = CommitSelection::new("1111111".into(), "2222222".into());
+    app.select_commit_selection(Some(range.clone()));
+    app.selected_diff_line.insert("1".into(), 3);
+    app.details_scroll = 7;
+    let status = app.status.clone();
+    for selection in [
+        None,
+        Some(CommitSelection::Single("2222222".into())),
+        Some(CommitSelection::new("0000000".into(), "2222222".into())),
+    ] {
+        app.handle_msg(AppMsg::DiffLoaded {
+            item_id: "1".into(),
+            selection,
+            diff: Ok(commit_test_diff()),
+        });
+    }
+    assert!(app.current_diff().is_none());
+    assert_eq!(app.selected_diff_line.get("1"), Some(&3));
+    assert_eq!(app.details_scroll, 7);
+    assert_eq!(app.status, status);
+    app.handle_msg(AppMsg::DiffLoaded {
+        item_id: "1".into(),
+        selection: Some(range),
+        diff: Ok(commit_test_diff()),
+    });
+    assert!(matches!(app.current_diff(), Some(DiffState::Loaded(_))));
+}
+
+#[test]
 fn show_diff_focuses_diff_files_for_pull_requests() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
 
@@ -2108,7 +2698,7 @@ fn v_opens_diff_from_any_focus_region() {
     app.focus_list();
     assert!(!handle_key(
         &mut app,
-        key(KeyCode::Char('V')),
+        key(KeyCode::Char('v')),
         &config,
         &store,
         &tx
@@ -2120,7 +2710,7 @@ fn v_opens_diff_from_any_focus_region() {
     app.focus_sections();
     assert!(!handle_key(
         &mut app,
-        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SHIFT),
+        key(KeyCode::Char('v')),
         &config,
         &store,
         &tx
@@ -2239,6 +2829,8 @@ diff --git a/src/github.rs b/src/github.rs
     let mut app_comment = comment("alice", "inline", None);
     app_comment.id = Some(1);
     app_comment.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/app.rs".to_string(),
         line: Some(1),
@@ -2257,6 +2849,8 @@ diff --git a/src/github.rs b/src/github.rs
     let mut github_comment = comment("carol", "inline", None);
     github_comment.id = Some(3);
     github_comment.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(1),
@@ -3501,6 +4095,7 @@ fn ui_state_restores_view_selection_focus_and_scroll() {
         details_scroll_by_item: HashMap::new(),
         selected_comment_index_by_item: HashMap::new(),
         seen_item_updated_at: HashMap::new(),
+        selected_commits: HashMap::new(),
         selected_diff_file: HashMap::new(),
         selected_diff_line: HashMap::new(),
         diff_file_details_scroll: HashMap::new(),
@@ -3577,12 +4172,16 @@ fn ui_state_restores_diff_mode_for_selected_pull_request() {
         focus: "details".to_string(),
         details_mode: "diff".to_string(),
         details_scroll: 19,
+        selected_commits: HashMap::from([(
+            "1".to_string(),
+            CommitSelection::Single("1111111".to_string()),
+        )]),
         selected_diff_file: HashMap::from([("1".to_string(), 2)]),
         selected_diff_line: HashMap::from([("1".to_string(), 7)]),
         ..UiState::default()
     };
 
-    let app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
+    let mut app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
     let saved = app.ui_state();
 
     assert_eq!(app.details_mode, DetailsMode::Diff);
@@ -3593,6 +4192,12 @@ fn ui_state_restores_diff_mode_for_selected_pull_request() {
     assert_eq!(saved.details_mode, "diff");
     assert_eq!(saved.selected_diff_file.get("1"), Some(&2));
     assert_eq!(saved.selected_diff_line.get("1"), Some(&7));
+    app.handle_msg(AppMsg::DiffLoaded {
+        item_id: "1".to_string(),
+        selection: Some(CommitSelection::Single("1111111".to_string())),
+        diff: Ok(commit_test_diff()),
+    });
+    assert!(matches!(app.current_diff(), Some(DiffState::Loaded(_))));
 }
 
 #[test]
@@ -3610,6 +4215,7 @@ fn ui_state_restores_diff_file_details_scroll_after_diff_load() {
     let mut app = AppState::with_ui_state(SectionKind::PullRequests, vec![test_section()], state);
 
     app.handle_msg(AppMsg::DiffLoaded {
+        selection: None,
         item_id: "1".to_string(),
         diff: Ok(parse_pull_request_diff(
             r#"diff --git a/src/lib.rs b/src/lib.rs
@@ -7798,7 +8404,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
     app.show_diff();
     app.focus_details();
     let diff = footer_line(&app, &paths).to_string();
-    assert!(diff.contains("j/k line  tab files  n/p comment  h/l page"));
+    assert!(diff.contains("j/k line  tab files  V commits  n/p comment  h/l page"));
     assert!(!diff.contains("Details diff"));
     assert!(diff.contains("c inline  a comment"));
     assert!(!diff.contains("m/e range"));
@@ -7810,7 +8416,7 @@ fn footer_switches_shortcuts_for_each_focus_region() {
 
     app.focus_list();
     let diff_list = footer_line(&app, &paths).to_string();
-    assert!(diff_list.contains("j/k/n/p file  tab diff  enter diff"));
+    assert!(diff_list.contains("j/k/n/p file  tab diff  enter diff  V commits"));
     assert!(!diff_list.contains("m text-select"));
 }
 
@@ -10897,11 +11503,7 @@ fn details_meta_shows_pr_action_hints() {
     assert!(rendered.contains("action: Approvable, Mergeable"));
     assert!(rendered.contains("checks: 10 pass, 2 fail, 1 pending"));
     assert!(rendered.contains("commits: 4"));
-    assert_document_link_for_text(
-        &document,
-        "4",
-        "https://github.com/chenyukang/ghr/pull/1/commits",
-    );
+    assert_document_action_for_text(&document, "4", DetailAction::SelectCommit(None));
     assert!(rendered.contains("branch: chenyukang/ghr:feature/checks"));
     assert_document_link_for_text(
         &document,
@@ -11076,10 +11678,10 @@ fn pr_details_render_commit_ci_statuses_in_activity() {
     assert!(rendered.contains("✗ 2222222 failing commit"));
     assert!(rendered.contains("• 3333333 running commit"));
     assert!(rendered.contains("  4444444 commit without checks"));
-    assert_document_link_for_text(
+    assert_document_action_for_text(
         &document,
         "passing commit",
-        "https://github.com/owner/repo/commit/1111111",
+        DetailAction::SelectCommit(Some("1111111111111111111111111111111111111111".into())),
     );
 }
 
@@ -11792,6 +12394,8 @@ fn selected_details_text_uses_segment_copy_metadata() {
     child.id = Some(2);
     child.parent_id = Some(1);
     let review = crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(1),
@@ -12701,6 +13305,8 @@ fn github_mentions_in_comments_are_clickable() {
 fn review_replies_render_under_parent_comment() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let review = crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(10),
@@ -12840,6 +13446,8 @@ fn details_comments_show_inline_review_location() {
         Some("https://github.com/chenyukang/ghr/pull/8#discussion_r88"),
     );
     inline.review = Some(crate::model::ReviewCommentPreview {
+            commit_id: None,
+            original_commit_id: None,
             thread_id: None,
             path: "src/github.rs".to_string(),
             line: Some(876),
@@ -12899,6 +13507,8 @@ fn details_comments_keep_long_inline_review_metadata_on_own_line() {
         Some("https://github.com/rust-lang/rust/pull/156000#discussion_r99"),
     );
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "tests/ui/drop/explicit-drop-call-error.stderr".to_string(),
         line: Some(10),
@@ -12964,6 +13574,8 @@ fn inline_review_context_can_fall_back_to_original_line() {
     }
     diff_hunk.push_str("+outputsData: [ccc.bytesFrom(scriptBinary)],");
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "skill/deployment.md".to_string(),
         line: Some(56),
@@ -18824,6 +19436,8 @@ fn inline_review_comment_edit_uses_review_edit_mode() {
     let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let mut inline = own_comment(88, "chenyukang", "old inline", None);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(876),
@@ -18861,6 +19475,8 @@ fn ctrl_enter_in_inline_review_reply_submits_review_reply() {
     );
     inline.id = Some(88);
     inline.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/github.rs".to_string(),
         line: Some(876),
@@ -19021,67 +19637,93 @@ fn c_in_diff_details_opens_review_comment_dialog_and_a_opens_normal_comment() {
 
 #[test]
 fn ctrl_enter_in_review_dialog_submits_review_comment() {
-    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
-    app.show_diff();
-    app.diffs.insert(
-        "1".to_string(),
-        DiffState::Loaded(
-            parse_pull_request_diff(
-                r#"diff --git a/src/lib.rs b/src/lib.rs
+    for (selection, range) in [
+        (None, false),
+        (Some(CommitSelection::Single("1111111".into())), false),
+        (Some(CommitSelection::Single("1111111".into())), true),
+        (
+            Some(CommitSelection::new("1111111".into(), "2222222".into())),
+            false,
+        ),
+        (
+            Some(CommitSelection::new("1111111".into(), "2222222".into())),
+            true,
+        ),
+    ] {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.select_commit_selection(selection.clone());
+        app.diffs.insert(
+            app.diff_scope_key("1"),
+            DiffState::Loaded(
+                parse_pull_request_diff(
+                    r#"diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -1 +1 @@
 -old
 +new
 "#,
-            )
-            .expect("parse diff"),
-        ),
-    );
-    app.move_diff_line(1, None);
-    app.start_review_comment_dialog();
-    app.comment_dialog
-        .as_mut()
-        .unwrap()
-        .body
-        .set_text("please tighten this");
-    let mut submitted = None;
+                )
+                .expect("parse diff"),
+            ),
+        );
+        app.move_diff_line(1, None);
+        if range {
+            app.begin_diff_mark();
+            app.move_diff_line(-1, None);
+            app.end_diff_mark();
+        }
+        app.start_review_comment_dialog();
+        app.comment_dialog
+            .as_mut()
+            .unwrap()
+            .body
+            .set_text("please tighten this");
+        let mut submitted = None;
 
-    app.handle_comment_dialog_key_with_submit(
-        KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
-        None,
-        |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
-    );
+        app.handle_comment_dialog_key_with_submit(
+            KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::CONTROL),
+            None,
+            |pending| submitted = Some((pending.item.id, pending.body, pending.mode)),
+        );
 
-    assert!(app.comment_dialog.is_none());
-    assert!(app.posting_comment);
-    assert_eq!(app.status, "posting review comment");
-    assert_eq!(
-        app.message_dialog
-            .as_ref()
-            .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
-        Some((
-            "Posting Review Comment",
-            "Waiting for GitHub to accept the review comment..."
-        ))
-    );
-    assert_eq!(
-        submitted,
-        Some((
-            "1".to_string(),
-            "please tighten this".to_string(),
-            PendingCommentMode::Review {
-                target: DiffReviewTarget {
-                    path: "src/lib.rs".to_string(),
-                    line: 1,
-                    side: DiffReviewSide::Right,
-                    start_line: None,
-                    start_side: None,
-                    preview: "new".to_string(),
+        assert!(app.comment_dialog.is_none());
+        assert!(app.posting_comment);
+        assert_eq!(app.status, "posting review comment");
+        assert_eq!(
+            app.message_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title.as_str(), dialog.body.as_str())),
+            Some((
+                "Posting Review Comment",
+                "Waiting for GitHub to accept the review comment..."
+            ))
+        );
+        assert_eq!(
+            submitted,
+            Some((
+                "1".to_string(),
+                "please tighten this".to_string(),
+                PendingCommentMode::Review {
+                    target: DiffReviewTarget {
+                        first_commit_id: selection.as_ref().and_then(|selection| match selection {
+                            CommitSelection::Range { first, .. } => Some(first.clone()),
+                            _ => None,
+                        }),
+                        commit_id: selection
+                            .as_ref()
+                            .map(|selection| selection.last().to_string()),
+                        path: "src/lib.rs".to_string(),
+                        line: 1,
+                        side: DiffReviewSide::Right,
+                        start_line: range.then_some(1),
+                        start_side: range.then_some(DiffReviewSide::Left),
+                        preview: if range { "2 lines selected" } else { "new" }.to_string(),
+                    }
                 }
-            }
-        ))
-    );
+            ))
+        );
+    }
 }
 
 #[test]
@@ -19411,6 +20053,8 @@ fn posted_review_comment_is_rendered_locally_in_diff_mode() {
     posted.id = Some(99);
     posted.is_mine = true;
     posted.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: "src/lib.rs".to_string(),
         line: Some(2),
@@ -22532,6 +23176,37 @@ fn assert_manual_refresh_scope(mut app: AppState, expected_view: &str) {
     assert_eq!(scope, RefreshScope::View(expected_view.to_string()));
 }
 
+fn commit_diff_test_app() -> AppState {
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let commits = ["1111111", "2222222"]
+        .into_iter()
+        .map(|sha| PullRequestCommit {
+            oid: sha.into(),
+            message_headline: format!("Change {sha}"),
+            committed_date: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            author: None,
+        })
+        .collect();
+    app.commits
+        .insert("1".into(), CommitsState::Loaded(commits));
+    app
+}
+
+fn commit_test_diff() -> PullRequestDiff {
+    parse_pull_request_diff(
+        r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,3 @@
+-old
++new
++added
+ context
+"#,
+    )
+    .expect("parse commit diff")
+}
+
 fn test_diff_file(path: &str, additions: usize, deletions: usize) -> DiffFile {
     DiffFile {
         old_path: path.to_string(),
@@ -22547,6 +23222,8 @@ fn test_review_comment(id: u64, path: &str) -> CommentPreview {
     let mut comment = comment("alice", "inline", None);
     comment.id = Some(id);
     comment.review = Some(crate::model::ReviewCommentPreview {
+        commit_id: None,
+        original_commit_id: None,
         thread_id: None,
         path: path.to_string(),
         line: Some(1),

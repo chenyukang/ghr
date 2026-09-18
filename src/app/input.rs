@@ -108,6 +108,7 @@ pub(super) fn mouse_wheel_target(
         || app.project_switcher.is_some()
         || app.top_menu_switcher.is_some()
         || app.theme_switcher.is_some()
+        || app.commit_picker.is_some()
         || app.recent_items_dialog.is_some()
         || app.diagnostics_dialog.is_some()
         || app.saved_search_dialog.is_some()
@@ -283,6 +284,11 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.dismiss_message_dialog(),
             _ => {}
         }
+        return false;
+    }
+
+    if app.commit_picker.is_some() {
+        app.handle_commit_picker_key(key, tx);
         return false;
     }
 
@@ -476,6 +482,12 @@ pub(super) fn handle_key_in_area_mut(
         return false;
     }
     if handle_mouse_or_mark_key(app, key) {
+        return false;
+    }
+    if key.code == KeyCode::Char('V')
+        || (key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        app.open_commit_picker(None, Some(tx));
         return false;
     }
     if is_diff_key(key) {
@@ -1069,6 +1081,9 @@ pub(super) fn handle_mouse_with_sync(
             return true;
         }
         return false;
+    }
+    if app.commit_picker.is_some() {
+        return app.handle_commit_picker_mouse(mouse, area);
     }
     if app.command_palette.is_some()
         || app.project_switcher.is_some()
@@ -2469,7 +2484,7 @@ pub(super) fn table_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize
 
 pub(super) fn diff_file_row_at(app: &AppState, area: Rect, row: u16) -> Option<usize> {
     let item = app.current_item()?;
-    let diff = match app.diffs.get(&item.id)? {
+    let diff = match app.current_diff()? {
         DiffState::Loaded(diff) => diff,
         _ => return None,
     };

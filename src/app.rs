@@ -44,16 +44,17 @@ use crate::config::{
 use crate::dirs::Paths;
 use crate::github::{
     AssigneeAction, CommentFetchResult, GitHubRateLimitSnapshot, ItemDetailsMetadata, MergeMethod,
-    PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
+    PullRequestCommit, PullRequestReviewCommentTarget, PullRequestReviewEvent, RefreshScope,
     add_issue_comment_reaction, add_issue_label, add_issue_reaction,
     add_pull_request_review_comment_reaction, approve_pull_request, change_issue_milestone,
     close_issue, close_pull_request, convert_pull_request_to_draft, create_issue, create_milestone,
     create_pending_pull_request_review, create_pull_request, disable_pull_request_auto_merge,
     discard_pending_pull_request_review, edit_issue_comment, edit_item_metadata,
     edit_pull_request_review_comment, enable_pull_request_auto_merge, fetch_comments,
-    fetch_github_rate_limits, fetch_open_milestones, fetch_pull_request_action_hints,
-    fetch_pull_request_diff, fetch_repository_assignees, fetch_repository_labels,
-    mark_all_notifications_read, mark_notification_thread_done, mark_notification_thread_read,
+    fetch_commit_range_diff, fetch_github_rate_limits, fetch_open_milestones,
+    fetch_pull_request_action_hints, fetch_pull_request_commits, fetch_pull_request_diff,
+    fetch_repository_assignees, fetch_repository_labels, mark_all_notifications_read,
+    mark_notification_thread_done, mark_notification_thread_read,
     mark_pull_request_ready_for_review, merge_pull_request, mute_notification_thread,
     post_issue_comment, post_pull_request_review_comment, post_pull_request_review_reply,
     refresh_dashboard, refresh_dashboard_with_progress, refresh_idle_search_sections,
@@ -79,13 +80,14 @@ use crate::model::{
 };
 use crate::snapshot::{RepoCandidateCache, SnapshotStore};
 use crate::state::{
-    GlobalSearchSavedState, GlobalSearchState, MAX_GLOBAL_SAVED_SEARCHES_PER_REPO,
+    CommitSelection, GlobalSearchSavedState, GlobalSearchState, MAX_GLOBAL_SAVED_SEARCHES_PER_REPO,
     MAX_RECENT_COMMANDS, MAX_RECENT_ITEMS, RecentCommandState, RecentItemState,
     RepoUnseenItemsState, UiState, ViewSnapshot as SavedViewSnapshot,
 };
 use crate::theme::{ThemeFamily, ThemeName, ThemePreference, active_theme, set_active_theme};
 
 mod command_palette;
+mod commits;
 mod details;
 mod dialogs;
 mod diff;
@@ -111,6 +113,7 @@ use command_palette::{
     command_palette_filtered_indices, command_palette_input_line, command_palette_normalized_text,
     command_palette_result_line, command_palette_visible_start, top_menu_palette_command,
 };
+use commits::*;
 use details::*;
 use dialogs::*;
 use diff::{
@@ -191,8 +194,13 @@ enum AppMsg {
         item_id: String,
         actions: std::result::Result<ActionHints, String>,
     },
+    CommitsLoaded {
+        item_id: String,
+        commits: std::result::Result<Vec<PullRequestCommit>, String>,
+    },
     DiffLoaded {
         item_id: String,
+        selection: Option<CommitSelection>,
         diff: std::result::Result<PullRequestDiff, String>,
     },
     CommentPosted {
@@ -1683,6 +1691,9 @@ struct AppState {
     details_refreshed_at: HashMap<String, DateTime<Utc>>,
     optimistic_comment_ids: HashMap<String, HashSet<u64>>,
     diffs: HashMap<String, DiffState>,
+    commits: HashMap<String, CommitsState>,
+    selected_commits: HashMap<String, CommitSelection>,
+    commit_picker: Option<CommitPicker>,
     selected_diff_file: HashMap<String, usize>,
     selected_diff_line: HashMap<String, usize>,
     diff_file_details_scroll: HashMap<String, u16>,
@@ -2354,15 +2365,6 @@ fn pull_request_changes_url(item: &WorkItem) -> String {
             format!("https://github.com/{}/pull/{number}/changes", item.repo)
         }
         _ => format!("{}/changes", item.url.trim_end_matches('/')),
-    }
-}
-
-fn pull_request_commits_url(item: &WorkItem) -> String {
-    match item.number {
-        Some(number) if !item.repo.trim().is_empty() => {
-            format!("https://github.com/{}/pull/{number}/commits", item.repo)
-        }
-        _ => format!("{}/commits", item.url.trim_end_matches('/')),
     }
 }
 
@@ -3240,6 +3242,9 @@ impl AppState {
             details_refreshed_at: HashMap::new(),
             optimistic_comment_ids: HashMap::new(),
             diffs: HashMap::new(),
+            commits: HashMap::new(),
+            selected_commits: ui_state.selected_commits.clone(),
+            commit_picker: None,
             selected_diff_file: ui_state.selected_diff_file.clone(),
             selected_diff_line: ui_state.selected_diff_line.clone(),
             diff_file_details_scroll: ui_state.diff_file_details_scroll.clone(),
@@ -3510,6 +3515,7 @@ impl AppState {
                 .map(|(item_id, state)| (item_id.clone(), state.selected_comment_index))
                 .collect(),
             seen_item_updated_at: self.seen_item_updated_at.clone(),
+            selected_commits: self.selected_commits.clone(),
             selected_diff_file: self.selected_diff_file.clone(),
             selected_diff_line: self.selected_diff_line.clone(),
             diff_file_details_scroll,
@@ -4169,45 +4175,16 @@ impl AppState {
                     }
                 }
             },
-            AppMsg::DiffLoaded { item_id, diff } => match diff {
-                Ok(diff) => {
-                    let restore_current_scroll = self.details_mode == DetailsMode::Diff
-                        && self
-                            .current_item()
-                            .is_some_and(|item| item.id.as_str() == item_id);
-                    let file_count = diff.files.len();
-                    if file_count == 0 {
-                        self.selected_diff_file.insert(item_id.clone(), 0);
-                        self.selected_diff_line.insert(item_id.clone(), 0);
-                    } else {
-                        let selected = self.selected_diff_file.entry(item_id.clone()).or_insert(0);
-                        *selected = (*selected).min(file_count - 1);
-                        let selected_line =
-                            self.selected_diff_line.entry(item_id.clone()).or_insert(0);
-                        let line_count = diff_review_targets(&diff.files[*selected]).len();
-                        if line_count == 0 {
-                            *selected_line = 0;
-                        } else {
-                            *selected_line = (*selected_line).min(line_count - 1);
-                        }
-                    }
-                    self.diffs.insert(item_id.clone(), DiffState::Loaded(diff));
-                    if restore_current_scroll {
-                        self.restore_selected_diff_file_details_scroll(
-                            &item_id,
-                            self.details_scroll,
-                        );
-                    }
-                    self.status = format!("diff loaded: {file_count} file(s)");
-                }
-                Err(error) => {
-                    if self.setup_dialog.is_none() {
-                        self.setup_dialog = setup_dialog_from_error(&error);
-                    }
-                    self.diffs.insert(item_id, DiffState::Error(error));
-                    self.status = "diff load failed".to_string();
-                }
-            },
+            AppMsg::CommitsLoaded { item_id, commits } => {
+                self.finish_commits_load(item_id, commits)
+            }
+            AppMsg::DiffLoaded {
+                item_id,
+                selection,
+                diff,
+            } => {
+                self.finish_diff_load(item_id, selection, diff);
+            }
             AppMsg::CommentPosted { item_id, result } => match result {
                 Ok(comment) => {
                     self.remember_optimistic_comment(&item_id, &comment);
@@ -6956,18 +6933,37 @@ impl AppState {
         if !matches!(item.kind, ItemKind::PullRequest) || item.number.is_none() {
             return false;
         }
-        if self.diffs.contains_key(&item.id) {
+        if self.selected_commits.contains_key(&item.id) {
+            self.ensure_commits_loading(Some(tx));
+        }
+        if self.diffs.contains_key(&self.diff_scope_key(&item.id)) {
             return false;
         }
 
-        self.diffs.insert(item.id.clone(), DiffState::Loading);
-        start_diff_load(item, tx.clone());
+        let selection = self.selected_commits.get(&item.id).cloned();
+        let base = if let Some(selection) = &selection {
+            let Some(base) = self.commit_range_base(&item.id, selection) else {
+                if let Some(CommitsState::Error(error)) = self.commits.get(&item.id) {
+                    self.diffs.insert(
+                        self.diff_scope_key(&item.id),
+                        DiffState::Error(error.clone()),
+                    );
+                }
+                return false;
+            };
+            base
+        } else {
+            None
+        };
+        self.diffs
+            .insert(self.diff_scope_key(&item.id), DiffState::Loading);
+        start_diff_load(item, selection, base, tx.clone());
         true
     }
 
     fn current_diff(&self) -> Option<&DiffState> {
         self.current_item()
-            .and_then(|item| self.diffs.get(&item.id))
+            .and_then(|item| self.diffs.get(&self.diff_scope_key(&item.id)))
     }
 
     fn selected_diff_file_index_for(&self, item_id: &str, diff: &PullRequestDiff) -> usize {
@@ -7008,7 +7004,7 @@ impl AppState {
 
     fn current_diff_review_targets(&self) -> Option<Vec<DiffReviewTarget>> {
         let item = self.current_item()?;
-        let diff = match self.diffs.get(&item.id)? {
+        let diff = match self.diffs.get(&self.diff_scope_key(&item.id))? {
             DiffState::Loaded(diff) => diff,
             _ => return None,
         };
@@ -7016,7 +7012,20 @@ impl AppState {
             return Some(Vec::new());
         }
         let file_index = self.selected_diff_file_index_for(&item.id, diff);
-        Some(diff_review_targets(&diff.files[file_index]))
+        Some(
+            diff_review_targets(&diff.files[file_index])
+                .into_iter()
+                .map(|mut target| {
+                    if let Some(selection) = self.selected_commits.get(&item.id) {
+                        target.commit_id = Some(selection.last().to_string());
+                        if let CommitSelection::Range { first, .. } = selection {
+                            target.first_commit_id = Some(first.clone());
+                        }
+                    }
+                    target
+                })
+                .collect(),
+        )
     }
 
     fn current_diff_review_target_result(&self) -> Result<Option<DiffReviewTarget>, String> {
@@ -7042,11 +7051,12 @@ impl AppState {
     }
 
     fn current_diff_file_count(&self) -> Option<usize> {
-        self.current_item()
-            .and_then(|item| match self.diffs.get(&item.id) {
+        self.current_item().and_then(
+            |item| match self.diffs.get(&self.diff_scope_key(&item.id)) {
                 Some(DiffState::Loaded(diff)) => Some(diff.files.len()),
                 _ => None,
-            })
+            },
+        )
     }
 
     fn current_diff_file_details_scroll_entry(&self) -> Option<(String, u16)> {
@@ -7059,7 +7069,7 @@ impl AppState {
             return None;
         }
         let item = self.current_item()?;
-        let diff = match self.diffs.get(&item.id)? {
+        let diff = match self.diffs.get(&self.diff_scope_key(&item.id))? {
             DiffState::Loaded(diff) => diff,
             _ => return None,
         };
@@ -7068,7 +7078,7 @@ impl AppState {
         }
         let selected_file = self.selected_diff_file_index_for(&item.id, diff);
         Some(diff_file_details_scroll_key(
-            &item.id,
+            &self.diff_scope_key(&item.id),
             &diff.files[selected_file],
         ))
     }
@@ -7080,7 +7090,7 @@ impl AppState {
     }
 
     fn selected_diff_file_details_scroll(&self, item_id: &str) -> Option<u16> {
-        let diff = match self.diffs.get(item_id)? {
+        let diff = match self.diffs.get(&self.diff_scope_key(item_id))? {
             DiffState::Loaded(diff) => diff,
             _ => return None,
         };
@@ -7088,7 +7098,8 @@ impl AppState {
             return None;
         }
         let selected_file = self.selected_diff_file_index_for(item_id, diff);
-        let key = diff_file_details_scroll_key(item_id, &diff.files[selected_file]);
+        let key =
+            diff_file_details_scroll_key(&self.diff_scope_key(item_id), &diff.files[selected_file]);
         self.diff_file_details_scroll.get(&key).copied()
     }
 
@@ -7099,8 +7110,8 @@ impl AppState {
     }
 
     fn current_diff_file_order(&self) -> Option<Vec<usize>> {
-        self.current_item()
-            .and_then(|item| match self.diffs.get(&item.id) {
+        self.current_item().and_then(
+            |item| match self.diffs.get(&self.diff_scope_key(&item.id)) {
                 Some(DiffState::Loaded(diff)) => Some(
                     diff_tree_entries(diff)
                         .into_iter()
@@ -7108,7 +7119,8 @@ impl AppState {
                         .collect(),
                 ),
                 _ => None,
-            })
+            },
+        )
     }
 
     fn start_comments_load_if_needed(&mut self, item: &WorkItem) -> bool {
@@ -8139,8 +8151,11 @@ impl AppState {
         let previous_mode = self.details_mode;
         let previous_focus = self.focus;
         self.save_current_conversation_details_state();
-        let loading = !self.diffs.contains_key(&item_id);
-        let saved_diff_state = self.diff_mode_state.get(&item_id).cloned();
+        let loading = !self.diffs.contains_key(&self.diff_scope_key(&item_id));
+        let saved_diff_state = self
+            .diff_mode_state
+            .get(&self.diff_scope_key(&item_id))
+            .cloned();
         if let Some(saved) = saved_diff_state.as_ref() {
             self.restore_diff_mode_state_for(&item_id, saved);
         } else {
@@ -8225,7 +8240,7 @@ impl AppState {
         };
         self.save_current_diff_file_details_scroll();
         self.diff_mode_state.insert(
-            item_id.clone(),
+            self.diff_scope_key(&item_id),
             DiffModeState {
                 focus: self.focus,
                 details_scroll: self.details_scroll,
@@ -8236,7 +8251,7 @@ impl AppState {
     }
 
     fn restore_diff_mode_state_for(&mut self, item_id: &str, saved: &DiffModeState) {
-        let (selected_file, selected_line) = match self.diffs.get(item_id) {
+        let (selected_file, selected_line) = match self.diffs.get(&self.diff_scope_key(item_id)) {
             Some(DiffState::Loaded(diff)) if !diff.files.is_empty() => {
                 let selected_file = saved.selected_file.min(diff.files.len() - 1);
                 let line_count = diff_review_targets(&diff.files[selected_file]).len();
@@ -8851,6 +8866,7 @@ impl AppState {
             }
             DetailAction::CopyBlock(text) => self.copy_block_to_clipboard(&text),
             DetailAction::OpenUrl(url) => self.open_url(&url),
+            DetailAction::SelectCommit(sha) => self.open_commit_picker(sha, tx),
             DetailAction::SubscribeItem => {
                 if let Some(tx) = tx {
                     self.start_item_subscription_action(ItemSubscriptionAction::Subscribe, tx);
@@ -12649,6 +12665,20 @@ impl AppState {
 
         let item = self.current_item()?;
         if self.details_mode == DetailsMode::Diff && item.kind == ItemKind::PullRequest {
+            if let Some(selection) = self.selected_commits.get(&item.id) {
+                let path = match selection {
+                    CommitSelection::Single(sha) => format!("commits/{sha}"),
+                    CommitSelection::Range { last, .. } => {
+                        match self.commit_range_base(&item.id, selection)? {
+                            Some(base) => format!("files/{base}..{last}"),
+                            // /changes/{sha} opens a single commit; /files/{sha}
+                            // preserves the web UI's prefix-of-PR comparison.
+                            None => format!("files/{last}"),
+                        }
+                    }
+                };
+                return Some(format!("{}/{path}", item.url.trim_end_matches('/')));
+            }
             return Some(pull_request_changes_url(item));
         }
         Some(item.url.clone())
@@ -12785,6 +12815,13 @@ impl AppState {
         if self.details.contains_key(&item.id) {
             self.details_stale.insert(item.id.clone());
         }
+        if !matches!(self.commits.get(&item.id), Some(CommitsState::Loading)) {
+            self.commits.remove(&item.id);
+        }
+        let diff_key = self.diff_scope_key(&item.id);
+        if !matches!(self.diffs.get(&diff_key), Some(DiffState::Loading)) {
+            self.diffs.remove(&diff_key);
+        }
         self.mark_action_hints_stale(item.id);
     }
 
@@ -12860,6 +12897,7 @@ impl AppState {
             || self.project_switcher.is_some()
             || self.top_menu_switcher.is_some()
             || self.theme_switcher.is_some()
+            || self.commit_picker.is_some()
             || self.recent_items_dialog.is_some()
             || self.diagnostics_dialog.is_some()
             || self.project_add_dialog.is_some()

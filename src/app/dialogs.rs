@@ -3960,7 +3960,15 @@ pub(super) fn draw_comment_dialog(
         }
         CommentDialogMode::Edit { .. } => "Edit Comment".to_string(),
         CommentDialogMode::Review { target } => {
-            format!("Review {}", target.location_label())
+            format!(
+                "Review {}{}",
+                target.location_label(),
+                target
+                    .commit_id
+                    .as_ref()
+                    .map(|sha| format!(" @ {}", &sha[..sha.len().min(7)]))
+                    .unwrap_or_default()
+            )
         }
     };
     draw_comment_editor(frame, app, &title, dialog, area);
@@ -4629,6 +4637,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
         help_key_line("S", "search PRs/issues or inbox notifications"),
         help_key_line("f", "filter with state:closed label:bug, unread, or done"),
         help_key_line("v", "show pull request diff"),
+        help_key_line("V", "select a commit or the entire PR diff"),
         help_key_line("e / T", "edit selected issue or PR fields"),
         help_key_line("M", "open PR merge confirmation"),
         help_key_line("C", "open close or reopen confirmation"),
@@ -4689,6 +4698,7 @@ pub(super) fn help_dialog_content(command_palette_key: &str) -> Vec<Line<'static
             "top clears comment focus / bottom focuses last comment",
         ),
         help_key_line("v", "show PR diff"),
+        help_key_line("V", "select a commit or the entire PR diff"),
         help_key_line("[ / ]", "jump previous / next diff file"),
         help_key_line("m in diff", "begin a review range"),
         help_key_line("e in diff", "end the review range"),

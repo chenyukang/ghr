@@ -141,6 +141,7 @@ Press `?` in the TUI for the live shortcut reference. The top-right status shows
 | `i` | Ignore the selected PR or issue and hide it from future lists |
 | `x` / `Delete` in Inbox | Mark the selected GitHub inbox notification done |
 | `v` | Open PR diff mode |
+| `V` | Select a contiguous commit range or all PR changes |
 | `q` in diff mode | Return to the state before opening diff |
 | `o` | Open the selected item in the browser; in diff mode, open the PR `changes` page; in Details, open the focused check URL when one is selected |
 | `a` | Add a normal issue or PR comment |
@@ -216,6 +217,16 @@ top-menu item is also generated as a direct command, including projects added at
 | `Info` | Show terminal, version, config/db/log paths, cache counts, runtime state, and ghr system diagnostics in a scrollable popup |
 | `Log` | Show recent direct API and `gh api` requests with timestamps, status, response sizes, errors, and rate-limit events; use `j`/`k` to select and `Enter` to open details |
 | `Rate Limit` | Query and show current GitHub core, search, and GraphQL quotas together with local queue and cooldown state |
+
+Commit diffs:
+
+- Press `V`, click the commits count, or click a commit in the conversation to open its diff.
+- The picker lists commits oldest first with SHA, title, author, and date. Use `Space` or click to toggle checkboxes, then `Enter` (or click **Enter apply**) to apply; `Esc` cancels and `r` reloads.
+- Selecting outside the checked range fills the gap. Unchecking the first commit keeps the remaining range; unchecking a middle or last commit keeps only the earlier part. Unchecking the only selected commit clears the selection. Checking every commit applies **All commits**. To return directly to the full PR diff, focus **All commits** above the divider and press `Enter`, or click it; no `Space` is needed.
+- The Details title shows `All commits`, a single SHA with title and `(N/M)`, or a SHA range with `(N–K/M)`. Each selection remembers its file and scroll position.
+- Commit selections use the PR's comparison base, including upstream changes merged into the branch. Across merges, ghr builds the same virtual base as the web review: merge the upstream snapshot into the selection's starting snapshot, keeping the starting side on conflicts, then compare against the last selected commit.
+- These comparisons require **Git 2.46 or newer**. Git snapshots are fetched into `~/.ghr/git-diffs/` and reused; credentials follow the selected GitHub backend. Comparison failures remain visible and can be retried with `r`.
+- Inline comments (`c`, including selected line ranges) target the last selected commit; drafts are kept separate for each commit selection. `a` posts a general PR comment. Comments on older commits may become outdated as the PR changes.
 
 Diff review ranges:
 

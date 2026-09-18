@@ -294,7 +294,7 @@ fn client() -> Result<&'static Octocrab> {
         .map_err(|message| anyhow!(message.clone()))
 }
 
-fn token_from_env() -> Option<String> {
+pub(crate) fn token_from_env() -> Option<String> {
     TOKEN_ENV_VARS
         .into_iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))

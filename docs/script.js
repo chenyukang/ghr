@@ -23,6 +23,7 @@ const shortcuts = [
   ["List", "Shift+[ / Shift+]", "Switch to the left or right Section, then return to List after 200 ms"],
   ["List", "Enter", "Focus the Details pane"],
   ["List", "v", "Open pull request diff mode"],
+  ["List / Diff", "V", "Select a commit or the entire PR diff"],
   ["List", "e / T", "Edit selected issue or pull request fields"],
   ["Issue/PR", "a", "Add a normal issue or PR comment"],
   ["Issue/PR", "L", "Add a label"],

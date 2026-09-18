@@ -396,17 +396,47 @@ pub(super) fn start_action_hints_load(item: WorkItem, tx: UnboundedSender<AppMsg
     });
 }
 
-pub(super) fn start_diff_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+pub(super) fn start_commits_load(item: WorkItem, tx: UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        let commits = match item.number {
+            Some(number) => fetch_pull_request_commits(&item.repo, number)
+                .await
+                .map_err(error_chain_message),
+            None => Err("selected item has no pull request number".to_string()),
+        };
+        let _ = tx.send(AppMsg::CommitsLoaded {
+            item_id: item.id,
+            commits,
+        });
+    });
+}
+
+pub(super) fn start_diff_load(
+    item: WorkItem,
+    selection: Option<CommitSelection>,
+    base: Option<String>,
+    tx: UnboundedSender<AppMsg>,
+) {
     tokio::spawn(async move {
         let item_id = item.id.clone();
         let diff = match item.number {
-            Some(number) => match fetch_pull_request_diff(&item.repo, number).await {
+            Some(number) => match match &selection {
+                Some(selection) => {
+                    fetch_commit_range_diff(&item.repo, number, base.as_deref(), selection.last())
+                        .await
+                }
+                None => fetch_pull_request_diff(&item.repo, number).await,
+            } {
                 Ok(diff) => parse_pull_request_diff(&diff),
                 Err(error) => Err(error_chain_message(error)),
             },
             None => Err("selected item has no pull request number".to_string()),
         };
-        let _ = tx.send(AppMsg::DiffLoaded { item_id, diff });
+        let _ = tx.send(AppMsg::DiffLoaded {
+            item_id,
+            selection,
+            diff,
+        });
     });
 }
 
@@ -630,6 +660,7 @@ pub(super) fn start_review_comment_submit(
                 &item.repo,
                 number,
                 PullRequestReviewCommentTarget {
+                    commit_id: target.commit_id.as_deref(),
                     path: &target.path,
                     line: target.line,
                     side: target.side.as_api_value(),

@@ -51,11 +51,19 @@ pub(super) fn review_comment_draft_key(item: &WorkItem, target: &DiffReviewTarge
         })
         .unwrap_or_default();
     format!(
-        "comment:{}:review:{}:{}:{}{start}",
+        "comment:{}:review:{}:{}:{}{start}{}",
         editor_draft_item_key(item),
         target.path,
         target.side.as_api_value(),
-        target.line
+        target.line,
+        target
+            .commit_id
+            .as_ref()
+            .map(|sha| match &target.first_commit_id {
+                Some(first) => format!(":commit:{first}..{sha}"),
+                None => format!(":commit:{sha}"),
+            })
+            .unwrap_or_default()
     )
 }
 

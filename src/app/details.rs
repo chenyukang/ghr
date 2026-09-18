@@ -227,6 +227,8 @@ impl DiffReviewSide {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiffReviewTarget {
+    pub(super) first_commit_id: Option<String>,
+    pub(super) commit_id: Option<String>,
     pub(super) path: String,
     pub(super) line: usize,
     pub(super) side: DiffReviewSide,
@@ -345,6 +347,7 @@ pub(super) enum DetailAction {
     ReactComment(usize),
     CopyBlock(String),
     OpenUrl(String),
+    SelectCommit(Option<String>),
     SubscribeItem,
     UnsubscribeItem,
     AddLabel,
@@ -1393,7 +1396,7 @@ pub(super) fn build_conversation_document(app: &AppState, width: u16) -> Details
     if matches!(item.kind, ItemKind::PullRequest) {
         secondary_meta.push((
             "commits",
-            commit_count_segments(app.action_hints.get(&item.id), item),
+            commit_count_segments(app.action_hints.get(&item.id)),
         ));
     }
     if matches!(item.kind, ItemKind::Issue | ItemKind::PullRequest) {
@@ -1699,7 +1702,7 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
     ]);
     builder.push_blank();
 
-    match app.diffs.get(&item.id) {
+    match app.current_diff() {
         Some(DiffState::Loaded(diff)) => {
             let selected_file = app.selected_diff_file_index_for(&item.id, diff);
             let selected_line = diff
@@ -1707,16 +1710,13 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
                 .get(selected_file)
                 .map(|file| app.selected_diff_line_index_for(&item.id, file))
                 .unwrap_or(0);
-            let inline_comments = match app.details.get(&item.id) {
-                Some(DetailState::Loaded(comments)) => Some(comments.as_slice()),
-                _ => None,
-            };
+            let inline_comments = app.diff_comments_for_item(&item.id);
             push_diff(
                 &mut builder,
                 diff,
                 DiffRenderContext {
                     item_id: &item.id,
-                    comments: inline_comments,
+                    comments: inline_comments.as_deref(),
                     expanded_comments: &app.expanded_comments,
                     diff_inline_comments_visible: app.diff_inline_comments_visible,
                     revealed_diff_inline_comments: app.revealed_diff_inline_comments.get(&item.id),
@@ -1725,7 +1725,14 @@ pub(super) fn build_diff_document(app: &AppState, width: u16) -> DetailsDocument
                     selected_file,
                     selected_line,
                     selected_range: app.diff_mark_range_for(&item.id),
-                    file_link_base: diff_file_link_base(item, app.action_hints.get(&item.id)),
+                    file_link_base: app
+                        .selected_commits
+                        .get(&item.id)
+                        .map(|selection| DiffFileLinkBase {
+                            repository: item.repo.clone(),
+                            branch: selection.last().to_string(),
+                        })
+                        .or_else(|| diff_file_link_base(item, app.action_hints.get(&item.id))),
                     show_thread_markers: app.mouse_capture_enabled,
                 },
             );
@@ -2631,10 +2638,11 @@ pub(super) fn diff_review_target_from_range(
     let end = end.min(targets.len() - 1);
     let first = &targets[start];
     let last = &targets[end];
-    if targets[start..=end]
-        .iter()
-        .any(|target| target.path != first.path)
-    {
+    if targets[start..=end].iter().any(|target| {
+        target.path != first.path
+            || target.commit_id != first.commit_id
+            || target.first_commit_id != first.first_commit_id
+    }) {
         return Err("range must stay in one file".to_string());
     }
     let mut target = last.clone();
@@ -2654,6 +2662,8 @@ pub(super) fn diff_review_target(file: &DiffFile, line: &DiffLine) -> Option<Dif
     };
 
     Some(DiffReviewTarget {
+        first_commit_id: None,
+        commit_id: None,
         path: diff_review_path(file, side),
         line: line_number,
         side,
@@ -3293,15 +3303,15 @@ fn push_timeline_commit_row(
 ) {
     let mut segments = vec![commit_status_segment(commit_status_for(app, &commit.sha))];
     let short_sha = short_commit_sha(&commit.sha).to_string();
-    if let Some(url) = commit.url.as_ref().filter(|url| !url.trim().is_empty()) {
-        segments.push(DetailSegment::link(short_sha, url.clone()));
-        segments.push(DetailSegment::raw(" "));
-        segments.push(DetailSegment::link(commit.title.clone(), url.clone()));
-    } else {
-        segments.push(DetailSegment::styled(short_sha, active_theme().muted()));
-        segments.push(DetailSegment::raw(" "));
-        segments.push(DetailSegment::raw(commit.title.clone()));
-    }
+    segments.push(DetailSegment::action(
+        short_sha,
+        DetailAction::SelectCommit(Some(commit.sha.clone())),
+    ));
+    segments.push(DetailSegment::raw(" "));
+    segments.push(DetailSegment::action(
+        commit.title.clone(),
+        DetailAction::SelectCommit(Some(commit.sha.clone())),
+    ));
     builder.push_prefixed_wrapped_limited(segments, prefix.to_vec(), DESCRIPTION_BODY_PADDING, 3);
 }
 
@@ -4288,17 +4298,14 @@ pub(super) fn check_hint_segments(state: Option<&ActionHintState>) -> Vec<Detail
     }
 }
 
-pub(super) fn commit_count_segments(
-    state: Option<&ActionHintState>,
-    item: &WorkItem,
-) -> Vec<DetailSegment> {
+pub(super) fn commit_count_segments(state: Option<&ActionHintState>) -> Vec<DetailSegment> {
     match state {
         Some(ActionHintState::Loaded(hints)) => hints
             .commits
             .map(|commits| {
-                vec![DetailSegment::link(
+                vec![DetailSegment::action(
                     commits.to_string(),
-                    pull_request_commits_url(item),
+                    DetailAction::SelectCommit(None),
                 )]
             })
             .unwrap_or_else(|| vec![DetailSegment::raw("-")]),

@@ -1069,10 +1069,12 @@ impl AppState {
 
     pub(super) fn clear_loaded_details_local(&mut self) -> usize {
         self.save_current_conversation_details_state();
-        let count = self.details.len() + self.diffs.len() + self.action_hints.len();
+        let count =
+            self.details.len() + self.diffs.len() + self.action_hints.len() + self.commits.len();
         self.details.clear();
         self.details_refreshed_at.clear();
         self.diffs.clear();
+        self.commits.clear();
         self.action_hints.clear();
         self.action_hints_stale.clear();
         self.action_hints_refreshing.clear();

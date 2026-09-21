@@ -114,9 +114,9 @@ impl AppState {
         let Some(picker) = self.commit_picker.as_ref() else {
             return;
         };
-        if !self
+        if self
             .current_item()
-            .is_some_and(|item| item.id == picker.item_id)
+            .is_none_or(|item| item.id != picker.item_id)
         {
             self.commit_picker = None;
             return;
@@ -382,9 +382,9 @@ impl AppState {
         let Some(picker) = self.commit_picker.as_ref() else {
             return;
         };
-        if !self
+        if self
             .current_item()
-            .is_some_and(|item| item.id == picker.item_id)
+            .is_none_or(|item| item.id != picker.item_id)
         {
             self.commit_picker = None;
             return;

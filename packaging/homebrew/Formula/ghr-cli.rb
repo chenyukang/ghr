@@ -7,25 +7,25 @@ class GhrCli < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.9.0/ghr-v0.9.0-aarch64-apple-darwin.tar.gz"
-      sha256 "1ce48f118b9ef1450f2791756bddd6036f0c5e023b7d33ad1c6357939be2b5fa"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.9.1/ghr-v0.9.1-aarch64-apple-darwin.tar.gz"
+      sha256 "58cc276bb384024027f55c67e9190af0491ce6214537043cbc098ec973cfab91"
     end
 
     on_intel do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.9.0/ghr-v0.9.0-x86_64-apple-darwin.tar.gz"
-      sha256 "e0e62e8e24ad370cfa7b9c4e2fe2bca7a2c3c9eab1ac8fb65ee64dcd0a619bcd"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.9.1/ghr-v0.9.1-x86_64-apple-darwin.tar.gz"
+      sha256 "3523ae6a86e834cdd405c3bb6976dcc41f8121aca12fb2b428961ab8c24a1933"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.9.0/ghr-v0.9.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "83a876429df10d09bd45caa307a0141caca04be8d7228031f7df42ef21be1845"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.9.1/ghr-v0.9.1-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "c358e644483ac60b94f69b78d1fe48c507db856e20567428606eea5968dd84dc"
     end
 
     on_intel do
-      url "https://github.com/chenyukang/ghr/releases/download/v0.9.0/ghr-v0.9.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "bda958d412d98ee6ee396956c4b6299145c88f664e64c0a2eeff2a0897b69bc2"
+      url "https://github.com/chenyukang/ghr/releases/download/v0.9.1/ghr-v0.9.1-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "ce7bb0b82d94cdc25e1abbbdff541b60acc2371db19a935e05a093d19b7fc516"
     end
   end
 

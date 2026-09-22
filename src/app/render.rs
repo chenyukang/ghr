@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn draw(frame: &mut Frame<'_>, app: &AppState, paths: &Paths) {
+pub(super) fn draw(frame: &mut Frame<'_>, app: &mut AppState, paths: &Paths) {
     set_active_theme(app.theme_name);
     let area = frame.area();
     frame.buffer_mut().set_style(area, active_theme().base());
@@ -853,7 +853,7 @@ fn active_details_input_prompt(app: &AppState) -> Option<(String, Color)> {
     None
 }
 
-fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+fn draw_details(frame: &mut Frame<'_>, app: &mut AppState, area: Rect) {
     let text_selection_mode = !app.mouse_capture_enabled;
     let details_focused = app.focus == FocusTarget::Details;
     let details_prompt = active_details_input_prompt(app);
@@ -908,12 +908,10 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .add_modifier(Modifier::BOLD);
     }
 
-    let document_width = if text_selection_mode {
-        area.width
-    } else {
-        area.width.saturating_sub(2)
-    };
-    let mut document = build_details_document(app, document_width);
+    let inner = details_content_area(app, area);
+    let mut document = build_details_document(app, inner.width);
+    // Content and viewport sizes can change without a scroll input.
+    app.clamp_details_scroll(document.max_scroll(inner.height));
     apply_details_text_selection(app, &mut document);
 
     frame.render_widget(Clear, area);
@@ -931,7 +929,6 @@ fn draw_details(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .border_type(border_type)
         .border_style(border_style)
         .title(Span::styled(title, title_style));
-    let inner = block_inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
         DetailsLines::new(&document.lines, app.details_scroll, active_theme().panel()),

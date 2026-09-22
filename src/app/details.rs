@@ -28,6 +28,13 @@ pub(super) struct DetailsDocument {
 }
 
 impl DetailsDocument {
+    pub(super) fn max_scroll(&self, height: u16) -> u16 {
+        self.lines
+            .len()
+            .saturating_sub(usize::from(height))
+            .min(usize::from(u16::MAX)) as u16
+    }
+
     pub(super) fn link_at(&self, line: usize, column: u16) -> Option<String> {
         self.links
             .iter()

@@ -130,7 +130,7 @@ use keymap::{
 };
 use layout::{
     block_inner, body_areas_with_ratio, centered_rect, centered_rect_width,
-    centered_rect_with_size, details_area_for, page_areas, rect_contains,
+    centered_rect_with_size, details_area_for, details_content_area, page_areas, rect_contains,
     split_percent_from_column, splitter_contains,
 };
 use participants::*;
@@ -3679,9 +3679,7 @@ impl AppState {
             100 - self.list_width_percent
         );
         let details_area = body_areas_with_ratio(body, self.list_width_percent)[1];
-        self.details_scroll = self
-            .details_scroll
-            .min(max_details_scroll(self, details_area));
+        self.clamp_details_scroll(max_details_scroll(self, details_area));
     }
 
     fn finish_split_drag(&mut self) -> bool {
@@ -7793,12 +7791,12 @@ impl AppState {
                 self.move_diff_file_from_page_boundary(direction, None);
                 return;
             }
-            self.move_diff_line(diff_line_page_delta(self, None, direction), None);
+            self.move_diff_line(details_page_delta(self, None, direction), None);
             return;
         };
 
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         let page_height = usize::from(inner.height.max(1));
         let max_scroll = usize::from(max_details_scroll(self, details_area));
         let current_scroll = usize::from(self.details_scroll).min(max_scroll);
@@ -7932,7 +7930,7 @@ impl AppState {
 
     fn select_first_visible_diff_line(&mut self, area: Rect) -> bool {
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         let start = usize::from(self.details_scroll);
         let end = start.saturating_add(usize::from(inner.height.max(1)));
         let next = {
@@ -7975,7 +7973,7 @@ impl AppState {
             return;
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         let document = build_details_document(self, inner.width);
         let Some(selected_line) = document.selected_diff_line else {
             return;
@@ -8287,11 +8285,28 @@ impl AppState {
         );
     }
 
-    fn scroll_details(&mut self, delta: i16) {
+    fn clamp_details_scroll(&mut self, max_scroll: u16) {
+        if self.details_scroll > max_scroll {
+            self.details_scroll = max_scroll;
+            self.remember_current_conversation_details_position();
+        }
+    }
+
+    fn scroll_details(&mut self, delta: isize, area: Option<Rect>) {
+        let max_scroll = area
+            .map(|area| max_details_scroll(self, details_area_for(self, area)))
+            .unwrap_or(u16::MAX);
+        self.scroll_details_bounded(delta, max_scroll);
+    }
+
+    fn scroll_details_bounded(&mut self, delta: isize, max_scroll: u16) {
+        let current = usize::from(self.details_scroll.min(max_scroll));
         if delta < 0 {
-            self.details_scroll = self.details_scroll.saturating_sub(delta.unsigned_abs());
+            self.details_scroll = current.saturating_sub(delta.unsigned_abs()) as u16;
         } else {
-            self.details_scroll = self.details_scroll.saturating_add(delta as u16);
+            self.details_scroll = current
+                .saturating_add(delta as usize)
+                .min(usize::from(max_scroll)) as u16;
         }
         self.remember_current_conversation_details_position();
     }
@@ -8385,7 +8400,7 @@ impl AppState {
             return;
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         if inner.height == 0 {
             self.remember_current_conversation_details_position();
             return;
@@ -8522,7 +8537,7 @@ impl AppState {
         }
         let comment_order = if let Some(area) = area {
             let details_area = details_area_for(self, area);
-            let inner = block_inner(details_area);
+            let inner = details_content_area(self, details_area);
             if inner.height == 0 {
                 Vec::new()
             } else {
@@ -8600,7 +8615,7 @@ impl AppState {
             return true;
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         if inner.height == 0 {
             return true;
         }
@@ -8655,7 +8670,7 @@ impl AppState {
             return false;
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         if inner.height == 0 {
             return false;
         }
@@ -8755,21 +8770,14 @@ impl AppState {
     fn scroll_details_past_comment_edge(&mut self, delta: isize, area: Option<Rect>) {
         let amount = area
             .map(|area| {
-                usize::from(block_inner(details_area_for(self, area)).height)
+                usize::from(details_content_area(self, details_area_for(self, area)).height)
                     .saturating_div(2)
                     .max(3)
             })
             .unwrap_or(6)
             .min(i16::MAX as usize) as i16;
         let signed = if delta < 0 { -amount } else { amount };
-        self.scroll_details(signed);
-        if let Some(area) = area {
-            let details_area = details_area_for(self, area);
-            self.details_scroll = self
-                .details_scroll
-                .min(max_details_scroll(self, details_area));
-        }
-        self.remember_current_conversation_details_position();
+        self.scroll_details(isize::from(signed), area);
     }
 
     fn scroll_selected_comment_into_view(&mut self, area: Option<Rect>) {
@@ -8778,7 +8786,7 @@ impl AppState {
             return;
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         if inner.height == 0 {
             self.remember_current_conversation_details_position();
             return;
@@ -8822,7 +8830,7 @@ impl AppState {
             return self.current_selected_comment().is_some();
         };
         let details_area = details_area_for(self, area);
-        let inner = block_inner(details_area);
+        let inner = details_content_area(self, details_area);
         if inner.height == 0 {
             return false;
         }

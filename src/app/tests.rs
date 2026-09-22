@@ -2015,7 +2015,7 @@ fn commit_picker_keyboard_selects_commit_and_returns_to_conversation() {
         let backend = ratatui::backend::TestBackend::new(180, 32);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| draw(frame, &app, &test_paths()))
+            .draw(|frame| draw(frame, &mut app, &test_paths()))
             .expect("draw commit diff");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("Details | 2222222 (2/2) Change 2222222"));
@@ -2036,7 +2036,7 @@ fn commit_picker_keyboard_selects_commit_and_returns_to_conversation() {
         assert!(!app.selected_commits.contains_key("1"));
         assert_eq!(app.details_mode, DetailsMode::Diff);
         terminal
-            .draw(|frame| draw(frame, &app, &test_paths()))
+            .draw(|frame| draw(frame, &mut app, &test_paths()))
             .expect("draw entire PR diff");
         let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
         assert!(rendered.contains("Details | All commits"));
@@ -2083,7 +2083,7 @@ fn commit_picker_fills_gaps_truncates_and_cancels() {
     );
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 25)).unwrap();
     terminal
-        .draw(|frame| draw(frame, &app, &test_paths()))
+        .draw(|frame| draw(frame, &mut app, &test_paths()))
         .unwrap();
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     assert!(rendered.contains("[ ] 1111111"));
@@ -2142,7 +2142,7 @@ fn commit_picker_fills_gaps_truncates_and_cancels() {
         Some("https://github.com/rust-lang/rust/pull/1/files/2222222")
     );
     terminal
-        .draw(|frame| draw(frame, &app, &test_paths()))
+        .draw(|frame| draw(frame, &mut app, &test_paths()))
         .unwrap();
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     assert!(rendered.contains("Details | 1111111..2222222 (1–2/5)"));
@@ -2198,7 +2198,7 @@ fn commit_picker_fills_gaps_truncates_and_cancels() {
         ],
     );
     terminal
-        .draw(|frame| draw(frame, &app, &test_paths()))
+        .draw(|frame| draw(frame, &mut app, &test_paths()))
         .unwrap();
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     assert!(rendered.contains("✓ All commits"));
@@ -2241,7 +2241,7 @@ fn commit_picker_mouse_selects_the_visible_row_after_scrolling() {
     let backend = ratatui::backend::TestBackend::new(100, 12);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     terminal
-        .draw(|frame| draw(frame, &app, &test_paths()))
+        .draw(|frame| draw(frame, &mut app, &test_paths()))
         .expect("draw");
     let lines = buffer_lines(terminal.backend().buffer());
     let row = lines
@@ -6656,7 +6656,7 @@ fn issue_details_position_updates_memory_while_focused() {
     );
 
     app.focus_details();
-    app.scroll_details(8);
+    app.scroll_details(8, None);
     app.select_comment(1);
 
     let key = work_item_details_memory_key(&issue).expect("issue memory key");
@@ -7690,7 +7690,7 @@ fn text_selection_mode_renders_details_without_side_by_side_list() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -7712,7 +7712,7 @@ fn light_theme_renders_background_and_active_tabs_from_palette() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let theme = crate::theme::Theme::from_name(ThemeName::Light);
@@ -7770,7 +7770,7 @@ fn dark_theme_renders_explicit_background() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let theme = crate::theme::Theme::from_name(ThemeName::Dark);
@@ -7802,7 +7802,7 @@ fn light_theme_global_search_modal_uses_contrast_styles() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let theme = crate::theme::Theme::from_name(ThemeName::Light);
@@ -7856,8 +7856,9 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
     let item_id = app.current_item().expect("item").id.clone();
     let mut comment = comment("chenyukang", "short body", None);
     comment.reactions.heart = 1;
-    app.details
-        .insert(item_id, DetailState::Loaded(vec![comment]));
+    let mut comments = vec![comment];
+    comments.extend((0..10).map(|_| self::comment("alice", "following comment", None)));
+    app.details.insert(item_id, DetailState::Loaded(comments));
     app.focus_details();
     app.selected_comment_index = 0;
     let area = Rect::new(0, 0, 120, 32);
@@ -7878,13 +7879,15 @@ fn details_render_clears_stale_cells_when_scrolling_short_lines() {
 
     app.details_scroll = header_line.min(usize::from(u16::MAX)) as u16;
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw header");
+    assert_eq!(usize::from(app.details_scroll), header_line);
 
     app.details_scroll = header_line.saturating_add(1).min(usize::from(u16::MAX)) as u16;
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw following short line");
+    assert_eq!(usize::from(app.details_scroll), header_line + 1);
 
     let top_details_line = &buffer_lines(terminal.backend().buffer())[inner.y as usize];
     assert!(
@@ -7904,7 +7907,7 @@ fn list_table_renders_updated_next_to_meta() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let lines = buffer_lines(terminal.backend().buffer());
@@ -7976,7 +7979,7 @@ fn repo_list_table_hides_redundant_repo_column() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let lines = buffer_lines(terminal.backend().buffer());
@@ -8020,13 +8023,13 @@ fn repo_list_table_hides_redundant_repo_column() {
 
 #[test]
 fn list_rows_start_immediately_after_header() {
-    let app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
     let backend = ratatui::backend::TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let lines = buffer_lines(terminal.backend().buffer());
@@ -8071,7 +8074,7 @@ fn notification_list_table_hides_meta_and_moves_updated_right() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let lines = buffer_lines(terminal.backend().buffer());
@@ -8140,7 +8143,7 @@ fn first_load_repo_section_renders_loading_hint_in_list() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -8165,7 +8168,7 @@ fn empty_loaded_repo_section_renders_empty_hint_not_loading() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -8321,7 +8324,7 @@ fn section_page_loading_dialog_renders_page_context() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -8705,7 +8708,7 @@ fn list_title_shows_filter_input_prompt() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -8726,7 +8729,7 @@ fn list_title_shows_repo_search_input_prompt() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -8868,7 +8871,7 @@ fn list_title_and_footer_show_active_quick_filter() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -9043,7 +9046,7 @@ fn details_title_shows_comment_search_input_prompt() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -9071,7 +9074,7 @@ fn details_title_keeps_comment_search_prompt_after_enter() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -9398,13 +9401,13 @@ fn ghr_title_is_bold_when_unread_notifications_exist() {
 fn list_title_shows_visible_loaded_and_total_count() {
     let mut section = many_items_section(50);
     section.total_count = Some(120);
-    let app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     let backend = ratatui::backend::TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -9417,13 +9420,13 @@ fn list_title_offsets_visible_range_for_result_page() {
     section.total_count = Some(120);
     section.page = 2;
     section.page_size = 50;
-    let app = AppState::new(SectionKind::PullRequests, vec![section]);
+    let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
     let backend = ratatui::backend::TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -15052,7 +15055,7 @@ fn issue_dialog_renders_field_colons_and_separators() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -16279,7 +16282,7 @@ fn auto_merge_action_dialog_prompt_is_clear() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -16633,7 +16636,7 @@ fn capital_d_key_opens_convert_to_draft_confirmation_for_ready_pr() {
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
@@ -16668,7 +16671,7 @@ fn capital_d_key_opens_ready_confirmation_for_draft_pr_details() {
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
 
@@ -17218,7 +17221,9 @@ fn item_edit_form_prefills_editable_fields_without_repo_or_number() {
     let backend = ratatui::backend::TestBackend::new(100, 32);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
-    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut app, &paths))
+        .unwrap();
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     let title_index = rendered.find("Title:").expect("title field");
     let assign_index = rendered.find("Assign:").expect("assign field");
@@ -17251,7 +17256,9 @@ fn item_edit_cursor_positions_match_rendered_field_rows() {
     let backend = ratatui::backend::TestBackend::new(area.width, area.height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let paths = test_paths();
-    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut app, &paths))
+        .unwrap();
     let lines = buffer_lines(terminal.backend().buffer());
     let labels_y = lines
         .iter()
@@ -17274,7 +17281,9 @@ fn item_edit_cursor_positions_match_rendered_field_rows() {
 
     let backend = ratatui::backend::TestBackend::new(area.width, area.height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal.draw(|frame| draw(frame, &app, &paths)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &mut app, &paths))
+        .unwrap();
     let lines = buffer_lines(terminal.backend().buffer());
     let body_first_y = lines
         .iter()
@@ -17420,7 +17429,7 @@ fn item_edit_candidate_lists_only_show_for_focused_collection_field() {
     let area = Rect::new(0, 0, 120, 34);
     let paths = test_paths();
 
-    let render = |app: &AppState| {
+    let render = |app: &mut AppState| {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal.draw(|frame| draw(frame, app, &paths)).unwrap();
@@ -17433,17 +17442,17 @@ fn item_edit_candidate_lists_only_show_for_focused_collection_field() {
         dialog.label_suggestions = vec!["bug".to_string()];
     }
 
-    let rendered = render(&app);
+    let rendered = render(&mut app);
     assert!(!rendered.contains("Assignee candidates"));
     assert!(!rendered.contains("Label candidates"));
 
     app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Assignees;
-    let rendered = render(&app);
+    let rendered = render(&mut app);
     assert!(rendered.contains("Assignee candidates"));
     assert!(!rendered.contains("Label candidates"));
 
     app.item_edit_dialog.as_mut().expect("dialog").field = ItemEditField::Labels;
-    let rendered = render(&app);
+    let rendered = render(&mut app);
     assert!(!rendered.contains("Assignee candidates"));
     assert!(rendered.contains("Label candidates"));
 }
@@ -18416,7 +18425,7 @@ fn message_dialog_renders_ok_button() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -18487,7 +18496,7 @@ fn retryable_message_dialog_footer_shows_cancel_and_retry_keys() {
     let paths = test_paths();
 
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw");
 
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
@@ -21155,6 +21164,179 @@ fn focus_panel_title_marks_active_panel() {
 }
 
 #[test]
+fn details_keyboard_scroll_and_pages_stop_at_viewport_boundaries() {
+    for mouse_capture_enabled in [true, false] {
+        let mut section = test_section();
+        section.items[0].body = Some((0..50).map(|i| format!("paragraph {i}\n\n")).collect());
+        let mut app = AppState::new(SectionKind::PullRequests, vec![section]);
+        app.mouse_capture_enabled = mouse_capture_enabled;
+        app.focus_details();
+        let area = Rect::new(0, 0, 100, 24);
+        let pane = details_area_for(&app, area);
+        let inner = if mouse_capture_enabled {
+            block_inner(pane)
+        } else {
+            pane
+        };
+        let document = build_details_document(&app, inner.width);
+        let max_scroll = (document.lines.len() - usize::from(inner.height)) as u16;
+        assert!(max_scroll > inner.height);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(PathBuf::from("/tmp/ghr-test-unused.db"));
+        let press = |app: &mut AppState, code| {
+            assert!(!handle_key_in_area(
+                app,
+                key(code),
+                &config,
+                &store,
+                &tx,
+                Some(area)
+            ));
+        };
+
+        for code in [KeyCode::Down, KeyCode::Char('j')] {
+            app.details_scroll = max_scroll - 1;
+            press(&mut app, code);
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, max_scroll);
+        }
+        for code in [KeyCode::PageDown, KeyCode::Char('d')] {
+            app.details_scroll = 0;
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, inner.height);
+            app.details_scroll = max_scroll - 1;
+            press(&mut app, code);
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, max_scroll);
+        }
+        for code in [KeyCode::PageUp, KeyCode::Char('u')] {
+            app.details_scroll = max_scroll;
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, max_scroll - inner.height);
+            app.details_scroll = 1;
+            press(&mut app, code);
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, 0);
+        }
+        for code in [KeyCode::Up, KeyCode::Char('k')] {
+            app.details_scroll = 1;
+            press(&mut app, code);
+            press(&mut app, code);
+            assert_eq!(app.details_scroll, 0);
+        }
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('G'));
+            assert_eq!(app.details_scroll, max_scroll);
+        }
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('g'));
+            assert_eq!(app.details_scroll, 0);
+        }
+        if mouse_capture_enabled {
+            app.details_scroll = max_scroll - 1;
+            handle_details_scroll(&mut app, pane, MOUSE_DETAILS_SCROLL_LINES as i16);
+            assert_eq!(app.details_scroll, max_scroll);
+        }
+    }
+}
+
+#[test]
+fn details_keyboard_does_not_scroll_content_that_fits() {
+    for mouse_capture_enabled in [true, false] {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.mouse_capture_enabled = mouse_capture_enabled;
+        app.focus_details();
+        let area = Rect::new(0, 0, 160, 80);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::default();
+        let store = SnapshotStore::new(PathBuf::from("/tmp/ghr-test-unused.db"));
+        for code in [
+            KeyCode::Down,
+            KeyCode::Char('j'),
+            KeyCode::PageDown,
+            KeyCode::Char('d'),
+            KeyCode::Char('G'),
+        ] {
+            handle_key_in_area(&mut app, key(code), &config, &store, &tx, Some(area));
+            assert_eq!(app.details_scroll, 0);
+        }
+    }
+}
+
+#[test]
+fn details_render_clamps_scroll_after_resize_collapse_and_content_change() {
+    for mouse_capture_enabled in [true, false] {
+        let mut app = AppState::new(SectionKind::PullRequests, vec![test_section()]);
+        app.mouse_capture_enabled = mouse_capture_enabled;
+        app.focus_details();
+        let body = (0..80)
+            .map(|i| {
+                format!(
+                    "long comment line {i} with enough words to wrap in a narrow details panel\n\n"
+                )
+            })
+            .collect::<String>();
+        app.details.insert(
+            "1".to_string(),
+            DetailState::Loaded(vec![comment("alice", &body, None)]),
+        );
+        app.select_comment(0);
+        app.toggle_selected_comment_expanded();
+        let paths = test_paths();
+        let render = |app: &mut AppState, width, height| {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, app, &paths)).unwrap();
+            let pane = details_area_for(app, Rect::new(0, 0, width, height));
+            let inner = if app.mouse_capture_enabled {
+                block_inner(pane)
+            } else {
+                pane
+            };
+            let document = build_details_document(app, inner.width);
+            let expected = document
+                .lines
+                .len()
+                .saturating_sub(usize::from(inner.height)) as u16;
+            assert_eq!(app.details_scroll, expected);
+            let memory_key = work_item_details_memory_key(app.current_item().unwrap()).unwrap();
+            assert_eq!(
+                app.conversation_details_state[&memory_key].details_scroll,
+                expected
+            );
+            // The rendered viewport must contain the final non-empty content line.
+            let last = document
+                .lines
+                .iter()
+                .rposition(|line| !line.to_string().trim().is_empty())
+                .unwrap();
+            let row = inner.y + (last - usize::from(app.details_scroll)) as u16;
+            let rendered = buffer_lines(terminal.backend().buffer());
+            assert!(rendered[usize::from(row)].contains(document.lines[last].to_string().trim()));
+        };
+
+        // A restored position beyond the document is corrected on the first draw.
+        app.details_scroll = u16::MAX;
+        render(&mut app, 70, 18);
+        let old_scroll = app.details_scroll;
+        render(&mut app, 140, 18);
+        assert!(app.details_scroll < old_scroll);
+        let old_scroll = app.details_scroll;
+        render(&mut app, 140, 30);
+        assert!(app.details_scroll < old_scroll);
+        let expanded_scroll = app.details_scroll;
+        app.toggle_selected_comment_expanded();
+        render(&mut app, 140, 30);
+        assert!(app.details_scroll < expanded_scroll);
+        app.details
+            .insert("1".to_string(), DetailState::Loaded(Vec::new()));
+        render(&mut app, 160, 80);
+        assert_eq!(app.details_scroll, 0);
+    }
+}
+
+#[test]
 fn mouse_wheel_scrolls_details_when_content_overflows() {
     let mut item = work_item("1", "rust-lang/rust", 1, "Compiler diagnostics", None);
     item.body = Some(
@@ -22154,7 +22336,7 @@ fn render_marks_only_one_focused_region() {
 
     app.focus_sections();
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw sections focus");
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     assert_eq!(rendered.matches("[Focus").count(), 1);
@@ -22163,7 +22345,7 @@ fn render_marks_only_one_focused_region() {
 
     app.focus_list();
     terminal
-        .draw(|frame| draw(frame, &app, &paths))
+        .draw(|frame| draw(frame, &mut app, &paths))
         .expect("draw list focus");
     let rendered = buffer_lines(terminal.backend().buffer()).join("\n");
     assert_eq!(rendered.matches("[Focus").count(), 1);
@@ -22199,7 +22381,7 @@ fn escape_returns_from_details_to_list() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_details();
-    app.scroll_details(5);
+    app.scroll_details(5, None);
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Esc),
@@ -22909,7 +23091,7 @@ fn three_focuses_primary_list_without_changing_page() {
     let store = SnapshotStore::new(std::path::PathBuf::from("/tmp/ghr-test-unused.db"));
 
     app.focus_details();
-    app.scroll_details(3);
+    app.scroll_details(3, None);
     assert!(!handle_key(
         &mut app,
         key(KeyCode::Char('3')),

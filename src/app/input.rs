@@ -757,10 +757,14 @@ pub(super) fn handle_key_in_area_mut(
             KeyCode::Enter if app.details_mode == DetailsMode::Conversation => {
                 app.toggle_selected_comment_expanded()
             }
-            KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1),
-            KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1),
-            KeyCode::PageDown | KeyCode::Char('d') => app.scroll_details(8),
-            KeyCode::PageUp | KeyCode::Char('u') => app.scroll_details(-8),
+            KeyCode::Down | KeyCode::Char('j') => app.scroll_details(1, area),
+            KeyCode::Up | KeyCode::Char('k') => app.scroll_details(-1, area),
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                app.scroll_details(details_page_delta(app, area, 1), area)
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                app.scroll_details(details_page_delta(app, area, -1), area)
+            }
             KeyCode::Char('g') => app.scroll_conversation_details_to_top(),
             KeyCode::Char('G') => app.scroll_conversation_details_to_bottom(area),
             _ => {}
@@ -2333,19 +2337,7 @@ pub(super) fn handle_details_scroll(app: &mut AppState, area: Rect, delta: i16) 
     app.filter_input_active = false;
 
     let max_scroll = max_details_scroll(app, area);
-    if max_scroll == 0 {
-        app.details_scroll = 0;
-        app.remember_current_conversation_details_position();
-        return;
-    }
-
-    if delta < 0 {
-        app.details_scroll = app.details_scroll.saturating_sub(delta.unsigned_abs());
-    } else {
-        app.details_scroll = app.details_scroll.saturating_add(delta as u16);
-    }
-    app.details_scroll = app.details_scroll.min(max_scroll);
-    app.remember_current_conversation_details_position();
+    app.scroll_details_bounded(isize::from(delta), max_scroll);
 }
 
 pub(super) fn handle_list_scroll(app: &mut AppState, area: Rect, delta: isize) {
@@ -2391,21 +2383,23 @@ pub(super) fn diff_file_page_delta(app: &AppState, area: Option<Rect>, direction
     direction.saturating_mul(rows as isize)
 }
 
-pub(super) fn diff_line_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
+pub(super) fn details_page_delta(app: &AppState, area: Option<Rect>, direction: isize) -> isize {
     let rows = area
-        .map(|area| usize::from(block_inner(details_area_for(app, area)).height.max(1)))
+        .map(|area| {
+            usize::from(
+                details_content_area(app, details_area_for(app, area))
+                    .height
+                    .max(1),
+            )
+        })
         .unwrap_or(10);
     direction.saturating_mul(rows as isize)
 }
 
 pub(super) fn max_details_scroll(app: &AppState, area: Rect) -> u16 {
-    let inner = block_inner(area);
+    let inner = details_content_area(app, area);
     let document = build_details_document(app, inner.width);
-    let max = document
-        .lines
-        .len()
-        .saturating_sub(usize::from(inner.height));
-    max.min(usize::from(u16::MAX)) as u16
+    document.max_scroll(inner.height)
 }
 
 pub(super) fn handle_table_click(

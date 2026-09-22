@@ -21,6 +21,14 @@ pub(super) fn details_area_for(app: &AppState, area: Rect) -> Rect {
     }
 }
 
+pub(super) fn details_content_area(app: &AppState, area: Rect) -> Rect {
+    if app.mouse_capture_enabled {
+        block_inner(area)
+    } else {
+        area
+    }
+}
+
 pub(super) fn page_areas(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)

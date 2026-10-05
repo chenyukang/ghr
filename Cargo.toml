@@ -19,7 +19,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 futures = "0.3"
 http = "1"
 md5 = "0.8"

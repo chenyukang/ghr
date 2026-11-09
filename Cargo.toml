@@ -27,7 +27,7 @@ octocrab = { version = "0.54", default-features = false, features = ["default-cl
 open = "5"
 pulldown-cmark = "0.13"
 ratatui = "0.30"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"

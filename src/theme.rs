@@ -30,6 +30,9 @@ pub enum ThemeName {
     GitHubDark = 13,
     #[serde(rename = "github_light", alias = "git_hub_light")]
     GitHubLight = 14,
+    /// The terminal's own colors: its default foreground and background and its 16 ANSI colors,
+    /// so ghr looks like the rest of the terminal and follows a change to its palette.
+    Terminal = 15,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +67,7 @@ impl ThemeName {
         ThemeName::Monokai,
         ThemeName::GitHubDark,
         ThemeName::GitHubLight,
+        ThemeName::Terminal,
     ];
 
     fn from_u8(value: u8) -> Self {
@@ -83,6 +87,7 @@ impl ThemeName {
             12 => Self::Monokai,
             13 => Self::GitHubDark,
             14 => Self::GitHubLight,
+            15 => Self::Terminal,
             _ => Self::Dark,
         }
     }
@@ -104,6 +109,8 @@ impl ThemeName {
             Self::Monokai => ThemeFamily::Dark,
             Self::GitHubDark => ThemeFamily::Dark,
             Self::GitHubLight => ThemeFamily::Light,
+            // Terminal is not really any family, it will work on both. Most terminal apps are Dark by default though.
+            Self::Terminal => ThemeFamily::Dark,
         }
     }
 
@@ -124,6 +131,7 @@ impl ThemeName {
             Self::Monokai => "monokai",
             Self::GitHubDark => "github_dark",
             Self::GitHubLight => "github_light",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -663,6 +671,37 @@ impl Theme {
                 label: Color::Rgb(9, 105, 218),
                 search: Color::Rgb(154, 103, 0),
             },
+            // Reset is the terminal's default color; with it as the background, nothing is
+            // painted (with_bg). The rest are the ANSI colors 0-15, as the terminal defines them.
+            ThemeName::Terminal => Self {
+                background: Color::Reset,
+                surface: Color::Reset,
+                text: Color::Reset,
+                muted: Color::Gray,
+                subtle: Color::DarkGray,
+                border: Color::DarkGray,
+                focus: Color::Yellow,
+                focus_alt: Color::Magenta,
+                highlight_fg: Color::Black,
+                highlight_bg: Color::Yellow,
+                selected_fg: Color::Reset,
+                selected_bg: Color::Black,
+                code_bg: Color::Black,
+                quote_bg: Color::Black,
+                link: Color::Blue,
+                action: Color::Yellow,
+                success: Color::Green,
+                warning: Color::Yellow,
+                error: Color::Red,
+                info: Color::Blue,
+                added: Color::Green,
+                removed: Color::Red,
+                code: Color::Cyan,
+                quote: Color::Gray,
+                reaction: Color::Yellow,
+                label: Color::Blue,
+                search: Color::Yellow,
+            },
         }
     }
 
@@ -800,7 +839,8 @@ mod tests {
 
     #[test]
     fn all_themes_use_explicit_colors() {
-        for &name in ThemeName::ALL {
+        // But terminal, whose point is the terminal's own default colors.
+        for &name in ThemeName::ALL.iter().filter(|&&n| n != ThemeName::Terminal) {
             let theme = Theme::from_name(name);
             assert_ne!(
                 theme.background,
@@ -844,6 +884,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_theme_paints_no_background_and_uses_ansi_colors() {
+        let theme = Theme::from_name(ThemeName::Terminal);
+        assert_eq!(theme.base().bg, None);
+        assert_eq!(theme.panel().bg, None);
+        for color in [
+            theme.border,
+            theme.focus,
+            theme.link,
+            theme.added,
+            theme.removed,
+        ] {
+            assert!(
+                !matches!(color, Color::Rgb(..)),
+                "{color:?} is not an ANSI color"
+            );
+        }
+        let decoded: ThemeName = toml::from_str::<std::collections::BTreeMap<String, ThemeName>>(
+            "theme_name = \"terminal\"",
+        )
+        .unwrap()["theme_name"];
+        assert_eq!(decoded, ThemeName::Terminal);
     }
 
     #[test]
